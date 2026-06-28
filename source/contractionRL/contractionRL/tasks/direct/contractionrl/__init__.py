@@ -13,11 +13,12 @@ from . import agents
 
 
 gym.register(
-    id="Template-Contractionrl-Direct-v0",
+    id="Contractionrl-Direct-v0",
     entry_point=f"{__name__}.contractionrl_env:ContractionrlEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.contractionrl_env_cfg:ContractionrlEnvCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+        "skrl_cfg_entry_point":     f"{agents.__name__}:skrl_ppo_cfg.yaml",
+        "skrl_sac_cfg_entry_point": f"{agents.__name__}:skrl_sac_cfg.yaml",
     },
 )

@@ -59,6 +59,7 @@ parser.add_argument(
     ),
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument("--debug_vis", action="store_true", default=False, help="Enable debug visualisation (velocity arrows above robots).")
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -68,11 +69,31 @@ args_cli, hydra_args = parser.parse_known_args()
 if args_cli.video:
     args_cli.enable_cameras = True
 
+# Disable Kit's hang-detector watchdog at launch. The play loop blocks Kit's main
+# thread while stepping the sim / running inference; after 120s the watchdog wrongly
+# assumes Kit froze and tries to pop a GTK "send crash report" dialog via zenity
+# (which spams "Failed to open display" in headless/no-DISPLAY sessions). The sim is
+# not hung. Passed as a kit arg so it is set before the watchdog plugin initialises.
+args_cli.kit_args = (args_cli.kit_args or "") + " --/app/hangDetector/enabled=false"
+
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
+
+# Silence the benign Fabric "mismatched prototypes on point instancer" warning that
+# fires when VisualizationMarkers PointInstancers are created after sim start (stock
+# IsaacLab emits it too). Lower this one channel to ERROR; real errors still surface.
+if args_cli.debug_vis:
+    try:
+        import omni.log
+
+        omni.log.get_log().set_channel_level(
+            "omni.physx.fabric.plugin", omni.log.Level.ERROR, omni.log.SettingBehavior.OVERRIDE
+        )
+    except Exception as _e:  # noqa: BLE001
+        print(f"[WARN] Could not lower omni.physx.fabric.plugin log level: {_e}")
 
 """Rest everything follows."""
 
@@ -183,6 +204,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
         dt = env.step_dt
     except AttributeError:
         dt = env.unwrapped.step_dt
+
+    # enable debug visualisation (velocity arrows above robots)
+    if args_cli.debug_vis:
+        env.unwrapped.set_debug_vis(True)
 
     # wrap for video recording
     if args_cli.video:

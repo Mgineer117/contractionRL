@@ -3,6 +3,9 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import gymnasium as gym
+import numpy as np
+
 from isaaclab_assets.robots.cartpole import CARTPOLE_CFG
 
 from isaaclab.assets import ArticulationCfg
@@ -17,8 +20,8 @@ class ContractionrlEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2
     episode_length_s = 5.0
-    # - spaces definition
-    action_space = 1
+    # action: normalised cart force in [-1, 1], scaled by action_scale [N]
+    action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
     observation_space = 4
     state_space = 0
 

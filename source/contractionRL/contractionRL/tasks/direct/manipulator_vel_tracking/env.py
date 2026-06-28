@@ -1,0 +1,210 @@
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import torch
+
+import isaaclab.sim as sim_utils
+from isaaclab.assets import Articulation
+from isaaclab.envs import DirectRLEnv
+from isaaclab.markers import VisualizationMarkers
+from isaaclab.markers.config import BLUE_ARROW_X_MARKER_CFG, GREEN_ARROW_X_MARKER_CFG
+from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+
+from ..common.vel_commands import VelCommands
+from .env_cfg import ManipulatorVelTrackingEnvCfg
+
+
+class ManipulatorVelTrackingEnv(DirectRLEnv):
+    """Franka Panda EE-velocity-tracking environment.
+
+    Commands: constant (vx, vy, vz) EE linear velocity + sinusoidal EE yaw rate.
+
+    State for path-tracking export (21 dims):
+        joint_pos(7) + joint_vel(7) + ee_pos_local(3)
+        + ee_lin_vel(3) + ee_yaw_vel(1)
+    """
+
+    cfg: ManipulatorVelTrackingEnvCfg
+
+    STATE_DIM = 21
+
+    def __init__(self, cfg: ManipulatorVelTrackingEnvCfg, render_mode: str | None = None, **kwargs):
+        super().__init__(cfg, render_mode, **kwargs)
+
+        self._arm_ids, _ = self._robot.find_joints(self.cfg.arm_joint_names)
+        self._ee_id, _ = self._robot.find_bodies(self.cfg.ee_body_name)
+
+        self._actions = torch.zeros(self.num_envs, self.action_space.shape[0], device=self.device)
+        self._prev_actions = torch.zeros_like(self._actions)
+        self._cmd = VelCommands(self.num_envs, self.device, self.cfg.vel_cmd)
+
+    def _setup_scene(self):
+        self._robot = Articulation(self.cfg.robot_cfg)
+        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+        self.scene.clone_environments(copy_from_source=False)
+        if self.device == "cpu":
+            self.scene.filter_collisions(global_prim_paths=[])
+        self.scene.articulations["robot"] = self._robot
+        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        light_cfg.func("/World/Light", light_cfg)
+
+    def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        self._prev_actions = self._actions.clone()
+        self._actions = actions.clone()
+        # scale action from [-1,1] to joint position within soft limits
+        limits = self._robot.data.soft_joint_pos_limits[:, self._arm_ids, :]  # (N, 7, 2)
+        mid = 0.5 * (limits[..., 0] + limits[..., 1])
+        half_range = 0.5 * (limits[..., 1] - limits[..., 0])
+        self._joint_targets = mid + half_range * self._actions
+
+    def _apply_action(self) -> None:
+        self._robot.set_joint_position_target(self._joint_targets, joint_ids=self._arm_ids)
+
+    def get_physical_state(self) -> torch.Tensor:
+        """Returns (N, 21) physical state: joint_pos(7) + joint_vel(7)
+        + ee_pos_local(3) + ee_lin_vel(3) + ee_yaw_vel(1).
+        """
+        ee_pos = self._robot.data.body_pos_w[:, self._ee_id[0], :] - self.scene.env_origins   # (N, 3)
+        ee_lin_vel = self._robot.data.body_lin_vel_w[:, self._ee_id[0], :]                     # (N, 3)
+        ee_yaw_vel = self._robot.data.body_ang_vel_w[:, self._ee_id[0], 2:3]                   # (N, 1)
+        return torch.cat(
+            [
+                self._robot.data.joint_pos[:, self._arm_ids],
+                self._robot.data.joint_vel[:, self._arm_ids],
+                ee_pos,
+                ee_lin_vel,
+                ee_yaw_vel,
+            ],
+            dim=-1,
+        )
+
+    def _get_observations(self) -> dict:
+        t = self.episode_length_buf.float() * self.step_dt
+        cmds = self._cmd.get(t)                   # (N, 4): [vx, vy, vz, yaw_rate]
+        state = self.get_physical_state()          # (N, 21)
+        obs = torch.cat([state, cmds, self._prev_actions], dim=-1)
+        return {"policy": obs}
+
+    def _get_rewards(self) -> torch.Tensor:
+        t = self.episode_length_buf.float() * self.step_dt
+        cmds = self._cmd.get(t)
+
+        ee_lin_vel = self._robot.data.body_lin_vel_w[:, self._ee_id[0], :]      # (N, 3)
+        ee_yaw_vel = self._robot.data.body_ang_vel_w[:, self._ee_id[0], 2]      # (N,)
+
+        # velocity tracking error
+        vel_err = torch.sum(torch.square(ee_lin_vel - cmds[:, :3]), dim=1)
+        rew_vel = vel_err * self.cfg.rew_ee_vel
+
+        yaw_err = torch.square(ee_yaw_vel - cmds[:, 3])
+        rew_yaw = yaw_err * self.cfg.rew_ee_yaw
+
+        rew_ar = torch.sum(torch.square(self._actions - self._prev_actions), dim=1) * self.cfg.rew_action_rate
+
+        # soft joint-limit penalty: penalise if |q - q_mid| > 0.9 * half_range
+        limits = self._robot.data.soft_joint_pos_limits[:, self._arm_ids, :]
+        mid = 0.5 * (limits[..., 0] + limits[..., 1])
+        half_range = 0.5 * (limits[..., 1] - limits[..., 0])
+        normalised = (self._robot.data.joint_pos[:, self._arm_ids] - mid) / (half_range + 1e-6)
+        rew_limits = torch.sum(torch.clamp(normalised.abs() - 0.9, min=0.0) ** 2, dim=1) * self.cfg.rew_joint_limits
+
+        return rew_vel + rew_yaw + rew_ar + rew_limits
+
+    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        time_out = self.episode_length_buf >= self.max_episode_length - 1
+        terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        return terminated, time_out
+
+    def _reset_idx(self, env_ids: Sequence[int] | None):
+        if env_ids is None:
+            env_ids = self._robot._ALL_INDICES
+        super()._reset_idx(env_ids)
+
+        self._actions[env_ids] = 0.0
+        self._prev_actions[env_ids] = 0.0
+        self._cmd.reset(env_ids)
+
+        joint_pos = self._robot.data.default_joint_pos[env_ids]
+        joint_vel = self._robot.data.default_joint_vel[env_ids]
+        root = self._robot.data.default_root_state[env_ids]
+        root[:, :3] += self.scene.env_origins[env_ids]
+
+        self._robot.write_root_pose_to_sim(root[:, :7], env_ids)
+        self._robot.write_root_velocity_to_sim(root[:, 7:], env_ids)
+        self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+
+    # ------------------------------------------------------------------ #
+    # Debug visualisation: blue = command EE vel, green = current EE vel
+    # Arrows shown at the EE position; 3D direction via axis-angle rotation.
+    # ------------------------------------------------------------------ #
+
+    def _set_debug_vis_impl(self, debug_vis: bool):
+        if debug_vis:
+            if not hasattr(self, "_cmd_vel_marker"):
+                cmd_cfg = BLUE_ARROW_X_MARKER_CFG.replace(prim_path="/Visuals/ManipulatorVelCmd")
+                cur_cfg = GREEN_ARROW_X_MARKER_CFG.replace(prim_path="/Visuals/ManipulatorVelCur")
+                self._cmd_vel_marker = VisualizationMarkers(cmd_cfg)
+                self._cur_vel_marker = VisualizationMarkers(cur_cfg)
+            self._cmd_vel_marker.set_visibility(True)
+            self._cur_vel_marker.set_visibility(True)
+        else:
+            if hasattr(self, "_cmd_vel_marker"):
+                self._cmd_vel_marker.set_visibility(False)
+                self._cur_vel_marker.set_visibility(False)
+
+    def _debug_vis_callback(self, event):
+        # event stream can fire before the scene is ready or during teardown
+        if not hasattr(self, "scene") or not self._robot.is_initialized:
+            return
+        t = self.episode_length_buf.float() * self.step_dt
+        cmds = self._cmd.get(t)  # (N, 4): [vx, vy, vz, yaw] in world frame
+
+        ee_pos = self._robot.data.body_pos_w[:, self._ee_id[0], :]  # (N, 3) world
+        cmd_pos = ee_pos.clone(); cmd_pos[:, 2] += 0.15
+        cur_pos = ee_pos.clone(); cur_pos[:, 2] -= 0.05
+
+        ee_vel = self._robot.data.body_lin_vel_w[:, self._ee_id[0], :]  # (N, 3)
+
+        cmd_quat, cmd_spd = self._world_vel_to_arrow(cmds[:, :3])
+        cur_quat, cur_spd = self._world_vel_to_arrow(ee_vel)
+
+        # length grows with speed (gain); width fixed so arrows stay visible at low speed
+        len_gain, width = 3.0, 0.15
+        cmd_scale = torch.cat([cmd_spd * len_gain, torch.full_like(cmd_spd, width), torch.full_like(cmd_spd, width)], dim=-1)
+        cur_scale = torch.cat([cur_spd * len_gain, torch.full_like(cur_spd, width), torch.full_like(cur_spd, width)], dim=-1)
+
+        proto = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self._cmd_vel_marker.visualize(translations=cmd_pos, orientations=cmd_quat, scales=cmd_scale, marker_indices=proto)
+        self._cur_vel_marker.visualize(translations=cur_pos, orientations=cur_quat, scales=cur_scale, marker_indices=proto)
+
+    def _world_vel_to_arrow(self, vel_w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(N, 3) world-frame velocity → (N, 4) wxyz quaternion (rotate +X → vel dir) + (N, 1) speed."""
+        speed = vel_w.norm(dim=-1, keepdim=True)  # (N, 1)
+        d = vel_w / speed.clamp(min=1e-6)          # (N, 3) unit direction
+
+        # axis = [1,0,0] × d = [0, -dz, dy]
+        axis_y = -d[:, 2]
+        axis_z = d[:, 1]
+        axis_norm = torch.sqrt(axis_y ** 2 + axis_z ** 2)  # (N,)
+
+        cos_a = d[:, 0].clamp(-1.0, 1.0)
+        ha = torch.acos(cos_a) * 0.5
+        sin_ha = torch.sin(ha)
+        safe_n = axis_norm.clamp(min=1e-6)
+
+        qw = torch.cos(ha)
+        qx = torch.zeros_like(qw)
+        qy = axis_y / safe_n * sin_ha
+        qz = axis_z / safe_n * sin_ha
+        quat = torch.stack([qw, qx, qy, qz], dim=-1)
+
+        # degenerate: velocity along ±X
+        identity = torch.tensor([1.0, 0.0, 0.0, 0.0], device=vel_w.device).expand_as(quat)
+        flip_z = torch.tensor([0.0, 0.0, 0.0, 1.0], device=vel_w.device).expand_as(quat)
+        is_singular = (axis_norm < 1e-4).unsqueeze(-1)
+        is_neg_x = (is_singular) & (cos_a < 0).unsqueeze(-1)
+        quat = torch.where(is_singular & ~is_neg_x, identity, quat)
+        quat = torch.where(is_neg_x, flip_z, quat)
+
+        return quat, speed.clamp(0.05, 0.5)

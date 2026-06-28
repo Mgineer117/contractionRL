@@ -59,6 +59,30 @@ parser.add_argument(
 parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
+parser.add_argument("--wandb", action="store_true", default=False, help="Enable Weights & Biases logging.")
+parser.add_argument("--wandb_project", "--wandb-project", type=str, default=None, help="W&B project name (overrides YAML).")
+parser.add_argument("--wandb_run_name", "--wandb-run-name", type=str, default=None, help="W&B run name (overrides YAML).")
+# Hyperparameter overrides injected by search scripts via wandb sweep ${args}.
+# Each flag has both underscore (wandb) and hyphen (human-friendly) forms.
+# SAC
+parser.add_argument("--sac_lr", "--sac-lr", type=float, default=None, help="SAC learning rate.")
+parser.add_argument("--sac_batch_size", "--sac-batch-size", type=int, default=None, help="SAC batch size.")
+parser.add_argument("--sac_discount", "--sac-discount", type=float, default=None, help="SAC discount factor.")
+parser.add_argument("--sac_polyak", "--sac-polyak", type=float, default=None, help="SAC polyak coefficient.")
+parser.add_argument("--sac_gradient_steps", "--sac-gradient-steps", type=int, default=None, help="SAC gradient steps per env step.")
+parser.add_argument("--sac_entropy", "--sac-entropy", type=float, default=None, help="SAC initial entropy value.")
+parser.add_argument("--sac_memory_size", "--sac-memory-size", type=int, default=None, help="SAC replay buffer size per env.")
+# PPO
+parser.add_argument("--ppo_lr", "--ppo-lr", type=float, default=None, help="PPO learning rate.")
+parser.add_argument("--ppo_rollouts", "--ppo-rollouts", type=int, default=None, help="PPO rollout steps per update.")
+parser.add_argument("--ppo_learning_epochs", "--ppo-learning-epochs", type=int, default=None, help="PPO gradient epochs per update.")
+parser.add_argument("--ppo_mini_batches", "--ppo-mini-batches", type=int, default=None, help="PPO mini-batches per epoch.")
+parser.add_argument("--ppo_discount", "--ppo-discount", type=float, default=None, help="PPO discount factor.")
+parser.add_argument("--ppo_lambda", "--ppo-lambda", type=float, default=None, help="PPO GAE lambda.")
+parser.add_argument("--ppo_ratio_clip", "--ppo-ratio-clip", type=float, default=None, help="PPO clip ratio epsilon.")
+parser.add_argument("--ppo_entropy_scale", "--ppo-entropy-scale", type=float, default=None, help="PPO entropy loss scale.")
+# shared
+parser.add_argument("--num_timesteps", "--num-timesteps", type=int, default=None, help="Total training timesteps.")
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -66,6 +90,13 @@ args_cli, hydra_args = parser.parse_known_args()
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
+
+# Disable Kit's hang-detector watchdog at launch. Long training/sim steps block Kit's
+# main thread; after 120s the watchdog wrongly assumes Kit froze and tries to pop a GTK
+# "send crash report" dialog via zenity (which spams "Failed to open display" in
+# headless/no-DISPLAY sessions). The sim is not hung. Passed as a kit arg so it is set
+# before the watchdog plugin initialises.
+args_cli.kit_args = (args_cli.kit_args or "") + " --/app/hangDetector/enabled=false"
 
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
@@ -150,7 +181,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # max iterations for training
     if args_cli.max_iterations:
         agent_cfg["trainer"]["timesteps"] = args_cli.max_iterations * agent_cfg["agent"]["rollouts"]
+    if args_cli.num_timesteps is not None:
+        agent_cfg["trainer"]["timesteps"] = args_cli.num_timesteps
     agent_cfg["trainer"]["close_environment_at_exit"] = False
+
+    # Hyperparameter overrides from search scripts (injected via wandb sweep ${args})
+    a = agent_cfg["agent"]
+    # SAC
+    if args_cli.sac_lr is not None:               a["learning_rate"]          = args_cli.sac_lr
+    if args_cli.sac_batch_size is not None:        a["batch_size"]             = args_cli.sac_batch_size
+    if args_cli.sac_discount is not None:          a["discount_factor"]        = args_cli.sac_discount
+    if args_cli.sac_polyak is not None:            a["polyak"]                 = args_cli.sac_polyak
+    if args_cli.sac_gradient_steps is not None:    a["gradient_steps"]         = args_cli.sac_gradient_steps
+    if args_cli.sac_entropy is not None:           a["initial_entropy_value"]  = args_cli.sac_entropy
+    if args_cli.sac_memory_size is not None:       agent_cfg["memory"]["memory_size"] = args_cli.sac_memory_size
+    # PPO
+    if args_cli.ppo_lr is not None:               a["learning_rate"]    = args_cli.ppo_lr
+    if args_cli.ppo_rollouts is not None:          a["rollouts"]         = args_cli.ppo_rollouts
+    if args_cli.ppo_learning_epochs is not None:   a["learning_epochs"]  = args_cli.ppo_learning_epochs
+    if args_cli.ppo_mini_batches is not None:      a["mini_batches"]     = args_cli.ppo_mini_batches
+    if args_cli.ppo_discount is not None:          a["discount_factor"]  = args_cli.ppo_discount
+    if args_cli.ppo_lambda is not None:            a["lambda"]           = args_cli.ppo_lambda
+    if args_cli.ppo_ratio_clip is not None:        a["ratio_clip"]       = args_cli.ppo_ratio_clip
+    if args_cli.ppo_entropy_scale is not None:     a["entropy_loss_scale"] = args_cli.ppo_entropy_scale
     # configure the ML framework into the global skrl variable
     if args_cli.ml_framework.startswith("jax"):
         skrl.config.jax.backend = "jax" if args_cli.ml_framework == "jax" else "numpy"
@@ -180,6 +233,59 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg["agent"]["experiment"]["experiment_name"] = log_dir
     # update log_dir
     log_dir = os.path.join(log_root_path, log_dir)
+
+    # configure wandb from CLI flags (bypasses Hydra struct-mode restrictions)
+    _wandb_video_thread = None
+    _wandb_stop_event = None
+    if args_cli.wandb:
+        agent_cfg["agent"]["experiment"]["wandb"] = True
+        # skrl uses its own custom SummaryWriter that bypasses PyTorch's writer,
+        # so wandb's sync_tensorboard=True never intercepts any writes.
+        # Patch add_scalar to also call wandb.log() directly.
+        import glob as _glob
+        import re as _re
+        import threading as _threading
+        import skrl.utils.tensorboard as _skrl_tb
+        import wandb as _wandb
+        _orig_add_scalar = _skrl_tb.SummaryWriter.add_scalar
+
+        def _wandb_add_scalar(self, *, tag: str, value: float, timestep: int) -> None:
+            _orig_add_scalar(self, tag=tag, value=value, timestep=timestep)
+            if _wandb.run is not None:
+                _wandb.log({tag: value}, step=timestep)
+
+        _skrl_tb.SummaryWriter.add_scalar = _wandb_add_scalar
+
+        # background thread: upload RecordVideo MP4s to wandb as they appear
+        if args_cli.video:
+            _video_dir = os.path.join(log_dir, "videos", "train")
+            _uploaded_videos: set = set()
+            _wandb_stop_event = _threading.Event()
+
+            def _upload_pending_videos(step: int | None = None) -> None:
+                for mp4 in sorted(_glob.glob(os.path.join(_video_dir, "*.mp4"))):
+                    if mp4 not in _uploaded_videos and _wandb.run is not None:
+                        m = _re.search(r"step-(\d+)", os.path.basename(mp4))
+                        log_step = int(m.group(1)) if m else step
+                        try:
+                            _wandb.log({"train/video": _wandb.Video(mp4, format="mp4")}, step=log_step)
+                            _uploaded_videos.add(mp4)
+                        except Exception as _e:
+                            logger.warning(f"wandb video upload failed: {_e}")
+
+            def _video_watcher() -> None:
+                while not _wandb_stop_event.is_set():
+                    _upload_pending_videos()
+                    _wandb_stop_event.wait(timeout=30)
+                _upload_pending_videos()  # final flush
+
+            _wandb_video_thread = _threading.Thread(target=_video_watcher, daemon=True)
+            _wandb_video_thread.start()
+
+    if args_cli.wandb_project is not None:
+        agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})["project"] = args_cli.wandb_project
+    if args_cli.wandb_run_name is not None:
+        agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})["name"] = args_cli.wandb_run_name
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
@@ -236,6 +342,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner.run()
 
     print(f"Training time: {round(time.time() - start_time, 2)} seconds")
+
+    # stop video watcher thread and wait for final upload
+    if _wandb_stop_event is not None:
+        _wandb_stop_event.set()
+    if _wandb_video_thread is not None:
+        _wandb_video_thread.join(timeout=120)
 
     # close the simulator
     env.close()

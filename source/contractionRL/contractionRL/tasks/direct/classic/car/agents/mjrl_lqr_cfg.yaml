@@ -1,0 +1,12 @@
+seed: 42
+
+agent:
+  class: LQR
+  device: cpu          # LQR solves a CARE per state on CPU (scipy)
+  Q_scaler: 1.0
+  R_scaler: 1.0          # nonzero control cost — R=0 gives unstable (huge) gains under discrete dt
+
+trainer:
+  class: EvalTrainer
+  num_agent: 4         # == num_worker for the parallel rollout sampler
+  num_eval_rounds: 1
