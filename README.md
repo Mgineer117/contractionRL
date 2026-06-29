@@ -94,15 +94,21 @@ python scripts/list_envs.py --keyword classic
 
 ### Robots and task families
 
-Three robots across three task families give nine Isaac Sim environments,
-plus one classic (no-sim) env:
+The three Isaac Sim robots each come in three registered task variants:
 
-| Robot | Model | Joints controlled | Task families |
-|-------|-------|-------------------|---------------|
+| Robot | Model | Joints controlled | Registered variants |
+|-------|-------|-------------------|---------------------|
 | **Quadruped** | Unitree Go2 | 12 (3×4 legs: hip/thigh/calf) | base, vel_tracking, path_tracking |
 | **Humanoid** | Unitree H1 | 19 (legs 11, torso 1, arms 8) | base, vel_tracking, path_tracking |
 | **Manipulator** | Franka Panda | 7 (arm joints, no fingers) | base, vel_tracking, path_tracking |
-| **Classic** | — (analytical) | 2 (car: ω, a) | — (contraction only) |
+
+Each "variant" is a **separate gym registration** with a distinct obs/reward/reset design:
+
+- **base** — locomotion without a structured tracking goal; a starting point for custom reward shaping. Runs with skrl (PPO/SAC).
+- **vel_tracking** — follow a randomly sampled velocity command each episode. Runs with skrl (PPO/SAC). Also usable for mjrl dynamics data collection.
+- **path_tracking** — follow a pre-recorded state trajectory `[x_ref, u_ref]` step-by-step. Observation format `[x, x_ref, u_ref]` is contraction-compatible, so both skrl and mjrl agents can run in it.
+
+The classic **Car-Direct-v0** is a completely separate, no-sim environment. It is not a variant of the Isaac envs — it has its own single registration and is only supported by the mjrl algorithm stack. It is described in its own section below.
 
 ---
 
