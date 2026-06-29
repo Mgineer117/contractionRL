@@ -83,13 +83,14 @@ from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 import contractionRL.tasks  # noqa: F401, E402
 
 from mjrl.models.dynamics import NeuralDynamics  # noqa: E402
+from mjrl.utils import get_device  # noqa: E402
 from mjrl.utils.isaac_wrapper import IsaacMjrlWrapper  # noqa: E402
 from mjrl.utils.runner.torch import Runner  # noqa: E402
 
 
 def _build_cfg(algo: str, dyn: NeuralDynamics, args) -> dict:
     """Build a minimal mjrl cfg dict for the given algorithm."""
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = args.device or get_device()
     if algo == "lqr":
         return {
             "seed": args.seed,
@@ -132,7 +133,7 @@ def _build_cfg(algo: str, dyn: NeuralDynamics, args) -> dict:
 
 
 def main():
-    device = args_cli.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = args_cli.device or get_device()
 
     # load dynamics checkpoint
     dyn = NeuralDynamics.load(args_cli.dynamics_checkpoint, device=device)

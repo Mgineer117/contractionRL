@@ -39,6 +39,7 @@ import torch
 from mjrl.agents.torch import C3M, LQR
 from mjrl.models import CCM_Generator, CLActor
 from mjrl.trainers.torch import C3MTrainer, EvalTrainer
+from mjrl.utils import get_device
 
 _AGENTS = {"C3M": C3M, "LQR": LQR}
 _TRAINERS = {"C3MTrainer": C3MTrainer, "EvalTrainer": EvalTrainer}
@@ -94,7 +95,7 @@ class Runner:
         if agent_class not in _AGENTS:
             raise ValueError(f"Unknown agent class {agent_class!r}. Choose from {list(_AGENTS)}")
 
-        device = agent_cfg.pop("device", "cuda" if torch.cuda.is_available() else "cpu")
+        device = agent_cfg.pop("device", get_device())
         x_dim = int(env.num_dim_x)
         u_dim = int(env.num_dim_control)
 

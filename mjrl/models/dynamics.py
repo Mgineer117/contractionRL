@@ -52,6 +52,7 @@ class NeuralDynamics(nn.Module):
         u_dim: int,
         hidden_dim: Sequence[int] = (256, 256, 256),
         activation: str = "relu",
+        device: str | None = None,
     ):
         super().__init__()
         self.x_dim = x_dim
@@ -59,6 +60,9 @@ class NeuralDynamics(nn.Module):
         self.null_dim = x_dim - u_dim
         self._hidden_dim = list(hidden_dim)
         self._activation_str = activation
+        
+        from mjrl.utils import get_device
+        self.device = torch.device(device or get_device())
 
         act = _ACT_MAP.get(activation, nn.ReLU())
 
@@ -75,7 +79,6 @@ class NeuralDynamics(nn.Module):
             activation=act,
         )
 
-        self.device = torch.device("cpu")
 
     # ------------------------------------------------------------------ #
     # primary interface for agents (autodiff-compatible)

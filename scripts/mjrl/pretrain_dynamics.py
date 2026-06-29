@@ -92,8 +92,11 @@ def train(
 
     best_val, best_state = float("inf"), None
     n_trn = x_t.shape[0]
+    val_loss = float("inf")
 
-    for epoch in range(1, epochs + 1):
+    from tqdm import tqdm
+    pbar = tqdm(range(1, epochs + 1), desc="Pre-training NeuralDynamics")
+    for epoch in pbar:
         model.train()
         perm = torch.randperm(n_trn, device=device)
         total_loss = 0.0
@@ -118,11 +121,13 @@ def train(
             if val_loss < best_val:
                 best_val = val_loss
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            print(
-                f"  epoch {epoch:5d}/{epochs}  "
-                f"train={total_loss/n_batches:.4e}  val={val_loss:.4e}  "
-                f"best_val={best_val:.4e}  lr={scheduler.get_last_lr()[0]:.2e}"
-            )
+        
+        pbar.set_postfix({
+            "trn": f"{total_loss/n_batches:.3e}", 
+            "val": f"{val_loss:.3e}",
+            "best": f"{best_val:.3e}",
+            "lr": f"{scheduler.get_last_lr()[0]:.1e}"
+        })
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -150,12 +155,15 @@ def main():
     parser.add_argument("--batch_size", type=int, default=2048)
     parser.add_argument("--hidden_dim", type=int, nargs="+", default=[256, 256, 256])
     parser.add_argument("--activation", type=str, default="relu")
-    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--device", type=str, default=None, help="Device to use. (defaults to get_device())")
     parser.add_argument("--save", type=str, default="checkpoints/dynamics.pt",
                         help="Output checkpoint path.")
     args = parser.parse_args()
 
     _bootstrap_paths()
+
+    from mjrl.utils import get_device
+    args.device = args.device or get_device()
 
     from mjrl.models.dynamics import NeuralDynamics
 

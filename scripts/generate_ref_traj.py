@@ -40,6 +40,7 @@ parser.add_argument("--robot",      type=str, required=True, choices=["quadruped
 parser.add_argument("--num_envs",   type=int, default=128)
 parser.add_argument("--num_trajs",  type=int, default=2000, help="Target number of episodes to record")
 parser.add_argument("--out_dir",    type=str, default="logs/ref_trajs")
+parser.add_argument("--device", type=str, default=None)
 AppLauncher.add_app_launcher_args(parser)
 args, hydra_args = parser.parse_known_args()
 args.headless = True
@@ -70,7 +71,11 @@ _STATE_METHOD = "get_physical_state"
 
 @hydra_task_config(args.task, "skrl_cfg_entry_point")
 def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
+    from mjrl.utils import get_device
+    device = args.device or get_device()
     env_cfg.scene.num_envs = args.num_envs
+    env_cfg.sim.device = device
+    agent_cfg["device"] = device
     agent_cfg["trainer"]["timesteps"] = 0    # we drive the loop manually
 
     # Build env + wrapper

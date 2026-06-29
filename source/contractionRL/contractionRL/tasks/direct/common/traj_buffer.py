@@ -10,12 +10,19 @@ File format (produced by scripts/generate_ref_traj.py):
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 
 
 class TrajectoryBuffer:
     def __init__(self, traj_path: str, device: str):
+        if not os.path.exists(traj_path):
+            raise FileNotFoundError(
+                f"Locomotion policy (reference trajectory) not found at: {traj_path}. "
+                "Please generate it first."
+            )
         data = np.load(traj_path)
         self._states = torch.tensor(data["states"], dtype=torch.float32, device=device)
         self._actions = torch.tensor(data["actions"], dtype=torch.float32, device=device)
