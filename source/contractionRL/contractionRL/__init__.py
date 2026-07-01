@@ -7,8 +7,9 @@
 Python module serving as a project/extension template.
 """
 
-# Register Gym environments.
-from .tasks import *
-
-# Register UI extensions.
-from .ui_extension_example import *
+# Register Gym environments (Isaac Sim only; skipped when Isaac is absent).
+try:
+    from .tasks import *
+    from .ui_extension_example import *
+except (ImportError, ModuleNotFoundError):
+    pass

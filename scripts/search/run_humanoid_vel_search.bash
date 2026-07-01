@@ -1,5 +1,5 @@
 #!/bin/bash
-# SAC / PPO hyperparameter search — Humanoid-VelTracking-Direct-v0
+# SAC / PPO hyperparameter search — Humanoid-VelTracking-v0
 #
 # Usage:
 #   bash scripts/search/run_humanoid_vel_search.bash
@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-TASK="Humanoid-VelTracking-Direct-v0"
+TASK="Humanoid-VelTracking-v0"
 PROJECT="contractionRL-search"
 ALGORITHM="SAC"
 COUNT=20

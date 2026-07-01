@@ -24,7 +24,7 @@ def _find_task_roots() -> Path:
 
 
 def _parse_registrations(tasks_dir: Path) -> list[dict]:
-    """
+    """ 
     Walk every __init__.py under tasks_dir and extract gym.register calls.
     Returns list of dicts with keys: id, entry_point, env_cfg, skrl_cfgs, pkg_dir.
     """

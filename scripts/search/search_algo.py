@@ -11,7 +11,7 @@ Usage
 -----
 # 1. Create a new sweep (prints SWEEP_ID, exits immediately):
 python scripts/search/search_algo.py \\
-    --task Quadruped-VelTracking-Direct-v0 \\
+    --task Quadruped-VelTracking-v0 \\
     --algorithm SAC \\
     --count 0
 
@@ -29,7 +29,7 @@ import wandb
 
 # ── defaults ──────────────────────────────────────────────────────────────────
 DEFAULT_PROJECT   = "contractionRL-search"
-DEFAULT_TASK      = "Quadruped-VelTracking-Direct-v0"
+DEFAULT_TASK      = "Quadruped-VelTracking-v0"
 DEFAULT_ALGORITHM = "SAC"
 DEFAULT_NUM_ENVS  = 128
 DEFAULT_TIMESTEPS = 50_000

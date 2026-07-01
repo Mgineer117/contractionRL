@@ -1,5 +1,5 @@
 #!/bin/bash
-# SAC / PPO hyperparameter search — Manipulator-VelTracking-Direct-v0
+# SAC / PPO hyperparameter search — Manipulator-VelTracking-v0
 #
 # Usage:
 #   bash scripts/search/run_manipulator_vel_search.bash
@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-TASK="Manipulator-VelTracking-Direct-v0"
+TASK="Manipulator-VelTracking-v0"
 PROJECT="contractionRL-search"
 ALGORITHM="SAC"
 COUNT=20

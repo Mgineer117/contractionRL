@@ -1,5 +1,5 @@
 #!/bin/bash
-# SAC / PPO hyperparameter search — Quadruped-VelTracking-Direct-v0
+# SAC / PPO hyperparameter search — Quadruped-VelTracking-v0
 #
 # Usage:
 #   bash scripts/search/run_quadruped_vel_search.bash              # SAC, 20 trials
@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-TASK="Quadruped-VelTracking-Direct-v0"
+TASK="Quadruped-VelTracking-v0"
 PROJECT="contractionRL-search"
 ALGORITHM="SAC"
 COUNT=20
