@@ -1,0 +1,52 @@
+from __future__ import annotations
+
+import torch
+from torch.distributions import Normal
+
+from skrl.resources.noises.torch import Noise
+
+
+# speed up distribution construction by disabling checking
+Normal.set_default_validate_args(False)
+
+
+class GaussianNoise(Noise):
+    def __init__(self, *, mean: float, std: float, device: str | torch.device | None = None) -> None:
+        """Gaussian noise.
+
+        :param mean: Mean of the normal distribution.
+        :param std: Standard deviation of the normal distribution.
+        :param device: Data allocation and computation device. If not specified, the default device will be used.
+
+        Example::
+
+            >>> noise = GaussianNoise(mean=0, std=1)
+        """
+        super().__init__(device=device)
+
+        self.distribution = Normal(
+            loc=torch.tensor(mean, device=self.device, dtype=torch.float32),
+            scale=torch.tensor(std, device=self.device, dtype=torch.float32),
+        )
+
+    def sample(self, size: list[int] | torch.Size) -> torch.Tensor:
+        """Sample a Gaussian noise.
+
+        :param size: Noise shape.
+
+        :return: Sampled noise.
+
+        Example::
+
+            >>> noise.sample((3, 2))
+            tensor([[-0.4901,  1.3357],
+                    [-1.2141,  0.3323],
+                    [-0.0889, -1.1651]], device='cuda:0')
+
+            >>> x = torch.rand(3, 2, device="cuda:0")
+            >>> noise.sample(x.shape)
+            tensor([[0.5398, 1.2009],
+                    [0.0307, 1.3065],
+                    [0.2082, 0.6116]], device='cuda:0')
+        """
+        return self.distribution.sample(size)

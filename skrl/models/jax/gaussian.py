@@ -1,0 +1,180 @@
+from __future__ import annotations
+
+from typing import Any, Literal
+
+import math
+from functools import partial
+
+import flax
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from skrl import config
+from skrl.utils.spaces.jax import compute_space_limits
+
+
+LOG_SQRT_2_PI = math.log(math.sqrt(2 * math.pi))
+HALF_LOG_2_PI_PLUS = 0.5 + 0.5 * math.log(2 * math.pi)
+
+
+# https://jax.readthedocs.io/en/latest/faq.html#strategy-1-jit-compiled-helper-function
+@partial(jax.jit, static_argnames=("reduction"))
+def _gaussian(
+    loc,
+    log_std,
+    min_log_std,
+    max_log_std,
+    min_actions,
+    max_actions,
+    min_mean_actions,
+    max_mean_actions,
+    taken_actions,
+    key,
+    reduction,
+):
+    # clip mean actions
+    loc = jnp.clip(loc, min=min_mean_actions, max=max_mean_actions)
+
+    # clip log standard deviations
+    log_std = jnp.clip(log_std, min=min_log_std, max=max_log_std)
+
+    # distribution
+    scale = jnp.exp(log_std)
+
+    # sample actions
+    actions = jax.random.normal(key, loc.shape) * scale + loc
+
+    # clip actions
+    actions = jnp.clip(actions, min=min_actions, max=max_actions)
+
+    # log of the probability density function
+    taken_actions = actions if taken_actions is None else taken_actions
+    log_prob = -jnp.square(taken_actions - loc) / (2 * jnp.square(scale)) - jnp.log(scale) - LOG_SQRT_2_PI
+
+    if reduction is not None:
+        log_prob = reduction(log_prob, axis=-1)
+    if log_prob.ndim != actions.ndim:
+        log_prob = jnp.expand_dims(log_prob, -1)
+
+    return loc, actions, log_prob, log_std, scale
+
+
+@jax.jit
+def _entropy(scale):
+    return (HALF_LOG_2_PI_PLUS + jnp.log(scale)).sum(axis=-1, keepdims=True)
+
+
+class GaussianMixin:
+    def __init__(
+        self,
+        *,
+        clip_actions: bool = False,
+        clip_mean_actions: bool = False,
+        clip_log_std: bool = True,
+        min_log_std: float = -20,
+        max_log_std: float = 2,
+        reduction: Literal["mean", "sum", "prod", "none"] = "sum",
+        role: str = "",
+    ) -> None:
+        """Gaussian mixin model (stochastic model).
+
+        :param clip_actions: Flag to indicate whether the actions should be clipped to the action space.
+        :param clip_mean_actions: Flag to indicate whether the mean actions should be clipped to the action space.
+            If ``True``, the mean actions will be clipped before sampling the actions.
+        :param clip_log_std: Flag to indicate whether the log standard deviations should be clipped.
+        :param min_log_std: Minimum value of the log standard deviation if ``clip_log_std`` is True.
+        :param max_log_std: Maximum value of the log standard deviation if ``clip_log_std`` is True.
+        :param reduction: Reduction method for returning the log probability density function.
+            If ``"none"``, the log probability density function is returned as a tensor of shape
+            ``(num_samples, num_actions)`` instead of ``(num_samples, 1)``.
+        :param role: Role played by the model.
+
+        :raises ValueError: If the reduction method is not valid.
+        """
+        self._g_clip_actions = clip_actions
+        self._g_clip_mean_actions = clip_mean_actions
+
+        min_actions, max_actions = compute_space_limits(self.action_space, device=self.device, none_if_unbounded="any")
+        self._g_min_actions = min_actions if self._g_clip_actions else None
+        self._g_max_actions = max_actions if self._g_clip_actions else None
+        self._g_min_mean_actions = min_actions if self._g_clip_mean_actions else None
+        self._g_max_mean_actions = max_actions if self._g_clip_mean_actions else None
+
+        self._g_clip_log_std = clip_log_std
+        self._g_min_log_std = min_log_std if self._g_clip_log_std else None
+        self._g_max_log_std = max_log_std if self._g_clip_log_std else None
+
+        if reduction not in ["mean", "sum", "prod", "none"]:
+            raise ValueError("Reduction must be one of 'mean', 'sum', 'prod' or 'none'")
+        self._g_reduction = (
+            jnp.mean
+            if reduction == "mean"
+            else jnp.sum if reduction == "sum" else jnp.prod if reduction == "prod" else None
+        )
+
+        self._g_i = 0
+        self._g_key = config.jax.key
+
+        # https://flax.readthedocs.io/en/latest/api_reference/flax.errors.html#flax.errors.IncorrectPostInitOverrideError
+        flax.linen.Module.__post_init__(self)
+
+    def act(
+        self, inputs: dict[str, Any], *, role: str = "", params: jax.Array | None = None
+    ) -> tuple[jax.Array, dict[str, Any]]:
+        """Act stochastically in response to the observations/states of the environment.
+
+        :param inputs: Model inputs. The most common keys are:
+
+            - ``"observations"``: observation of the environment used to make the decision.
+            - ``"states"``: state of the environment used to make the decision.
+            - ``"taken_actions"``: actions taken by the policy for the given observations/states.
+        :param role: Role played by the model.
+        :param params: Parameters used to compute the output. If not provided, internal parameters will be used.
+
+        :return: Model output. The first component is the expected action/value returned by the model.
+            The second component is a dictionary containing the following extra output values:
+
+            - ``"log_std"``: log of the standard deviation.
+            - ``"log_prob"``: log of the probability density function.
+            - ``"mean_actions"``: mean actions (network output after optional clipping).
+        """
+        with jax.default_device(self.device):
+            self._g_i += 1
+            subkey = jax.random.fold_in(self._g_key, self._g_i)
+            inputs["key"] = subkey
+
+        # map from observations/states to mean actions and log standard deviations
+        mean_actions, outputs = self.apply(self.state_dict.params if params is None else params, inputs, role)
+
+        mean_actions, actions, log_prob, log_std, stddev = _gaussian(
+            mean_actions,
+            outputs["log_std"],
+            self._g_min_log_std,
+            self._g_max_log_std,
+            self._g_min_actions,
+            self._g_max_actions,
+            self._g_min_mean_actions,
+            self._g_max_mean_actions,
+            inputs.get("taken_actions", None),
+            subkey,
+            self._g_reduction,
+        )
+
+        outputs["log_prob"] = log_prob
+        outputs["mean_actions"] = mean_actions
+        # avoid jax.errors.UnexpectedTracerError
+        outputs["log_std"] = log_std
+        outputs["stddev"] = stddev
+
+        return actions, outputs
+
+    def get_entropy(self, stddev: jax.Array, *, role: str = "") -> jax.Array:
+        """Compute and return the entropy of the model.
+
+        :param stddev: Model standard deviation.
+        :param role: Role played by the model.
+
+        :return: Entropy of the model.
+        """
+        return _entropy(stddev)
