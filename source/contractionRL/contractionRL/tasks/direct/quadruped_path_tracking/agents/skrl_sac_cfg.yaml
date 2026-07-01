@@ -4,51 +4,52 @@ models:
   separate: True
   policy:
     class: GaussianMixin
+    backbone: contraction
     clip_actions: True
     clip_log_std: True
-    min_log_std: -20.0
+    min_log_std: -4.605
     max_log_std: 2.0
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [256, 256]
-        activations: elu
+        layers: [128, 128]
+        activations: tanh
     output: ACTIONS
   critic_1:
     class: DeterministicMixin
-    clip_actions: False
+    clip_actions: True
     network:
       - name: net
         input: "concatenate([OBSERVATIONS, ACTIONS])"
-        layers: [256, 256]
-        activations: elu
+        layers: [128, 128]
+        activations: tanh
     output: ONE
   critic_2:
     class: DeterministicMixin
-    clip_actions: False
+    clip_actions: True
     network:
       - name: net
         input: "concatenate([OBSERVATIONS, ACTIONS])"
-        layers: [256, 256]
-        activations: elu
+        layers: [128, 128]
+        activations: tanh
     output: ONE
   target_critic_1:
     class: DeterministicMixin
-    clip_actions: False
+    clip_actions: True
     network:
       - name: net
         input: "concatenate([OBSERVATIONS, ACTIONS])"
-        layers: [256, 256]
-        activations: elu
+        layers: [128, 128]
+        activations: tanh
     output: ONE
   target_critic_2:
     class: DeterministicMixin
-    clip_actions: False
+    clip_actions: True
     network:
       - name: net
         input: "concatenate([OBSERVATIONS, ACTIONS])"
-        layers: [256, 256]
-        activations: elu
+        layers: [128, 128]
+        activations: tanh
     output: ONE
 
 memory:
@@ -67,13 +68,11 @@ agent:
   random_timesteps: 80
   learning_starts: 80
   grad_norm_clip: 1.0
-  observation_preprocessor: RunningStandardScaler
-  observation_preprocessor_kwargs: null
   experiment:
     directory: "quadruped_path_tracking_sac"
     experiment_name: ""
-    write_interval: auto
-    checkpoint_interval: auto
+    write_interval: 1
+    checkpoint_interval: 1
 
 trainer:
   class: SequentialTrainer

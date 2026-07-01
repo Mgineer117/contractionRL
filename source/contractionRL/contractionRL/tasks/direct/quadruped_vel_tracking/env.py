@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 import torch
@@ -7,9 +8,9 @@ import torch
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
-from isaaclab.markers import VisualizationMarkers
-from isaaclab.markers.config import BLUE_ARROW_X_MARKER_CFG, GREEN_ARROW_X_MARKER_CFG
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 from ..common.vel_commands import VelCommands
 from .env_cfg import QuadrupedVelTrackingEnvCfg
@@ -20,13 +21,12 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
 
     Commands: constant (vx, vy) + sinusoidal yaw rate.
     State for path-tracking export:
-        base_lin_vel_b(3) + base_ang_vel_b(3) + proj_gravity_b(3)
-        + joint_pos_rel(12) + joint_vel(12)  → 33 dims
+        proj_gravity_b(3) + joint_pos_rel(12) + joint_vel(12)  → 27 dims
     """
 
     cfg: QuadrupedVelTrackingEnvCfg
 
-    STATE_DIM = 33   # dims recorded as reference state for path tracking
+    STATE_DIM = 27   # dims recorded as reference state for path tracking
 
     def __init__(self, cfg: QuadrupedVelTrackingEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
@@ -35,6 +35,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         self._actions = torch.zeros(self.num_envs, len(self._joint_ids), device=self.device)
         self._prev_actions = torch.zeros_like(self._actions)
         self._cmd = VelCommands(self.num_envs, self.device, self.cfg.vel_cmd)
+        self._episode_vel_auc = torch.zeros(self.num_envs, device=self.device)
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot_cfg)
@@ -60,15 +61,14 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
     # ------------------------------------------------------------------ #
 
     def get_physical_state(self) -> torch.Tensor:
-        """Returns (N, 33) physical state without commands or actions.
+        """Returns (N, 27) physical state without commands or actions.
 
-        Layout: [base_lin_vel_b(3), base_ang_vel_b(3), proj_gravity_b(3),
-                 joint_pos_rel(12), joint_vel(12)]
+        Layout: [proj_gravity_b(3), joint_pos_rel(12), joint_vel(12)]
+        Linear and angular body velocities are excluded so the state is
+        purely proprioceptive and matches the path-tracking observation.
         """
         return torch.cat(
             [
-                self._robot.data.root_lin_vel_b,
-                self._robot.data.root_ang_vel_b,
                 self._robot.data.projected_gravity_b,
                 self._robot.data.joint_pos[:, self._joint_ids] - self._robot.data.default_joint_pos[:, self._joint_ids],
                 self._robot.data.joint_vel[:, self._joint_ids],
@@ -78,9 +78,19 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
 
     def _get_observations(self) -> dict:
         t = self.episode_length_buf.float() * self.step_dt
-        cmds = self._cmd.get(t)                  # (N, 4)
-        state = self.get_physical_state()         # (N, 33)
-        obs = torch.cat([state, cmds, self._prev_actions], dim=-1)
+        cmds = self._cmd.get(t)  # (N, 4)
+        # Full 33-dim state for the locomotion policy (needs velocities to track commands)
+        full_state = torch.cat(
+            [
+                self._robot.data.root_lin_vel_b,
+                self._robot.data.root_ang_vel_b,
+                self._robot.data.projected_gravity_b,
+                self._robot.data.joint_pos[:, self._joint_ids] - self._robot.data.default_joint_pos[:, self._joint_ids],
+                self._robot.data.joint_vel[:, self._joint_ids],
+            ],
+            dim=-1,
+        )
+        obs = torch.cat([full_state, cmds, self._prev_actions], dim=-1)
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
@@ -103,6 +113,12 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         rew_ar = torch.sum(torch.square(self._actions - self._prev_actions), dim=1) * self.cfg.rew_action_rate
         rew_alive = (1.0 - self.reset_terminated.float()) * self.cfg.rew_alive
 
+        vel_err_vec = torch.cat([
+            cmds[:, :2] - self._robot.data.root_lin_vel_b[:, :2],
+            (cmds[:, 3] - self._robot.data.root_ang_vel_b[:, 2]).unsqueeze(-1),
+        ], dim=-1)
+        self._episode_vel_auc += torch.norm(vel_err_vec, dim=-1)
+
         return rew_lin + rew_yaw + rew_z + rew_axy + rew_tau + rew_ar + rew_alive
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -115,14 +131,37 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
             env_ids = self._robot._ALL_INDICES
         super()._reset_idx(env_ids)
 
+        auc_vals = self._episode_vel_auc[env_ids]
+        if (auc_vals > 0).any():
+            self.extras.setdefault("log", {})
+            self.extras["log"]["Episode/auc"] = auc_vals[auc_vals > 0].mean().item()
+        self._episode_vel_auc[env_ids] = 0.0
+
         self._actions[env_ids] = 0.0
         self._prev_actions[env_ids] = 0.0
         self._cmd.reset(env_ids)
 
-        joint_pos = self._robot.data.default_joint_pos[env_ids]
-        joint_vel = self._robot.data.default_joint_vel[env_ids]
-        root = self._robot.data.default_root_state[env_ids]
+        joint_pos = self._robot.data.default_joint_pos[env_ids].clone()
+        joint_vel = self._robot.data.default_joint_vel[env_ids].clone()
+        root = self._robot.data.default_root_state[env_ids].clone()
         root[:, :3] += self.scene.env_origins[env_ids]
+
+        if self.cfg.randomize_init:
+            n = len(env_ids)
+            # Random yaw: sample θ ∈ [0, 2π], build wxyz quaternion around Z
+            theta = torch.empty(n, device=self.device).uniform_(0.0, 2.0 * math.pi)
+            cos_h, sin_h = torch.cos(theta * 0.5), torch.sin(theta * 0.5)
+            root[:, 3:7] = torch.stack(
+                [cos_h, torch.zeros_like(cos_h), torch.zeros_like(cos_h), sin_h], dim=-1
+            )
+            # Random x,y offset (spread robots across scene)
+            root[:, :2] += torch.empty(n, 2, device=self.device).uniform_(
+                -self.cfg.init_pos_range, self.cfg.init_pos_range
+            )
+            # Joint noise: perturb around default pose for trajectory diversity
+            joint_pos[:, self._joint_ids] += torch.empty(
+                n, len(self._joint_ids), device=self.device
+            ).uniform_(-self.cfg.init_joint_noise, self.cfg.init_joint_noise)
 
         self._robot.write_root_pose_to_sim(root[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(root[:, 7:], env_ids)
@@ -135,8 +174,21 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:
             if not hasattr(self, "_cmd_vel_marker"):
-                cmd_cfg = BLUE_ARROW_X_MARKER_CFG.replace(prim_path="/Visuals/QuadrupedVelCmd")
-                cur_cfg = GREEN_ARROW_X_MARKER_CFG.replace(prim_path="/Visuals/QuadrupedVelCur")
+                _arrow = f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd"
+                cmd_cfg = VisualizationMarkersCfg(
+                    prim_path="/Visuals/QuadrupedVelCmd",
+                    markers={"arrow": sim_utils.UsdFileCfg(
+                        usd_path=_arrow, scale=(0.6, 0.06, 0.06),
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 1.0)),
+                    )},
+                )
+                cur_cfg = VisualizationMarkersCfg(
+                    prim_path="/Visuals/QuadrupedVelCur",
+                    markers={"arrow": sim_utils.UsdFileCfg(
+                        usd_path=_arrow, scale=(0.6, 0.06, 0.06),
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0)),
+                    )},
+                )
                 self._cmd_vel_marker = VisualizationMarkers(cmd_cfg)
                 self._cur_vel_marker = VisualizationMarkers(cur_cfg)
             self._cmd_vel_marker.set_visibility(True)
@@ -157,20 +209,16 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         cmd_pos = base_pos.clone(); cmd_pos[:, 2] += 1.5
         cur_pos = base_pos.clone(); cur_pos[:, 2] += 1.1
 
-        cmd_quat, cmd_spd = self._vel_body_xy_to_arrow(cmds[:, :2])
-        cur_quat, cur_spd = self._vel_body_xy_to_arrow(self._robot.data.root_lin_vel_b[:, :2])
+        cmd_quat = self._vel_body_xy_to_arrow(cmds[:, :2])
+        cur_quat = self._vel_body_xy_to_arrow(self._robot.data.root_lin_vel_b[:, :2])
 
-        # length grows with speed (gain); width fixed so arrows stay visible at low speed
-        len_gain, width = 2.5, 0.4
-        cmd_scale = torch.cat([cmd_spd * len_gain, torch.full_like(cmd_spd, width), torch.full_like(cmd_spd, width)], dim=-1)
-        cur_scale = torch.cat([cur_spd * len_gain, torch.full_like(cur_spd, width), torch.full_like(cur_spd, width)], dim=-1)
-
+        fixed_scale = torch.ones(self.num_envs, 3, device=self.device)
         proto = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
-        self._cmd_vel_marker.visualize(translations=cmd_pos, orientations=cmd_quat, scales=cmd_scale, marker_indices=proto)
-        self._cur_vel_marker.visualize(translations=cur_pos, orientations=cur_quat, scales=cur_scale, marker_indices=proto)
+        self._cmd_vel_marker.visualize(translations=cmd_pos, orientations=cmd_quat, scales=fixed_scale, marker_indices=proto)
+        self._cur_vel_marker.visualize(translations=cur_pos, orientations=cur_quat, scales=fixed_scale, marker_indices=proto)
 
-    def _vel_body_xy_to_arrow(self, vel_body_xy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Body-frame XY velocity → world-frame arrow quaternion (wxyz) + speed scale."""
+    def _vel_body_xy_to_arrow(self, vel_body_xy: torch.Tensor) -> torch.Tensor:
+        """Body-frame XY velocity → world-frame arrow quaternion (wxyz)."""
         q = self._robot.data.root_quat_w  # (N, 4) w,x,y,z
         yaw = torch.atan2(
             2.0 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
@@ -181,6 +229,4 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         vy_w = sy * vel_body_xy[:, 0] + cy * vel_body_xy[:, 1]
         angle = torch.atan2(vy_w, vx_w)
         ha = angle * 0.5
-        quat = torch.stack([torch.cos(ha), torch.zeros_like(ha), torch.zeros_like(ha), torch.sin(ha)], dim=-1)
-        speed = vel_body_xy.norm(dim=-1).clamp(0.1, 2.0).unsqueeze(-1)
-        return quat, speed
+        return torch.stack([torch.cos(ha), torch.zeros_like(ha), torch.zeros_like(ha), torch.sin(ha)], dim=-1)

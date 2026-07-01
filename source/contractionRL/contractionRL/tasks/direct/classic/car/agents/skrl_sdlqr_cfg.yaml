@@ -1,0 +1,15 @@
+seed: 42
+
+agent:
+  class: SDLQR
+  Q_scaler: 1.0
+  R_scaler: 0.0
+  experiment:
+    directory: "car_sdlqr"
+    experiment_name: ""
+    write_interval: 100
+    checkpoint_interval: 100
+
+trainer:
+  class: SequentialTrainer
+  timesteps: 10000

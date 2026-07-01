@@ -2,6 +2,7 @@ seed: 42
 
 agent:
   class: LQR
+  use_state_norm: false  # not applicable for analytical LQR
   device: cpu          # LQR solves a CARE per state on CPU (scipy)
   Q_scaler: 1.0
   R_scaler: 1.0          # nonzero control cost — R=0 gives unstable (huge) gains under discrete dt

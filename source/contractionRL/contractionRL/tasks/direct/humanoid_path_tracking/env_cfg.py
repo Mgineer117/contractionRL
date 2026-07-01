@@ -17,16 +17,19 @@ class HumanoidPathTrackingEnvCfg(DirectRLEnvCfg):
     decimation = 4
     episode_length_s = 10.0
 
-    # state_dim = 47, action_dim = 19
-    # obs: x(47) + x_ref(47) + u_ref(19) = 113
+    # state_dim = 41: proj_gravity_b(3) + joint_pos_rel(19) + joint_vel(19)
+    # obs: x(41) + x_ref(41) + u_ref(19) = 101
     action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(19,), dtype=np.float32)
-    observation_space = 113
+    observation_space = 101
     state_space = 0
 
     sim: SimulationCfg = SimulationCfg(dt=1 / 200, render_interval=decimation)
     robot_cfg: ArticulationCfg = H1_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=1024, env_spacing=4.0, replicate_physics=True)
 
     action_scale = 0.25
-    traj_path: str = "logs/ref_trajs/humanoid.npz"
+    traj_path: str = "logs/humanoid/ref_trajs.npz"
     base_height_min = 0.50
+
+    # uniform joint-position noise added to x_ref[0] at reset [rad]
+    init_noise_scale: float = 0.05

@@ -65,10 +65,14 @@ class BaseEnv(gym.Env):
         self.STATE_MAX = np.concatenate((self.X_MAX.flatten(), ref_unit_max))
 
         self.observation_space = spaces.Box(
-            low=self.STATE_MIN.flatten(), high=self.STATE_MAX.flatten(), dtype=np.float64
+            low=self.STATE_MIN.flatten().astype(np.float32),
+            high=self.STATE_MAX.flatten().astype(np.float32),
+            dtype=np.float32,
         )
         self.action_space = spaces.Box(
-            low=self.UREF_MIN.flatten(), high=self.UREF_MAX.flatten(), dtype=np.float64
+            low=self.UREF_MIN.flatten().astype(np.float32),
+            high=self.UREF_MAX.flatten().astype(np.float32),
+            dtype=np.float32,
         )
 
         self.reset()
@@ -161,7 +165,15 @@ class BaseEnv(gym.Env):
         idx = min(self.time_steps, self.episode_len - 1)
         xref = self.xref[idx]
         uref = self.uref[idx]
-        return np.concatenate([x, xref.flatten(), uref.flatten()])
+        return np.concatenate([x, xref.flatten(), uref.flatten()]).astype(np.float32)
+
+    @property
+    def x_dim(self) -> int:
+        return self.num_dim_x
+
+    @property
+    def u_dim(self) -> int:
+        return self.num_dim_control
 
     # ------------------------------------------------------------------ #
     # control-affine dynamics: f(x), B(x), B_null(x) (torch/numpy dual)

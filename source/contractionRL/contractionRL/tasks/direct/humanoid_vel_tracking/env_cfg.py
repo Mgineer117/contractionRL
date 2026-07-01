@@ -24,16 +24,16 @@ class HumanoidVelTrackingEnvCfg(DirectRLEnvCfg):
     #   legs:  2 hip_yaw + 2 hip_roll + 2 hip_pitch + 2 knee + 1 torso = 9
     #   feet:  2 ankle = 2
     #   arms:  2 shoulder_pitch + 2 shoulder_roll + 2 shoulder_yaw + 2 elbow = 8
-    # state:   base_lin_vel(3) + base_ang_vel(3) + proj_gravity(3)
-    #          + joint_pos_rel(19) + joint_vel(19)  = 47
-    # obs:     state(47) + commands(4) + prev_actions(19) = 70
+    # state (path-tracking export): proj_gravity(3) + joint_pos_rel(19) + joint_vel(19) = 41
+    # obs:     full_state(47) + commands(4) + prev_actions(19) = 70
+    #   (full_state still includes lin_vel_b+ang_vel_b for the locomotion policy to use)
     action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(19,), dtype=np.float32)
     observation_space = 70
     state_space = 0
 
     sim: SimulationCfg = SimulationCfg(dt=1 / 200, render_interval=decimation)
     robot_cfg: ArticulationCfg = H1_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=1024, env_spacing=4.0, replicate_physics=True)
 
     vel_cmd: VelCmdCfg = VelCmdCfg(
         vx_range=(-1.0, 1.5),
@@ -46,6 +46,11 @@ class HumanoidVelTrackingEnvCfg(DirectRLEnvCfg):
     action_scale = 0.25
 
     base_height_min = 0.50  # [m]
+
+    # initial-state randomisation (used by generate_ref_traj.py for trajectory diversity)
+    randomize_init: bool = False
+    init_pos_range: float = 0.3    # [m]  uniform x,y offset around env origin
+    init_joint_noise: float = 0.05  # [rad] uniform noise on joint positions
 
     # reward scales (tentative)
     rew_lin_vel = 2.0

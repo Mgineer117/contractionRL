@@ -7,8 +7,8 @@ import torch
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
-from isaaclab.markers import VisualizationMarkers
-from isaaclab.markers.config import BLUE_ARROW_X_MARKER_CFG, GREEN_ARROW_X_MARKER_CFG
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 
 from ..common.vel_commands import VelCommands
@@ -38,6 +38,7 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
         self._actions = torch.zeros(self.num_envs, self.action_space.shape[0], device=self.device)
         self._prev_actions = torch.zeros_like(self._actions)
         self._cmd = VelCommands(self.num_envs, self.device, self.cfg.vel_cmd)
+        self._episode_vel_auc = torch.zeros(self.num_envs, device=self.device)
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot_cfg)
@@ -102,6 +103,12 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
 
         rew_ar = torch.sum(torch.square(self._actions - self._prev_actions), dim=1) * self.cfg.rew_action_rate
 
+        vel_err_vec = torch.cat([
+            ee_lin_vel - cmds[:, :3],
+            (ee_yaw_vel - cmds[:, 3]).unsqueeze(-1),
+        ], dim=-1)
+        self._episode_vel_auc += torch.norm(vel_err_vec, dim=-1)
+
         # soft joint-limit penalty: penalise if |q - q_mid| > 0.9 * half_range
         limits = self._robot.data.soft_joint_pos_limits[:, self._arm_ids, :]
         mid = 0.5 * (limits[..., 0] + limits[..., 1])
@@ -120,6 +127,12 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = self._robot._ALL_INDICES
         super()._reset_idx(env_ids)
+
+        auc_vals = self._episode_vel_auc[env_ids]
+        if (auc_vals > 0).any():
+            self.extras.setdefault("log", {})
+            self.extras["log"]["Episode/auc"] = auc_vals[auc_vals > 0].mean().item()
+        self._episode_vel_auc[env_ids] = 0.0
 
         self._actions[env_ids] = 0.0
         self._prev_actions[env_ids] = 0.0
@@ -142,8 +155,21 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:
             if not hasattr(self, "_cmd_vel_marker"):
-                cmd_cfg = BLUE_ARROW_X_MARKER_CFG.replace(prim_path="/Visuals/ManipulatorVelCmd")
-                cur_cfg = GREEN_ARROW_X_MARKER_CFG.replace(prim_path="/Visuals/ManipulatorVelCur")
+                _arrow = f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd"
+                cmd_cfg = VisualizationMarkersCfg(
+                    prim_path="/Visuals/ManipulatorVelCmd",
+                    markers={"arrow": sim_utils.UsdFileCfg(
+                        usd_path=_arrow, scale=(0.3, 0.03, 0.03),
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 1.0)),
+                    )},
+                )
+                cur_cfg = VisualizationMarkersCfg(
+                    prim_path="/Visuals/ManipulatorVelCur",
+                    markers={"arrow": sim_utils.UsdFileCfg(
+                        usd_path=_arrow, scale=(0.3, 0.03, 0.03),
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0)),
+                    )},
+                )
                 self._cmd_vel_marker = VisualizationMarkers(cmd_cfg)
                 self._cur_vel_marker = VisualizationMarkers(cur_cfg)
             self._cmd_vel_marker.set_visibility(True)
@@ -166,20 +192,16 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
 
         ee_vel = self._robot.data.body_lin_vel_w[:, self._ee_id[0], :]  # (N, 3)
 
-        cmd_quat, cmd_spd = self._world_vel_to_arrow(cmds[:, :3])
-        cur_quat, cur_spd = self._world_vel_to_arrow(ee_vel)
+        cmd_quat = self._world_vel_to_arrow(cmds[:, :3])
+        cur_quat = self._world_vel_to_arrow(ee_vel)
 
-        # length grows with speed (gain); width fixed so arrows stay visible at low speed
-        len_gain, width = 3.0, 0.15
-        cmd_scale = torch.cat([cmd_spd * len_gain, torch.full_like(cmd_spd, width), torch.full_like(cmd_spd, width)], dim=-1)
-        cur_scale = torch.cat([cur_spd * len_gain, torch.full_like(cur_spd, width), torch.full_like(cur_spd, width)], dim=-1)
-
+        fixed_scale = torch.ones(self.num_envs, 3, device=self.device)
         proto = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
-        self._cmd_vel_marker.visualize(translations=cmd_pos, orientations=cmd_quat, scales=cmd_scale, marker_indices=proto)
-        self._cur_vel_marker.visualize(translations=cur_pos, orientations=cur_quat, scales=cur_scale, marker_indices=proto)
+        self._cmd_vel_marker.visualize(translations=cmd_pos, orientations=cmd_quat, scales=fixed_scale, marker_indices=proto)
+        self._cur_vel_marker.visualize(translations=cur_pos, orientations=cur_quat, scales=fixed_scale, marker_indices=proto)
 
-    def _world_vel_to_arrow(self, vel_w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """(N, 3) world-frame velocity → (N, 4) wxyz quaternion (rotate +X → vel dir) + (N, 1) speed."""
+    def _world_vel_to_arrow(self, vel_w: torch.Tensor) -> torch.Tensor:
+        """(N, 3) world-frame velocity → (N, 4) wxyz quaternion (rotate +X → vel dir)."""
         speed = vel_w.norm(dim=-1, keepdim=True)  # (N, 1)
         d = vel_w / speed.clamp(min=1e-6)          # (N, 3) unit direction
 
@@ -207,4 +229,4 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
         quat = torch.where(is_singular & ~is_neg_x, identity, quat)
         quat = torch.where(is_neg_x, flip_z, quat)
 
-        return quat, speed.clamp(0.05, 0.5)
+        return quat

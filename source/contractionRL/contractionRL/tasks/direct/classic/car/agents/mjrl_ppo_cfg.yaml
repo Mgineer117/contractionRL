@@ -1,0 +1,24 @@
+seed: 42
+
+agent:
+  class: PPO
+  actor_type: RL          # RL | CL
+  anneal_stddev: true     # exponential log_std 0 → -20 over training
+  hidden_dim: [256, 256]
+  actor_lr: 3.0e-4
+  critic_lr: 5.0e-4
+  num_minibatch: 4
+  minibatch_size: 256
+  eps_clip: 0.2
+  entropy_scaler: 0.0     # no entropy regularization
+  target_kl: 0.03
+  gamma: 0.99
+  gae: 0.95
+  K: 5
+
+trainer:
+  class: OnlineTrainer
+  num_agent: 4            # == num_worker (OnlineSampler parallelism)
+  epochs: 2000
+  eval_interval: 200
+  log_interval: 20

@@ -1,0 +1,48 @@
+seed: 42
+
+agent:
+  class: TEMP
+  # PPO shared config
+  rollouts: 300
+  learning_epochs: 5
+  mini_batches: 4
+  gae_lambda: 0.95
+  learning_rate: 3.0e-4
+  ratio_clip: 0.2
+  value_clip: 0.2
+  entropy_loss_scale: 0.0
+  value_loss_scale: 1.0
+  kl_threshold: 0.0
+  grad_norm_clip: 1.0
+  # TEMP-specific
+  gamma_contracting: 0.0
+  gamma_optimal: 0.99
+  con_only: false
+  # CMG
+  W_lr: 3.0e-4
+  w_ub: 10.0
+  w_lb: 0.1
+  lbd: 0.01
+  eps: 0.01
+  W_entropy_scaler: 1.0e-3
+  cmg_updates_per_iter: 3
+  cmg_minibatch_size: 1024
+  buffer_size: 2048
+  # reward normalisation
+  reward_norm_beta: 0.99
+  tracking_scaler: 1.0
+  control_scaler: 0.0
+  # model architecture
+  hidden_dim: [128, 128]
+  cmg_hidden_dim: [128, 128]
+  experiment:
+    directory: "car_temp"
+    experiment_name: ""
+    write_interval: 6000
+    checkpoint_interval: 6000
+
+trainer:
+  class: TEMPTrainer
+  timesteps: 600000
+  rollouts: 300
+  con_only: false

@@ -19,13 +19,13 @@ import torch
 @dataclass
 class VelCmdCfg:
     # linear velocity ranges [m/s], constant per episode
-    vx_range: tuple[float, float] = (-1.0, 1.0)
-    vy_range: tuple[float, float] = (-0.5, 0.5)
-    vz_range: tuple[float, float] = (0.0, 0.0)   # zero for flat-ground locomotion
+    vx_range: tuple[float, float] = (0.5, 1.5)    # always forward → trajectories go "away"
+    vy_range: tuple[float, float] = (-0.2, 0.2)   # small lateral drift
+    vz_range: tuple[float, float] = (0.0, 0.0)    # zero for flat-ground locomotion
 
-    # sinusoidal yaw parameters
-    yaw_A_range: tuple[float, float] = (0.3, 1.0)    # amplitude  [rad/s]
-    yaw_omega_range: tuple[float, float] = (0.5, 2.0) # frequency  [rad/s]
+    # sinusoidal yaw parameters — slower frequency keeps trajectories from looping back
+    yaw_A_range: tuple[float, float] = (0.2, 0.8)    # amplitude  [rad/s]
+    yaw_omega_range: tuple[float, float] = (0.3, 1.0) # frequency  [rad/s]
     # phi sampled from [0, 2π] uniformly
 
 

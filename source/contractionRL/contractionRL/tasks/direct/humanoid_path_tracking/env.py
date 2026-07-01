@@ -13,11 +13,10 @@ from .env_cfg import HumanoidPathTrackingEnvCfg
 class HumanoidPathTrackingEnv(PathTrackingBase):
     """Unitree H1 path-tracking environment.
 
-    obs  = [x(47), x_ref(47), u_ref(19)] = 113
+    obs  = [x(41), x_ref(41), u_ref(19)] = 101
     reward = -||x - x_ref||^2
 
-    x layout: base_lin_vel_b(3) + base_ang_vel_b(3) + proj_gravity_b(3)
-               + joint_pos_rel(19) + joint_vel(19)
+    x layout: proj_gravity_b(3) + joint_pos_rel(19) + joint_vel(19)
     """
 
     cfg: HumanoidPathTrackingEnvCfg
@@ -52,8 +51,6 @@ class HumanoidPathTrackingEnv(PathTrackingBase):
     def _get_physical_state(self) -> torch.Tensor:
         return torch.cat(
             [
-                self._robot.data.root_lin_vel_b,
-                self._robot.data.root_ang_vel_b,
                 self._robot.data.projected_gravity_b,
                 self._robot.data.joint_pos[:, self._joint_ids] - self._robot.data.default_joint_pos[:, self._joint_ids],
                 self._robot.data.joint_vel[:, self._joint_ids],
@@ -67,20 +64,25 @@ class HumanoidPathTrackingEnv(PathTrackingBase):
         return fell, time_out
 
     def _set_robot_state_from_ref(self, env_ids: torch.Tensor, x_ref_init: torch.Tensor) -> None:
-        # x: [lin_vel(3), ang_vel(3), gravity(3), joint_pos_rel(19), joint_vel(19)]
-        joint_pos_rel = x_ref_init[:, 9:28]
-        joint_vel_ref = x_ref_init[:, 28:47]
-        base_lin_vel  = x_ref_init[:, 0:3]
-        base_ang_vel  = x_ref_init[:, 3:6]
+        # x layout: [gravity(3), joint_pos_rel(3:22), joint_vel(22:41)]
+        joint_pos_rel = x_ref_init[:, 3:22]   # (n, 19)
+        joint_vel_ref = x_ref_init[:, 22:41]  # (n, 19)
 
+        n = len(env_ids)
         full_pos = self._robot.data.default_joint_pos[env_ids].clone()
         full_vel = self._robot.data.default_joint_vel[env_ids].clone()
-        full_pos[:, self._joint_ids] = full_pos[:, self._joint_ids] + joint_pos_rel
+
+        # Reference joint state + small random offset so the controller has something to correct
+        noise = torch.empty(n, len(self._joint_ids), device=self.device).uniform_(
+            -self.cfg.init_noise_scale, self.cfg.init_noise_scale
+        )
+        full_pos[:, self._joint_ids] = full_pos[:, self._joint_ids] + joint_pos_rel + noise
         full_vel[:, self._joint_ids] = joint_vel_ref
 
-        root = self._robot.data.default_root_state[env_ids]
+        # Root: default pose (upright) + env origin — velocity zeroed (not in state)
+        root = self._robot.data.default_root_state[env_ids].clone()
         root[:, :3] += self.scene.env_origins[env_ids]
-        root_vel = torch.cat([base_lin_vel, base_ang_vel], dim=-1)
+        root_vel = torch.zeros(n, 6, device=self.device)
 
         self._robot.write_root_pose_to_sim(root[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(root_vel, env_ids)

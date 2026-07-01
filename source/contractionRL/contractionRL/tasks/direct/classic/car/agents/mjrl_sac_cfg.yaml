@@ -1,0 +1,24 @@
+seed: 42
+
+agent:
+  class: SAC
+  hidden_dim: [256, 256]
+  activation: relu
+  gamma: 0.99
+  tau: 0.005
+  actor_lr: 3.0e-4
+  critic_lr: 3.0e-4
+  alpha_lr: 3.0e-4
+  init_alpha: 0.2
+  autotune_alpha: true
+  buffer_size: 1000000
+  sac_batch_size: 256
+  utd_ratio: 1.0
+  learning_starts: 1000
+
+trainer:
+  class: OffPolicyTrainer
+  num_agent: 4
+  epochs: 2000
+  eval_interval: 200
+  log_interval: 20

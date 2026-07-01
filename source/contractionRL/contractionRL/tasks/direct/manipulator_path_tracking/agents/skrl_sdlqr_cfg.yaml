@@ -1,0 +1,21 @@
+seed: 42
+models:
+  separate: True
+
+memory:
+  class: RandomMemory
+  memory_size: 4096
+
+agent:
+  class: SDLQR
+  Q_scaler: 1.0
+  R_scaler: 0.01
+  experiment:
+    directory: "manipulator_sdlqr"
+    experiment_name: ""
+    write_interval: 500
+    checkpoint_interval: 500
+
+trainer:
+  class: SequentialTrainer
+  timesteps: 50000

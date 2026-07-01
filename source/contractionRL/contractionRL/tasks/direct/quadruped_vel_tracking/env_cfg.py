@@ -30,7 +30,7 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
 
     sim: SimulationCfg = SimulationCfg(dt=1 / 200, render_interval=decimation)
     robot_cfg: ArticulationCfg = UNITREE_GO2_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=2.5, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=1024, env_spacing=2.5, replicate_physics=True)
 
     # velocity commands
     vel_cmd: VelCmdCfg = VelCmdCfg(
@@ -46,6 +46,11 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
 
     # termination
     base_height_min = 0.20  # [m]
+
+    # initial-state randomisation (used by generate_ref_traj.py for trajectory diversity)
+    randomize_init: bool = False
+    init_pos_range: float = 0.3    # [m]  uniform x,y offset around env origin
+    init_joint_noise: float = 0.05  # [rad] uniform noise on joint positions
 
     # reward scales (tentative)
     rew_lin_vel = 2.0
