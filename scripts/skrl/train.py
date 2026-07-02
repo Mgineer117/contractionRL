@@ -35,6 +35,8 @@ parser.add_argument("--seed", type=int, default=None, help="Random seed.")
 parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint path to resume from.")
 parser.add_argument("--num_timesteps", "--num-timesteps", type=int, default=None,
                     help="Total training timesteps.")
+parser.add_argument("--analytical", type=str, default="",
+                    help="Pass 'dynamics' to use analytical dynamics (C3M/LQR).")
 
 # W&B
 parser.add_argument("--no_wandb", "--no-wandb", action="store_true", default=False,
@@ -505,6 +507,8 @@ if _is_classic:
         agent_cfg["trainer"]["timesteps"] = args_cli.num_timesteps
     if args_cli.lr is not None:
         agent_cfg["agent"]["learning_rate"] = args_cli.lr
+    if args_cli.analytical == "dynamics":
+        agent_cfg["agent"]["use_analytical_dynamics"] = True
 
     _run_ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_dir = os.path.join("logs", "classic", algorithm, _run_ts)

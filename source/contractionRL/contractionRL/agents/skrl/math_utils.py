@@ -16,11 +16,12 @@ def jacobian(f: torch.Tensor, x: torch.Tensor, create_graph: bool = True) -> tor
     n, f_dim, x_dim = x.shape[0], f.shape[-1], x.shape[-1]
     if not f.requires_grad:
         return torch.zeros((n, f_dim, x_dim), device=x.device, dtype=x.dtype)
-    v = torch.eye(f_dim, device=x.device, dtype=x.dtype).unsqueeze(1).expand(f_dim, n, f_dim)
-    J_tuple = grad(f, x, grad_outputs=v, create_graph=create_graph, retain_graph=True, is_grads_batched=True, allow_unused=True)
-    if J_tuple[0] is None:
-        return torch.zeros((n, f_dim, x_dim), device=x.device, dtype=x.dtype)
-    return J_tuple[0].transpose(0, 1)
+    J = torch.zeros(n, f_dim, x_dim, device=x.device, dtype=x.dtype)
+    for i in range(f_dim):
+        g = grad(f[:, i].sum(), x, create_graph=create_graph, retain_graph=True, allow_unused=True)[0]
+        if g is not None:
+            J[:, i, :] = g
+    return J
 
 
 def b_jacobian(B: torch.Tensor, x: torch.Tensor, u_dim: int, create_graph: bool = True) -> torch.Tensor:

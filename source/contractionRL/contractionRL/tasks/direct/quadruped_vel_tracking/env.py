@@ -47,7 +47,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[])
         self.scene.articulations["robot"] = self._robot
-        light_cfg = sim_utils.DistantLightCfg(intensity=3000.0, color=(1.0, 1.0, 1.0)))
+        light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
@@ -120,8 +120,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         rew_rp = torch.sum(torch.square(self._robot.data.root_ang_vel_b[:, :2]), dim=1) * self.cfg.rew_roll_pitch
         rew_tau = torch.sum(torch.square(self._robot.data.applied_torque), dim=1) * self.cfg.rew_torque
         rew_act = torch.sum(torch.square(self._actions - self._prev_actions), dim=1) * self.cfg.rew_action_rate
-        
-                total_reward = rew_lin + rew_yaw + rew_z + rew_rp + rew_tau + rew_act
+        total_reward = rew_lin + rew_yaw + rew_z + rew_rp + rew_tau + rew_act
         
         if not hasattr(self, "_episode_discounted_returns"):
             self._episode_discounted_returns = torch.zeros(self.num_envs, device=self.device)

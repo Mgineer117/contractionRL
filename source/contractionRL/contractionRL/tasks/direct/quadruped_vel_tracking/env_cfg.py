@@ -65,10 +65,11 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     # rate) or EXACTLY 2*pi/episode_length_s (one full, gentle S-turn sine
     # cycle over the whole episode) — never an in-between frequency.
     vel_cmd: VelCmdCfg = VelCmdCfg(
-        vx_range=(-0.5, 0.5),
-        vy_range=(-0.5, 0.5),
+        vx_range=(-0.2, 0.2),
+        vy_range=(-0.2, 0.2),
         vz_range=(0.0, 0.0),
-        yaw_A_range=(0.1, 0.5),
+        yaw_A_range=(0.0, 0.0),
+        # yaw_A_range=(0.1, 0.5),
         yaw_omega_range=(0.0, 2 * math.pi / episode_length_s),
         yaw_omega_binary=True,
     )
@@ -80,7 +81,7 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     base_height_min = 0.20  # [m]
 
     # initial-state randomisation (used by generate_ref_traj.py for trajectory diversity)
-    randomize_init: bool = False
+    randomize_init: bool = True
     init_pos_range: float = 0.3    # [m]  uniform x,y offset around env origin
     init_joint_noise: float = 0.05  # [rad] uniform noise on joint positions
 
