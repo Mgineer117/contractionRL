@@ -45,10 +45,7 @@ from .nn_modules import NeuralDynamics
 
 @dataclass
 class C3MCfg(AgentCfg):
-    batch_size: int = 2048
-    num_minibatch: int = 8
-    minibatch_size: int = 256
-    cmg_updates_per_policy_update: int = 1
+    batch_size: int = 1024
     W_lr: float = 3e-4
     u_lr: float = 3e-4
     lbd: float = 1e-2
@@ -180,8 +177,9 @@ class C3MAgent(Agent):
         else:
             self._lr_scheduler = None
 
-        # ── Data buffer (numpy; refreshed every update) ─────────────────── #
-        self._data = get_rollout(cfg.batch_size, "c3m")
+        # ── Data buffer (numpy; static for analytical, or pre-generated) ────── #
+        self._memory_size = getattr(self.memory, "memory_size", 131072) if self.memory is not None else 131072
+        self._data = get_rollout(self._memory_size, "c3m")
         self._get_rollout = get_rollout
         self._batch_size = cfg.batch_size
         self._num_updates = 0
@@ -229,13 +227,7 @@ class C3MAgent(Agent):
         # 2. Anneal CLActor log_std
         self.models["policy"].cl_actor.anneal_stddev(self._progress)
 
-        # 3. Refresh data buffer periodically (not every timestep)
-        # The reference code pre-generates all data; we refresh every N steps.
-        refresh_interval = max(1, self._batch_size // self._cfg.minibatch_size)
-        if timestep % refresh_interval == 0:
-            self._data = self._get_rollout(self._batch_size, "c3m")
-
-        # 4. Run contraction update (single pass through minibatches)
+        # 3. Full epoch update (looping entire buffer in batch_size chunks)
         loss_dict = self._learn()
         for k, v in loss_dict.items():
             self.track_data(f"Loss / {k}", v)
@@ -246,16 +238,14 @@ class C3MAgent(Agent):
         dev = self._device
         return torch.from_numpy(arr).to(torch.float32).to(dev)
 
-    def _compute_loss(self):
+    def _compute_loss(self, idx):
         cfg = self._cfg
         device = self._device
         x_dim, u_dim = self._x_dim, self._u_dim
         I = torch.eye(x_dim, device=device)
 
         buf = self._data
-        n = buf["x"].shape[0]
-        batch_size = min(cfg.minibatch_size, n)
-        idx = np.random.choice(n, size=batch_size, replace=False)
+        batch_size = len(idx)
 
         x     = self._to_tensor(buf["x"][idx]).requires_grad_()
         xref  = self._to_tensor(buf["xref"][idx])
@@ -325,26 +315,30 @@ class C3MAgent(Agent):
 
         total_pd_loss = 0.0
         total_c1_loss = 0.0
-        total_c2_loss = 0.0
-        total_loss = 0.0
+        buf = self._data
+        n = buf["x"].shape[0]
+        batch_size = cfg.batch_size
+        
+        # shuffle indices for the epoch
+        indices = np.random.permutation(n)
+        
+        iters = max(1, n // batch_size)
+        total_pd = total_c1 = total_c2 = total_loss = 0.0
 
-        # Single joint optimizer step per minibatch — matches reference code.
-        # The reference code uses one Adam optimizer for both W and u parameters
-        # with a single loss.backward() + optimizer.step() per batch.
-        for _ in range(cfg.num_minibatch):
-            loss, infos = self._compute_loss()
+        for b in range(iters):
+            idx = indices[b * batch_size : (b + 1) * batch_size]
+            loss, infos = self._compute_loss(idx)
+
             self._joint_optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(self._ccm_gen.parameters()) + list(self._cl_actor.parameters()), 1.0
-            )
+            torch.nn.utils.clip_grad_norm_(self._cl_actor.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self._ccm_gen.parameters(), 1.0)
             self._joint_optimizer.step()
-
-            self._num_updates += 1
+            
             total_loss += loss.item()
-            total_pd_loss += infos["pd_loss"]
-            total_c1_loss += infos["c1_loss"]
-            total_c2_loss += infos["c2_loss"]
+            total_pd += infos["pd_loss"]
+            total_c1 += infos["c1_loss"]
+            total_c2 += infos["c2_loss"]
 
         # Step LR scheduler once per update call
         if self._lr_scheduler is not None:

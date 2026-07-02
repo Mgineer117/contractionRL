@@ -29,13 +29,11 @@ models:
 
 memory:
   class: RandomMemory
-  memory_size: 4096  # Capacity of the experience replay buffer (-1 means dynamic/infinite)
+  memory_size: 131072  # Capacity of the experience replay buffer (-1 means dynamic/infinite)
 
 agent:
   class: C3M
-  batch_size: 4096  # Number of samples to collect from the environment before performing an update
-  num_minibatch: 8  # Number of minibatches to split the collected batch into
-  minibatch_size: 512  # Size of each minibatch for gradient descent updates
+  batch_size: 1024
   learning_rate_scheduler: null  # Optional PyTorch learning rate scheduler (e.g., "StepLR")
   cmg_updates_per_policy_update: 3  # Number of CMG metric updates to perform per policy update
   W_lr: 3.0e-4  # Learning rate for the Contraction Metric Generator (CMG) network
@@ -50,7 +48,7 @@ agent:
   dynamics_lr_scheduler_kwargs:  # Arguments for the NeuralDynamics scheduler
     step_size: 1  # anneal every epoch
     gamma: 0.99
-  batch_size: 4096  # Number of samples to collect for NeuralDynamics training
+  dynamics_batch_size: 4096
   dynamics_pretrain_epochs: 100  # Number of epochs for offline data, or number of rollouts for online fallback
   experiment:
     directory: "manipulator_c3m"
