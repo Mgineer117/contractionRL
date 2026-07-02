@@ -23,6 +23,7 @@ from typing import Callable
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 import tqdm as _tqdm
 from torch import matmul, transpose
 
@@ -328,7 +329,8 @@ class C3MAgent(Agent):
         iters = max(1, n // batch_size)
         total_pd = total_c1 = total_c2 = total_loss = 0.0
 
-        for b in range(iters):
+        pbar = tqdm(range(iters), desc=f"Epoch C3M Update", leave=False)
+        for b in pbar:
             idx = indices[b * batch_size : (b + 1) * batch_size]
             loss, infos = self._compute_loss(idx)
 
