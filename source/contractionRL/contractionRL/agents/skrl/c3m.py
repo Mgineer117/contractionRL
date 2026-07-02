@@ -165,18 +165,20 @@ class C3MAgent(Agent):
         self._cl_actor = models["policy"].cl_actor
 
         # ── Optimizers + LR schedulers ──────────────────────────────────── #
-        self._W_optimizer = torch.optim.Adam(self._ccm_gen.parameters(), lr=cfg.W_lr)
-        self._actor_optimizer = torch.optim.Adam(self._cl_actor.parameters(), lr=cfg.u_lr)
+        # Single joint optimizer (matches reference CAC code) — one Adam for
+        # both W (CMG) and u (CLActor) parameters with per-group LR.
+        self._joint_optimizer = torch.optim.Adam([
+            {"params": self._ccm_gen.parameters(), "lr": cfg.W_lr},
+            {"params": self._cl_actor.parameters(), "lr": cfg.u_lr},
+        ])
         self._progress = 0.0
         
         if getattr(cfg, "learning_rate_scheduler", None):
             scheduler_cls = getattr(torch.optim.lr_scheduler, cfg.learning_rate_scheduler)
             kwargs = getattr(cfg, "learning_rate_scheduler_kwargs", {})
-            self._W_lr_scheduler = scheduler_cls(self._W_optimizer, **kwargs)
-            self._actor_lr_scheduler = scheduler_cls(self._actor_optimizer, **kwargs)
+            self._lr_scheduler = scheduler_cls(self._joint_optimizer, **kwargs)
         else:
-            self._W_lr_scheduler = None
-            self._actor_lr_scheduler = None
+            self._lr_scheduler = None
 
         # ── Data buffer (numpy; refreshed every update) ─────────────────── #
         self._data = get_rollout(cfg.batch_size, "c3m")
@@ -227,8 +229,13 @@ class C3MAgent(Agent):
         # 2. Anneal CLActor log_std
         self.models["policy"].cl_actor.anneal_stddev(self._progress)
 
-        # 3. Refresh data buffer and run contraction update
-        self._data = self._get_rollout(self._batch_size, "c3m")
+        # 3. Refresh data buffer periodically (not every timestep)
+        # The reference code pre-generates all data; we refresh every N steps.
+        refresh_interval = max(1, self._batch_size // self._cfg.minibatch_size)
+        if timestep % refresh_interval == 0:
+            self._data = self._get_rollout(self._batch_size, "c3m")
+
+        # 4. Run contraction update (single pass through minibatches)
         loss_dict = self._learn()
         for k, v in loss_dict.items():
             self.track_data(f"Loss / {k}", v)
@@ -277,14 +284,18 @@ class C3MAgent(Agent):
         dot_M = weighted_gradients(M, dot_x, x)
 
         ABK = A + matmul(B, K)
-        MABK = matmul(M, ABK)
+        # Detach M in contraction condition (matches reference: M.detach())
+        # to prevent gradients flowing through M → W during early training
+        M_det = M.detach()
+        MABK = matmul(M_det, ABK)
         sym_MABK = 0.5 * (MABK + transpose(MABK, 1, 2))
-        Cu = dot_M + 2 * sym_MABK + 2 * cfg.lbd * M
+        Cu = dot_M + 2 * sym_MABK + 2 * cfg.lbd * M_det
 
         DfW = weighted_gradients(W, f, x)
         DfDxW = matmul(DfDx, W)
         sym_DfDxW = 0.5 * (DfDxW + transpose(DfDxW, 1, 2))
-        C1_inner = -DfW + 2 * sym_DfDxW + 2 * cfg.lbd * W
+        # Detach W in C1 condition (matches reference: W.detach())
+        C1_inner = -DfW + 2 * sym_DfDxW + 2 * cfg.lbd * W.detach()
         C1 = matmul(matmul(transpose(Bbot, 1, 2), C1_inner), Bbot)
 
         c2_loss = torch.zeros(1, device=device)
@@ -316,36 +327,27 @@ class C3MAgent(Agent):
         total_c2_loss = 0.0
         total_loss = 0.0
 
+        # Single joint optimizer step per minibatch — matches reference code.
+        # The reference code uses one Adam optimizer for both W and u parameters
+        # with a single loss.backward() + optimizer.step() per batch.
         for _ in range(cfg.num_minibatch):
-            for _ in range(cfg.cmg_updates_per_policy_update):
-                loss, _ = self._compute_loss()
-                self._W_optimizer.zero_grad()
-                self._actor_optimizer.zero_grad()
-                loss.backward()
-                if all(torch.isfinite(p.grad).all() for p in self._ccm_gen.parameters() if p.grad is not None):
-                    torch.nn.utils.clip_grad_norm_(self._ccm_gen.parameters(), 1.0)
-                    self._W_optimizer.step()
-                self._W_optimizer.zero_grad(); self._actor_optimizer.zero_grad()
-
             loss, infos = self._compute_loss()
-            self._W_optimizer.zero_grad()
-            self._actor_optimizer.zero_grad()
+            self._joint_optimizer.zero_grad()
             loss.backward()
-            if all(torch.isfinite(p.grad).all() for p in self._cl_actor.parameters() if p.grad is not None):
-                torch.nn.utils.clip_grad_norm_(self._cl_actor.parameters(), 1.0)
-                self._actor_optimizer.step()
-                
-            self._num_updates += cfg.cmg_updates_per_policy_update
+            torch.nn.utils.clip_grad_norm_(
+                list(self._ccm_gen.parameters()) + list(self._cl_actor.parameters()), 1.0
+            )
+            self._joint_optimizer.step()
+
+            self._num_updates += 1
             total_loss += loss.item()
             total_pd_loss += infos["pd_loss"]
             total_c1_loss += infos["c1_loss"]
             total_c2_loss += infos["c2_loss"]
 
-        # Step LR schedulers once per rollout
-        if self._W_lr_scheduler is not None:
-            self._W_lr_scheduler.step()
-        if self._actor_lr_scheduler is not None:
-            self._actor_lr_scheduler.step()
+        # Step LR scheduler once per update call
+        if self._lr_scheduler is not None:
+            self._lr_scheduler.step()
 
         self._ccm_gen.eval(); self._cl_actor.eval()
         
@@ -355,8 +357,7 @@ class C3MAgent(Agent):
             "C3M/loss/pd_loss": total_pd_loss / n_mb,
             "C3M/loss/c1_loss": total_c1_loss / n_mb,
             "C3M/loss/c2_loss": total_c2_loss / n_mb,
-            "C3M/lr/W_lr":      self._W_lr_scheduler.get_last_lr()[0] if self._W_lr_scheduler else cfg.W_lr,
-            "C3M/lr/u_lr":      self._actor_lr_scheduler.get_last_lr()[0] if self._actor_lr_scheduler else cfg.u_lr,
+            "C3M/lr/lr":        self._lr_scheduler.get_last_lr()[0] if self._lr_scheduler else cfg.W_lr,
         }
 
     def _train_dynamics(self, data: dict) -> float:
