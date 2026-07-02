@@ -51,14 +51,14 @@ class CarEnv(BaseEnv):
 
     def _f_logic(self, x, lib):
         n = x.shape[0]
-        f = lib.zeros((n, self.num_dim_x))
+        f = self._zeros((n, self.num_dim_x), x, lib)
         f[:, 0] = x[:, 3] * lib.cos(x[:, 2])
         f[:, 1] = x[:, 3] * lib.sin(x[:, 2])
         return f
 
     def _B_logic(self, x, lib):
         n = x.shape[0]
-        B = lib.zeros((n, self.num_dim_x, self.num_dim_control))
+        B = self._zeros((n, self.num_dim_x, self.num_dim_control), x, lib)
         B[:, 2, 0] = 1
         B[:, 3, 1] = 1
         return B

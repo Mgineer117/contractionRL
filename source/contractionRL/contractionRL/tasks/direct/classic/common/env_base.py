@@ -186,6 +186,20 @@ class BaseEnv(gym.Env):
     # ------------------------------------------------------------------ #
     # control-affine dynamics: f(x), B(x), B_null(x) (torch/numpy dual)
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _zeros(shape, x, lib):
+        """``lib.zeros`` allocated on ``x``'s device when ``lib`` is torch.
+
+        ``torch.zeros(shape)`` defaults to CPU regardless of where ``x`` lives,
+        so a subsequent ``f[:, i] = x[:, j] * ...`` silently mixes devices and
+        raises once ``x`` is a CUDA tensor (e.g. C3M/TEMP running their
+        contraction math on GPU). The numpy path (env.step's physics rollout)
+        is unaffected since ``np.zeros`` has no device concept.
+        """
+        if lib is torch:
+            return lib.zeros(shape, device=x.device, dtype=x.dtype)
+        return lib.zeros(shape)
+
     @abstractmethod
     def _f_logic(self, x, lib):
         ...
@@ -198,7 +212,11 @@ class BaseEnv(gym.Env):
         eye_dims = self.num_dim_x - self.num_dim_control
         zero_dims = (self.num_dim_control, eye_dims)
         if lib == torch:
-            Bbot = torch.cat((torch.eye(eye_dims), torch.zeros(zero_dims)), dim=0)
+            Bbot = torch.cat(
+                (torch.eye(eye_dims, device=x.device, dtype=x.dtype),
+                 torch.zeros(zero_dims, device=x.device, dtype=x.dtype)),
+                dim=0,
+            )
             return Bbot.repeat(n, 1, 1)
         Bbot = np.concatenate((np.eye(eye_dims), np.zeros(zero_dims)), axis=0)
         return np.repeat(Bbot[np.newaxis, :, :], n, axis=0)

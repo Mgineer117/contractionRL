@@ -70,7 +70,7 @@ class CartPoleEnv(BaseEnv):
     def _f_logic(self, x, lib):
         n = x.shape[0]
         p, theta, v, omega = [x[:, i] for i in range(self.num_dim_x)]
-        f = lib.zeros((n, self.num_dim_x))
+        f = self._zeros((n, self.num_dim_x), x, lib)
         f[:, 0] = v
         f[:, 1] = omega
         f[:, 2] = (
@@ -86,7 +86,7 @@ class CartPoleEnv(BaseEnv):
     def _B_logic(self, x, lib):
         n = x.shape[0]
         theta = x[:, 1]
-        B = lib.zeros((n, self.num_dim_x, self.num_dim_control))
+        B = self._zeros((n, self.num_dim_x, self.num_dim_control), x, lib)
         B[:, 2, 0] = 1 / (mc + mp * (lib.sin(theta) ** 2))
         B[:, 3, 0] = lib.cos(theta) / l / (mc + mp * (lib.sin(theta) ** 2))
         return B

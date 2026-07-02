@@ -65,13 +65,13 @@ class TurtlebotEnv(BaseEnv):
 
     def _f_logic(self, x, lib):
         n = x.shape[0]
-        f = lib.zeros((n, self.num_dim_x))
+        f = self._zeros((n, self.num_dim_x), x, lib)
         return f
 
     def _B_logic(self, x, lib):
         n = x.shape[0]
         theta = x[:, 2]
-        B = lib.zeros((n, self.num_dim_x, self.num_dim_control))
+        B = self._zeros((n, self.num_dim_x, self.num_dim_control), x, lib)
         B[:, 0, 0] = k1 * lib.cos(theta)
         B[:, 1, 0] = k2 * lib.sin(theta)
         B[:, 2, 1] = k3

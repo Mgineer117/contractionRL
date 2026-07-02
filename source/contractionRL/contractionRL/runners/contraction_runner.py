@@ -142,10 +142,16 @@ def _make_skrl_env(env, task_id: str | None, num_envs: int, is_classic: bool):
         from gymnasium.vector import SyncVectorEnv
         from skrl.envs.wrappers.torch import wrap_env
         vec_env = SyncVectorEnv([lambda: gym.make(task_id)] * num_envs)
-        # Classic envs are numpy-based (CPU-only). skrl's GymnasiumWrapper picks
-        # up the device from `vec_env.device` if present, else defaults to the
-        # global skrl device (cuda:0) — which would mismatch CPU-only models.
-        vec_env.device = "cpu"
+        # Do NOT force vec_env.device = "cpu" here. The underlying physics step
+        # is numpy/CPU-bound either way, but GymnasiumWrapper.step/reset already
+        # bridges numpy <-> torch at the right device via tensorize_space /
+        # untensorize_space (actions are .cpu().numpy()'d before being handed to
+        # the numpy env; observations are re-tensorized onto `device` after).
+        # Leaving vec_env.device unset lets GymnasiumWrapper fall back to the
+        # global skrl device (cuda:0 when available) — matching Isaac envs and
+        # letting C3M/TEMP's batched Jacobian/backprop math run on GPU instead
+        # of silently pinning the whole classic pipeline (including the neural
+        # networks) to CPU.
         return wrap_env(vec_env, wrapper="gymnasium")
     return env  # Isaac: already wrapped
 
@@ -219,10 +225,15 @@ class ContractionRunner:
         from contractionRL.agents.skrl.models import CLActorModel, CMGModel
 
         skrl_env = _make_skrl_env(env, task_id, num_envs, is_classic)
-        # Classic envs (numpy/CPU) must run on CPU regardless of skrl's global device.
-        # Isaac envs already propagate the right device from the GPU-vectorized wrapper.
-        import torch
-        device = torch.device("cpu") if is_classic else skrl_env.device
+        # Use the wrapped env's device for both classic and Isaac envs. The
+        # classic env's own physics step is numpy/CPU-bound regardless (see
+        # _make_skrl_env), but the agent's neural networks and gradient math
+        # (C3M/TEMP Jacobians, batched contraction losses) benefit hugely from
+        # GPU — hardcoding CPU here was pinning that compute off the GPU even
+        # when one was available. SD-LQR/LQR are unaffected: they pin their own
+        # internal `_compute_device = "cpu"` regardless of this value, since
+        # scipy's CARE solver is CPU-only anyway.
+        device = skrl_env.device
         obs_space = skrl_env.observation_space
         act_space = skrl_env.action_space
         state_space = getattr(skrl_env, "state_space", None)
