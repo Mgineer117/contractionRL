@@ -18,6 +18,7 @@ models:
         input: OBSERVATIONS
         layers: [256, 256]
         activations: tanh
+        constrain_eigenvalues: True
   dynamics:
     class: NeuralDynamics
     network:

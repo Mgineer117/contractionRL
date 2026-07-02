@@ -262,7 +262,8 @@ class C3MAgent(Agent):
         uref  = self._to_tensor(buf["uref"][idx])
 
         raw_W, _ = self._ccm_gen(x)
-        W = bound_W(raw_W, cfg.w_lb, x_dim)
+        bounded = getattr(self._ccm_gen, "bounded", False)
+        W = bound_W(raw_W, cfg.w_lb, x_dim, bounded)
         M = torch.linalg.solve(W, I.unsqueeze(0).expand(batch_size, -1, -1))
 
         with torch.enable_grad():
@@ -284,18 +285,14 @@ class C3MAgent(Agent):
         dot_M = weighted_gradients(M, dot_x, x)
 
         ABK = A + matmul(B, K)
-        # Detach M in contraction condition (matches reference: M.detach())
-        # to prevent gradients flowing through M → W during early training
-        M_det = M.detach()
-        MABK = matmul(M_det, ABK)
+        MABK = matmul(M, ABK)
         sym_MABK = 0.5 * (MABK + transpose(MABK, 1, 2))
-        Cu = dot_M + 2 * sym_MABK + 2 * cfg.lbd * M_det
+        Cu = dot_M + 2 * sym_MABK + 2 * cfg.lbd * M
 
         DfW = weighted_gradients(W, f, x)
         DfDxW = matmul(DfDx, W)
         sym_DfDxW = 0.5 * (DfDxW + transpose(DfDxW, 1, 2))
-        # Detach W in C1 condition (matches reference: W.detach())
-        C1_inner = -DfW + 2 * sym_DfDxW + 2 * cfg.lbd * W.detach()
+        C1_inner = -DfW + 2 * sym_DfDxW + 2 * cfg.lbd * W
         C1 = matmul(matmul(transpose(Bbot, 1, 2), C1_inner), Bbot)
 
         c2_loss = torch.zeros(1, device=device)
@@ -306,14 +303,18 @@ class C3MAgent(Agent):
             C2_inner = DbW - 2 * sym_DbDxW
             C2 = matmul(matmul(transpose(Bbot, 1, 2), C2_inner), Bbot)
             c2_loss = c2_loss + (C2 ** 2).reshape(batch_size, -1).sum(1).mean()
-
-        overshoot = W - cfg.w_ub * I
+            
         Cu_reg = Cu + cfg.eps * I
         C1_reg = C1 + cfg.eps * torch.eye(C1.shape[-1], device=device)
 
         pd_loss,  pd_reg  = loss_pos_matrix_random_sampling(-Cu_reg)
         c1_loss,  c1_reg  = loss_pos_matrix_random_sampling(-C1_reg)
-        os_loss,  os_reg  = loss_pos_matrix_random_sampling(-overshoot)
+        
+        if bounded:
+            os_loss = os_reg = torch.zeros(1, device=device)
+        else:
+            overshoot = W - cfg.w_ub * I
+            os_loss,  os_reg  = loss_pos_matrix_random_sampling(-overshoot)
 
         loss = os_loss + pd_loss + c1_loss + c2_loss + pd_reg + c1_reg + os_reg
         return loss, {"pd_loss": pd_loss.item(), "c1_loss": c1_loss.item(), "c2_loss": c2_loss.item()}

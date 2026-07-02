@@ -318,3 +318,78 @@ class NeuralDynamics(nn.Module):
         if args and isinstance(args[0], (torch.device, str)):
             result.device = torch.device(args[0])
         return result
+
+class BoundedCCM_Generator(nn.Module):
+    """CMG with hard eigenvalue bounds baked into the forward pass."""
+    bounded = True
+
+    def __init__(
+        self,
+        x_dim: int,
+        hidden_dim: list,
+        activation: str | nn.Module = "tanh",
+        mode: str = "deterministic",
+        w_lb: float = 0.1,
+        w_ub: float = 10.0,
+        device: str = "cpu",
+    ):
+        super().__init__()
+
+        self.x_dim = x_dim
+        self.mode = mode
+        self.device = device
+        self.w_lb = w_lb
+        self.w_ub = w_ub
+
+        if isinstance(activation, str):
+            activation = {"tanh": nn.Tanh(), "relu": nn.ReLU()}.get(
+                activation.lower(), nn.Tanh()
+            )
+        self.model = MLP(
+            input_dim=x_dim, hidden_dims=hidden_dim,
+            activation=activation,
+        )
+        
+        self.model.to(device)
+
+        out_dim = x_dim * x_dim
+        self.mu = nn.Linear(self.model.output_dim, out_dim).to(device)
+        self.logstd = nn.Linear(self.model.output_dim, out_dim).to(device)
+
+    def _to_bounded_spd(self, flat: torch.Tensor) -> torch.Tensor:
+        """Reshape → symmetrise → sigmoid-on-eigenvalues → bounded SPD."""
+        n = flat.shape[0]
+        S_raw = flat.view(n, self.x_dim, self.x_dim)
+        S = 0.5 * (S_raw + S_raw.mT)           # symmetric; eigenvalues span ℝ
+        lam, V = torch.linalg.eigh(S.cpu())    # eigh unsupported on MPS; run on CPU
+        lam, V = lam.to(S.device), V.to(S.device)
+        lam = self.w_lb + (self.w_ub - self.w_lb) * torch.sigmoid(lam)
+        return V @ torch.diag_embed(lam) @ V.mT  # SPD, λ ∈ (w_lb, w_ub)
+
+    def forward(self, x: torch.Tensor, deterministic: bool = True):
+        logits = self.model(x)
+        mu = self.mu(logits)
+
+        # Return-dict keys mirror CCM_Generator so the two are drop-in compatible.
+        if self.mode == "deterministic" or deterministic:
+            W = self._to_bounded_spd(mu)
+            logprobs = torch.zeros(x.shape[0], 1, device=x.device)
+            return W, {
+                "dist": None,
+                "probs": torch.ones_like(logprobs),
+                "logprobs": logprobs,
+                "entropy": torch.zeros_like(logprobs),
+            }
+
+        logstd = self.logstd(logits).clamp(-5, 2)
+        std = torch.exp(logstd)
+        dist = Normal(mu, std)
+        sample = dist.rsample()
+        W = self._to_bounded_spd(sample)
+        logprobs = dist.log_prob(sample).sum(-1, keepdim=True)
+        return W, {
+            "dist": dist,
+            "probs": torch.exp(logprobs),
+            "logprobs": logprobs,
+            "entropy": dist.entropy().sum(-1, keepdim=True),
+        }

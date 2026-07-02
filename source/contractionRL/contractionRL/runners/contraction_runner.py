@@ -315,9 +315,13 @@ class ContractionRunner:
         policy_kwargs.pop("network", None)
         policy_kwargs.pop("backbone", None)
 
+        constrain_eigenvalues = models_cfg.get("cmg", {}).get("network", [{}])[0].get("constrain_eigenvalues", False)
+        w_lb = agent_cfg.get("w_lb", 0.1)
+        w_ub = agent_cfg.get("w_ub", 10.0)
+
         models = {
             "policy": policy_cls(obs_space, act_space, device, hidden_dim=hd_policy, activation=act_policy, x_dim=x_dim, **policy_kwargs),
-            "cmg": CMGModel(obs_space, act_space, device, hidden_dim=hd_cmg, activation=act_cmg, x_dim=x_dim),
+            "cmg": CMGModel(obs_space, act_space, device, hidden_dim=hd_cmg, activation=act_cmg, x_dim=x_dim, constrain_eigenvalues=constrain_eigenvalues, w_lb=w_lb, w_ub=w_ub),
         }
         
         if "dynamics" in models_cfg:

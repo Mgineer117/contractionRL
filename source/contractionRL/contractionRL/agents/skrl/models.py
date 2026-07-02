@@ -19,7 +19,7 @@ try:
 except ImportError:
     raise ImportError("skrl is required. Install it or use the local developer copy.")
 
-from .nn_modules import CCM_Generator, CLActor
+from .nn_modules import CCM_Generator, BoundedCCM_Generator, CLActor, NeuralDynamics
 
 _MIN_LOG_STD = math.log(0.01)  # ≈ -4.605; matches CLActor annealing floor
 
@@ -92,13 +92,28 @@ class CMGModel(Model):
             x_dim = (self.obs_dim - self.u_dim) // 2
         self.x_dim = x_dim
 
-        self.ccm_gen = CCM_Generator(
-            x_dim=x_dim,
-            hidden_dim=hidden_dim or [256, 256],
-            activation=activation,
-            mode=mode,
-            device=str(device) if not isinstance(device, str) else device,
-        )
+        constrain_eigenvalues = kwargs.get("constrain_eigenvalues", False)
+        
+        if constrain_eigenvalues:
+            w_lb = kwargs.get("w_lb", 0.1)
+            w_ub = kwargs.get("w_ub", 10.0)
+            self.ccm_gen = BoundedCCM_Generator(
+                x_dim=x_dim,
+                hidden_dim=hidden_dim or [256, 256],
+                activation=activation,
+                mode=mode,
+                w_lb=w_lb,
+                w_ub=w_ub,
+                device=str(device) if not isinstance(device, str) else device,
+            )
+        else:
+            self.ccm_gen = CCM_Generator(
+                x_dim=x_dim,
+                hidden_dim=hidden_dim or [256, 256],
+                activation=activation,
+                mode=mode,
+                device=str(device) if not isinstance(device, str) else device,
+            )
 
     def compute(self, inputs: dict, role: str = "cmg"):
         x = inputs["observations"][:, : self.x_dim]
