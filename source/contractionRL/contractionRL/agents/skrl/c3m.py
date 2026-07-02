@@ -15,16 +15,16 @@ Contraction conditions verified jointly:
 
 from __future__ import annotations
 
+import os
 import sys
-import time
 from dataclasses import dataclass, field
 from typing import Callable
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+import tqdm as _tqdm
 from torch import matmul, transpose
-from torch.optim.lr_scheduler import LambdaLR
 
 from skrl.agents.torch.base import Agent, AgentCfg
 from skrl.trainers.torch.base import Trainer, TrainerCfg
@@ -33,7 +33,8 @@ from .math_utils import (
     b_jacobian,
     bound_W,
     jacobian,
-    loss_pos_matrix_random_sampling,
+    loss_pos_matrix_eigen,
+    spd_inverse,
     weighted_gradients,
 )
 from .nn_modules import NeuralDynamics
@@ -254,7 +255,7 @@ class C3MAgent(Agent):
         raw_W, _ = self._ccm_gen(x)
         bounded = getattr(self._ccm_gen, "bounded", False)
         W = bound_W(raw_W, cfg.w_lb, x_dim, bounded)
-        M = torch.linalg.solve(W, I.unsqueeze(0).expand(batch_size, -1, -1))
+        M = spd_inverse(W)
 
         with torch.enable_grad():
             f, B, Bbot = self._get_f_and_B(x)
@@ -266,8 +267,11 @@ class C3MAgent(Agent):
         DBDx = b_jacobian(B, x, u_dim, create_graph=False).detach()
         f = f.detach(); B = B.detach(); Bbot = Bbot.detach()
 
+        # Certify the *deterministic* controller: use the mean control, not a
+        # noisy rsample. Exploration noise would otherwise perturb A and dot_x
+        # (and hence the contraction condition Cu) — this matches TEMP's CMG loss.
         state = torch.cat([x, xref, uref], dim=1)
-        u, _ = self._cl_actor(state)
+        u = self._cl_actor.mean_control(state)
         K = jacobian(u, x)
 
         A = DfDx + torch.einsum('bxyu,bu->bxy', DBDx, u)
@@ -297,14 +301,16 @@ class C3MAgent(Agent):
         Cu_reg = Cu + cfg.eps * I
         C1_reg = C1 + cfg.eps * torch.eye(C1.shape[-1], device=device)
 
-        pd_loss,  pd_reg  = loss_pos_matrix_random_sampling(-Cu_reg)
-        c1_loss,  c1_reg  = loss_pos_matrix_random_sampling(-C1_reg)
-        
+        # Exact eigenvalue-based PD loss (checks all directions) — more robust and
+        # accurate than random-projection sampling; matches TEMP's CMG loss.
+        pd_loss,  pd_reg  = loss_pos_matrix_eigen(-Cu_reg)
+        c1_loss,  c1_reg  = loss_pos_matrix_eigen(-C1_reg)
+
         if bounded:
             os_loss = os_reg = torch.zeros(1, device=device)
         else:
             overshoot = W - cfg.w_ub * I
-            os_loss,  os_reg  = loss_pos_matrix_random_sampling(-overshoot)
+            os_loss,  os_reg  = loss_pos_matrix_eigen(-overshoot)
 
         loss = os_loss + pd_loss + c1_loss + c2_loss + pd_reg + c1_reg + os_reg
         return loss, {"pd_loss": pd_loss.item(), "c1_loss": c1_loss.item(), "c2_loss": c2_loss.item()}
@@ -313,15 +319,12 @@ class C3MAgent(Agent):
         cfg = self._cfg
         self._ccm_gen.train(); self._cl_actor.train()
 
-        total_pd_loss = 0.0
-        total_c1_loss = 0.0
         buf = self._data
         n = buf["x"].shape[0]
         batch_size = cfg.batch_size
-        
-        # shuffle indices for the epoch
+
+        # shuffle indices for the epoch; one full pass in batch_size chunks
         indices = np.random.permutation(n)
-        
         iters = max(1, n // batch_size)
         total_pd = total_c1 = total_c2 = total_loss = 0.0
 
@@ -334,7 +337,7 @@ class C3MAgent(Agent):
             torch.nn.utils.clip_grad_norm_(self._cl_actor.parameters(), 1.0)
             torch.nn.utils.clip_grad_norm_(self._ccm_gen.parameters(), 1.0)
             self._joint_optimizer.step()
-            
+
             total_loss += loss.item()
             total_pd += infos["pd_loss"]
             total_c1 += infos["c1_loss"]
@@ -345,13 +348,12 @@ class C3MAgent(Agent):
             self._lr_scheduler.step()
 
         self._ccm_gen.eval(); self._cl_actor.eval()
-        
-        n_mb = max(1, cfg.num_minibatch)
+
         return {
-            "C3M/loss/loss":    total_loss / n_mb,
-            "C3M/loss/pd_loss": total_pd_loss / n_mb,
-            "C3M/loss/c1_loss": total_c1_loss / n_mb,
-            "C3M/loss/c2_loss": total_c2_loss / n_mb,
+            "C3M/loss/loss":    total_loss / iters,
+            "C3M/loss/pd_loss": total_pd / iters,
+            "C3M/loss/c1_loss": total_c1 / iters,
+            "C3M/loss/c2_loss": total_c2 / iters,
             "C3M/lr/lr":        self._lr_scheduler.get_last_lr()[0] if self._lr_scheduler else cfg.W_lr,
         }
 
@@ -402,17 +404,14 @@ class C3MSkrlTrainer(Trainer):
         agent.init(trainer_cfg=self.cfg)
         agent.enable_training_mode(True)
 
-        import tqdm as _tqdm
-        
         # Pretrain dynamics if needed
-        epochs = getattr(agent.cfg, "dynamics_pretrain_epochs", 5) if hasattr(agent, "cfg") else getattr(agent._cfg, "dynamics_pretrain_epochs", 5)
-        data_path = getattr(agent.cfg, "dynamics_pretrain_data_path", None) if hasattr(agent, "cfg") else getattr(agent._cfg, "dynamics_pretrain_data_path", None)
-        
+        epochs = getattr(agent.cfg, "dynamics_pretrain_epochs", 5)
+        data_path = getattr(agent.cfg, "dynamics_pretrain_data_path", None)
+
         if agent._neural_dynamics is not None and epochs > 0:
             dev = agent._neural_dynamics.device
             if data_path:
                 print(f"[C3M] Loading dynamics pretrain data from {data_path}")
-                import numpy as np
                 npz = np.load(data_path)
                 
                 # Check for NaNs in current offline data
@@ -502,7 +501,6 @@ class C3MSkrlTrainer(Trainer):
                 agent.write_tracking_data(timestep=t, timesteps=timesteps)
 
         if agent._neural_dynamics is not None:
-            import os
             dyn_path = os.path.join(agent.experiment_dir, "checkpoints", "dynamics.pt")
             agent.save_dynamics(dyn_path)
 
@@ -530,8 +528,10 @@ class C3MSkrlTrainer(Trainer):
             observations, rewards, terminated, truncated, _ = self.env.step(actions)
             total_reward += rewards.view(self.env.num_envs, 1)
             steps_count += 1
-            done = bool((terminated | truncated).any())
-            
+            # Only stop once *every* env has finished, so per-env metrics are not
+            # truncated by whichever env happens to terminate first.
+            done = bool((terminated | truncated).all())
+
         agent.enable_training_mode(True)
         return {
             "reward_mean": total_reward.mean().item(),

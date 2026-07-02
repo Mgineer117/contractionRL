@@ -104,7 +104,15 @@ class BaseEnv(gym.Env):
 
     def step(self, u):
         self.time_steps += 1
-        u = self.uref[self.time_steps] + u
+        # The agent emits the *full* control: CLActor returns uref + feedback,
+        # LQR/SD-LQR return uref - K·e, and an MLP policy learns the full u
+        # (uref is part of the observation). Apply it directly — do NOT re-add
+        # uref here. This (a) keeps the executed control identical to the action
+        # the policy sampled, so PPO's stored log π(a|s) is the log-prob of what
+        # actually runs, and (b) matches the Isaac envs, which map actions to
+        # actuator targets without re-adding uref. Re-adding it would double the
+        # feedforward term (u = uref + (uref + fb)) and corrupt both tracking and
+        # the contraction certificate.
         self.current_u = u.copy()
         reward, infos = self.get_rewards(u)
         next_x, next_x_wrapped, termination, truncation, _ = self.get_transition(self.x_t, u)

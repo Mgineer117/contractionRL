@@ -22,11 +22,11 @@ from typing import Callable
 import numpy as np
 import torch
 import torch.nn as nn
+import tqdm as _tqdm
 from torch import matmul, transpose
 from torch.optim.lr_scheduler import LambdaLR
 
 from skrl.agents.torch.base import Agent, AgentCfg
-from skrl.agents.torch.ppo import PPO, PPO_CFG
 from skrl.memories.torch import RandomMemory
 from skrl.trainers.torch.base import Trainer, TrainerCfg
 
@@ -35,6 +35,7 @@ from .math_utils import (
     bound_W,
     jacobian,
     loss_pos_matrix_eigen,
+    spd_inverse,
     weighted_gradients,
 )
 
@@ -174,12 +175,20 @@ class TEMPAgent(Agent):
         )
 
         def _make_base_cfg(gamma: float) -> dict:
-            d = self._raw_cfg.copy()
+            # Project the raw TEMP config down to *only* the base agent's own
+            # fields. Passing TEMP/CMG-specific keys (W_lr, lbd, gamma_*, ...) to
+            # PPO_CFG(**cfg) / SAC_CFG(**cfg) would raise TypeError, since those
+            # are kw_only dataclasses that reject unknown kwargs. Also rebuild
+            # `experiment` as a plain dict (the raw value may be an ExperimentCfg
+            # object, which is not subscriptable).
+            if self._base_algorithm == "SAC":
+                from skrl.agents.torch.sac import SAC_CFG as _BaseCfg
+            else:
+                from skrl.agents.torch.ppo import PPO_CFG as _BaseCfg
+            valid = _BaseCfg.__dataclass_fields__
+            d = {k: v for k, v in self._raw_cfg.items() if k in valid and k != "experiment"}
             d["discount_factor"] = gamma
-            if "experiment" not in d:
-                d["experiment"] = {}
-            d["experiment"]["write_interval"] = 0
-            d["experiment"]["checkpoint_interval"] = 0
+            d["experiment"] = {"write_interval": 0, "checkpoint_interval": 0}
             return d
 
         if self._base_algorithm == "PPO":
@@ -281,9 +290,7 @@ class TEMPAgent(Agent):
         """Compute -||e||²_M / std  (normalised Riemannian tracking energy)."""
         cfg = self._cfg
         x_dim = self._x_dim
-        device = self._device
         dtype = torch.float32
-        I = torch.eye(x_dim, device=device, dtype=dtype)
 
         x    = observations[:, :x_dim].to(dtype)
         xref = observations[:, x_dim : 2 * x_dim].to(dtype)
@@ -292,7 +299,7 @@ class TEMPAgent(Agent):
         with torch.no_grad():
             raw_W, _ = self._ccm_gen(x)
             W = bound_W(raw_W, cfg.w_lb, x_dim)
-            M = torch.linalg.solve(W, I.unsqueeze(0).expand_as(W))
+            M = spd_inverse(W)
             quad = (e.transpose(1, 2) @ M @ e).squeeze(-1)
 
             batch_var = quad.var(unbiased=False).item()
@@ -330,7 +337,7 @@ class TEMPAgent(Agent):
 
         raw_W, info_W = self._ccm_gen(x)
         W = bound_W(raw_W, cfg.w_lb, x_dim)
-        M = torch.linalg.solve(W, I.unsqueeze(0).expand(batch_size, -1, -1))
+        M = spd_inverse(W)
 
         with torch.enable_grad():
             f, B, _ = self._get_f_and_B(x)
@@ -456,7 +463,6 @@ class TEMPSkrlTrainer(Trainer):
         states = env.state() if hasattr(env, "state") else None
         global_step = 0
 
-        import tqdm as _tqdm
         total_iters = timesteps // (rollout_steps * (1 if con_only else 2))
         pbar = _tqdm.tqdm(range(max(1, total_iters)), desc="TEMP training", file=sys.stdout)
 
@@ -538,5 +544,5 @@ class TEMPSkrlTrainer(Trainer):
                 actions, _ = ppo.models["policy"].act({"observations": observations}, role="policy")
             observations, rewards, terminated, truncated, _ = self.env.step(actions)
             states = self.env.state() if hasattr(self.env, "state") else None
-            done = bool((terminated | truncated).any())
+            done = bool((terminated | truncated).all())
         ppo.enable_training_mode(True)

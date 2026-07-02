@@ -361,8 +361,11 @@ class BoundedCCM_Generator(nn.Module):
         n = flat.shape[0]
         S_raw = flat.view(n, self.x_dim, self.x_dim)
         S = 0.5 * (S_raw + S_raw.mT)           # symmetric; eigenvalues span ℝ
-        lam, V = torch.linalg.eigh(S.cpu())    # eigh unsupported on MPS; run on CPU
-        lam, V = lam.to(S.device), V.to(S.device)
+        if S.device.type == "mps":             # eigh unsupported on MPS → run on CPU
+            lam, V = torch.linalg.eigh(S.cpu())
+            lam, V = lam.to(S.device), V.to(S.device)
+        else:                                  # CUDA/CPU: keep it on-device
+            lam, V = torch.linalg.eigh(S)
         lam = self.w_lb + (self.w_ub - self.w_lb) * torch.sigmoid(lam)
         return V @ torch.diag_embed(lam) @ V.mT  # SPD, λ ∈ (w_lb, w_ub)
 

@@ -7,7 +7,6 @@ dependency.
 from __future__ import annotations
 
 import torch
-from torch import matmul, transpose
 from torch.autograd import grad
 
 
@@ -46,19 +45,6 @@ def weighted_gradients(W: torch.Tensor, v: torch.Tensor, x: torch.Tensor,
     return dot_W
 
 
-def loss_pos_matrix_random_sampling(A: torch.Tensor, reg: bool = True):
-    """PD loss via random projections: relu(-zᵀAz).mean() → (loss, reg_loss)."""
-    n, d, _ = A.shape
-    device, dtype = A.device, A.dtype
-    z = torch.randn(n, d, device=device, dtype=dtype)
-    z = z / z.norm(dim=-1, keepdim=True)
-    z = z.unsqueeze(-1)
-    zTAz = (transpose(z, 1, 2) @ A @ z)
-    loss_eigen = torch.relu(-zTAz).mean()
-    loss_reg = torch.relu(zTAz - 200).mean() if reg else torch.zeros(1, device=device, dtype=dtype)
-    return loss_eigen, loss_reg
-
-
 def loss_pos_matrix_eigen(A: torch.Tensor, reg: bool = True):
     """PD loss via eigenvalues: relu(-λ).sum() → (loss, reg_loss)."""
     device = A.device
@@ -79,3 +65,17 @@ def bound_W(raw_W: torch.Tensor, w_lb: float, x_dim: int, bounded: bool = False)
         return raw_W
     I = torch.eye(x_dim, device=raw_W.device, dtype=raw_W.dtype)
     return raw_W + w_lb * I
+
+
+def spd_inverse(W: torch.Tensor) -> torch.Tensor:
+    """Numerically stable inverse of a batch of SPD matrices via Cholesky.
+
+    ``W`` is SPD by construction (``VᵀV + w_lb·I`` or eigenvalue-bounded), so a
+    Cholesky solve is both faster and more stable than the general LU-based
+    ``torch.linalg.solve`` — and it won't silently return garbage if ``W`` drifts
+    ill-conditioned.
+    """
+    n, d, _ = W.shape
+    I = torch.eye(d, device=W.device, dtype=W.dtype).expand(n, d, d).contiguous()
+    L = torch.linalg.cholesky(W)
+    return torch.cholesky_solve(I, L)

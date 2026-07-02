@@ -302,13 +302,17 @@ class ContractionRunner:
         act_policy = models_cfg.get("policy", {}).get("network", [{}])[0].get("activations", "tanh")
         act_cmg = models_cfg.get("cmg", {}).get("network", [{}])[0].get("activations", "tanh")
 
-        policy_class_str = models_cfg.get("policy", {}).get("class", "GaussianMixin")
-        if policy_class_str == "DeterministicMixin":
-            from contractionRL.agents.skrl.models import CLDeterministicActorModel
-            policy_cls = CLDeterministicActorModel
-        else:
+        # C3M is a certificate-based controller synthesis (not a stochastic-policy
+        # RL method), so the CLActor should be deterministic by default — no
+        # Gaussian log_std / sampling machinery. A config may still opt into the
+        # GaussianMixin wrapper explicitly.
+        policy_class_str = models_cfg.get("policy", {}).get("class", "DeterministicMixin")
+        if policy_class_str == "GaussianMixin":
             from contractionRL.agents.skrl.models import CLActorModel
             policy_cls = CLActorModel
+        else:
+            from contractionRL.agents.skrl.models import CLDeterministicActorModel
+            policy_cls = CLDeterministicActorModel
 
         policy_kwargs = models_cfg.get("policy", {}).copy()
         policy_kwargs.pop("class", None)

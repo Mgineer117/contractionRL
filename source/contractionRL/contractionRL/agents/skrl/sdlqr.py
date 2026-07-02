@@ -35,7 +35,9 @@ from .math_utils import b_jacobian, jacobian
 @dataclass
 class SDLQRCfg(AgentCfg):
     Q_scaler: float = 1.0
-    R_scaler: float = 0.0
+    # R must be strictly positive: R_scaler = 0 → R ≈ 1e-5·I → huge gains
+    # K = R⁻¹BᵀP → discrete-dt divergence. Default to 1.0.
+    R_scaler: float = 1.0
 
 
 LQRCfg = SDLQRCfg
@@ -51,12 +53,18 @@ def _care_gain(A: torch.Tensor, B_mat: torch.Tensor,
     dtype = A.dtype
     Q = (Q_scaler + 1e-5) * torch.eye(x_dim, dtype=dtype, device=A.device)
     R = (R_scaler + 1e-5) * torch.eye(u_dim, dtype=dtype, device=A.device)
-    P_np = solve_continuous_are(
-        A.detach().cpu().numpy(),
-        B_mat.detach().cpu().numpy(),
-        Q.detach().cpu().numpy(),
-        R.detach().cpu().numpy(),
-    )
+    try:
+        P_np = solve_continuous_are(
+            A.detach().cpu().numpy(),
+            B_mat.detach().cpu().numpy(),
+            Q.detach().cpu().numpy(),
+            R.detach().cpu().numpy(),
+        )
+    except (np.linalg.LinAlgError, ValueError):
+        # (A, B) not stabilizable / no finite CARE solution at this linearization
+        # point → fall back to zero feedback (u = uref) rather than aborting the
+        # entire batched rollout for one bad env.
+        return torch.zeros(u_dim, x_dim, dtype=dtype, device=A.device)
     P = torch.from_numpy(P_np).to(A)
     return solve(R, B_mat.T @ P)  # (u_dim, x_dim)
 
