@@ -1,23 +1,25 @@
-seed: 42
+seed: 42  # Random seed for reproducibility
 
 agent:
   class: TEMP
+  batch_size: 2048
+  minibatch_size: 2048
   optimal_policy: ppo   # ppo | sac
   actor_type: CL        # CL (contracting weight-matrix actor) | RL (standard MLP)
   con_only: false       # true → skip optimal policy (only train contracting + CMG)
   anneal_stddev: true   # anneal log_std of the RL backbone 0 → -20
-  gamma_contracting: 0.0
-  gamma_optimal: 0.99
+  gamma_contracting: 0.0  # Blending weight for the contraction metric reward component
+  gamma_optimal: 0.99  # Blending weight for the optimal task reward component
   # shared PPO hyperparams for both con + opt policies
   actor_lr: 3.0e-4
   critic_lr: 5.0e-4
   eps_clip: 0.2
   target_kl: 0.03
   gae: 0.95
-  hidden_dim: [256, 256]
+  hidden_dim: [256, 256]  # General hidden layer dimensions for internal networks
   # CMG
   cmg:
-    hidden_dim: [128, 128]
+    hidden_dim: [128, 128]  # General hidden layer dimensions for internal networks
     activation: tanh
     mode: deterministic
   W_lr: 3.0e-4
@@ -29,10 +31,12 @@ agent:
   buffer_size: 65536   # rollout buffer for CMG training data
 
 trainer:
-  class: TEMPTrainer
+  class: TEMP
+  batch_size: 2048
+  minibatch_size: 2048Trainer
   optimal_policy: ppo
   num_agent: 4
   epochs: 2000
-  eval_interval: 200
+  eval_interval: 200  # Frequency of running evaluation rollouts
   log_interval: 20
   cmg_updates_per_iter: 5

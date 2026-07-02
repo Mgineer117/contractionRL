@@ -10,7 +10,7 @@ from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from isaaclab.utils.math import quat_apply
 
 from ..common.vel_commands import VelCommands
 from .env_cfg import QuadrupedVelTrackingEnvCfg
@@ -39,12 +39,15 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot_cfg)
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+        # Explicit, strongly-contrasting ground color (dark blue-teal) instead of relying on
+        # GroundPlaneCfg's default grid-texture tint — the robot is light-colored, so a dark,
+        # saturated (non-gray) ground reads clearly against it regardless of scene brightness.
+        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg(color=(0.05, 0.2, 0.35)))
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[])
         self.scene.articulations["robot"] = self._robot
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        light_cfg = sim_utils.DomeLightCfg(intensity=1200.0, color=(0.75, 0.75, 0.75), visible_in_primary_ray=False)
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
@@ -101,17 +104,11 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         lin_err = torch.sum(
             torch.square(cmds[:, :2] - self._robot.data.root_lin_vel_b[:, :2]), dim=1
         )
-        rew_lin = torch.exp(-lin_err / 0.25) * self.cfg.rew_lin_vel
+        rew_lin = torch.exp(-lin_err / 0.1) * self.cfg.rew_lin_vel
 
         # yaw rate tracking
         yaw_err = torch.square(cmds[:, 3] - self._robot.data.root_ang_vel_b[:, 2])
-        rew_yaw = torch.exp(-yaw_err / 0.25) * self.cfg.rew_yaw_rate
-
-        rew_z = torch.square(self._robot.data.root_lin_vel_b[:, 2]) * self.cfg.rew_z_vel
-        rew_axy = torch.sum(torch.square(self._robot.data.root_ang_vel_b[:, :2]), dim=1) * self.cfg.rew_ang_vel_xy
-        rew_tau = torch.sum(torch.square(self._robot.data.applied_torque), dim=1) * self.cfg.rew_torques
-        rew_ar = torch.sum(torch.square(self._actions - self._prev_actions), dim=1) * self.cfg.rew_action_rate
-        rew_alive = (1.0 - self.reset_terminated.float()) * self.cfg.rew_alive
+        rew_yaw = torch.exp(-yaw_err / 0.1) * self.cfg.rew_yaw_rate
 
         vel_err_vec = torch.cat([
             cmds[:, :2] - self._robot.data.root_lin_vel_b[:, :2],
@@ -119,7 +116,14 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         ], dim=-1)
         self._episode_vel_auc += torch.norm(vel_err_vec, dim=-1)
 
-        return rew_lin + rew_yaw + rew_z + rew_axy + rew_tau + rew_ar + rew_alive
+        rew_z = torch.square(self._robot.data.root_lin_vel_b[:, 2]) * self.cfg.rew_z_vel
+        rew_rp = torch.sum(torch.square(self._robot.data.root_ang_vel_b[:, :2]), dim=1) * self.cfg.rew_roll_pitch
+        rew_tau = torch.sum(torch.square(self._robot.data.applied_torque), dim=1) * self.cfg.rew_torque
+        rew_act = torch.sum(torch.square(self._actions - self._prev_actions), dim=1) * self.cfg.rew_action_rate
+        rew_flat = torch.sum(torch.square(self._robot.data.projected_gravity_b[:, :2]), dim=1) * self.cfg.rew_flat
+        rew_acc = torch.sum(torch.square(self._robot.data.joint_acc), dim=1) * self.cfg.rew_joint_accel
+        
+        return rew_lin + rew_yaw + rew_z + rew_rp + rew_tau + rew_act + rew_flat + rew_acc
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
@@ -169,26 +173,39 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
 
     # ------------------------------------------------------------------ #
     # Debug visualisation: blue = command vel, green = current vel
+    #
+    # Arrows are built from two 3D primitives (cylinder shaft + cone head,
+    # both axis="X") rather than the flat arrow_x.usd mesh — a flat mesh
+    # looks like a thin line (direction ambiguous) from many camera angles,
+    # while a cylinder+cone is a real 3D solid, recognizable from any angle.
     # ------------------------------------------------------------------ #
+
+    _ARROW_SHAFT_LEN = 0.4
+    _ARROW_SHAFT_RADIUS = 0.02
+    _ARROW_HEAD_LEN = 0.2
+    _ARROW_HEAD_RADIUS = 0.05
+
+    def _make_arrow_markers_cfg(self, prim_path: str, color: tuple[float, float, float]) -> VisualizationMarkersCfg:
+        material = sim_utils.PreviewSurfaceCfg(diffuse_color=color)
+        return VisualizationMarkersCfg(
+            prim_path=prim_path,
+            markers={
+                "shaft": sim_utils.CylinderCfg(
+                    radius=self._ARROW_SHAFT_RADIUS, height=self._ARROW_SHAFT_LEN,
+                    axis="X", visual_material=material,
+                ),
+                "head": sim_utils.ConeCfg(
+                    radius=self._ARROW_HEAD_RADIUS, height=self._ARROW_HEAD_LEN,
+                    axis="X", visual_material=material,
+                ),
+            },
+        )
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:
             if not hasattr(self, "_cmd_vel_marker"):
-                _arrow = f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd"
-                cmd_cfg = VisualizationMarkersCfg(
-                    prim_path="/Visuals/QuadrupedVelCmd",
-                    markers={"arrow": sim_utils.UsdFileCfg(
-                        usd_path=_arrow, scale=(0.6, 0.06, 0.06),
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 1.0)),
-                    )},
-                )
-                cur_cfg = VisualizationMarkersCfg(
-                    prim_path="/Visuals/QuadrupedVelCur",
-                    markers={"arrow": sim_utils.UsdFileCfg(
-                        usd_path=_arrow, scale=(0.6, 0.06, 0.06),
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0)),
-                    )},
-                )
+                cmd_cfg = self._make_arrow_markers_cfg("/Visuals/QuadrupedVelCmd", (0.0, 0.0, 1.0))
+                cur_cfg = self._make_arrow_markers_cfg("/Visuals/QuadrupedVelCur", (0.0, 1.0, 0.0))
                 self._cmd_vel_marker = VisualizationMarkers(cmd_cfg)
                 self._cur_vel_marker = VisualizationMarkers(cur_cfg)
             self._cmd_vel_marker.set_visibility(True)
@@ -198,6 +215,34 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
                 self._cmd_vel_marker.set_visibility(False)
                 self._cur_vel_marker.set_visibility(False)
 
+    def _arrow_parts(self, base_pos: torch.Tensor, quat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build (translations, orientations, marker_indices) for a shaft+head arrow at base_pos, pointing along quat.
+
+        Cylinder/cone primitives are centered at their own local origin, so
+        each part is offset along local +X by half its own length plus
+        whatever precedes it — this reproduces the old arrow_x.usd mesh's
+        convention of "origin at the tail, extending outward" for the
+        combined shaft+head, with the cone's base flush against the shaft's tip.
+        """
+        n = base_pos.shape[0]
+        shaft_offset = torch.tensor(
+            [self._ARROW_SHAFT_LEN / 2, 0.0, 0.0], device=self.device
+        ).expand(n, -1)
+        head_offset = torch.tensor(
+            [self._ARROW_SHAFT_LEN + self._ARROW_HEAD_LEN / 2, 0.0, 0.0], device=self.device
+        ).expand(n, -1)
+
+        shaft_pos = base_pos + quat_apply(quat, shaft_offset)
+        head_pos = base_pos + quat_apply(quat, head_offset)
+
+        translations = torch.cat([shaft_pos, head_pos], dim=0)
+        orientations = torch.cat([quat, quat], dim=0)
+        marker_indices = torch.cat([
+            torch.zeros(n, dtype=torch.int32, device=self.device),  # 0 -> "shaft"
+            torch.ones(n, dtype=torch.int32, device=self.device),   # 1 -> "head"
+        ], dim=0)
+        return translations, orientations, marker_indices
+
     def _debug_vis_callback(self, event):
         # event stream can fire before the scene is ready or during teardown
         if not hasattr(self, "scene") or not self._robot.is_initialized:
@@ -206,16 +251,28 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         cmds = self._cmd.get(t)  # (N, 4): [vx_b, vy_b, vz, yaw]
 
         base_pos = self._robot.data.root_pos_w  # (N, 3)
-        cmd_pos = base_pos.clone(); cmd_pos[:, 2] += 1.5
-        cur_pos = base_pos.clone(); cur_pos[:, 2] += 1.1
+        cmd_pos = self._robot.data.root_pos_w.clone()
+        cmd_pos[:, 2] += 0.5  # Same height
+        cur_pos = self._robot.data.root_pos_w.clone()
+        cur_pos[:, 2] += 0.5  # Same height
 
         cmd_quat = self._vel_body_xy_to_arrow(cmds[:, :2])
         cur_quat = self._vel_body_xy_to_arrow(self._robot.data.root_lin_vel_b[:, :2])
 
-        fixed_scale = torch.ones(self.num_envs, 3, device=self.device)
-        proto = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
-        self._cmd_vel_marker.visualize(translations=cmd_pos, orientations=cmd_quat, scales=fixed_scale, marker_indices=proto)
-        self._cur_vel_marker.visualize(translations=cur_pos, orientations=cur_quat, scales=fixed_scale, marker_indices=proto)
+        cmd_translations, cmd_orientations, cmd_indices = self._arrow_parts(cmd_pos, cmd_quat)
+        cur_translations, cur_orientations, cur_indices = self._arrow_parts(cur_pos, cur_quat)
+
+        cmd_scale = torch.ones(2 * self.num_envs, 3, device=self.device)
+        cmd_scale[:, 1:] = 1.5  # Make command arrow 50% thicker
+        cur_scale = torch.ones(2 * self.num_envs, 3, device=self.device)
+        cur_scale[:, 1:] = 0.7  # Make current arrow thinner
+
+        self._cmd_vel_marker.visualize(
+            translations=cmd_translations, orientations=cmd_orientations, scales=cmd_scale, marker_indices=cmd_indices
+        )
+        self._cur_vel_marker.visualize(
+            translations=cur_translations, orientations=cur_orientations, scales=cur_scale, marker_indices=cur_indices
+        )
 
     def _vel_body_xy_to_arrow(self, vel_body_xy: torch.Tensor) -> torch.Tensor:
         """Body-frame XY velocity → world-frame arrow quaternion (wxyz)."""

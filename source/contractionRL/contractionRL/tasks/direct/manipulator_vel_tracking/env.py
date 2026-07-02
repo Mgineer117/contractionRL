@@ -32,8 +32,20 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
     def __init__(self, cfg: ManipulatorVelTrackingEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
-        self._arm_ids, _ = self._robot.find_joints(self.cfg.arm_joint_names)
+        self._arm_ids, arm_names = self._robot.find_joints(self.cfg.arm_joint_names)
         self._ee_id, _ = self._robot.find_bodies(self.cfg.ee_body_name)
+
+        # per-joint action scale: panda_forearm (joints 5-7) is torque-limited at
+        # 12 Nm vs panda_shoulder's 87 Nm, so it needs a much smaller position-delta
+        # scale to avoid saturating its actuator (see env_cfg.py for the derivation).
+        _forearm_joints = {"panda_joint5", "panda_joint6", "panda_joint7"}
+        self._action_scale = torch.tensor(
+            [
+                self.cfg.action_scale_forearm if name in _forearm_joints else self.cfg.action_scale_shoulder
+                for name in arm_names
+            ],
+            device=self.device,
+        )
 
         self._actions = torch.zeros(self.num_envs, self.action_space.shape[0], device=self.device)
         self._prev_actions = torch.zeros_like(self._actions)
@@ -42,22 +54,22 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot_cfg)
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+        # Explicit, strongly-contrasting ground color (dark blue-teal) instead of relying on
+        # GroundPlaneCfg's default grid-texture tint — the robot is light-colored, so a dark,
+        # saturated (non-gray) ground reads clearly against it regardless of scene brightness.
+        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg(color=(0.05, 0.2, 0.35)))
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[])
         self.scene.articulations["robot"] = self._robot
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        light_cfg = sim_utils.DomeLightCfg(intensity=1200.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self._prev_actions = self._actions.clone()
         self._actions = actions.clone()
-        # scale action from [-1,1] to joint position within soft limits
-        limits = self._robot.data.soft_joint_pos_limits[:, self._arm_ids, :]  # (N, 7, 2)
-        mid = 0.5 * (limits[..., 0] + limits[..., 1])
-        half_range = 0.5 * (limits[..., 1] - limits[..., 0])
-        self._joint_targets = mid + half_range * self._actions
+        default_pos = self._robot.data.default_joint_pos[:, self._arm_ids]
+        self._joint_targets = default_pos + self._action_scale * self._actions
 
     def _apply_action(self) -> None:
         self._robot.set_joint_position_target(self._joint_targets, joint_ids=self._arm_ids)

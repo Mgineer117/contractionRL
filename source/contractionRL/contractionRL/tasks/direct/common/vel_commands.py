@@ -26,6 +26,10 @@ class VelCmdCfg:
     # sinusoidal yaw parameters — slower frequency keeps trajectories from looping back
     yaw_A_range: tuple[float, float] = (0.2, 0.8)    # amplitude  [rad/s]
     yaw_omega_range: tuple[float, float] = (0.3, 1.0) # frequency  [rad/s]
+    # If True, yaw_omega is sampled as a binary {lo, hi} choice (50/50) instead
+    # of continuous uniform — e.g. lo=0.0 (constant yaw rate, no oscillation)
+    # vs hi=one-cycle-per-episode, with nothing in between.
+    yaw_omega_binary: bool = False
     # phi sampled from [0, 2π] uniformly
 
 
@@ -71,7 +75,11 @@ class VelCommands:
         lo, hi = self.cfg.yaw_A_range
         self.yaw_A[env_ids] = _u(lo, hi)
         lo, hi = self.cfg.yaw_omega_range
-        self.yaw_omega[env_ids] = _u(lo, hi)
+        if self.cfg.yaw_omega_binary:
+            choice = (torch.rand(n, device=self.device) < 0.5).float()  # 0 -> lo, 1 -> hi
+            self.yaw_omega[env_ids] = lo + choice * (hi - lo)
+        else:
+            self.yaw_omega[env_ids] = _u(lo, hi)
         self.yaw_phi[env_ids] = _u(0.0, 2.0 * math.pi)
 
     def get(self, episode_time: torch.Tensor) -> torch.Tensor:

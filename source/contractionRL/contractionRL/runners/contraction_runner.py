@@ -424,6 +424,7 @@ class ContractionRunner:
             device=device,
             get_rollout=get_rollout,
             get_f_and_B=get_f_and_B,
+            num_envs=env.num_envs,
         )
         trainer_cfg.setdefault("timesteps", 300000)
         trainer_cfg.setdefault("rollouts", agent_cfg.get("rollouts", 300))

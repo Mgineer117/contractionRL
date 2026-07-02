@@ -1,7 +1,9 @@
-seed: 42
+seed: 42  # Random seed for reproducibility
 
 agent:
   class: LQR
+  batch_size: 2048
+  minibatch_size: 2048
   use_state_norm: false  # not applicable for analytical LQR
   device: cpu          # LQR solves a CARE per state on CPU (scipy)
   Q_scaler: 1.0

@@ -47,7 +47,8 @@ parser.add_argument("--wandb_run_name", "--wandb-run-name", type=str, default=No
 # Isaac Sim-specific
 parser.add_argument("--video", action="store_true", default=False,
                     help="Record videos during training (Isaac only).")
-parser.add_argument("--video_length", type=int, default=200)
+parser.add_argument("--video_length", type=int, default=0,
+                    help="Length of video in steps (0 = auto-calculate to 1 episode length)")
 parser.add_argument("--video_interval", type=int, default=2000)
 parser.add_argument("--agent", type=str, default=None,
                     help="Explicit skrl cfg entry-point key (Isaac only).")
@@ -74,6 +75,11 @@ parser.add_argument("--ppo_discount", "--ppo-discount", type=float, default=None
 parser.add_argument("--ppo_lambda", "--ppo-lambda", type=float, default=None)
 parser.add_argument("--ppo_ratio_clip", "--ppo-ratio-clip", type=float, default=None)
 parser.add_argument("--ppo_entropy_scale", "--ppo-entropy-scale", type=float, default=None)
+parser.add_argument("--ppo_kl_threshold", "--ppo-kl-threshold", type=float, default=None)
+parser.add_argument("--ppo_use_state_norm", "--ppo-use-state-norm", type=str, default=None)
+parser.add_argument("--ppo_use_value_norm", "--ppo-use-value-norm", type=str, default=None)
+parser.add_argument("--ppo_activations", "--ppo-activations", type=str, default=None)
+parser.add_argument("--ppo_network_arch", "--ppo-network-arch", type=str, default=None)
 
 # Classic-specific
 parser.add_argument("--cfg", type=str, default=None,
@@ -95,6 +101,8 @@ if not _is_classic:
 args_cli, hydra_args = parser.parse_known_args()
 if not _is_classic and args_cli.video:
     args_cli.enable_cameras = True
+    if "--enable_cameras" not in sys.argv:
+        sys.argv.append("--enable_cameras")
 
 if not _is_classic:
     args_cli.kit_args = (args_cli.kit_args or "") + " --/app/hangDetector/enabled=false"
@@ -350,6 +358,102 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
     print(f"       x_dot  shape: {x_dot_arr.shape}")
 
 
+def _patch_kl_logging(agent) -> None:
+    """Log per-epoch approximate KL divergence to 'Policy / KL divergence'.
+
+    skrl's PPO computes KL every epoch to drive KLAdaptiveLR but never records
+    it, so early-stop events (kl_threshold) are invisible in tensorboard/wandb
+    even though they silently truncate — and thus deflate — the averaged
+    Loss/Policy loss, Loss/Value loss, Loss/Entropy loss for that update
+    (skrl divides by the full learning_epochs*mini_batches regardless of how
+    many minibatches actually ran before the break). No-ops for agents without
+    a KLAdaptiveLR scheduler (SAC, contraction agents, PPO with scheduler=null).
+    """
+    import skrl.resources.schedulers.torch as _sched
+
+    scheduler = getattr(agent, "scheduler", None)
+    if not isinstance(scheduler, _sched.KLAdaptiveLR):
+        return
+
+    _orig_step = scheduler.step
+
+    def _step(kl=None, *, epoch=None):
+        if kl is not None:
+            agent.track_data("Policy / KL divergence", float(kl))
+        _orig_step(kl, epoch=epoch)
+
+    scheduler.step = _step
+
+
+def _patch_sac_entropy_clamp(agent, min_log_alpha: float = -5.0, max_log_alpha: float = 2.0) -> None:
+    """Clamp log_entropy_coefficient in-place after every entropy optimizer step.
+
+    skrl's SAC applies grad_norm_clip to the policy and critic optimizers but
+    NOT to entropy_optimizer, and _entropy_coefficient = exp(log_entropy_coefficient)
+    is exponentiated with no bound. A noisy/undertrained critic can push this
+    single scalar's gradient large, and exponentiation turns even a moderate
+    excursion into a runaway entropy coefficient that then dominates both the
+    critic target and the policy loss — a textbook SAC divergence mechanism.
+    Bounds exp(log_alpha) to roughly [0.0067, 7.39], mirroring the clip_log_std
+    bounds skrl already applies to GaussianMixin policies elsewhere. No-op for
+    agents without learn_entropy (PPO, contraction agents, SAC with learn_entropy=False).
+    """
+    import torch
+
+    entropy_optimizer = getattr(agent, "entropy_optimizer", None)
+    log_alpha = getattr(agent, "log_entropy_coefficient", None)
+    if entropy_optimizer is None or log_alpha is None:
+        return
+
+    _orig_step = entropy_optimizer.step
+
+    def _step(*args, **kwargs):
+        result = _orig_step(*args, **kwargs)
+        with torch.no_grad():
+            log_alpha.clamp_(min_log_alpha, max_log_alpha)
+        return result
+
+    entropy_optimizer.step = _step
+
+def _patch_ppo_std_annealing(agent, std_dev_annealing: bool) -> None:
+    """Adds manual standard deviation annealing to SKRL's PPO policy.
+    
+    If `std_dev_annealing` is True, this disables the entropy loss entirely
+    (setting entropy_loss_scale to 0.0) and linearly anneals the policy's
+    log_std_parameter from its initial value down to its configured minimum
+    (min_log_std) over the total training timesteps.
+    """
+    if not std_dev_annealing:
+        return
+
+    # Ignore entropy
+    if hasattr(agent, "_cfg") and isinstance(agent._cfg, dict):
+        agent._cfg["entropy_loss_scale"] = 0.0
+    if hasattr(agent, "cfg"):
+        if isinstance(agent.cfg, dict):
+            agent.cfg["entropy_loss_scale"] = 0.0
+        else:
+            setattr(agent.cfg, "entropy_loss_scale", 0.0)
+
+    if not hasattr(agent, "policy") or not hasattr(agent.policy, "log_std_parameter"):
+        return
+
+    # Disable gradients on log_std_parameter because we update it manually
+    agent.policy.log_std_parameter.requires_grad_(False)
+
+    initial_log_std = agent.policy.log_std_parameter.mean().item()
+    final_log_std = getattr(agent.policy, "_g_min_log_std", -2.0)
+
+    _orig_post = agent.post_interaction
+
+    def _annealed_post(*, timestep: int, timesteps: int) -> None:
+        progress = min(1.0, max(0.0, timestep / max(1, timesteps)))
+        current_log_std = initial_log_std + progress * (final_log_std - initial_log_std)
+        agent.policy.log_std_parameter.data.fill_(current_log_std)
+        _orig_post(timestep=timestep, timesteps=timesteps)
+
+    agent.post_interaction = _annealed_post
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CLASSIC ROUTE  (--classic flag)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -402,9 +506,8 @@ if _is_classic:
     if args_cli.lr is not None:
         agent_cfg["agent"]["learning_rate"] = args_cli.lr
 
-    log_dir = os.path.join(
-        "logs", "classic", algorithm, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
-    )
+    _run_ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_dir = os.path.join("logs", "classic", algorithm, _run_ts)
     os.makedirs(log_dir, exist_ok=True)
     agent_cfg["agent"]["experiment"]["directory"] = os.path.abspath(log_dir)
     agent_cfg["trainer"]["close_environment_at_exit"] = False
@@ -415,9 +518,24 @@ if _is_classic:
         import wandb as _wandb
 
         agent_cfg["agent"]["experiment"]["wandb"] = True
-        agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})["project"] = args_cli.wandb_project
-        if args_cli.wandb_run_name:
-            agent_cfg["agent"]["experiment"]["wandb_kwargs"]["name"] = args_cli.wandb_run_name
+        _wkw = agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})
+        _wkw["project"] = args_cli.wandb_project
+        _wkw["sync_tensorboard"] = False
+        # Consistent run name: CLI override > YAML-provided name > deterministic
+        # default that matches the local log directory (logs/classic/<algo>/<ts>).
+        _wkw["name"] = args_cli.wandb_run_name or _wkw.get("name") or f"classic_{algorithm}_{_run_ts}"
+
+        # If a sweep is running, init early to retrieve hyperparams and inject into agent_cfg
+        if "WANDB_SWEEP_ID" in os.environ:
+            _wandb.init(project=_wkw["project"], name=_wkw["name"])
+            for k, v in _wandb.config.items():
+                keys = k.split('.')
+                curr = agent_cfg
+                for key in keys[:-1]:
+                    if key not in curr:
+                        curr[key] = {}
+                    curr = curr[key]
+                curr[keys[-1]] = v
 
         _orig_add_scalar = _skrl_tb.SummaryWriter.add_scalar
 
@@ -434,12 +552,12 @@ if _is_classic:
         if _src_dir not in sys.path:
             sys.path.insert(0, _src_dir)
 
-        from gymnasium.vector import SyncVectorEnv
+        from gymnasium.vector import AsyncVectorEnv
         from skrl.envs.wrappers.torch import wrap_env
         from contractionRL.runners import ContractionRunner
 
         num_envs = args_cli.num_envs or 4
-        vec_env = SyncVectorEnv([lambda: gym.make(args_cli.task)] * num_envs)
+        vec_env = AsyncVectorEnv([lambda: gym.make(args_cli.task)] * num_envs)
         vec_env.device = "cpu"
         env = wrap_env(vec_env, wrapper="gymnasium")
 
@@ -451,7 +569,7 @@ if _is_classic:
 
     else:
         # PPO / SAC use the built-in skrl Runner
-        from gymnasium.vector import SyncVectorEnv
+        from gymnasium.vector import AsyncVectorEnv
         from skrl.envs.wrappers.torch import wrap_env
         from contractionRL.agents.skrl.runner import CLActorRunner as Runner
 
@@ -466,10 +584,12 @@ if _is_classic:
             _a["value_preprocessor_kwargs"] = None
 
         num_envs = args_cli.num_envs or 4
-        vec_env = SyncVectorEnv([lambda: gym.make(args_cli.task)] * num_envs)
+        vec_env = AsyncVectorEnv([lambda: gym.make(args_cli.task)] * num_envs)
         env = wrap_env(vec_env, wrapper="gymnasium")
 
         runner = Runner(env, agent_cfg)
+        _patch_kl_logging(runner.agent)
+        _patch_sac_entropy_clamp(runner.agent)
         if args_cli.checkpoint:
             runner.agent.load(args_cli.checkpoint)
         runner.run()
@@ -552,9 +672,32 @@ else:
         if args_cli.ppo_learning_epochs is not None: a["learning_epochs"]  = args_cli.ppo_learning_epochs
         if args_cli.ppo_mini_batches is not None:    a["mini_batches"]     = args_cli.ppo_mini_batches
         if args_cli.ppo_discount is not None:        a["discount_factor"]  = args_cli.ppo_discount
-        if args_cli.ppo_lambda is not None:          a["lambda"]           = args_cli.ppo_lambda
+        if args_cli.ppo_lambda is not None:          
+            a["lambda"] = args_cli.ppo_lambda
+            a["gae_lambda"] = args_cli.ppo_lambda
         if args_cli.ppo_ratio_clip is not None:      a["ratio_clip"]       = args_cli.ppo_ratio_clip
         if args_cli.ppo_entropy_scale is not None:   a["entropy_loss_scale"] = args_cli.ppo_entropy_scale
+        if args_cli.ppo_kl_threshold is not None:    a["kl_threshold"]     = args_cli.ppo_kl_threshold
+        if args_cli.ppo_use_state_norm is not None:  a["use_state_norm"]   = (args_cli.ppo_use_state_norm.lower() == 'true')
+        if args_cli.ppo_use_value_norm is not None:  a["use_value_norm"]   = (args_cli.ppo_use_value_norm.lower() == 'true')
+
+        if args_cli.ppo_activations is not None:
+            models_cfg = agent_cfg.get("models", {})
+            for model_type in ["policy", "value"]:
+                if model_type in models_cfg:
+                    for layer in models_cfg[model_type].get("network", []):
+                        if "activations" in layer:
+                            layer["activations"] = args_cli.ppo_activations
+                            
+        if args_cli.ppo_network_arch is not None:
+            arch_str = args_cli.ppo_network_arch.replace("[", "").replace("]", "")
+            layers = [int(x.strip()) for x in arch_str.split(",")]
+            models_cfg = agent_cfg.get("models", {})
+            for model_type in ["policy", "value"]:
+                if model_type in models_cfg:
+                    for layer in models_cfg[model_type].get("network", []):
+                        if "layers" in layer:
+                            layer["layers"] = layers
 
         if args_cli.ml_framework.startswith("jax"):
             skrl.config.jax.backend = "jax" if args_cli.ml_framework == "jax" else "numpy"
@@ -587,6 +730,7 @@ else:
             import wandb as _wandb
 
             agent_cfg["agent"]["experiment"]["wandb"] = True
+            agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})["sync_tensorboard"] = False
             _orig_add_scalar = _skrl_tb.SummaryWriter.add_scalar
 
             def _wandb_add_scalar(self, *, tag: str, value: float, timestep: int) -> None:
@@ -600,14 +744,25 @@ else:
                 _video_dir = os.path.join(log_dir, "videos", "train")
                 _uploaded_videos: set = set()
                 _wandb_stop_event = _threading.Event()
+                _video_metric_defined = [False]
 
                 def _upload_pending_videos(step: int | None = None) -> None:
                     for mp4 in sorted(_glob.glob(os.path.join(_video_dir, "*.mp4"))):
                         if mp4 not in _uploaded_videos and _wandb.run is not None:
+                            if not _video_metric_defined[0]:
+                                # The video-watcher thread uploads asynchronously (polling every
+                                # 30s) and can land after the main loop has already logged
+                                # scalars at a later step — wandb rejects any step= that isn't
+                                # monotonically increasing across ALL calls in the run. Give the
+                                # video its own x-axis instead of the shared step counter, so an
+                                # out-of-order upload is never rejected (https://wandb.me/define-metric).
+                                _wandb.define_metric("train/video_step")
+                                _wandb.define_metric("train/video", step_metric="train/video_step")
+                                _video_metric_defined[0] = True
                             m = _re.search(r"step-(\d+)", os.path.basename(mp4))
                             log_step = int(m.group(1)) if m else step
                             try:
-                                _wandb.log({"train/video": _wandb.Video(mp4, format="mp4")}, step=log_step)
+                                _wandb.log({"train/video": _wandb.Video(mp4, format="mp4"), "train/video_step": log_step})
                                 _uploaded_videos.add(mp4)
                             except Exception as _e:
                                 logger.warning(f"wandb video upload failed: {_e}")
@@ -621,10 +776,13 @@ else:
                 _wandb_video_thread = _threading.Thread(target=_video_watcher, daemon=True)
                 _wandb_video_thread.start()
 
+        _wkw = agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})
         if args_cli.wandb_project is not None:
-            agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})["project"] = args_cli.wandb_project
-        if args_cli.wandb_run_name is not None:
-            agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})["name"] = args_cli.wandb_run_name
+            _wkw["project"] = args_cli.wandb_project
+        # Consistent run name: CLI override > YAML-provided name > deterministic
+        # default that matches the local experiment_name (tensorboard dir), so
+        # every W&B run can be correlated with its local log directory.
+        _wkw["name"] = args_cli.wandb_run_name or _wkw.get("name") or agent_cfg["agent"]["experiment"]["experiment_name"]
 
         dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
         dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
@@ -651,14 +809,18 @@ else:
         if isinstance(env.unwrapped, DirectMARLEnv) and algorithm in ["ppo"]:
             env = multi_agent_to_single_agent(env)
 
-        if args_cli.debug_vis:
+        if args_cli.debug_vis or args_cli.video:
+            # Recording a video implies you want to see the tracked-vs-target velocity
+            # arrows in it, not just the raw robot — enable debug markers automatically
+            # instead of requiring a separate --debug_vis flag on top of --video.
             env.unwrapped.set_debug_vis(True)
 
         if args_cli.video:
+            video_len = args_cli.video_length if args_cli.video_length > 0 else getattr(env.unwrapped, "max_episode_length", 200)
             video_kwargs = {
                 "video_folder": os.path.join(log_dir, "videos", "train"),
                 "step_trigger": lambda step: step % args_cli.video_interval == 0,
-                "video_length": args_cli.video_length,
+                "video_length": video_len,
                 "disable_logger": True,
             }
             print("[INFO] Recording videos during training.")
@@ -692,6 +854,7 @@ else:
 
         _a.pop("anneal_stddev", None)   # no longer a PPO_CFG field; handled below
         _a.pop("anneal_log_std", None)
+        _std_dev_annealing = _a.pop("std_dev_annealing", False)
 
         # Auto-enable stddev annealing when policy uses the contraction backbone
         _is_contraction = (
@@ -703,6 +866,10 @@ else:
             runner = ContractionRunner(env, agent_cfg, is_classic=False)
         else:
             runner = Runner(env, agent_cfg)
+
+        _patch_kl_logging(runner.agent)
+        _patch_sac_entropy_clamp(runner.agent)
+        _patch_ppo_std_annealing(runner.agent, _std_dev_annealing)
 
         if _is_contraction and hasattr(runner.agent, "policy") and hasattr(runner.agent.policy, "cl_actor"):
             _orig_post = runner.agent.post_interaction

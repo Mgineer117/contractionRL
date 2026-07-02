@@ -102,6 +102,9 @@ class TEMPAgent(Agent):
     Extra constructor kwargs:
       ``get_rollout``:  ``(buffer_size, mode) -> dict(x, xref, uref)``
       ``get_f_and_B``:  ``(x) -> (f, B, Bbot)``
+      ``num_envs``:     number of parallel environments — con/opt ``RandomMemory``
+        buffers are allocated with this shape up front (skrl memory tensors are
+        sized at ``init()`` time and cannot be resized afterwards).
     """
 
     def __init__(
@@ -118,11 +121,17 @@ class TEMPAgent(Agent):
         get_f_and_B: Callable,
         x_dim: int | None = None,
         u_dim: int | None = None,
+        num_envs: int = 1,
     ) -> None:
         if isinstance(cfg, dict):
-            cfg = TEMPCfg(**{k: v for k, v in cfg.items() if k in TEMPCfg.__dataclass_fields__})
+            self._raw_cfg = cfg.copy()
+            parsed_cfg = TEMPCfg(**{k: v for k, v in cfg.items() if k in TEMPCfg.__dataclass_fields__})
+        else:
+            self._raw_cfg = cfg.__dict__.copy()
+            parsed_cfg = cfg
+
         super().__init__(
-            cfg=cfg,
+            cfg=parsed_cfg,
             models=models,
             memory=memory,
             observation_space=observation_space,
@@ -142,63 +151,73 @@ class TEMPAgent(Agent):
         self._x_dim = x_dim
         self._u_dim = u_dim
         self._device = device
-        self._cfg = cfg
-        self._con_only = cfg.con_only
+        self._cfg = parsed_cfg
+        self._con_only = parsed_cfg.con_only
+        self._base_algorithm = self._raw_cfg.get("base_algorithm", "PPO").upper()
 
-        # ── Build two PPO agents (con + opt) ─────────────────────────────── #
-        num_envs = 1
-        con_memory = RandomMemory(memory_size=cfg.rollouts, num_envs=num_envs, device=device)
-        opt_memory = RandomMemory(memory_size=cfg.rollouts, num_envs=num_envs, device=device)
+        # ── Build two RL agents (con + opt) ─────────────────────────────── #
+        # Memory tensors are physically allocated at agent.init() below with
+        # this num_envs — they cannot be resized later, so it must be correct
+        # up front (see TEMPSkrlTrainer.train, which used to mutate _num_envs
+        # post-hoc; that silently corrupted the con/opt buffers on multi-env
+        # Isaac Sim runs since the underlying tensors stayed shape (rollouts, 1, ...)).
+        self._num_envs = num_envs
+        rollouts = self._raw_cfg.get("rollouts", 300)
+        con_memory = RandomMemory(memory_size=rollouts, num_envs=num_envs, device=device)
+        opt_memory = RandomMemory(memory_size=rollouts, num_envs=num_envs, device=device)
 
-        import dataclasses as _dc
-        ppo_common = dict(
-            learning_epochs=cfg.learning_epochs,
-            mini_batches=cfg.mini_batches,
-            gae_lambda=cfg.gae_lambda,
-            learning_rate=cfg.learning_rate,
-            ratio_clip=cfg.ratio_clip,
-            value_clip=cfg.value_clip,
-            entropy_loss_scale=cfg.entropy_loss_scale,
-            value_loss_scale=cfg.value_loss_scale,
-            kl_threshold=cfg.kl_threshold,
-            grad_norm_clip=cfg.grad_norm_clip,
-            rollouts=cfg.rollouts,
-        )
-
-        def _make_ppo_cfg(gamma: float) -> dict:
-            d = _dc.asdict(PPO_CFG(**{k: v for k, v in ppo_common.items() if k in PPO_CFG.__dataclass_fields__}))
-            d["discount_factor"] = gamma
-            d["experiment"]["write_interval"] = 0
-            d["experiment"]["checkpoint_interval"] = 0
-            return d
-
-        ppo_kwargs = dict(
+        rl_kwargs = dict(
             observation_space=observation_space,
             state_space=state_space,
             action_space=action_space,
             device=device,
         )
-        self._con_ppo = PPO(
-            cfg=_make_ppo_cfg(cfg.gamma_contracting),
-            models={"policy": models["con_policy"], "value": models["con_value"]},
+
+        def _make_base_cfg(gamma: float) -> dict:
+            d = self._raw_cfg.copy()
+            d["discount_factor"] = gamma
+            if "experiment" not in d:
+                d["experiment"] = {}
+            d["experiment"]["write_interval"] = 0
+            d["experiment"]["checkpoint_interval"] = 0
+            return d
+
+        if self._base_algorithm == "PPO":
+            from skrl.agents.torch.ppo import PPO as BaseRLAgent
+            con_models = {"policy": models["con_policy"], "value": models["con_value"]}
+            opt_models = {"policy": models["opt_policy"], "value": models["opt_value"]} if "opt_policy" in models else {}
+        elif self._base_algorithm == "SAC":
+            from skrl.agents.torch.sac import SAC as BaseRLAgent
+            con_models = {
+                "policy": models["con_policy"], "q1": models["con_q1"], "q2": models["con_q2"],
+                "target_q1": models["con_target_q1"], "target_q2": models["con_target_q2"]
+            }
+            opt_models = {
+                "policy": models["opt_policy"], "q1": models["opt_q1"], "q2": models["opt_q2"],
+                "target_q1": models["opt_target_q1"], "target_q2": models["opt_target_q2"]
+            } if "opt_policy" in models else {}
+        else:
+            raise ValueError(f"[TEMP] Unsupported base_algorithm: {self._base_algorithm}")
+
+        self._con_agent = BaseRLAgent(
+            cfg=_make_base_cfg(parsed_cfg.gamma_contracting),
+            models=con_models,
             memory=con_memory,
-            **ppo_kwargs,
+            **rl_kwargs,
         )
-        self._opt_ppo = PPO(
-            cfg=_make_ppo_cfg(cfg.gamma_optimal),
-            models={"policy": models["opt_policy"], "value": models["opt_value"]},
+        self._opt_agent = BaseRLAgent(
+            cfg=_make_base_cfg(parsed_cfg.gamma_optimal),
+            models=opt_models,
             memory=opt_memory,
-            **ppo_kwargs,
-        ) if not cfg.con_only else None
+            **rl_kwargs,
+        ) if not parsed_cfg.con_only else None
 
         self._con_memory = con_memory
         self._opt_memory = opt_memory
 
-        # PPO.init() lazily creates memory tensors — call it here since sub-PPOs
-        # are driven manually (not by a standard Trainer).
-        self._con_ppo.init()
-        if self._opt_ppo is not None:
-            self._opt_ppo.init()
+        self._con_agent.init()
+        if self._opt_agent is not None:
+            self._opt_agent.init()
 
         # ── CMG + TEMP math ───────────────────────────────────────────────── #
         self._ccm_gen = models["cmg"].ccm_gen
@@ -228,7 +247,7 @@ class TEMPAgent(Agent):
 
     def act(self, observations, states, *, timestep: int, timesteps: int):
         """During inference uses the optimal policy (or con_policy if con_only)."""
-        ppo = self._opt_ppo if (self._opt_ppo and not self._con_only) else self._con_ppo
+        ppo = self._opt_agent if (self._opt_agent and not self._con_only) else self._con_agent
         with torch.no_grad():
             result = ppo.models["policy"].act({"observations": observations}, role="policy")
             actions = result[0]
@@ -322,9 +341,7 @@ class TEMPAgent(Agent):
         DBDx = b_jacobian(B, x, u_dim, create_graph=False)
         f = f.detach(); B = B.detach()
 
-        A = DfDx + sum(
-            u[:, i].unsqueeze(-1).unsqueeze(-1) * DBDx[:, :, :, i] for i in range(u_dim)
-        )
+        A = DfDx + torch.einsum('bxyu,bu->bxy', DBDx, u)
         dot_x = f + matmul(B, u.unsqueeze(-1)).squeeze(-1)
         dot_M = weighted_gradients(M, dot_x, x)
 
@@ -350,7 +367,7 @@ class TEMPAgent(Agent):
         """Inject Mahalanobis rewards into con_memory and run PPO update."""
         maha_r = self._compute_mahalanobis_reward(observations)
         try:
-            r_tensor = self._con_ppo.memory.get_tensor_by_name("rewards")
+            r_tensor = self._con_agent.memory.get_tensor_by_name("rewards")
             if r_tensor.shape != maha_r.shape:
                 import skrl
                 skrl.logger.warning(f"[TEMP] Reward shape mismatch in update_con: {r_tensor.shape} != {maha_r.shape}")
@@ -358,16 +375,16 @@ class TEMPAgent(Agent):
         except RuntimeError as e:
             import skrl
             skrl.logger.warning(f"[TEMP] Failed to inject Mahalanobis reward in update_con: {e}")
-        self._con_ppo.update(timestep=timestep, timesteps=timesteps)
+        self._con_agent.update(timestep=timestep, timesteps=timesteps)
         return {}
 
     def update_opt(self, observations: torch.Tensor, *, timestep: int, timesteps: int) -> dict:
         """Inject Mahalanobis rewards into opt_memory and run PPO update."""
-        if self._con_only or self._opt_ppo is None:
+        if self._con_only or self._opt_agent is None:
             return {}
         maha_r = self._compute_mahalanobis_reward(observations)
         try:
-            r_tensor = self._opt_ppo.memory.get_tensor_by_name("rewards")
+            r_tensor = self._opt_agent.memory.get_tensor_by_name("rewards")
             if r_tensor.shape != maha_r.shape:
                 import skrl
                 skrl.logger.warning(f"[TEMP] Reward shape mismatch in update_opt: {r_tensor.shape} != {maha_r.shape}")
@@ -375,7 +392,7 @@ class TEMPAgent(Agent):
         except RuntimeError as e:
             import skrl
             skrl.logger.warning(f"[TEMP] Failed to inject Mahalanobis reward in update_opt: {e}")
-        self._opt_ppo.update(timestep=timestep, timesteps=timesteps)
+        self._opt_agent.update(timestep=timestep, timesteps=timesteps)
         return {}
 
     def update_cmg(self, *, timestep: int, timesteps: int) -> dict:
@@ -416,17 +433,24 @@ class TEMPSkrlTrainer(Trainer):
         timesteps = self.cfg.timesteps
         con_only = agent._con_only
 
+        # con/opt RandomMemory buffers are allocated inside TEMPAgent.__init__ (at
+        # agent.init() there) using the num_envs passed to its constructor — skrl
+        # memory tensors are physically sized at creation and cannot be resized
+        # afterwards, so num_envs/rollouts must already match here.
+        if agent._num_envs != num_envs:
+            raise ValueError(
+                f"[TEMP] Agent was constructed with num_envs={agent._num_envs} but the "
+                f"environment has num_envs={num_envs}. Pass the correct num_envs to "
+                f"TEMPAgent(...) (ContractionRunner does this automatically)."
+            )
+        if agent._con_memory.memory_size != rollout_steps:
+            raise ValueError(
+                f"[TEMP] Agent con_memory was sized for rollouts={agent._con_memory.memory_size} "
+                f"but the trainer is configured for rollouts={rollout_steps}. Keep "
+                f"agent.rollouts and trainer.rollouts in sync in the YAML config."
+            )
+
         agent.init(trainer_cfg=self.cfg)
-
-        agent._con_memory._memory_size = rollout_steps
-        agent._con_memory._num_envs = num_envs
-        if not con_only and agent._opt_memory is not None:
-            agent._opt_memory._memory_size = rollout_steps
-            agent._opt_memory._num_envs = num_envs
-
-        agent._con_ppo.memory = agent._con_memory
-        if not con_only and agent._opt_ppo is not None:
-            agent._opt_ppo.memory = agent._opt_memory
 
         observations, infos = env.reset()
         states = env.state() if hasattr(env, "state") else None
@@ -439,20 +463,20 @@ class TEMPSkrlTrainer(Trainer):
         for epoch in pbar:
 
             # ── Phase 1: contracting rollout ──────────────────────────── #
-            agent._con_ppo.enable_training_mode(True)
-            agent._con_ppo.memory.reset()
+            agent._con_agent.enable_training_mode(True)
+            agent._con_agent.memory.reset()
             con_obs_list = []
 
             for step in range(rollout_steps):
-                agent._con_ppo.pre_interaction(timestep=global_step, timesteps=timesteps)
+                agent._con_agent.pre_interaction(timestep=global_step, timesteps=timesteps)
                 with torch.no_grad():
-                    actions, _ = agent._con_ppo.act(
+                    actions, _ = agent._con_agent.act(
                         observations, states, timestep=global_step, timesteps=timesteps
                     )
                 next_obs, rewards, terminated, truncated, infos = env.step(actions)
                 next_states = env.state() if hasattr(env, "state") else None
                 con_obs_list.append(observations.clone())
-                agent._con_ppo.record_transition(
+                agent._con_agent.record_transition(
                     observations=observations, states=states, actions=actions,
                     rewards=rewards, next_observations=next_obs, next_states=next_states,
                     terminated=terminated, truncated=truncated, infos=infos,
@@ -464,24 +488,24 @@ class TEMPSkrlTrainer(Trainer):
 
             con_obs_tensor = torch.cat(con_obs_list, dim=0)
             agent.update_con(con_obs_tensor, timestep=global_step, timesteps=timesteps)
-            agent._con_ppo.post_interaction(timestep=global_step, timesteps=timesteps)
+            agent._con_agent.post_interaction(timestep=global_step, timesteps=timesteps)
 
             # ── Phase 2: optimal rollout ──────────────────────────────── #
-            if not con_only and agent._opt_ppo is not None:
-                agent._opt_ppo.enable_training_mode(True)
-                agent._opt_ppo.memory.reset()
+            if not con_only and agent._opt_agent is not None:
+                agent._opt_agent.enable_training_mode(True)
+                agent._opt_agent.memory.reset()
                 opt_obs_list = []
 
                 for step in range(rollout_steps):
-                    agent._opt_ppo.pre_interaction(timestep=global_step, timesteps=timesteps)
+                    agent._opt_agent.pre_interaction(timestep=global_step, timesteps=timesteps)
                     with torch.no_grad():
-                        actions, _ = agent._opt_ppo.act(
+                        actions, _ = agent._opt_agent.act(
                             observations, states, timestep=global_step, timesteps=timesteps
                         )
                     next_obs, rewards, terminated, truncated, infos = env.step(actions)
                     next_states = env.state() if hasattr(env, "state") else None
                     opt_obs_list.append(observations.clone())
-                    agent._opt_ppo.record_transition(
+                    agent._opt_agent.record_transition(
                         observations=observations, states=states, actions=actions,
                         rewards=rewards, next_observations=next_obs, next_states=next_states,
                         terminated=terminated, truncated=truncated, infos=infos,
@@ -493,7 +517,7 @@ class TEMPSkrlTrainer(Trainer):
 
                 opt_obs_tensor = torch.cat(opt_obs_list, dim=0)
                 agent.update_opt(opt_obs_tensor, timestep=global_step, timesteps=timesteps)
-                agent._opt_ppo.post_interaction(timestep=global_step, timesteps=timesteps)
+                agent._opt_agent.post_interaction(timestep=global_step, timesteps=timesteps)
 
             # ── CMG update ────────────────────────────────────────────── #
             cmg_dict = agent.update_cmg(timestep=global_step, timesteps=timesteps)
@@ -504,7 +528,7 @@ class TEMPSkrlTrainer(Trainer):
 
     def eval(self) -> None:
         agent: TEMPAgent = self.agents if not isinstance(self.agents, list) else self.agents[0]
-        ppo = agent._opt_ppo if (agent._opt_ppo and not agent._con_only) else agent._con_ppo
+        ppo = agent._opt_agent if (agent._opt_agent and not agent._con_only) else agent._con_agent
         ppo.enable_training_mode(False)
         observations, _ = self.env.reset()
         states = self.env.state() if hasattr(self.env, "state") else None

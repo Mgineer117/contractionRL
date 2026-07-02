@@ -130,15 +130,16 @@ class SDLQRAgent(Agent):
         f = f.float().to(self._compute_device)
         B = B.float().to(self._compute_device)
 
-        DfDx = jacobian(f, x, create_graph=False)                      # (batch, x, x)
-        DBDx = b_jacobian(B, x, u_dim, create_graph=False)             # (batch, x, x, u)
+        DfDx = jacobian(f, x, create_graph=False)
+        DBDx = b_jacobian(B, x, u_dim, create_graph=False)
+        f = f.detach(); B = B.detach()
+        
+        A_batch = DfDx + torch.einsum('bxyu,bu->bxy', DBDx, uref)
         
         actions = torch.zeros(batch_size, u_dim, device=self._compute_device)
         
         for i in range(batch_size):
-            A = DfDx[i].clone()
-            for j in range(u_dim):
-                A = A + uref[i, j] * DBDx[i, :, :, j]
+            A = A_batch[i]
             B_mat = B[i]
 
             K = _care_gain(A, B_mat, cfg.Q_scaler, cfg.R_scaler, x_dim, u_dim)
@@ -248,13 +249,13 @@ class LQRAgent(Agent):
 
         DfDx = jacobian(f_xref, xref, create_graph=False)              # (batch, x, x)
         DBDx = b_jacobian(B_xref, xref, u_dim, create_graph=False)     # (batch, x, x, u)
+
+        A_batch = DfDx + torch.einsum('bxyu,bu->bxy', DBDx, uref)
         
         actions = torch.zeros(batch_size, u_dim, device=self._compute_device)
 
         for i in range(batch_size):
-            A = DfDx[i].clone()
-            for j in range(u_dim):
-                A = A + uref[i, j] * DBDx[i, :, :, j]
+            A = A_batch[i]
             B_mat = B_xref[i]
 
             K = _care_gain(A, B_mat, cfg.Q_scaler, cfg.R_scaler, x_dim, u_dim)

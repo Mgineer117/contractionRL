@@ -1,8 +1,10 @@
-seed: 42
+seed: 42  # Random seed for reproducibility
 
 agent:
   class: SAC
-  hidden_dim: [256, 256]
+  state_preprocessor: RunningStandardScaler  # Mechanism for normalizing online states
+  state_preprocessor_kwargs: null
+  hidden_dim: [256, 256]  # General hidden layer dimensions for internal networks
   activation: relu
   gamma: 0.99
   tau: 0.005
@@ -20,5 +22,5 @@ trainer:
   class: OffPolicyTrainer
   num_agent: 4
   epochs: 2000
-  eval_interval: 200
+  eval_interval: 200  # Frequency of running evaluation rollouts
   log_interval: 20

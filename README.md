@@ -2,6 +2,45 @@
 
 Contraction-based reinforcement learning research repo built on [Isaac Lab](https://isaac-sim.github.io/IsaacLab).
 All algorithms run through a unified **skrl** backend.
+## Installation
+
+1. **Create the Conda Environment:**
+   We recommend using `conda` to isolate the dependencies.
+   ```bash
+   conda create -n contraction_rl python=3.10 -y
+   conda activate contraction_rl
+   ```
+
+2. **Install IsaacLab (if not already installed):**
+   Follow the [IsaacLab Installation Guide](https://isaac-sim.github.io/IsaacLab/) to set up the simulator.
+
+3. **Install contractionRL:**
+   Navigate to the root of this repository and install the package in editable mode:
+   ```bash
+   pip install -e source/contractionRL
+   ```
+   *Note: This will also install all required dependencies including `skrl`, `wandb`, and `torch`.*
+
+## Example Commands
+
+### 1. IsaacLab Training (Quadruped)
+Train a Unitree Go2 to track a velocity command using PPO:
+```bash
+python scripts/skrl/train.py --task Quadruped-VelTracking-v0 --algorithm ppo
+```
+
+### 2. Classic Environments (No Isaac Sim)
+Train C3M on a classic `Car-v0` environment (uses multiprocessing for efficiency):
+```bash
+python scripts/skrl/train.py --classic --task Car-v0 --algorithm c3m --num_envs 4
+```
+
+### 3. Hyperparameter Sweeps (W&B)
+Initialize a sweep and launch parallel agents across GPUs using the provided helper script:
+```bash
+# Edit search/run_c3m_sweeps.sh if necessary, then run:
+./search/run_c3m_sweeps.sh
+```
 
 | Algorithm | Type | Training | Description |
 |-----------|------|---------|-------------|

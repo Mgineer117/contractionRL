@@ -1,10 +1,10 @@
-seed: 42
+seed: 42  # Random seed for reproducibility
 
 agent:
   class: PPO
   actor_type: RL          # RL | CL
   anneal_stddev: true     # exponential log_std 0 → -20 over training
-  hidden_dim: [256, 256]
+  hidden_dim: [256, 256]  # General hidden layer dimensions for internal networks
   actor_lr: 3.0e-4
   critic_lr: 5.0e-4
   num_minibatch: 4
@@ -20,5 +20,5 @@ trainer:
   class: OnlineTrainer
   num_agent: 4            # == num_worker (OnlineSampler parallelism)
   epochs: 2000
-  eval_interval: 200
+  eval_interval: 200  # Frequency of running evaluation rollouts
   log_interval: 20

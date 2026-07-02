@@ -8,7 +8,7 @@ from isaaclab_assets.robots.unitree import H1_CFG
 from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sim import SimulationCfg
+from isaaclab.sim import SimulationCfg, PhysxCfg
 from isaaclab.utils import configclass
 
 from ..common.vel_commands import VelCmdCfg
@@ -17,6 +17,8 @@ from ..common.vel_commands import VelCmdCfg
 @configclass
 class HumanoidVelTrackingEnvCfg(DirectRLEnvCfg):
     # env
+
+    num_envs = 4096
     decimation = 4
     episode_length_s = 10.0
 
@@ -31,9 +33,12 @@ class HumanoidVelTrackingEnvCfg(DirectRLEnvCfg):
     observation_space = 70
     state_space = 0
 
-    sim: SimulationCfg = SimulationCfg(dt=1 / 200, render_interval=decimation)
+    sim: SimulationCfg = SimulationCfg(dt=1 / 200, render_interval=decimation, physx=PhysxCfg(enable_external_forces_every_iteration=True, min_velocity_iteration_count=1))
+    # Position-delta control needs the actuators' real PD gains (H1_CFG's own
+    # per-joint stiffness/damping in the "legs" [incl. torso], "feet", "arms"
+    # groups) — zero gains produce zero torque regardless of position target.
     robot_cfg: ArticulationCfg = H1_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=1024, env_spacing=4.0, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=num_envs, env_spacing=4.0, replicate_physics=True)
 
     vel_cmd: VelCmdCfg = VelCmdCfg(
         vx_range=(-1.0, 1.5),
@@ -43,6 +48,7 @@ class HumanoidVelTrackingEnvCfg(DirectRLEnvCfg):
         yaw_omega_range=(0.4, 1.5),
     )
 
+    # action: deviation from default joint positions [rad] — matches quadruped_vel_tracking's convention
     action_scale = 0.25
 
     base_height_min = 0.50  # [m]

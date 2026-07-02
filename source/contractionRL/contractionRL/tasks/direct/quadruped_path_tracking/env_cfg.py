@@ -8,13 +8,15 @@ from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
 from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sim import SimulationCfg
+from isaaclab.sim import SimulationCfg, PhysxCfg
 from isaaclab.utils import configclass
 
 
 @configclass
 class QuadrupedPathTrackingEnvCfg(DirectRLEnvCfg):
     # env
+
+    num_envs = 4096
     decimation = 4
     episode_length_s = 10.0
 
@@ -24,9 +26,9 @@ class QuadrupedPathTrackingEnvCfg(DirectRLEnvCfg):
     observation_space = 66
     state_space = 0
 
-    sim: SimulationCfg = SimulationCfg(dt=1 / 200, render_interval=decimation)
+    sim: SimulationCfg = SimulationCfg(dt=1 / 200, render_interval=decimation, physx=PhysxCfg(enable_external_forces_every_iteration=True, min_velocity_iteration_count=1))
     robot_cfg: ArticulationCfg = UNITREE_GO2_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=1024, env_spacing=2.5, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=num_envs, env_spacing=2.5, replicate_physics=True)
 
     action_scale = 0.25
 

@@ -8,7 +8,7 @@ from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG
 from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sim import SimulationCfg
+from isaaclab.sim import SimulationCfg, PhysxCfg
 from isaaclab.utils import configclass
 
 from ..common.vel_commands import VelCmdCfg
@@ -16,6 +16,7 @@ from ..common.vel_commands import VelCmdCfg
 
 @configclass
 class ManipulatorVelTrackingEnvCfg(DirectRLEnvCfg):
+    num_envs = 4096
     # env — EE Cartesian velocity tracking task
     decimation = 2
     episode_length_s = 5.0
@@ -28,9 +29,9 @@ class ManipulatorVelTrackingEnvCfg(DirectRLEnvCfg):
     observation_space = 32
     state_space = 0
 
-    sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
+    sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation, physx=PhysxCfg(enable_external_forces_every_iteration=True, min_velocity_iteration_count=1))
     robot_cfg: ArticulationCfg = FRANKA_PANDA_HIGH_PD_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=2.0, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=num_envs, env_spacing=2.0, replicate_physics=True)
 
     arm_joint_names = ["panda_joint[1-7]"]
     ee_body_name = "panda_hand"
@@ -43,8 +44,14 @@ class ManipulatorVelTrackingEnvCfg(DirectRLEnvCfg):
         yaw_omega_range=(0.3, 1.5),
     )
 
-    # action maps [-1,1] to joint positions within soft limits
-    # (handled inside the env via midpoint + range scaling)
+    # action: deviation from default joint positions [rad] — matches quadruped/humanoid_vel_tracking's convention
+    # Both groups run at FRANKA_PANDA_HIGH_PD_CFG's stiffness=400.0, but effort_limit_sim
+    # differs sharply per group (87 Nm vs 12 Nm), so a single action_scale=0.25 (needing
+    # 100 Nm at full-scale action) saturates BOTH: panda_shoulder by 15%, panda_forearm by
+    # 8.3x. Scaled below each group's own limit/stiffness ratio, with ~15-20% margin left
+    # for the PD law's damping*velocity_error term (not captured by this static torque estimate).
+    action_scale_shoulder = 0.20   # panda_joint[1-4]: 400*0.20=80 Nm vs 87 Nm limit
+    action_scale_forearm = 0.025   # panda_joint[5-7]: 400*0.025=10 Nm vs 12 Nm limit
 
     # reward scales (tentative)
     rew_ee_vel = -1.0       # -||ee_vel - cmd_vel||^2

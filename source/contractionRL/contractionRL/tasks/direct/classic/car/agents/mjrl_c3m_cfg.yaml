@@ -1,4 +1,4 @@
-seed: 42
+seed: 42  # Random seed for reproducibility
 
 agent:
   class: C3M
@@ -15,16 +15,16 @@ agent:
   cmg_updates_per_policy_update: 1
   buffer_size: 65536
   cmg:
-    hidden_dim: [128, 128]
+    hidden_dim: [128, 128]  # General hidden layer dimensions for internal networks
     activation: tanh
     mode: deterministic
   actor:
-    hidden_dim: [128, 128]
+    hidden_dim: [128, 128]  # General hidden layer dimensions for internal networks
     activation: tanh
 
 trainer:
   class: C3MTrainer
   num_agent: 4         # == num_worker for the parallel eval sampler
   epochs: 30000
-  eval_interval: 2000
+  eval_interval: 2000  # Frequency of running evaluation rollouts
   log_interval: 200

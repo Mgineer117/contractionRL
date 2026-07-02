@@ -42,12 +42,15 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot_cfg)
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+        # Explicit, strongly-contrasting ground color (dark blue-teal) instead of relying on
+        # GroundPlaneCfg's default grid-texture tint — the robot is light-colored, so a dark,
+        # saturated (non-gray) ground reads clearly against it regardless of scene brightness.
+        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg(color=(0.05, 0.2, 0.35)))
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[])
         self.scene.articulations["robot"] = self._robot
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        light_cfg = sim_utils.DomeLightCfg(intensity=1200.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
@@ -95,18 +98,17 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
         cmds = self._cmd.get(t)
 
         lin_err = torch.sum(torch.square(cmds[:, :2] - self._robot.data.root_lin_vel_b[:, :2]), dim=1)
-        rew_lin = torch.exp(-lin_err / 0.25) * self.cfg.rew_lin_vel
+        rew_lin = torch.exp(-lin_err / 0.1) * self.cfg.rew_lin_vel
 
         yaw_err = torch.square(cmds[:, 3] - self._robot.data.root_ang_vel_b[:, 2])
-        rew_yaw = torch.exp(-yaw_err / 0.25) * self.cfg.rew_yaw_rate
+        rew_yaw = torch.exp(-yaw_err / 0.1) * self.cfg.rew_yaw_rate
 
         rew_z = torch.square(self._robot.data.root_lin_vel_b[:, 2]) * self.cfg.rew_z_vel
         rew_axy = torch.sum(torch.square(self._robot.data.root_ang_vel_b[:, :2]), dim=1) * self.cfg.rew_ang_vel_xy
         rew_up = torch.sum(torch.square(self._robot.data.projected_gravity_b[:, :2]), dim=1) * self.cfg.rew_upright
         rew_tau = torch.sum(torch.square(self._robot.data.applied_torque), dim=1) * self.cfg.rew_torques
         rew_ar = torch.sum(torch.square(self._actions - self._prev_actions), dim=1) * self.cfg.rew_action_rate
-        rew_alive = (1.0 - self.reset_terminated.float()) * self.cfg.rew_alive
-
+        
         vel_err_vec = torch.cat([
             cmds[:, :2] - self._robot.data.root_lin_vel_b[:, :2],
             (cmds[:, 3] - self._robot.data.root_ang_vel_b[:, 2]).unsqueeze(-1),

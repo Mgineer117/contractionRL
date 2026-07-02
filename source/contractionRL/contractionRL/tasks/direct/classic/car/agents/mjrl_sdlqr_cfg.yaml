@@ -1,7 +1,9 @@
-seed: 42
+seed: 42  # Random seed for reproducibility
 
 agent:
   class: SDLQR
+  batch_size: 2048
+  minibatch_size: 2048
   Q_scaler: 1.0
   R_scaler: 0.0
 
@@ -9,5 +11,5 @@ trainer:
   class: EvalTrainer
   num_agent: 4
   epochs: 1        # SD-LQR is analytical — one eval pass is sufficient
-  eval_interval: 1
+  eval_interval: 1  # Frequency of running evaluation rollouts
   log_interval: 1

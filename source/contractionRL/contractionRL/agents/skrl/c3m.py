@@ -272,9 +272,7 @@ class C3MAgent(Agent):
         u, _ = self._cl_actor(state)
         K = jacobian(u, x)
 
-        A = DfDx + sum(
-            u[:, i].unsqueeze(-1).unsqueeze(-1) * DBDx[:, :, :, i] for i in range(u_dim)
-        )
+        A = DfDx + torch.einsum('bxyu,bu->bxy', DBDx, u)
         dot_x = f + matmul(B, u.unsqueeze(-1)).squeeze(-1)
         dot_M = weighted_gradients(M, dot_x, x)
 
@@ -332,6 +330,7 @@ class C3MAgent(Agent):
             loss, infos = self._compute_loss()
             self._W_optimizer.zero_grad()
             self._actor_optimizer.zero_grad()
+            loss.backward()
             if all(torch.isfinite(p.grad).all() for p in self._cl_actor.parameters() if p.grad is not None):
                 torch.nn.utils.clip_grad_norm_(self._cl_actor.parameters(), 1.0)
                 self._actor_optimizer.step()
