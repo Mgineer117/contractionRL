@@ -87,7 +87,7 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
 
     # reward scales (tentative)
     rew_lin_vel = 2.0
-    rew_yaw_rate = 0.5
+    rew_yaw_rate = 0.0
     rew_alive = 0.0
     rew_z_vel = -0.5
     rew_roll_pitch = -0.05

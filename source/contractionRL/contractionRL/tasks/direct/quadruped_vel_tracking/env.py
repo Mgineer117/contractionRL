@@ -110,10 +110,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         yaw_err = torch.square(cmds[:, 3] - self._robot.data.root_ang_vel_b[:, 2])
         rew_yaw = torch.exp(-yaw_err / 0.1) * self.cfg.rew_yaw_rate
 
-        vel_err_vec = torch.cat([
-            cmds[:, :2] - self._robot.data.root_lin_vel_b[:, :2],
-            (cmds[:, 3] - self._robot.data.root_ang_vel_b[:, 2]).unsqueeze(-1),
-        ], dim=-1)
+        vel_err_vec = cmds[:, :2] - self._robot.data.root_lin_vel_b[:, :2]
         self._episode_vel_auc += torch.norm(vel_err_vec, dim=-1)
 
         rew_z = torch.square(self._robot.data.root_lin_vel_b[:, 2]) * self.cfg.rew_z_vel
