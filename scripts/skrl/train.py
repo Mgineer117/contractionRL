@@ -562,7 +562,7 @@ if _is_classic:
 
         num_envs = args_cli.num_envs or 4
         vec_env = SyncVectorEnv([lambda: gym.make(args_cli.task)] * num_envs)
-        vec_env.device = "cpu"
+        # vec_env.device = "cpu"  # REMOVED: This was causing C3M to run its heavy batch gradients on the CPU!
         env = wrap_env(vec_env, wrapper="gymnasium")
 
         runner = ContractionRunner(env, agent_cfg, task_id=args_cli.task, num_envs=num_envs, is_classic=True)
