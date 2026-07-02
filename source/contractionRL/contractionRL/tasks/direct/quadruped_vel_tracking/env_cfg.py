@@ -87,8 +87,8 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
 
     # reward scales (tentative)
     rew_lin_vel = 2.0
+    rew_heading = 1.0  # Reward for aligning heading with commanded velocity
     rew_yaw_rate = 0.0
-    rew_alive = 0.0
     rew_z_vel = -0.5
     rew_roll_pitch = -0.05
     rew_torque = -1e-5

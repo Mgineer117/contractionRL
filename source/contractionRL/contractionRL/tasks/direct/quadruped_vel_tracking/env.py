@@ -100,24 +100,34 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         t = self.episode_length_buf.float() * self.step_dt
         cmds = self._cmd.get(t)
 
-        # linear velocity tracking (xy)
+        # linear velocity tracking (xy) in world frame
         lin_err = torch.sum(
-            torch.square(cmds[:, :2] - self._robot.data.root_lin_vel_b[:, :2]), dim=1
+            torch.square(cmds[:, :2] - self._robot.data.root_lin_vel_w[:, :2]), dim=1
         )
         rew_lin = torch.exp(-lin_err / 0.1) * self.cfg.rew_lin_vel
+
+        # heading bonus: align robot's yaw with the direction of the commanded velocity
+        cmd_yaw = torch.atan2(cmds[:, 1], cmds[:, 0])
+        # root_quat_w is (w, x, y, z)
+        w, x, y, z = self._robot.data.root_quat_w[:, 0], self._robot.data.root_quat_w[:, 1], self._robot.data.root_quat_w[:, 2], self._robot.data.root_quat_w[:, 3]
+        robot_yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        
+        heading_err = cmd_yaw - robot_yaw
+        heading_err = torch.remainder(heading_err + torch.pi, 2 * torch.pi) - torch.pi
+        rew_heading = torch.exp(-torch.square(heading_err) / 0.1) * self.cfg.rew_heading
 
         # yaw rate tracking
         yaw_err = torch.square(cmds[:, 3] - self._robot.data.root_ang_vel_b[:, 2])
         rew_yaw = torch.exp(-yaw_err / 0.1) * self.cfg.rew_yaw_rate
 
-        vel_err_vec = cmds[:, :2] - self._robot.data.root_lin_vel_b[:, :2]
+        vel_err_vec = cmds[:, :2] - self._robot.data.root_lin_vel_w[:, :2]
         self._episode_vel_auc += torch.norm(vel_err_vec, dim=-1)
 
         rew_z = torch.square(self._robot.data.root_lin_vel_b[:, 2]) * self.cfg.rew_z_vel
         rew_rp = torch.sum(torch.square(self._robot.data.root_ang_vel_b[:, :2]), dim=1) * self.cfg.rew_roll_pitch
         rew_tau = torch.sum(torch.square(self._robot.data.applied_torque), dim=1) * self.cfg.rew_torque
         rew_act = torch.sum(torch.square(self._actions - self._prev_actions), dim=1) * self.cfg.rew_action_rate
-        total_reward = rew_lin + rew_yaw + rew_z + rew_rp + rew_tau + rew_act
+        total_reward = rew_lin + rew_heading + rew_yaw + rew_z + rew_rp + rew_tau + rew_act
         
         if not hasattr(self, "_episode_discounted_returns"):
             self._episode_discounted_returns = torch.zeros(self.num_envs, device=self.device)
