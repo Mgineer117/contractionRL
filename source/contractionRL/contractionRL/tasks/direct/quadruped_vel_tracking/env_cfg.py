@@ -51,7 +51,7 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     # no texture_file) instead of the actual (dark) ground plane below the horizon.
     # No ground-color or lighting change can fix that if the ground isn't in frame.
     viewer: ViewerCfg = ViewerCfg(
-        eye=(-2.0, -2.0, 2.2),
+        eye=(-5.0, 8.66, 7.5),
         lookat=(0.0, 0.0, 0.0),
         origin_type="asset_root",
         env_index=0,
@@ -92,5 +92,3 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     rew_roll_pitch = -0.05
     rew_torque = -1e-5
     rew_action_rate = -0.01
-    rew_flat = -1.0
-    rew_joint_accel = -2.5e-7

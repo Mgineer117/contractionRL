@@ -250,6 +250,12 @@ class ContractionRunner:
 
         get_f_and_B = getattr(raw_env, "get_f_and_B", None)
         get_rollout = getattr(raw_env, "get_rollout", None)
+        if get_f_and_B is None and hasattr(raw_env, "envs") and len(raw_env.envs) > 0:
+            first_env = raw_env.envs[0]
+            if hasattr(first_env, "unwrapped"):
+                first_env = first_env.unwrapped
+            get_f_and_B = getattr(first_env, "get_f_and_B", None)
+            get_rollout = getattr(first_env, "get_rollout", None)
 
         agent_cfg = copy.deepcopy(cfg.get("agent", {}))
         agent_cfg.pop("class", None)
@@ -266,6 +272,12 @@ class ContractionRunner:
             
         x_dim = getattr(raw_env, "x_dim", None)
         u_dim = getattr(raw_env, "u_dim", None)
+        if x_dim is None and hasattr(raw_env, "envs") and len(raw_env.envs) > 0:
+            first_env = raw_env.envs[0]
+            if hasattr(first_env, "unwrapped"):
+                first_env = first_env.unwrapped
+            x_dim = getattr(first_env, "x_dim", None)
+            u_dim = getattr(first_env, "u_dim", None)
 
         models_cfg = copy.deepcopy(cfg.get("models", {}))
 

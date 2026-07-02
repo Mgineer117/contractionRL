@@ -14,9 +14,13 @@ from torch.autograd import grad
 def jacobian(f: torch.Tensor, x: torch.Tensor, create_graph: bool = True) -> torch.Tensor:
     """Batched autograd Jacobian ∂f/∂x → (n, f_dim, x_dim)."""
     n, f_dim, x_dim = x.shape[0], f.shape[-1], x.shape[-1]
+    if not f.requires_grad:
+        return torch.zeros((n, f_dim, x_dim), device=x.device, dtype=x.dtype)
     v = torch.eye(f_dim, device=x.device, dtype=x.dtype).unsqueeze(1).expand(f_dim, n, f_dim)
-    J = grad(f, x, grad_outputs=v, create_graph=create_graph, retain_graph=True, is_grads_batched=True)[0]
-    return J.transpose(0, 1)
+    J_tuple = grad(f, x, grad_outputs=v, create_graph=create_graph, retain_graph=True, is_grads_batched=True, allow_unused=True)
+    if J_tuple[0] is None:
+        return torch.zeros((n, f_dim, x_dim), device=x.device, dtype=x.dtype)
+    return J_tuple[0].transpose(0, 1)
 
 
 def b_jacobian(B: torch.Tensor, x: torch.Tensor, u_dim: int, create_graph: bool = True) -> torch.Tensor:

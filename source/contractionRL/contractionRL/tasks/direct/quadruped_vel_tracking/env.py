@@ -42,12 +42,12 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         # Explicit, strongly-contrasting ground color (dark blue-teal) instead of relying on
         # GroundPlaneCfg's default grid-texture tint — the robot is light-colored, so a dark,
         # saturated (non-gray) ground reads clearly against it regardless of scene brightness.
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg(color=(0.05, 0.2, 0.35)))
+        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[])
         self.scene.articulations["robot"] = self._robot
-        light_cfg = sim_utils.DomeLightCfg(intensity=1200.0, color=(0.75, 0.75, 0.75), visible_in_primary_ray=False)
+        light_cfg = sim_utils.DistantLightCfg(intensity=3000.0, color=(1.0, 1.0, 1.0)))
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
@@ -120,10 +120,21 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         rew_rp = torch.sum(torch.square(self._robot.data.root_ang_vel_b[:, :2]), dim=1) * self.cfg.rew_roll_pitch
         rew_tau = torch.sum(torch.square(self._robot.data.applied_torque), dim=1) * self.cfg.rew_torque
         rew_act = torch.sum(torch.square(self._actions - self._prev_actions), dim=1) * self.cfg.rew_action_rate
-        rew_flat = torch.sum(torch.square(self._robot.data.projected_gravity_b[:, :2]), dim=1) * self.cfg.rew_flat
-        rew_acc = torch.sum(torch.square(self._robot.data.joint_acc), dim=1) * self.cfg.rew_joint_accel
         
-        return rew_lin + rew_yaw + rew_z + rew_rp + rew_tau + rew_act + rew_flat + rew_acc
+                total_reward = rew_lin + rew_yaw + rew_z + rew_rp + rew_tau + rew_act
+        
+        if not hasattr(self, "_episode_discounted_returns"):
+            self._episode_discounted_returns = torch.zeros(self.num_envs, device=self.device)
+            self._current_discounts = torch.ones(self.num_envs, device=self.device)
+            self._episode_undiscounted_returns = torch.zeros(self.num_envs, device=self.device)
+            self._episode_lengths_custom = torch.zeros(self.num_envs, device=self.device)
+            
+        self._episode_discounted_returns += self._current_discounts * total_reward
+        self._episode_undiscounted_returns += total_reward
+        self._episode_lengths_custom += 1.0
+        self._current_discounts *= 0.99
+        
+        return total_reward 
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
@@ -136,9 +147,22 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
 
         auc_vals = self._episode_vel_auc[env_ids]
-        if (auc_vals > 0).any():
-            self.extras.setdefault("log", {})
-            self.extras["log"]["Episode/auc"] = auc_vals[auc_vals > 0].mean().item()
+        if hasattr(self, "_episode_discounted_returns"):
+            disc_returns = self._episode_discounted_returns[env_ids]
+            undisc_returns = self._episode_undiscounted_returns[env_ids]
+            lengths = self._episode_lengths_custom[env_ids]
+            if (auc_vals > 0).any():
+                self.extras.setdefault("log", {})
+                self.extras["log"]["Episode/auc"] = auc_vals[auc_vals > 0].mean().item()
+                self.extras["log"]["Episode/discounted_return"] = disc_returns[auc_vals > 0].mean().item()
+                self.extras["log"]["Episode/undiscounted_return"] = undisc_returns[auc_vals > 0].mean().item()
+                self.extras["log"]["Episode/avg_reward_per_step"] = (undisc_returns[auc_vals > 0] / lengths[auc_vals > 0]).mean().item()
+            
+            self._episode_discounted_returns[env_ids] = 0.0
+            self._episode_undiscounted_returns[env_ids] = 0.0
+            self._episode_lengths_custom[env_ids] = 0.0
+            self._current_discounts[env_ids] = 1.0
+            
         self._episode_vel_auc[env_ids] = 0.0
 
         self._actions[env_ids] = 0.0

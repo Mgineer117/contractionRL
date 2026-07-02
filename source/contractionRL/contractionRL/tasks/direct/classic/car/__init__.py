@@ -5,7 +5,7 @@ import gymnasium as gym
 from . import agents
 
 gym.register(
-    id="Car-v0",
+    id="classic-car-v0",
     entry_point=f"{__name__}.env:CarEnv",
     disable_env_checker=True,
     kwargs={

@@ -45,12 +45,12 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
         # Explicit, strongly-contrasting ground color (dark blue-teal) instead of relying on
         # GroundPlaneCfg's default grid-texture tint — the robot is light-colored, so a dark,
         # saturated (non-gray) ground reads clearly against it regardless of scene brightness.
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg(color=(0.05, 0.2, 0.35)))
+        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[])
         self.scene.articulations["robot"] = self._robot
-        light_cfg = sim_utils.DomeLightCfg(intensity=1200.0, color=(0.75, 0.75, 0.75))
+        light_cfg = sim_utils.DistantLightCfg(intensity=3000.0, color=(1.0, 1.0, 1.0)))
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
@@ -128,9 +128,22 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
 
         auc_vals = self._episode_vel_auc[env_ids]
-        if (auc_vals > 0).any():
-            self.extras.setdefault("log", {})
-            self.extras["log"]["Episode/auc"] = auc_vals[auc_vals > 0].mean().item()
+        if hasattr(self, "_episode_discounted_returns"):
+            disc_returns = self._episode_discounted_returns[env_ids]
+            undisc_returns = self._episode_undiscounted_returns[env_ids]
+            lengths = self._episode_lengths_custom[env_ids]
+            if (auc_vals > 0).any():
+                self.extras.setdefault("log", {})
+                self.extras["log"]["Episode/auc"] = auc_vals[auc_vals > 0].mean().item()
+                self.extras["log"]["Episode/discounted_return"] = disc_returns[auc_vals > 0].mean().item()
+                self.extras["log"]["Episode/undiscounted_return"] = undisc_returns[auc_vals > 0].mean().item()
+                self.extras["log"]["Episode/avg_reward_per_step"] = (undisc_returns[auc_vals > 0] / lengths[auc_vals > 0]).mean().item()
+            
+            self._episode_discounted_returns[env_ids] = 0.0
+            self._episode_undiscounted_returns[env_ids] = 0.0
+            self._episode_lengths_custom[env_ids] = 0.0
+            self._current_discounts[env_ids] = 1.0
+            
         self._episode_vel_auc[env_ids] = 0.0
 
         self._actions[env_ids] = 0.0

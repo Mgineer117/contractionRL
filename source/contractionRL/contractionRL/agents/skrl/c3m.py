@@ -399,6 +399,8 @@ class C3MSkrlTrainer(Trainer):
         agent = self.agents if not isinstance(self.agents, list) else self.agents[0]
         timesteps = self.cfg.timesteps
         log_interval = getattr(agent, "write_interval", 200)
+        if str(log_interval).lower() == "auto": log_interval = 200
+        log_interval = int(log_interval)
         eval_interval = getattr(self.cfg, "eval_interval", 0)
 
         agent.init(trainer_cfg=self.cfg)

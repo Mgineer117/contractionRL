@@ -471,7 +471,7 @@ if _is_classic:
     )
     if _classic_dir not in sys.path:
         sys.path.insert(0, _classic_dir)
-    import classic  # noqa: F401 — registers gymnasium envs (e.g. Car-v0)
+    import contractionRL.tasks.direct.classic  # noqa: F401 — registers gymnasium envs (e.g. Car-v0)
 
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -552,16 +552,16 @@ if _is_classic:
         if _src_dir not in sys.path:
             sys.path.insert(0, _src_dir)
 
-        from gymnasium.vector import AsyncVectorEnv
+        from gymnasium.vector import SyncVectorEnv
         from skrl.envs.wrappers.torch import wrap_env
         from contractionRL.runners import ContractionRunner
 
         num_envs = args_cli.num_envs or 4
-        vec_env = AsyncVectorEnv([lambda: gym.make(args_cli.task)] * num_envs)
+        vec_env = SyncVectorEnv([lambda: gym.make(args_cli.task)] * num_envs)
         vec_env.device = "cpu"
         env = wrap_env(vec_env, wrapper="gymnasium")
 
-        runner = ContractionRunner(env, agent_cfg, is_classic=True)
+        runner = ContractionRunner(env, agent_cfg, task_id=args_cli.task, num_envs=num_envs, is_classic=True)
         if args_cli.checkpoint:
             runner.load(args_cli.checkpoint)
         runner.run()
@@ -569,7 +569,7 @@ if _is_classic:
 
     else:
         # PPO / SAC use the built-in skrl Runner
-        from gymnasium.vector import AsyncVectorEnv
+        from gymnasium.vector import SyncVectorEnv
         from skrl.envs.wrappers.torch import wrap_env
         from contractionRL.agents.skrl.runner import CLActorRunner as Runner
 
@@ -584,7 +584,7 @@ if _is_classic:
             _a["value_preprocessor_kwargs"] = None
 
         num_envs = args_cli.num_envs or 4
-        vec_env = AsyncVectorEnv([lambda: gym.make(args_cli.task)] * num_envs)
+        vec_env = SyncVectorEnv([lambda: gym.make(args_cli.task)] * num_envs)
         env = wrap_env(vec_env, wrapper="gymnasium")
 
         runner = Runner(env, agent_cfg)
