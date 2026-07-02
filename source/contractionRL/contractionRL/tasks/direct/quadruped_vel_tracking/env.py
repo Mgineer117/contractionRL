@@ -287,8 +287,8 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         cur_pos = self._robot.data.root_pos_w.clone()
         cur_pos[:, 2] += 0.5  # Same height
 
-        cmd_quat = self._vel_body_xy_to_arrow(cmds[:, :2])
-        cur_quat = self._vel_body_xy_to_arrow(self._robot.data.root_lin_vel_b[:, :2])
+        cmd_quat = self._vel_world_xy_to_arrow(cmds[:, :2])
+        cur_quat = self._vel_world_xy_to_arrow(self._robot.data.root_lin_vel_w[:, :2])
 
         cmd_translations, cmd_orientations, cmd_indices = self._arrow_parts(cmd_pos, cmd_quat)
         cur_translations, cur_orientations, cur_indices = self._arrow_parts(cur_pos, cur_quat)
@@ -305,16 +305,8 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
             translations=cur_translations, orientations=cur_orientations, scales=cur_scale, marker_indices=cur_indices
         )
 
-    def _vel_body_xy_to_arrow(self, vel_body_xy: torch.Tensor) -> torch.Tensor:
-        """Body-frame XY velocity → world-frame arrow quaternion (wxyz)."""
-        q = self._robot.data.root_quat_w  # (N, 4) w,x,y,z
-        yaw = torch.atan2(
-            2.0 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
-            1.0 - 2.0 * (q[:, 2] ** 2 + q[:, 3] ** 2),
-        )
-        cy, sy = torch.cos(yaw), torch.sin(yaw)
-        vx_w = cy * vel_body_xy[:, 0] - sy * vel_body_xy[:, 1]
-        vy_w = sy * vel_body_xy[:, 0] + cy * vel_body_xy[:, 1]
-        angle = torch.atan2(vy_w, vx_w)
+    def _vel_world_xy_to_arrow(self, vel_world_xy: torch.Tensor) -> torch.Tensor:
+        """World-frame XY velocity → world-frame arrow quaternion (wxyz)."""
+        angle = torch.atan2(vel_world_xy[:, 1], vel_world_xy[:, 0])
         ha = angle * 0.5
         return torch.stack([torch.cos(ha), torch.zeros_like(ha), torch.zeros_like(ha), torch.sin(ha)], dim=-1)
