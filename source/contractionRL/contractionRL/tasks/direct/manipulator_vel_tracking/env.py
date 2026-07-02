@@ -147,10 +147,11 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
             lengths = self._episode_lengths_custom[env_ids]
             if (auc_vals > 0).any():
                 self.extras.setdefault("log", {})
-                self.extras["log"]["Episode/auc"] = auc_vals[auc_vals > 0].mean().item()
-                self.extras["log"]["Episode/discounted_return"] = disc_returns[auc_vals > 0].mean().item()
-                self.extras["log"]["Episode/undiscounted_return"] = undisc_returns[auc_vals > 0].mean().item()
-                self.extras["log"]["Episode/avg_reward_per_step"] = (undisc_returns[auc_vals > 0] / lengths[auc_vals > 0]).mean().item()
+                mask = auc_vals > 0
+                self.extras["log"]["Episode/auc"] = auc_vals[mask].mean()
+                self.extras["log"]["Episode/discounted_return"] = disc_returns[mask].mean()
+                self.extras["log"]["Episode/undiscounted_return"] = undisc_returns[mask].mean()
+                self.extras["log"]["Episode/avg_reward_per_step"] = (undisc_returns[mask] / lengths[mask]).mean()
             
             self._episode_discounted_returns[env_ids] = 0.0
             self._episode_undiscounted_returns[env_ids] = 0.0

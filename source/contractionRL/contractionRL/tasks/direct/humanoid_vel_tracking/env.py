@@ -50,7 +50,7 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[])
         self.scene.articulations["robot"] = self._robot
-        light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
+        light_cfg = sim_utils.DistantLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
@@ -134,10 +134,11 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
             lengths = self._episode_lengths_custom[env_ids]
             if (auc_vals > 0).any():
                 self.extras.setdefault("log", {})
-                self.extras["log"]["Episode/auc"] = auc_vals[auc_vals > 0].mean().item()
-                self.extras["log"]["Episode/discounted_return"] = disc_returns[auc_vals > 0].mean().item()
-                self.extras["log"]["Episode/undiscounted_return"] = undisc_returns[auc_vals > 0].mean().item()
-                self.extras["log"]["Episode/avg_reward_per_step"] = (undisc_returns[auc_vals > 0] / lengths[auc_vals > 0]).mean().item()
+                mask = auc_vals > 0
+                self.extras["log"]["Episode/auc"] = auc_vals[mask].mean()
+                self.extras["log"]["Episode/discounted_return"] = disc_returns[mask].mean()
+                self.extras["log"]["Episode/undiscounted_return"] = undisc_returns[mask].mean()
+                self.extras["log"]["Episode/avg_reward_per_step"] = (undisc_returns[mask] / lengths[mask]).mean()
             
             self._episode_discounted_returns[env_ids] = 0.0
             self._episode_undiscounted_returns[env_ids] = 0.0
