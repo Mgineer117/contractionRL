@@ -524,7 +524,7 @@ class C3MSkrlTrainer(Trainer):
                 else:
                     agent.track_data("C3M/lr/dynamics_lr", agent._dynamics_optimizer.param_groups[0]["lr"])
                     
-                if (epoch + 1) % log_interval == 0:
+                if (epoch + 1) % log_interval == 0 and getattr(agent, "writer", None) is not None:
                     agent.write_tracking_data(timestep=epoch - epochs, timesteps=timesteps)
 
         pbar = _tqdm.tqdm(range(timesteps), desc="C3M training", file=sys.stdout)
@@ -550,9 +550,13 @@ class C3MSkrlTrainer(Trainer):
                 if agent._neural_dynamics is not None:
                     postfix["dyn"] = f"{_last('Loss / C3M/dynamics/mse'):.3g}"
                 pbar.set_postfix(**postfix)
-                
-                # Write tracking data to wandb/tensorboard
-                agent.write_tracking_data(timestep=t, timesteps=timesteps)
+
+                # Write tracking data to wandb/tensorboard. The writer only
+                # exists when skrl resolved write_interval > 0 (auto =
+                # timesteps//100, so 0 for <100-step runs); guard so short runs
+                # and writer-less configs log to the progress bar without crashing.
+                if getattr(agent, "writer", None) is not None:
+                    agent.write_tracking_data(timestep=t, timesteps=timesteps)
 
         if agent._neural_dynamics is not None:
             dyn_path = os.path.join(agent.experiment_dir, "checkpoints", "dynamics.pt")

@@ -550,6 +550,10 @@ if _is_classic:
                 _wandb.log({tag: value}, step=timestep)
 
         _skrl_tb.SummaryWriter.add_scalar = _wandb_add_scalar
+    else:
+        # --no_wandb: override the YAML default (wandb: true) so the skrl agent
+        # does not call wandb.init() during agent.init().
+        agent_cfg["agent"].setdefault("experiment", {})["wandb"] = False
 
     if algorithm in _CONTRACTION_ALGOS:
         # Contraction algorithms use ContractionRunner
