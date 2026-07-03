@@ -31,6 +31,7 @@ from __future__ import annotations
 import copy
 import importlib
 import os
+import warnings
 
 import gymnasium as gym
 
@@ -50,6 +51,25 @@ _ENTRY_KEY: dict[str, str] = {
     "sdlqr": "skrl_sdlqr_cfg_entry_point",
     "temp":  "skrl_temp_cfg_entry_point",
 }
+
+
+def _filter_cfg_fields(cfg_dict: dict, dataclass_type, *, context: str) -> dict:
+    """Keep only keys that are declared fields of ``dataclass_type``.
+
+    Any other key is *not applied* to the agent/trainer — so instead of dropping
+    it silently (which is how config typos and stale sweep parameter names went
+    unnoticed), warn loudly with the ignored keys. ``class`` is expected to be
+    stripped by the caller and is never reported.
+    """
+    fields = dataclass_type.__dataclass_fields__
+    ignored = sorted(k for k in cfg_dict if k not in fields and k != "class")
+    if ignored:
+        warnings.warn(
+            f"[ContractionRunner] {context}: ignoring config key(s) not in "
+            f"{dataclass_type.__name__} (NOT applied to the algorithm): {ignored}",
+            stacklevel=2,
+        )
+    return {k: v for k, v in cfg_dict.items() if k in fields}
 
 
 def load_agent_cfg(task_id: str, algorithm: str, custom_path: str | None = None) -> dict:
@@ -313,6 +333,19 @@ class ContractionRunner:
         act_policy = models_cfg.get("policy", {}).get("network", [{}])[0].get("activations", "tanh")
         act_cmg = models_cfg.get("cmg", {}).get("network", [{}])[0].get("activations", "tanh")
 
+        # agent.actor_architecture: sweep-friendly override of the *policy* network
+        # spec (the CLActor's w1/w2 MLPs share these hidden layers; only their
+        # input/output sizes differ). Accepts a bare hidden-layer list
+        # (e.g. [256, 256]) or a dict {layers: [...], activations: "tanh"}.
+        # Popped here so it reaches model construction and does not trip the
+        # C3MCfg field filter. Only the policy net is affected — not the CMG.
+        actor_arch = agent_cfg.pop("actor_architecture", None)
+        if isinstance(actor_arch, dict):
+            hd_policy = actor_arch.get("layers", hd_policy)
+            act_policy = actor_arch.get("activations", act_policy)
+        elif actor_arch is not None:
+            hd_policy = list(actor_arch)
+
         # C3M is a certificate-based controller synthesis (not a stochastic-policy
         # RL method), so the CLActor should be deterministic by default — no
         # Gaussian log_std / sampling machinery. A config may still opt into the
@@ -346,9 +379,8 @@ class ContractionRunner:
             dyn_act = dyn_net.get("activations", "relu")
             models["dynamics"] = NeuralDynamics(x_dim, u_dim, hidden_dim=dyn_hd, activation=dyn_act, device=device)
 
-        cfg_fields = C3MCfg.__dataclass_fields__
         agent = C3MAgent(
-            cfg=C3MCfg(**{k: v for k, v in agent_cfg.items() if k in cfg_fields}),
+            cfg=C3MCfg(**_filter_cfg_fields(agent_cfg, C3MCfg, context="agent")),
             models=models,
             observation_space=obs_space,
             state_space=state_space,
@@ -360,9 +392,8 @@ class ContractionRunner:
             u_dim=u_dim,
         )
         trainer_cfg.setdefault("timesteps", 30000)
-        tcfg_fields = C3MTrainerCfg.__dataclass_fields__
         trainer = C3MSkrlTrainer(
-            cfg=C3MTrainerCfg(**{k: v for k, v in trainer_cfg.items() if k in tcfg_fields}),
+            cfg=C3MTrainerCfg(**_filter_cfg_fields(trainer_cfg, C3MTrainerCfg, context="trainer")),
             env=env,
             agents=agent,
         )

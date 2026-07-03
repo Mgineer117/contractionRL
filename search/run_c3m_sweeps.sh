@@ -42,8 +42,6 @@ parameters:
     distribution: log_uniform_values
     min: 1e-5
     max: 1e-3
-  agent.actor_architecture:
-    values: ["RL", "CL"]
   agent.cmg_updates_per_policy_update:
     values: [1, 5, 10, 30]
 

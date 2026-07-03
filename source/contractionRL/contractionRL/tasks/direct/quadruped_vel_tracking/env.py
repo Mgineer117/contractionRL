@@ -142,8 +142,13 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        # fell = self._robot.data.root_pos_w[:, 2] < self.cfg.base_height_min
-        fell = torch.zeros_like(time_out)
+        # Fall = base dropped too low OR body tilted past the limit. projected
+        # gravity z is -1 upright and rises toward 0/+1 as the base tilts, so
+        # ``> fall_grav_z_max`` (default -0.5) fires at ~>60 deg from upright —
+        # catches side/back falls that a height check alone would miss.
+        too_low = self._robot.data.root_pos_w[:, 2] < self.cfg.base_height_min
+        tilted = self._robot.data.projected_gravity_b[:, 2] > self.cfg.fall_grav_z_max
+        fell = too_low | tilted
         return fell, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):

@@ -78,7 +78,8 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     action_scale = 0.25
 
     # termination
-    base_height_min = 0.20  # [m]
+    base_height_min = 0.20     # [m] terminate if base drops below this
+    fall_grav_z_max = -0.5     # terminate if projected_gravity_b z rises above this (~>60 deg tilt)
 
     # initial-state randomisation (used by generate_ref_traj.py for trajectory diversity)
     randomize_init: bool = True

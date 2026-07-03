@@ -50,10 +50,18 @@ class C3MCfg(AgentCfg):
     batch_size: int = 1024
     W_lr: float = 3e-4
     u_lr: float = 3e-4
+    # Number of CMG (metric) gradient steps per controller step within each
+    # batch — read in _learn(). Must be a declared field or the runner's
+    # dataclass-field filter silently drops it (always defaulting to 1).
+    cmg_updates_per_policy_update: int = 1
+    # Alias for u_lr: some configs/sweeps name the controller LR "actor_lr".
+    # When set (non-None), __post_init__ copies it into u_lr so both spellings
+    # take effect instead of being silently ignored.
+    actor_lr: float | None = None
     lbd: float = 1e-2
     eps: float = 1e-2
     w_ub: float = 10.0
-    w_lb: float = 1e-1
+    w_lb: float = 0.1
     # Fraction of training (by progress, 0-1) during which the metric M is held
     # fixed (detached) in the contraction term Cu, mirroring the reference C3M
     # script's `detach=True if epoch < lr_step else False` warmup (5 of 15
@@ -70,6 +78,11 @@ class C3MCfg(AgentCfg):
     dynamics_batch_size: int = 4096
     dynamics_pretrain_epochs: int = 5
     dynamics_pretrain_data_path: str = ""
+
+    def __post_init__(self):
+        # "actor_lr" is an accepted alias for the controller learning rate u_lr.
+        if self.actor_lr is not None:
+            self.u_lr = self.actor_lr
 
 
 @dataclass
@@ -328,7 +341,8 @@ class C3MAgent(Agent):
             os_loss = torch.zeros((), device=device)
         else:
             overshoot = W - cfg.w_ub * I
-            os_loss = loss_pos_matrix_random_sampling(-overshoot)
+            undershoot = cfg.w_lb * I - W
+            os_loss = loss_pos_matrix_random_sampling(-overshoot) + loss_pos_matrix_random_sampling(-undershoot)
 
         loss = os_loss + pd_loss + c1_loss + c2_loss
         return loss, {"pd_loss": pd_loss.item(), "c1_loss": c1_loss.item(), "c2_loss": c2_loss.item()}
@@ -367,7 +381,7 @@ class C3MAgent(Agent):
             idx = indices[b * batch_size : (b + 1) * batch_size]
             
             # CMG (metric) updates holding controller fixed
-            for _ in range(getattr(cfg, "cmg_updates_per_policy_update", 1)):
+            for _ in range(cfg.cmg_updates_per_policy_update):
                 loss, infos = self._compute_loss(idx)
                 self._optimize_params(loss, self._w_optimizer, self._ccm_gen)
                 
