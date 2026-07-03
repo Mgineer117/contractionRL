@@ -148,7 +148,7 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
         return
 
     out_dir = os.path.join(_ROOT, "logs", robot)
-    out_path = os.path.join(out_dir, "ref_trajs.npz")
+    out_path = os.path.join(out_dir, "dynamics_data.npz")
     min_reward = args_cli.min_ref_quality if args_cli.min_ref_quality is not None \
         else _MIN_QUALITY_REWARD.get(robot, 750.0)
 
@@ -233,29 +233,38 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
     unwrapped = isaac_env.unwrapped
     num_envs = skrl_env.num_envs
     import tqdm
-    all_states, all_actions, all_pos = [], [], []
+    all_states, all_actions, all_pos, all_lengths = [], [], [], []
     if hasattr(skrl_env, "_reset_once"):
         skrl_env._reset_once = True
     obs_dict, _ = skrl_env.reset()
     obs = _get_obs(obs_dict)
-    
+
+    # Action-space bounds for clipping. The policy samples with clip_actions
+    # False (clipping inside the actor corrupts the log-prob used by PPO), but
+    # the env/actuators saturate out-of-range commands — so data must record
+    # the *clipped* action, and we step with that same clipped action so the
+    # recorded u is exactly the executed u (unbiased (x, u, x_dot) triples).
+    _act_low = torch.as_tensor(skrl_env.action_space.low, dtype=torch.float32, device=skrl_env.device)
+    _act_high = torch.as_tensor(skrl_env.action_space.high, dtype=torch.float32, device=skrl_env.device)
+
     # Pre-allocate tensors to avoid massive python list overhead
     with torch.no_grad():
         actions, _ = agent.act(obs, None, timestep=0, timesteps=0)
     state_tensor = unwrapped.get_physical_state()
     state_dim = state_tensor.shape[1]
     u_dim = actions.shape[1]
-    
+
     ep_states = torch.zeros((num_envs, T, state_dim), dtype=torch.float32, device=skrl_env.device)
     ep_actions = torch.zeros((num_envs, T, u_dim), dtype=torch.float32, device=skrl_env.device)
     ep_pos = torch.zeros((num_envs, T, 3), dtype=torch.float32, device=skrl_env.device)
     step_counts = torch.zeros(num_envs, dtype=torch.long, device=skrl_env.device)
-    
+
     pbar = tqdm.tqdm(total=num_trajs, desc="[RefTraj] Collecting")
 
     while len(all_states) < num_trajs:
         with torch.no_grad():
             actions, _ = agent.act(obs, None, timestep=0, timesteps=0)
+        actions = torch.clamp(actions, _act_low, _act_high)
         state_tensor = unwrapped.get_physical_state()
         
         # Record state and action for envs that are still within T steps
@@ -293,12 +302,14 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
                 s_np = ep_states[success_indices].cpu().numpy()
                 a_np = ep_actions[success_indices].cpu().numpy()
                 p_np = ep_pos[success_indices].cpu().numpy()
+                l_np = step_counts[success_indices].cpu().numpy()
                 for i in range(len(success_indices)):
                     if len(all_states) >= num_trajs:
                         break
                     all_states.append(s_np[i])
                     all_actions.append(a_np[i])
                     all_pos.append(p_np[i])
+                    all_lengths.append(int(l_np[i]))
                     pbar.update(1)
             
             # Reset the step counts for all finished environments
@@ -308,10 +319,9 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
     states_arr = np.stack(all_states[:num_trajs]).astype(np.float32)
     actions_arr = np.stack(all_actions[:num_trajs]).astype(np.float32)
     pos_arr = np.stack(all_pos[:num_trajs]).astype(np.float32)
-    
+    lengths_arr = np.asarray(all_lengths[:num_trajs], dtype=np.int64)
+
     os.makedirs(out_dir, exist_ok=True)
-    np.savez_compressed(out_path, states=states_arr, actions=actions_arr)
-    print(f"\n[RefTraj] Saved → {out_path}  states{states_arr.shape}  actions{actions_arr.shape}")
     
     # Plot absolute position of 10 sampled trajectories
     try:
@@ -351,13 +361,160 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
         states_arr = states_arr[valid_mask]
         actions_arr = actions_arr[valid_mask]
         x_dot_arr = x_dot_arr[valid_mask]
-    
+        lengths_arr = lengths_arr[valid_mask]
+
+    # Single unified file: reference trajectories ARE the (x, u) part of the
+    # dynamics data, so there is no separate ref_trajs.npz anymore.
+    #   x       (N, T, x_dim)  physical states; steps >= lengths[n] are padding
+    #                          (the last valid state repeated, keeping x_dot ~ 0)
+    #   u       (N, T, u_dim)  executed (clipped) actions, same padding rule
+    #   x_dot   (N, T, x_dim)  4th-order central differences of x
+    #   lengths (N,)           number of VALID steps per trajectory — consumers
+    #                          mask with arange(T) < lengths[:, None]
     dyn_path = os.path.join(out_dir, "dynamics_data.npz")
-    np.savez_compressed(dyn_path, x=states_arr, u=actions_arr, x_dot=x_dot_arr)
+    np.savez_compressed(dyn_path, x=states_arr, u=actions_arr, x_dot=x_dot_arr, lengths=lengths_arr)
     print(f"[RefTraj] Saved dynamics  → {dyn_path}")
-    print(f"       x      shape: {states_arr.shape}")
-    print(f"       u      shape: {actions_arr.shape}")
-    print(f"       x_dot  shape: {x_dot_arr.shape}")
+    print(f"       x       shape: {states_arr.shape}")
+    print(f"       u       shape: {actions_arr.shape}   (clipped to action-space bounds)")
+    print(f"       x_dot   shape: {x_dot_arr.shape}")
+    print(f"       lengths shape: {lengths_arr.shape}  (min {lengths_arr.min()}, max {lengths_arr.max()})")
+
+
+def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, num_groups: int = 10):
+    """Post-training evaluation of the BEST checkpoint (CAC-dev style).
+
+    Loads best_agent.pt, disables fall termination (episodes always run the
+    full length so metrics are comparable across policies), rolls out one full
+    episode in every parallel env with deterministic (mean) actions clipped to
+    the action space, and reports mean +/- 95% CI of:
+
+      * total reward
+      * AUC of the velocity-tracking error (trapezoid, dt-weighted)
+      * contraction rate lambda and overshoot C — the exponential envelope
+        C * exp(-lambda * k * dt) bounding the normalized error curves with
+        minimal envelope AUC (= C/lambda), fitted per env-group (CAC-dev
+        trainer/evaluator.py compute_contraction_rate).
+
+    Results are printed, logged to wandb (if active), and saved as
+    eval_results.json next to the checkpoints.
+    """
+    import json
+
+    import numpy as np
+    import torch
+
+    from contractionRL.agents.skrl.eval_metrics import (
+        fit_exponential_envelope,
+        mean_confidence_interval,
+    )
+
+    agent = runner.agent
+    best_ckpt = os.path.join(agent.experiment_dir, "checkpoints", "best_agent.pt")
+    if os.path.exists(best_ckpt):
+        print(f"[Eval] Loading best checkpoint: {best_ckpt}")
+        agent.load(best_ckpt)
+    else:
+        print("[Eval] WARNING: best_agent.pt not found; evaluating final weights.")
+    for model in agent.models.values():
+        if model is not None:
+            model.eval()
+
+    unwrapped = isaac_env.unwrapped
+    dt = env_cfg.sim.dt * env_cfg.decimation
+    T = int(env_cfg.episode_length_s / dt)
+    num_envs = skrl_env.num_envs
+
+    if not hasattr(unwrapped, "get_tracking_error"):
+        print(f"[Eval] SKIPPED — env {type(unwrapped).__name__} has no get_tracking_error().")
+        return
+
+    _act_low = torch.as_tensor(skrl_env.action_space.low, dtype=torch.float32, device=skrl_env.device)
+    _act_high = torch.as_tensor(skrl_env.action_space.high, dtype=torch.float32, device=skrl_env.device)
+
+    # Non-terminating evaluation: flip the cfg flag (read every step by
+    # _get_dones) and restore afterwards.
+    prev_flag = getattr(unwrapped.cfg, "terminate_on_fall", True)
+    unwrapped.cfg.terminate_on_fall = False
+    try:
+        if hasattr(skrl_env, "_reset_once"):
+            skrl_env._reset_once = True
+        obs_dict, _ = skrl_env.reset()
+        obs = obs_dict["policy"] if isinstance(obs_dict, dict) else obs_dict
+
+        total_reward = torch.zeros(num_envs, device=skrl_env.device)
+        errors = torch.zeros(num_envs, T + 1, device=skrl_env.device)
+        errors[:, 0] = unwrapped.get_tracking_error()
+
+        print(f"[Eval] Rolling out {num_envs} non-terminating episodes of {T} steps …")
+        for k in range(T):
+            with torch.no_grad():
+                # deterministic (mean) actions, clipped — the deployed controller
+                inputs = {"observations": agent._observation_preprocessor(obs)}
+                _, outputs = agent.policy.act(inputs, role="policy")
+                actions = torch.clamp(outputs["mean_actions"], _act_low, _act_high)
+            obs_dict, rewards, terminated, truncated, _ = skrl_env.step(actions)
+            obs = obs_dict["policy"] if isinstance(obs_dict, dict) else obs_dict
+            total_reward += rewards.squeeze(-1)
+            errors[:, k + 1] = unwrapped.get_tracking_error()
+    finally:
+        unwrapped.cfg.terminate_on_fall = prev_flag
+
+    err_np = errors.cpu().numpy()  # (N, T+1)
+    rew_np = total_reward.cpu().numpy()
+
+    # AUC over the raw error curve (dt-weighted trapezoid), per episode
+    auc_np = np.trapezoid(err_np, dx=dt, axis=1)
+
+    # Contraction envelope on NORMALIZED error e(t)/e(0) — CAC-dev convention.
+    # Envs whose initial error is ~0 (near-zero commanded velocity) carry no
+    # contraction information and are excluded from the fit.
+    e0 = err_np[:, 0]
+    fit_mask = e0 > 0.05
+    C_list, lbd_list = [], []
+    fit_ids = np.nonzero(fit_mask)[0]
+    if len(fit_ids) >= num_groups:
+        groups = np.array_split(fit_ids, num_groups)
+        for g in groups:
+            norm_trajs = [err_np[i, 1:] / e0[i] for i in g]
+            C, lbd = fit_exponential_envelope(norm_trajs, dt)
+            C_list.append(C)
+            lbd_list.append(lbd)
+    else:
+        print(f"[Eval] WARNING: only {len(fit_ids)} envs with e(0) > 0.05; skipping contraction fit.")
+
+    rew_mean, rew_ci = mean_confidence_interval(rew_np)
+    auc_mean, auc_ci = mean_confidence_interval(auc_np)
+    results = {
+        "checkpoint": best_ckpt if os.path.exists(best_ckpt) else "final",
+        "num_episodes": int(num_envs),
+        "episode_steps": int(T),
+        "total_reward_mean": rew_mean, "total_reward_ci95": rew_ci,
+        "auc_mean": auc_mean, "auc_ci95": auc_ci,
+    }
+    if C_list:
+        C_mean, C_ci = mean_confidence_interval(C_list)
+        lbd_mean, lbd_ci = mean_confidence_interval(lbd_list)
+        results.update({
+            "overshoot_mean": C_mean, "overshoot_ci95": C_ci,
+            "contraction_rate_mean": lbd_mean, "contraction_rate_ci95": lbd_ci,
+            "num_fit_groups": len(C_list),
+        })
+
+    print("[Eval] ── Best-model evaluation (non-terminating) ──")
+    print(f"[Eval] total reward     : {rew_mean:.2f} ± {rew_ci:.2f} (95% CI, n={num_envs})")
+    print(f"[Eval] error AUC        : {auc_mean:.4f} ± {auc_ci:.4f}")
+    if C_list:
+        print(f"[Eval] overshoot C      : {C_mean:.3f} ± {C_ci:.3f}")
+        print(f"[Eval] contraction rate : {lbd_mean:.4f} ± {lbd_ci:.4f}  (C·e^(−λkΔt), min AUC)")
+
+    out_json = os.path.join(agent.experiment_dir, "eval_results.json")
+    with open(out_json, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"[Eval] Saved → {out_json}")
+
+    if not args_cli.no_wandb and "wandb" in sys.modules and sys.modules["wandb"].run is not None:
+        sys.modules["wandb"].log({f"final_eval/{k}": v for k, v in results.items()
+                                  if isinstance(v, (int, float))})
 
 
 def _patch_kl_logging(agent) -> None:
@@ -417,18 +574,39 @@ def _patch_sac_entropy_clamp(agent, min_log_alpha: float = -5.0, max_log_alpha: 
 
     entropy_optimizer.step = _step
 
-def _patch_ppo_std_annealing(agent, std_dev_annealing: bool) -> None:
+def _patch_ppo_std_annealing(agent, std_dev_annealing: bool, kwargs: dict | None = None) -> None:
     """Adds manual standard deviation annealing to SKRL's PPO policy.
-    
+
     If `std_dev_annealing` is True, this disables the entropy loss entirely
-    (setting entropy_loss_scale to 0.0) and linearly anneals the policy's
-    log_std_parameter from its initial value down to its configured minimum
-    (min_log_std) over the total training timesteps.
+    (setting entropy_loss_scale to 0.0) and anneals the policy's
+    log_std_parameter from its initial value down to `final_log_std` over the
+    total training timesteps, following the chosen schedule.
+
+    YAML usage::
+
+        agent:
+          std_dev_annealing: True
+          std_dev_annealing_kwargs:
+            schedule: exponential   # linear | exponential | cosine
+            final_log_std: -2.3     # target log_std (std ~= 0.1)
+            power: 5.0              # exponential only: progress**power
+
+    Schedules (p = timestep/timesteps in [0, 1]):
+      linear:       log_std = init + p * (final - init)
+      exponential:  log_std = init + p**power * (final - init)  — slow early,
+                    fast late; keeps exploration wide for most of training
+      cosine:       log_std = init + (1 - cos(pi*p))/2 * (final - init)
     """
     if not std_dev_annealing:
         return
+    kwargs = dict(kwargs or {})
+    schedule = str(kwargs.pop("schedule", "linear")).lower()
+    final_log_std = float(kwargs.pop("final_log_std", -2.0))
+    power = float(kwargs.pop("power", 5.0))
+    if kwargs:
+        logger.warning(f"std_dev_annealing_kwargs: ignoring unknown keys {sorted(kwargs)}")
 
-    # Ignore entropy
+    # Ignore entropy: annealing and entropy bonus fight each other
     if hasattr(agent, "_cfg") and isinstance(agent._cfg, dict):
         agent._cfg["entropy_loss_scale"] = 0.0
     if hasattr(agent, "cfg"):
@@ -443,14 +621,21 @@ def _patch_ppo_std_annealing(agent, std_dev_annealing: bool) -> None:
     # Disable gradients on log_std_parameter because we update it manually
     agent.policy.log_std_parameter.requires_grad_(False)
 
+    import math as _math
     initial_log_std = agent.policy.log_std_parameter.mean().item()
-    final_log_std = getattr(agent.policy, "_g_min_log_std", -2.0)
+
+    def _ratio(p: float) -> float:
+        if schedule == "exponential":
+            return p ** power
+        if schedule == "cosine":
+            return (1.0 - _math.cos(_math.pi * p)) / 2.0
+        return p  # linear
 
     _orig_post = agent.post_interaction
 
     def _annealed_post(*, timestep: int, timesteps: int) -> None:
         progress = min(1.0, max(0.0, timestep / max(1, timesteps)))
-        current_log_std = initial_log_std + progress * (final_log_std - initial_log_std)
+        current_log_std = initial_log_std + _ratio(progress) * (final_log_std - initial_log_std)
         agent.policy.log_std_parameter.data.fill_(current_log_std)
         _orig_post(timestep=timestep, timesteps=timesteps)
 
@@ -532,7 +717,7 @@ if _is_classic:
         # If a sweep is running, init early to retrieve hyperparams and inject into agent_cfg
         if "WANDB_SWEEP_ID" in os.environ:
             if _wandb.run is None:
-                _wandb.init(project=_wkw["project"], name=_wkw["name"], sync_tensorboard=False)
+                _wandb.init(project=_wkw["project"], name=_wkw.get("name"), sync_tensorboard=False)
             for k, v in _wandb.config.items():
                 keys = k.split('.')
                 curr = agent_cfg
@@ -889,10 +1074,12 @@ else:
         _a.pop("anneal_stddev", None)   # no longer a PPO_CFG field; handled below
         _a.pop("anneal_log_std", None)
         _std_dev_annealing = _a.pop("std_dev_annealing", False)
+        _std_dev_annealing_kwargs = _a.pop("std_dev_annealing_kwargs", None)
 
-        # Auto-enable stddev annealing when policy uses the contraction backbone
+        # Auto-enable stddev annealing when policy uses the CLActor backbone
+        # ("control", with "contraction" kept as a backward-compatible alias)
         _is_contraction = (
-            agent_cfg.get("models", {}).get("policy", {}).get("backbone") == "contraction"
+            agent_cfg.get("models", {}).get("policy", {}).get("backbone") in ("control", "contraction")
         )
 
         if _alg in _CONTRACTION_ALGOS:
@@ -903,7 +1090,7 @@ else:
 
         _patch_kl_logging(runner.agent)
         _patch_sac_entropy_clamp(runner.agent)
-        _patch_ppo_std_annealing(runner.agent, _std_dev_annealing)
+        _patch_ppo_std_annealing(runner.agent, _std_dev_annealing, _std_dev_annealing_kwargs)
 
         if _is_contraction and hasattr(runner.agent, "policy") and hasattr(runner.agent.policy, "cl_actor"):
             _orig_post = runner.agent.post_interaction
@@ -927,6 +1114,13 @@ else:
             _wandb_video_thread.join(timeout=120)
 
         if "VelTracking" in (args_cli.task or ""):
+            _evaluate_best_model(
+                task=args_cli.task,
+                runner=runner,
+                isaac_env=_isaac_env,
+                skrl_env=env,
+                env_cfg=env_cfg,
+            )
             _generate_ref_trajs(
                 task=args_cli.task,
                 runner=runner,
@@ -944,3 +1138,5 @@ else:
         main()
         if not _is_classic:
             simulation_app.close()
+            import os
+            os._exit(0)

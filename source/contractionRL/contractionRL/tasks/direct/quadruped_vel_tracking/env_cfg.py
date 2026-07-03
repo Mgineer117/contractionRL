@@ -80,6 +80,10 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     action_scale = 0.25
 
     # termination
+    # terminate_on_fall: training uses fall termination; the post-training
+    # evaluator flips this to False at runtime so episodes always run the full
+    # length (metrics comparable across policies regardless of fall behavior).
+    terminate_on_fall: bool = True
     base_height_min = 0.20     # [m] terminate if base drops below this
     # -0.71 ≈ -cos(45°): terminate beyond ~45° tilt. The previous -0.5 (~60°)
     # left a loophole — a robot crouched at 40-55° never terminated and sat

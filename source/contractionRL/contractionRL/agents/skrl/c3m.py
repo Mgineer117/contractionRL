@@ -479,6 +479,7 @@ class C3MSkrlTrainer(Trainer):
                 
                 # Check for NaNs in current offline data
                 nan_mask = np.isnan(npz["x"]).any(axis=(1, 2)) | np.isnan(npz["u"]).any(axis=(1, 2)) | np.isnan(npz["x_dot"]).any(axis=(1, 2))
+                lengths_arr = npz["lengths"] if "lengths" in npz else None
                 if nan_mask.any():
                     num_nans = nan_mask.sum()
                     print(f"[C3M] WARNING: Found NaNs in {num_nans} offline episodes! Filtering them out...")
@@ -486,11 +487,25 @@ class C3MSkrlTrainer(Trainer):
                     x_arr = npz["x"][valid_mask]
                     u_arr = npz["u"][valid_mask]
                     x_dot_arr = npz["x_dot"][valid_mask]
+                    if lengths_arr is not None:
+                        lengths_arr = lengths_arr[valid_mask]
                 else:
                     x_arr = npz["x"]
                     u_arr = npz["u"]
                     x_dot_arr = npz["x_dot"]
-                    
+
+                # Unpack (N, T, S) trajectories into flat (n, S) samples. When a
+                # `lengths` array is present, steps >= lengths[n] are padding
+                # (the last valid state repeated) — mask them out so the
+                # dynamics fit isn't biased toward artificial x_dot ~ 0 samples.
+                if lengths_arr is not None:
+                    T_len = x_arr.shape[1]
+                    step_mask = np.arange(T_len)[None, :] < lengths_arr[:, None]  # (N, T)
+                    x_arr = x_arr[step_mask]          # (sum(lengths), x_dim)
+                    u_arr = u_arr[step_mask]
+                    x_dot_arr = x_dot_arr[step_mask]
+                    print(f"[C3M] Unpacked {step_mask.sum()} valid samples from {step_mask.shape[0]} trajectories (padding masked)")
+
                 x = torch.from_numpy(x_arr).reshape(-1, x_arr.shape[-1]).to(torch.float32).to(dev)
                 u = torch.from_numpy(u_arr).reshape(-1, u_arr.shape[-1]).to(torch.float32).to(dev)
                 x_dot = torch.from_numpy(x_dot_arr).reshape(-1, x_dot_arr.shape[-1]).to(torch.float32).to(dev)

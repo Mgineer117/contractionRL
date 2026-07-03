@@ -29,7 +29,7 @@ class HumanoidPathTrackingEnvCfg(DirectRLEnvCfg):
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=num_envs, env_spacing=4.0, replicate_physics=True)
 
     action_scale = 0.25
-    traj_path: str = "logs/humanoid/ref_trajs.npz"
+    traj_path: str = "logs/humanoid/dynamics_data.npz"
     base_height_min = 0.50
 
     # uniform joint-position noise added to x_ref[0] at reset [rad]

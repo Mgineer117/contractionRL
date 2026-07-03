@@ -14,7 +14,7 @@ seed: 42
 # Models are instantiated using skrl's model instantiator utility
 # https://skrl.readthedocs.io/en/latest/api/utils/model_instantiators.html
 models:
-  separate: False
+  separate: True
   policy:  # see gaussian_model parameters
     class: GaussianMixin
     clip_actions: False
@@ -26,7 +26,7 @@ models:
       - name: net
         input: OBSERVATIONS
         layers: [128, 128, 128]
-        activations: elu
+        activations: tanh
     output: ACTIONS
   value:  # see deterministic_model parameters
     class: DeterministicMixin
@@ -35,7 +35,7 @@ models:
       - name: net
         input: OBSERVATIONS
         layers: [128, 128, 128]
-        activations: elu
+        activations: tanh
     output: ONE
 
 
@@ -58,22 +58,22 @@ agent:
   learning_rate: 1.0e-03
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.01
+    kl_threshold: 0.008
   state_preprocessor: null
   state_preprocessor_kwargs: null
   value_preprocessor: null
   value_preprocessor_kwargs: null
   random_timesteps: 0
   learning_starts: 0
-  grad_norm_clip: 1.0
+  grad_norm_clip: 0.5
   ratio_clip: 0.2
-  value_clip: 0.2
-  clip_predicted_values: True
+  value_clip: 0.0
+  clip_predicted_values: False
   entropy_loss_scale: 0.01
-  value_loss_scale: 1.0
-  kl_threshold: 0.0
+  value_loss_scale: 0.5
+  kl_threshold: 0.016
   rewards_shaper_scale: 1.0
-  time_limit_bootstrap: False
+  time_limit_bootstrap: True
   # logging and checkpoint
   experiment:
     directory: "quadruped_vel_tracking"

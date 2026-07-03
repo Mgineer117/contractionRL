@@ -4,7 +4,7 @@ YAML policy config:
 
     policy:
       class: GaussianMixin
-      backbone: contraction       # CLActor (W2 @ tanh(W1 @ (x-x_ref)))
+      backbone: control           # CLActor (W2 @ tanh(W1 @ (x-x_ref))); alias: contraction
       clip_log_std: True
       min_log_std: -4.605
       max_log_std: 2.0
@@ -36,7 +36,9 @@ from skrl.utils.runner.torch import Runner
 
 def _gaussian_factory(observation_space, state_space, action_space, device,
                        backbone: str = "mlp", **kwargs):
-    if backbone == "contraction":
+    # "control" is the preferred spelling for the CLActor backbone;
+    # "contraction" is kept as a backward-compatible alias.
+    if backbone in ("control", "contraction"):
         import gymnasium
         obs_dim = observation_space.shape[0]
         act_dim = action_space.shape[0]

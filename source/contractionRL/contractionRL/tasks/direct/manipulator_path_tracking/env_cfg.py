@@ -31,4 +31,4 @@ class ManipulatorPathTrackingEnvCfg(DirectRLEnvCfg):
     arm_joint_names = ["panda_joint[1-7]"]
     ee_body_name = "panda_hand"
 
-    traj_path: str = "logs/manipulator/ref_trajs.npz"
+    traj_path: str = "logs/manipulator/dynamics_data.npz"

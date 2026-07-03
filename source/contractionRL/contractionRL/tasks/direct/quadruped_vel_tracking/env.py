@@ -140,6 +140,17 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         
         return total_reward 
 
+    def get_tracking_error(self) -> torch.Tensor:
+        """Current velocity-tracking error norm per env, (N,).
+
+        Same integrand as the Episode/auc metric: body-frame xy velocity error
+        against the commanded velocity. Used by the post-training evaluator to
+        fit the exponential contraction envelope.
+        """
+        t = self.episode_length_buf.float() * self.step_dt
+        cmds = self._cmd.get(t)
+        return torch.norm(cmds[:, :2] - self._robot.data.root_lin_vel_b[:, :2], dim=-1)
+
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         # Fall = base dropped too low OR body tilted past the limit. projected
@@ -149,6 +160,8 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         too_low = self._robot.data.root_pos_w[:, 2] < self.cfg.base_height_min
         tilted = self._robot.data.projected_gravity_b[:, 2] > self.cfg.fall_grav_z_max
         fell = too_low | tilted
+        if not getattr(self.cfg, "terminate_on_fall", True):
+            fell = torch.zeros_like(time_out)
         return fell, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
