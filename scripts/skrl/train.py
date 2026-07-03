@@ -521,7 +521,7 @@ if _is_classic:
         import skrl.utils.tensorboard as _skrl_tb
         import wandb as _wandb
 
-        agent_cfg["agent"]["experiment"]["wandb"] = True
+        agent_cfg["agent"]["experiment"]["wandb"] = ("WANDB_SWEEP_ID" not in os.environ)
         _wkw = agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})
         _wkw["project"] = args_cli.wandb_project
         _wkw["sync_tensorboard"] = False
@@ -531,7 +531,8 @@ if _is_classic:
 
         # If a sweep is running, init early to retrieve hyperparams and inject into agent_cfg
         if "WANDB_SWEEP_ID" in os.environ:
-            _wandb.init(project=_wkw["project"], name=_wkw["name"])
+            if _wandb.run is None:
+                _wandb.init(project=_wkw["project"], name=_wkw["name"])
             for k, v in _wandb.config.items():
                 keys = k.split('.')
                 curr = agent_cfg
@@ -570,6 +571,9 @@ if _is_classic:
             runner.load(args_cli.checkpoint)
         runner.run()
         env.close()
+        
+        if not args_cli.no_wandb and 'wandb' in sys.modules and sys.modules['wandb'].run is not None:
+            sys.modules['wandb'].finish()
 
     else:
         # PPO / SAC use the built-in skrl Runner
@@ -598,6 +602,9 @@ if _is_classic:
             runner.agent.load(args_cli.checkpoint)
         runner.run()
         env.close()
+        
+        if not args_cli.no_wandb and 'wandb' in sys.modules and sys.modules['wandb'].run is not None:
+            sys.modules['wandb'].finish()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -733,7 +740,7 @@ else:
             import skrl.utils.tensorboard as _skrl_tb
             import wandb as _wandb
 
-            agent_cfg["agent"]["experiment"]["wandb"] = True
+            agent_cfg["agent"]["experiment"]["wandb"] = ("WANDB_SWEEP_ID" not in os.environ)
             agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})["sync_tensorboard"] = False
             _orig_add_scalar = _skrl_tb.SummaryWriter.add_scalar
 
@@ -906,6 +913,9 @@ else:
             )
 
         env.close()
+        
+        if not args_cli.no_wandb and 'wandb' in sys.modules and sys.modules['wandb'].run is not None:
+            sys.modules['wandb'].finish()
 
     if __name__ == "__main__":
         main()

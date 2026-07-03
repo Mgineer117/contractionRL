@@ -144,7 +144,8 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        fell = self._robot.data.root_pos_w[:, 2] < self.cfg.base_height_min
+        # fell = self._robot.data.root_pos_w[:, 2] < self.cfg.base_height_min
+        fell = torch.zeros_like(time_out)
         return fell, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
