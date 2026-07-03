@@ -241,6 +241,7 @@ class C3MAgent(Agent):
         self._progress = float(timestep) / max(1, timesteps)
 
         # 1. Online NeuralDynamics training (skipped when analytical)
+        dyn_loss = None
         if self._neural_dynamics is not None:
             dyn_data = self._get_rollout(self._cfg.dynamics_batch_size, "dynamics")
             dyn_loss = self._train_dynamics(dyn_data)
@@ -253,6 +254,12 @@ class C3MAgent(Agent):
         loss_dict = self._learn()
         for k, v in loss_dict.items():
             self.track_data(f"Loss / {k}", v)
+        # Keep the latest losses on the agent so the trainer's progress-bar
+        # postfix can read them even after post_interaction → write_tracking_data
+        # clears tracking_data (otherwise the bar shows a spurious "nan").
+        self._last_metrics = dict(loss_dict)
+        if dyn_loss is not None:
+            self._last_metrics["C3M/dynamics/mse"] = dyn_loss
 
     # ── Contraction math (inlined from mjrl C3M) ───────────────────────── #
 
@@ -540,15 +547,16 @@ class C3MSkrlTrainer(Trainer):
                     agent.track_data(f"Eval / {k}", v)
 
             if log_interval and (t + 1) % log_interval == 0:
-                def _last(key):
-                    v = agent.tracking_data.get(key, [float("nan")])
-                    return v[-1] if isinstance(v, list) else float(v)
+                # Read the losses captured on the agent by update(); tracking_data
+                # may already be cleared by post_interaction → write_tracking_data,
+                # which would otherwise make _last() return a spurious nan.
+                metrics = getattr(agent, "_last_metrics", {})
                 postfix = dict(
-                    loss=f"{_last('Loss / C3M/loss/loss'):.3g}",
-                    pd=f"{_last('Loss / C3M/loss/pd_loss'):.3g}",
+                    loss=f"{metrics.get('C3M/loss/loss', float('nan')):.3g}",
+                    pd=f"{metrics.get('C3M/loss/pd_loss', float('nan')):.3g}",
                 )
                 if agent._neural_dynamics is not None:
-                    postfix["dyn"] = f"{_last('Loss / C3M/dynamics/mse'):.3g}"
+                    postfix["dyn"] = f"{metrics.get('C3M/dynamics/mse', float('nan')):.3g}"
                 pbar.set_postfix(**postfix)
 
                 # Write tracking data to wandb/tensorboard. The writer only

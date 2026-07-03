@@ -30,7 +30,11 @@ class VelCmdCfg:
     # of continuous uniform — e.g. lo=0.0 (constant yaw rate, no oscillation)
     # vs hi=one-cycle-per-episode, with nothing in between.
     yaw_omega_binary: bool = False
-    # phi sampled from [0, 2π] uniformly
+    # phase phi [rad] sampled uniformly from this range. Default (0, 2π) keeps the
+    # original random-start behavior; set to (0.0, 0.0) to start every episode at
+    # zero yaw rate (a deterministic S-weave that returns to the initial heading
+    # after exactly one full cycle).
+    yaw_phase_range: tuple[float, float] = (0.0, 2.0 * math.pi)
 
 
 class VelCommands:
@@ -80,7 +84,8 @@ class VelCommands:
             self.yaw_omega[env_ids] = lo + choice * (hi - lo)
         else:
             self.yaw_omega[env_ids] = _u(lo, hi)
-        self.yaw_phi[env_ids] = _u(0.0, 2.0 * math.pi)
+        lo, hi = self.cfg.yaw_phase_range
+        self.yaw_phi[env_ids] = _u(lo, hi)
 
     def get(self, episode_time: torch.Tensor) -> torch.Tensor:
         """

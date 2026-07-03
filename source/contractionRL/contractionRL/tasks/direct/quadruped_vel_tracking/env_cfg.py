@@ -59,19 +59,21 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
         resolution=(1920, 1080),
     )
 
-    # velocity commands
-    # yaw_omega_binary: each episode gets EXACTLY 0.0 (constant yaw rate,
-    # sin(phi) with omega=0 → no oscillation, just a random-but-fixed turn
-    # rate) or EXACTLY 2*pi/episode_length_s (one full, gentle S-turn sine
-    # cycle over the whole episode) — never an in-between frequency.
+    # velocity commands: forward speed along the *current heading* + a sinusoidal
+    # yaw rate. The command distribution has exactly two sampled dimensions —
+    # forward speed (vx) and yaw-rate amplitude (yaw_A). vy/vz are pinned to 0 so
+    # the linear command is purely along heading, and the yaw frequency is fixed
+    # to EXACTLY one full sine cycle per episode (omega = 2*pi/T), phase 0. Over
+    # one cycle the yaw integrates to zero, so the robot weaves left-then-right
+    # (an S) and returns to its initial heading.
     vel_cmd: VelCmdCfg = VelCmdCfg(
-        vx_range=(-0.2, 0.2),
-        vy_range=(-0.2, 0.2),
+        vx_range=(0.0, 0.5),        # forward speed [m/s] — sampled
+        vy_range=(0.0, 0.0),        # no lateral component: velocity is along heading
         vz_range=(0.0, 0.0),
-        yaw_A_range=(0.0, 0.0),
-        # yaw_A_range=(0.1, 0.5),
-        yaw_omega_range=(0.0, 2 * math.pi / episode_length_s),
-        yaw_omega_binary=True,
+        yaw_A_range=(0.0, 0.6),     # yaw-rate amplitude [rad/s] — sampled
+        yaw_omega_range=(2 * math.pi / episode_length_s, 2 * math.pi / episode_length_s),  # fixed: one cycle/episode
+        yaw_omega_binary=False,
+        yaw_phase_range=(0.0, 0.0),  # start each episode at zero yaw rate
     )
 
     # action: deviation from default joint positions [rad]

@@ -241,14 +241,20 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
             if not hasattr(self, "_cmd_vel_marker"):
                 cmd_cfg = self._make_arrow_markers_cfg("/Visuals/QuadrupedVelCmd", (0.0, 0.0, 1.0))
                 cur_cfg = self._make_arrow_markers_cfg("/Visuals/QuadrupedVelCur", (0.0, 1.0, 0.0))
+                # Yellow yaw-rate arrow: tangential to heading, pointing the way the
+                # nose is commanded to swing (left = CCW / positive yaw rate).
+                yaw_cfg = self._make_arrow_markers_cfg("/Visuals/QuadrupedYawCmd", (1.0, 0.9, 0.0))
                 self._cmd_vel_marker = VisualizationMarkers(cmd_cfg)
                 self._cur_vel_marker = VisualizationMarkers(cur_cfg)
+                self._yaw_cmd_marker = VisualizationMarkers(yaw_cfg)
             self._cmd_vel_marker.set_visibility(True)
             self._cur_vel_marker.set_visibility(True)
+            self._yaw_cmd_marker.set_visibility(True)
         else:
             if hasattr(self, "_cmd_vel_marker"):
                 self._cmd_vel_marker.set_visibility(False)
                 self._cur_vel_marker.set_visibility(False)
+                self._yaw_cmd_marker.set_visibility(False)
 
     def _arrow_parts(self, base_pos: torch.Tensor, quat: torch.Tensor, scale_len: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build (translations, orientations, marker_indices) for a shaft+head arrow at base_pos, pointing along quat.
@@ -327,6 +333,31 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         )
         self._cur_vel_marker.visualize(
             translations=cur_translations, orientations=cur_orientations, scales=cur_scale, marker_indices=cur_indices
+        )
+
+        # ── Yaw-rate arrow (yellow) ──────────────────────────────────────── #
+        # Commanded yaw rate = cmds[:, 3]. Draw a horizontal arrow tangential to
+        # the heading, showing which way the nose is being commanded to swing:
+        # for a point on the +x (heading) axis, the yaw-induced velocity is
+        # yaw_rate · (ẑ × x̂) = yaw_rate · ŷ_body, i.e. world (-sin_y, cos_y)
+        # scaled (and sign-flipped) by the yaw rate. Anchored at the nose and
+        # raised above the velocity arrows so the two don't overlap.
+        yaw_rate = cmds[:, 3]
+        yaw_vec_w = torch.stack([-sin_y * yaw_rate, cos_y * yaw_rate], dim=-1)
+        yaw_quat = self._vel_world_xy_to_arrow(yaw_vec_w)
+        # visual gain so a small rad/s reads clearly; min keeps a stub at the
+        # zero-crossings of the sine so the marker never fully disappears.
+        yaw_mag = torch.clamp(yaw_rate.abs() * 2.0, min=0.05)
+        nose = self._robot.data.root_pos_w.clone()
+        nose[:, 0] += 0.3 * cos_y  # 0.3 m ahead along heading
+        nose[:, 1] += 0.3 * sin_y
+        nose[:, 2] += 0.7  # above the velocity arrows
+        yaw_translations, yaw_orientations, yaw_indices = self._arrow_parts(nose, yaw_quat, yaw_mag)
+        yaw_scale = torch.ones(2 * self.num_envs, 3, device=self.device)
+        yaw_scale[:self.num_envs, 0] = yaw_mag
+        yaw_scale[:, 1:] = 1.2
+        self._yaw_cmd_marker.visualize(
+            translations=yaw_translations, orientations=yaw_orientations, scales=yaw_scale, marker_indices=yaw_indices
         )
 
     def _vel_world_xy_to_arrow(self, vel_world_xy: torch.Tensor) -> torch.Tensor:
