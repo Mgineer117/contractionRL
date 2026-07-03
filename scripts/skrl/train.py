@@ -108,6 +108,7 @@ if not _is_classic and args_cli.video:
 
 if not _is_classic:
     args_cli.kit_args = (args_cli.kit_args or "") + " --/app/hangDetector/enabled=false"
+    hydra_args = [arg for arg in hydra_args if not (arg.startswith("--") and ("=" in arg or "." in arg))]
     sys.argv = [sys.argv[0]] + hydra_args
     app_launcher = AppLauncher(args_cli)
     simulation_app = app_launcher.app
