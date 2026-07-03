@@ -245,7 +245,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
                 self._cmd_vel_marker.set_visibility(False)
                 self._cur_vel_marker.set_visibility(False)
 
-    def _arrow_parts(self, base_pos: torch.Tensor, quat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _arrow_parts(self, base_pos: torch.Tensor, quat: torch.Tensor, scale_len: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build (translations, orientations, marker_indices) for a shaft+head arrow at base_pos, pointing along quat.
 
         Cylinder/cone primitives are centered at their own local origin, so
@@ -255,11 +255,17 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         combined shaft+head, with the cone's base flush against the shaft's tip.
         """
         n = base_pos.shape[0]
+        if scale_len is None:
+            scale_len = torch.ones(n, device=self.device)
+            
+        s = scale_len.unsqueeze(-1)
         shaft_offset = torch.tensor(
             [self._ARROW_SHAFT_LEN / 2, 0.0, 0.0], device=self.device
-        ).expand(n, -1)
+        ).expand(n, -1) * s
         head_offset = torch.tensor(
-            [self._ARROW_SHAFT_LEN + self._ARROW_HEAD_LEN / 2, 0.0, 0.0], device=self.device
+            [self._ARROW_SHAFT_LEN, 0.0, 0.0], device=self.device
+        ).expand(n, -1) * s + torch.tensor(
+            [self._ARROW_HEAD_LEN / 2, 0.0, 0.0], device=self.device
         ).expand(n, -1)
 
         shaft_pos = base_pos + quat_apply(quat, shaft_offset)
@@ -296,13 +302,19 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         )
         cmd_quat = self._vel_world_xy_to_arrow(cmd_xy_w)
         cur_quat = self._vel_world_xy_to_arrow(self._robot.data.root_lin_vel_w[:, :2])
+        
+        cmd_mag = torch.clamp(torch.norm(cmd_xy_w, dim=-1), min=0.01)
+        cur_mag = torch.clamp(torch.norm(self._robot.data.root_lin_vel_w[:, :2], dim=-1), min=0.01)
 
-        cmd_translations, cmd_orientations, cmd_indices = self._arrow_parts(cmd_pos, cmd_quat)
-        cur_translations, cur_orientations, cur_indices = self._arrow_parts(cur_pos, cur_quat)
+        cmd_translations, cmd_orientations, cmd_indices = self._arrow_parts(cmd_pos, cmd_quat, cmd_mag)
+        cur_translations, cur_orientations, cur_indices = self._arrow_parts(cur_pos, cur_quat, cur_mag)
 
         cmd_scale = torch.ones(2 * self.num_envs, 3, device=self.device)
+        cmd_scale[:self.num_envs, 0] = cmd_mag  # scale shaft length
         cmd_scale[:, 1:] = 1.5  # Make command arrow 50% thicker
+        
         cur_scale = torch.ones(2 * self.num_envs, 3, device=self.device)
+        cur_scale[:self.num_envs, 0] = cur_mag  # scale shaft length
         cur_scale[:, 1:] = 0.7  # Make current arrow thinner
 
         self._cmd_vel_marker.visualize(
