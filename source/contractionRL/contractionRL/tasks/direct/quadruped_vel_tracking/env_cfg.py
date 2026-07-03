@@ -22,7 +22,7 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
 
     num_envs = 4096
     decimation = 4
-    episode_length_s = 10.0
+    episode_length_s = 20.0
 
     # Unitree Go2: 12 joints (3 per leg × 4 legs)
     # state:   base_lin_vel(3) + base_ang_vel(3) + proj_gravity(3)
@@ -70,7 +70,7 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
         vx_range=(0.0, 0.5),        # forward speed [m/s] — sampled
         vy_range=(0.0, 0.0),        # no lateral component: velocity is along heading
         vz_range=(0.0, 0.0),
-        yaw_A_range=(0.0, 0.6),     # yaw-rate amplitude [rad/s] — sampled
+        yaw_A_range=(0.0, 0.3),     # yaw-rate amplitude [rad/s] — sampled
         yaw_omega_range=(2 * math.pi / episode_length_s, 2 * math.pi / episode_length_s),  # fixed: one cycle/episode
         yaw_omega_binary=False,
         yaw_phase_range=(0.0, 0.0),  # start each episode at zero yaw rate
@@ -81,7 +81,11 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
 
     # termination
     base_height_min = 0.20     # [m] terminate if base drops below this
-    fall_grav_z_max = -0.5     # terminate if projected_gravity_b z rises above this (~>60 deg tilt)
+    # -0.71 ≈ -cos(45°): terminate beyond ~45° tilt. The previous -0.5 (~60°)
+    # left a loophole — a robot crouched at 40-55° never terminated and sat
+    # accumulating negative reward for the whole episode (observed as episode
+    # returns of ~-433), fattening the advantage tails that spike PPO's KL.
+    fall_grav_z_max = -0.71
 
     # initial-state randomisation (used by generate_ref_traj.py for trajectory diversity)
     randomize_init: bool = True
@@ -89,11 +93,16 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     init_joint_noise: float = 0.05  # [rad] uniform noise on joint positions
 
     # reward scales — legged_gym-style recipe: body-frame exp-tracking terms
-    # (sigma 0.25) dominate; flat-orientation replaces fall termination as the
-    # thing that makes "fallen" strictly worse than any upright behavior.
+    # (sigma 0.25) dominate. Falls are punished primarily by termination (lost
+    # future reward); the alive bonus keeps per-step reward positive in any
+    # reasonable alive state so terminating early is never advantageous, and
+    # the small flat-orientation term is smooth shaping toward upright — kept
+    # mild because a large one creates reward cliffs near falls, whose
+    # heavy-tailed advantages spike PPO's KL and crash the adaptive LR.
+    rew_alive = 0.5
     rew_lin_vel = 2.0
     rew_yaw_rate = 0.5
-    rew_flat_orientation = -2.5  # on sum(projected_gravity_b[:, :2]**2)
+    rew_flat_orientation = -0.5  # on sum(projected_gravity_b[:, :2]**2)
     rew_z_vel = -0.5
     rew_roll_pitch = -0.05
     rew_torque = -1e-5

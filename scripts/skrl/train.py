@@ -532,7 +532,7 @@ if _is_classic:
         # If a sweep is running, init early to retrieve hyperparams and inject into agent_cfg
         if "WANDB_SWEEP_ID" in os.environ:
             if _wandb.run is None:
-                _wandb.init(project=_wkw["project"], name=_wkw["name"])
+                _wandb.init(project=_wkw["project"], name=_wkw["name"], sync_tensorboard=False)
             for k, v in _wandb.config.items():
                 keys = k.split('.')
                 curr = agent_cfg
@@ -543,11 +543,19 @@ if _is_classic:
                 curr[keys[-1]] = v
 
         _orig_add_scalar = _skrl_tb.SummaryWriter.add_scalar
+        _scalar_metric_defined = [False]
 
         def _wandb_add_scalar(self, *, tag: str, value: float, timestep: int) -> None:
             _orig_add_scalar(self, tag=tag, value=value, timestep=timestep)
             if _wandb.run is not None:
-                _wandb.log({tag: value}, step=timestep)
+                # Custom step metric instead of wandb's internal step counter —
+                # see the Isaac-route patch below for why (step-less media logs
+                # advance the counter and get later explicit-step scalars dropped).
+                if not _scalar_metric_defined[0]:
+                    _wandb.define_metric("global_step")
+                    _wandb.define_metric("*", step_metric="global_step")
+                    _scalar_metric_defined[0] = True
+                _wandb.log({tag: value, "global_step": timestep})
 
         _skrl_tb.SummaryWriter.add_scalar = _wandb_add_scalar
     else:
@@ -747,11 +755,22 @@ else:
             agent_cfg["agent"]["experiment"]["wandb"] = ("WANDB_SWEEP_ID" not in os.environ)
             agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})["sync_tensorboard"] = False
             _orig_add_scalar = _skrl_tb.SummaryWriter.add_scalar
+            _scalar_metric_defined = [False]
 
             def _wandb_add_scalar(self, *, tag: str, value: float, timestep: int) -> None:
                 _orig_add_scalar(self, tag=tag, value=value, timestep=timestep)
                 if _wandb.run is not None:
-                    _wandb.log({tag: value}, step=timestep)
+                    # Log against a custom step metric instead of wandb's internal
+                    # step counter: any wandb.log() without step= (e.g. video/media
+                    # uploads) advances the internal counter, after which scalars
+                    # logged with an explicit smaller step= are silently dropped
+                    # ("steps must be monotonically increasing" warning). A step
+                    # *metric* has no monotonicity requirement.
+                    if not _scalar_metric_defined[0]:
+                        _wandb.define_metric("global_step")
+                        _wandb.define_metric("*", step_metric="global_step")
+                        _scalar_metric_defined[0] = True
+                    _wandb.log({tag: value, "global_step": timestep})
 
             _skrl_tb.SummaryWriter.add_scalar = _wandb_add_scalar
 
@@ -923,4 +942,5 @@ else:
 
     if __name__ == "__main__":
         main()
-        simulation_app.close()
+        if not _is_classic:
+            simulation_app.close()

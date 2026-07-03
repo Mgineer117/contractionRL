@@ -352,7 +352,7 @@ class C3MAgent(Agent):
             os_loss = loss_pos_matrix_random_sampling(-overshoot) + loss_pos_matrix_random_sampling(-undershoot)
 
         loss = os_loss + pd_loss + c1_loss + c2_loss
-        return loss, {"pd_loss": pd_loss.item(), "c1_loss": c1_loss.item(), "c2_loss": c2_loss.item()}
+        return loss, {"pd_loss": pd_loss.item(), "c1_loss": c1_loss.item(), "c2_loss": c2_loss.item(), "os_loss": os_loss.item() if not bounded else 0.0}
 
     def _optimize_params(self, loss: torch.Tensor, optimizer: torch.optim.Optimizer, module: torch.nn.Module) -> bool:
         self._w_optimizer.zero_grad()
@@ -381,7 +381,7 @@ class C3MAgent(Agent):
         # shuffle indices for the epoch; one full pass in batch_size chunks
         indices = np.random.permutation(n)
         iters = max(1, n // batch_size)
-        total_pd = total_c1 = total_c2 = total_loss = 0.0
+        total_pd = total_c1 = total_c2 = total_os = total_loss = 0.0
 
         pbar = tqdm(range(iters), desc=f"Epoch C3M Update", leave=False)
         for b in pbar:
@@ -400,6 +400,7 @@ class C3MAgent(Agent):
             total_pd += infos["pd_loss"]
             total_c1 += infos["c1_loss"]
             total_c2 += infos["c2_loss"]
+            total_os += infos["os_loss"]
 
         # Step LR scheduler once per epoch
         if self._w_lr_scheduler is not None:
@@ -414,6 +415,7 @@ class C3MAgent(Agent):
             "C3M/loss/pd_loss": total_pd / iters,
             "C3M/loss/c1_loss": total_c1 / iters,
             "C3M/loss/c2_loss": total_c2 / iters,
+            "C3M/loss/os_loss": total_os / iters,
             "C3M/lr/lr":        self._u_lr_scheduler.get_last_lr()[0] if self._u_lr_scheduler else cfg.u_lr,
         }
 
@@ -554,6 +556,7 @@ class C3MSkrlTrainer(Trainer):
                 postfix = dict(
                     loss=f"{metrics.get('C3M/loss/loss', float('nan')):.3g}",
                     pd=f"{metrics.get('C3M/loss/pd_loss', float('nan')):.3g}",
+                    os=f"{metrics.get('C3M/loss/os_loss', float('nan')):.3g}",
                 )
                 if agent._neural_dynamics is not None:
                     postfix["dyn"] = f"{metrics.get('C3M/dynamics/mse', float('nan')):.3g}"

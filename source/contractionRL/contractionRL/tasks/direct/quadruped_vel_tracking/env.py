@@ -125,7 +125,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         rew_rp = torch.sum(torch.square(self._robot.data.root_ang_vel_b[:, :2]), dim=1) * self.cfg.rew_roll_pitch
         rew_tau = torch.sum(torch.square(self._robot.data.applied_torque), dim=1) * self.cfg.rew_torque
         rew_act = torch.sum(torch.square(self._actions - self._prev_actions), dim=1) * self.cfg.rew_action_rate
-        total_reward = rew_lin + rew_yaw + rew_flat + rew_z + rew_rp + rew_tau + rew_act
+        total_reward = self.cfg.rew_alive + rew_lin + rew_yaw + rew_flat + rew_z + rew_rp + rew_tau + rew_act
         
         if not hasattr(self, "_episode_discounted_returns"):
             self._episode_discounted_returns = torch.zeros(self.num_envs, device=self.device)
