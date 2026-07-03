@@ -85,10 +85,12 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     init_pos_range: float = 0.3    # [m]  uniform x,y offset around env origin
     init_joint_noise: float = 0.05  # [rad] uniform noise on joint positions
 
-    # reward scales (tentative)
+    # reward scales — legged_gym-style recipe: body-frame exp-tracking terms
+    # (sigma 0.25) dominate; flat-orientation replaces fall termination as the
+    # thing that makes "fallen" strictly worse than any upright behavior.
     rew_lin_vel = 2.0
-    rew_heading = 1.0  # Reward for aligning heading with commanded velocity
-    rew_yaw_rate = 0.0
+    rew_yaw_rate = 0.5
+    rew_flat_orientation = -2.5  # on sum(projected_gravity_b[:, :2]**2)
     rew_z_vel = -0.5
     rew_roll_pitch = -0.05
     rew_torque = -1e-5

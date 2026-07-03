@@ -19,7 +19,7 @@ from .env_cfg import QuadrupedVelTrackingEnvCfg
 class QuadrupedVelTrackingEnv(DirectRLEnv):
     """Unitree Go2 velocity-tracking environment.
 
-    Commands: constant (vx, vy) + sinusoidal yaw rate.
+    Commands: constant body-frame (vx, vy) + sinusoidal yaw rate.
     State for path-tracking export:
         proj_gravity_b(3) + joint_pos_rel(12) + joint_vel(12)  → 27 dims
     """
@@ -100,34 +100,32 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         t = self.episode_length_buf.float() * self.step_dt
         cmds = self._cmd.get(t)
 
-        # linear velocity tracking (xy) in world frame
+        # linear velocity tracking (xy) in *body* frame. The observation only
+        # contains body-frame velocity and yaw-invariant projected gravity —
+        # world-frame tracking would require the unobserved yaw, making the
+        # task partially observable under randomize_init.
         lin_err = torch.sum(
-            torch.square(cmds[:, :2] - self._robot.data.root_lin_vel_w[:, :2]), dim=1
+            torch.square(cmds[:, :2] - self._robot.data.root_lin_vel_b[:, :2]), dim=1
         )
-        rew_lin = torch.exp(-lin_err / 0.1) * self.cfg.rew_lin_vel
-
-        # heading bonus: align robot's yaw with the direction of the commanded velocity
-        cmd_yaw = torch.atan2(cmds[:, 1], cmds[:, 0])
-        # root_quat_w is (w, x, y, z)
-        w, x, y, z = self._robot.data.root_quat_w[:, 0], self._robot.data.root_quat_w[:, 1], self._robot.data.root_quat_w[:, 2], self._robot.data.root_quat_w[:, 3]
-        robot_yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
-        
-        heading_err = cmd_yaw - robot_yaw
-        heading_err = torch.remainder(heading_err + torch.pi, 2 * torch.pi) - torch.pi
-        rew_heading = torch.exp(-torch.square(heading_err) / 0.1) * self.cfg.rew_heading
+        rew_lin = torch.exp(-lin_err / 0.25) * self.cfg.rew_lin_vel
 
         # yaw rate tracking
         yaw_err = torch.square(cmds[:, 3] - self._robot.data.root_ang_vel_b[:, 2])
-        rew_yaw = torch.exp(-yaw_err / 0.1) * self.cfg.rew_yaw_rate
+        rew_yaw = torch.exp(-yaw_err / 0.25) * self.cfg.rew_yaw_rate
 
-        vel_err_vec = cmds[:, :2] - self._robot.data.root_lin_vel_w[:, :2]
+        vel_err_vec = cmds[:, :2] - self._robot.data.root_lin_vel_b[:, :2]
         self._episode_vel_auc += torch.norm(vel_err_vec, dim=-1)
+
+        # flat-orientation penalty: projected gravity xy is ~0 upright, ~1 on
+        # the side/back. With no fall termination, this is what makes lying
+        # down strictly worse than any upright behavior.
+        rew_flat = torch.sum(torch.square(self._robot.data.projected_gravity_b[:, :2]), dim=1) * self.cfg.rew_flat_orientation
 
         rew_z = torch.square(self._robot.data.root_lin_vel_b[:, 2]) * self.cfg.rew_z_vel
         rew_rp = torch.sum(torch.square(self._robot.data.root_ang_vel_b[:, :2]), dim=1) * self.cfg.rew_roll_pitch
         rew_tau = torch.sum(torch.square(self._robot.data.applied_torque), dim=1) * self.cfg.rew_torque
         rew_act = torch.sum(torch.square(self._actions - self._prev_actions), dim=1) * self.cfg.rew_action_rate
-        total_reward = rew_lin + rew_heading + rew_yaw + rew_z + rew_rp + rew_tau + rew_act
+        total_reward = rew_lin + rew_yaw + rew_flat + rew_z + rew_rp + rew_tau + rew_act
         
         if not hasattr(self, "_episode_discounted_returns"):
             self._episode_discounted_returns = torch.zeros(self.num_envs, device=self.device)
@@ -288,7 +286,15 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         cur_pos = self._robot.data.root_pos_w.clone()
         cur_pos[:, 2] += 0.5  # Same height
 
-        cmd_quat = self._vel_world_xy_to_arrow(cmds[:, :2])
+        # commands are body-frame: rotate into world (yaw only) for display
+        w, x, y, z = self._robot.data.root_quat_w.unbind(-1)
+        yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
+        cmd_xy_w = torch.stack(
+            [cos_y * cmds[:, 0] - sin_y * cmds[:, 1],
+             sin_y * cmds[:, 0] + cos_y * cmds[:, 1]], dim=-1
+        )
+        cmd_quat = self._vel_world_xy_to_arrow(cmd_xy_w)
         cur_quat = self._vel_world_xy_to_arrow(self._robot.data.root_lin_vel_w[:, :2])
 
         cmd_translations, cmd_orientations, cmd_indices = self._arrow_parts(cmd_pos, cmd_quat)

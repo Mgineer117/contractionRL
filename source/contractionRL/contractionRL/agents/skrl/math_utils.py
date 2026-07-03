@@ -45,6 +45,25 @@ def weighted_gradients(W: torch.Tensor, v: torch.Tensor, x: torch.Tensor,
     return dot_W
 
 
+def loss_pos_matrix_random_sampling(A: torch.Tensor, num_samples: int = 1024) -> torch.Tensor:
+    """PD-violation hinge loss via random directional sampling (no eigendecomposition).
+
+    Projects ``A`` onto ``num_samples`` random unit vectors and penalizes only the
+    directions where ``zᵀAz < 0``. Unlike an exact eigenvalue loss, this never
+    differentiates through ``eigh``/``eigvalsh``, so it stays numerically stable
+    even when double-differentiated (as happens via ``weighted_gradients``).
+    """
+    device, dtype = A.device, A.dtype
+    d = A.size(-1)
+    z = torch.randn(num_samples, d, device=device, dtype=dtype)
+    z = z / z.norm(dim=1, keepdim=True)
+    zTAz = (z.matmul(A) * z.view(1, num_samples, -1)).sum(dim=2).reshape(-1)
+    negative = zTAz < 0
+    if negative.any():
+        return -zTAz[negative].mean()
+    return torch.zeros((), device=device, dtype=dtype, requires_grad=True)
+
+
 def loss_pos_matrix_eigen(A: torch.Tensor, reg: bool = True):
     """PD loss via eigenvalues: relu(-λ).sum() → (loss, reg_loss)."""
     device = A.device

@@ -34,7 +34,7 @@ from .math_utils import (
     b_jacobian,
     bound_W,
     jacobian,
-    loss_pos_matrix_eigen,
+    loss_pos_matrix_random_sampling,
     spd_inverse,
     weighted_gradients,
 )
@@ -54,6 +54,13 @@ class C3MCfg(AgentCfg):
     eps: float = 1e-2
     w_ub: float = 10.0
     w_lb: float = 1e-1
+    # Fraction of training (by progress, 0-1) during which the metric M is held
+    # fixed (detached) in the contraction term Cu, mirroring the reference C3M
+    # script's `detach=True if epoch < lr_step else False` warmup (5 of 15
+    # epochs ≈ 1/3). Lets the policy start becoming contracting w.r.t. a frozen
+    # initial metric before the double-backward Ṁ term (numerically the most
+    # fragile part of the loss) starts shaping both networks jointly.
+    detach_warmup_frac: float = 1.0 / 3.0
     use_analytical_dynamics: bool = False
     learning_rate_scheduler: str = ""
     learning_rate_scheduler_kwargs: dict = field(default_factory=dict)
@@ -277,12 +284,20 @@ class C3MAgent(Agent):
 
         A = DfDx + torch.einsum('bxyu,bu->bxy', DBDx, u)
         dot_x = f + matmul(B, u.unsqueeze(-1)).squeeze(-1)
-        dot_M = weighted_gradients(M, dot_x, x)
+
+        # Early-training warmup: freeze the metric M inside the contraction term
+        # so the double-backward Ṁ path (the most numerically fragile part of the
+        # loss) doesn't jointly destabilize the CMG while it's still poorly
+        # conditioned right after init. The actor still gets gradient signal via
+        # K (below), just w.r.t. a momentarily-fixed metric. See detach_warmup_frac.
+        detach = self._progress < cfg.detach_warmup_frac
+        dot_M = weighted_gradients(M, dot_x, x, detach=detach)
+        M_eff = M.detach() if detach else M
 
         ABK = A + matmul(B, K)
-        MABK = matmul(M, ABK)
+        MABK = matmul(M_eff, ABK)
         sym_MABK = 0.5 * (MABK + transpose(MABK, 1, 2))
-        Cu = dot_M + 2 * sym_MABK + 2 * cfg.lbd * M
+        Cu = dot_M + 2 * sym_MABK + 2 * cfg.lbd * M_eff
 
         DfW = weighted_gradients(W, f, x)
         DfDxW = matmul(DfDx, W)
@@ -302,18 +317,20 @@ class C3MAgent(Agent):
         Cu_reg = Cu + cfg.eps * I
         C1_reg = C1 + cfg.eps * torch.eye(C1.shape[-1], device=device)
 
-        # Exact eigenvalue-based PD loss (checks all directions) — more robust and
-        # accurate than random-projection sampling; matches TEMP's CMG loss.
-        pd_loss,  pd_reg  = loss_pos_matrix_eigen(-Cu_reg)
-        c1_loss,  c1_reg  = loss_pos_matrix_eigen(-C1_reg)
+        # Random-projection PD loss (reference C3M script): never differentiates
+        # through an eigendecomposition, unlike an exact eigenvalue loss — keeps
+        # the (already double-differentiated, via weighted_gradients) contraction
+        # term numerically stable instead of NaN-ing out.
+        pd_loss = loss_pos_matrix_random_sampling(-Cu_reg)
+        c1_loss = loss_pos_matrix_random_sampling(-C1_reg)
 
         if bounded:
-            os_loss = os_reg = torch.zeros(1, device=device)
+            os_loss = torch.zeros((), device=device)
         else:
             overshoot = W - cfg.w_ub * I
-            os_loss,  os_reg  = loss_pos_matrix_eigen(-overshoot)
+            os_loss = loss_pos_matrix_random_sampling(-overshoot)
 
-        loss = os_loss + pd_loss + c1_loss + c2_loss + pd_reg + c1_reg + os_reg
+        loss = os_loss + pd_loss + c1_loss + c2_loss
         return loss, {"pd_loss": pd_loss.item(), "c1_loss": c1_loss.item(), "c2_loss": c2_loss.item()}
 
     def _optimize_params(self, loss: torch.Tensor, optimizer: torch.optim.Optimizer, module: torch.nn.Module) -> bool:
@@ -418,8 +435,8 @@ class C3MSkrlTrainer(Trainer):
     def train(self) -> None:
         agent = self.agents if not isinstance(self.agents, list) else self.agents[0]
         timesteps = self.cfg.timesteps
-        log_interval = getattr(agent, "write_interval", 200)
-        if str(log_interval).lower() == "auto": log_interval = 200
+        log_interval = getattr(agent, "write_interval", 100)
+        if str(log_interval).lower() == "auto": log_interval = 100
         log_interval = int(log_interval)
         eval_interval = getattr(self.cfg, "eval_interval", 0)
 

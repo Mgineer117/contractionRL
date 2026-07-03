@@ -32,13 +32,13 @@ memory:
 agent:
   class: PPO
   std_dev_annealing: False
-  rollouts: 16        # 1024 envs × 64 = 65K samples per update; 64 steps ≈ 5s covers most vel-tracking episodes
+  rollouts: 16        # per-update batch = num_envs × 16 steps
   learning_epochs: 5  # Number of gradient descent passes over the collected batch
-  mini_batches: 4     # 1024 envs × 64 = 65K samples; 4 mini-batches ≈ 16K each
+  mini_batches: 4     # per-update batch split into 4 mini-batches
   discount_factor: 0.99  # Gamma discount factor weighting future rewards
   gae_lambda: 0.95  # Lambda parameter for Generalized Advantage Estimation (GAE)
-  learning_rate: 1.0e-06  # Global step size for neural network optimization
-  learning_rate_scheduler: null # KLAdaptiveLR  # adapts LR to hold per-update KL near kl_threshold — key PPO stabilizer
+  learning_rate: 1.0e-03  # Global step size for neural network optimization
+  learning_rate_scheduler: KLAdaptiveLR  # adapts LR to hold per-update KL near kl_threshold — key PPO stabilizer
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.008
   state_preprocessor: RunningStandardScaler
@@ -50,9 +50,9 @@ agent:
   grad_norm_clip: 0.5  # Maximum permitted magnitude for gradients (prevents exploding gradients)
   ratio_clip: 0.2  # PPO trust region clipping bound for the objective ratio
   value_clip: 0.0  # Clipping bound for the value function update
-  entropy_loss_scale: 0.001  # Coefficient to encourage exploration by maximizing action entropy
+  entropy_loss_scale: 0.0  # No entropy bonus: KLAdaptiveLR regulates update size and the std can decay naturally
   value_loss_scale: 0.5  # Weight coefficient for the value function loss term
-  kl_threshold: 0.01  # Early stopping threshold based on Kullback-Leibler divergence
+  kl_threshold: 0  # Epoch early-stop disabled — KLAdaptiveLR (above) is the KL stabilizer, matching the Isaac Lab recipe
   time_limit_bootstrap: True  # Bootstrap value estimates when episodes end due to time limits
   experiment:
     directory: "quadruped_vel_tracking"
@@ -66,5 +66,5 @@ agent:
 
 trainer:
   class: SequentialTrainer
-  timesteps: 1000000  # Total number of environment steps to train for
+  timesteps: 300000  # Total number of environment steps to train for
   environment_info: log  # Type of environment information to record (e.g., log)
