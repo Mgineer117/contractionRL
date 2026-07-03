@@ -1,0 +1,23 @@
+program: scripts/skrl/train.py
+method: random
+metric:
+  name: "Reward / Total reward (mean)"
+  goal: maximize
+
+parameters:
+  agent.learning_rate:
+    values: [1e-4, 5e-4]
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - "--task"
+  - "Quadruped-VelTracking-v0"
+  - "--algorithm"
+  - "ppo"
+  - "--num_envs"
+  - "16"
+  - "--max_iterations"
+  - "5"
+  - ${args}
