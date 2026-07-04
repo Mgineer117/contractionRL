@@ -28,7 +28,7 @@ parser.add_argument("--classic", action="store_true", default=False,
 parser.add_argument("--task", type=str, default=None, help="Environment ID.")
 parser.add_argument(
     "--algorithm", "--algo", type=str, default="PPO",
-    help="Algorithm: ppo | sac | c3m | lqr | sdlqr | temp | AMP | DDPG | TD3 | …"
+    help="Algorithm: ppo | sac | c3m | lqr | sdlqr | c2rl | AMP | DDPG | TD3 | …"
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of parallel environments.")
 parser.add_argument("--seed", type=int, default=None, help="Random seed.")
@@ -100,6 +100,11 @@ parser.add_argument("--min_ref_traj_length_frac", type=float, default=0.5,
                     help="Minimum fraction of the max episode length (T) a trajectory must survive "
                          "to be accepted into dynamics_data.npz. Trajectories shorter than "
                          "min_ref_traj_length_frac * T are discarded (default 0.5, i.e. half of T).")
+parser.add_argument("--ref_oversample_factor", type=float, default=2.0,
+                    help="Collect this many times ref_num_trajs candidate trajectories (that clear "
+                         "min_ref_traj_length_frac) before keeping only the longest ref_num_trajs of "
+                         "them — gives the selection room to prefer complete rollouts over ones that "
+                         "survived just past the minimum length. 1.0 disables oversampling.")
 
 if not _is_classic:
     AppLauncher.add_app_launcher_args(parser)
@@ -131,7 +136,7 @@ import gymnasium as gym
 import yaml
 
 algorithm = args_cli.algorithm.lower()
-_CONTRACTION_ALGOS = {"c3m", "lqr", "sdlqr", "temp"}
+_CONTRACTION_ALGOS = {"c3m", "lqr", "sdlqr", "c2rl"}
 
 seed = args_cli.seed if args_cli.seed is not None else random.randint(0, 10000)
 
@@ -249,17 +254,25 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
             )
             return
 
-    # Collect trajectories
+    # Collect trajectories. We over-collect a candidate pool larger than
+    # num_trajs (oversample_factor x) and then keep the LONGEST num_trajs of
+    # them — early termination is exactly what a poor/failing rollout looks
+    # like, so ranking by survival length is a simple, direct proxy for
+    # "better trajectory". Recording every one of num_envs (rather than just
+    # the first min(num_trajs, num_envs)) maximizes that pool for free: Isaac
+    # can't shrink the batch, so the extra envs are being simulated regardless.
+    # This also means num_envs < num_trajs naturally loops through as many
+    # per-env episode rounds as it takes to fill the pool — no special-casing
+    # needed for that direction.
+    import math
+    import tqdm
+
     num_trajs = args_cli.ref_num_trajs
-    print(f"[RefTraj] Collecting {num_trajs} trajectories → {out_path}")
+    pool_target = max(num_trajs, int(math.ceil(num_trajs * max(1.0, args_cli.ref_oversample_factor))))
+    print(f"[RefTraj] Collecting a candidate pool of {pool_target} trajectories "
+          f"(oversample x{args_cli.ref_oversample_factor:g}), keeping the longest {num_trajs} → {out_path}")
     unwrapped = isaac_env.unwrapped
     num_envs = skrl_env.num_envs
-    # All num_envs parallel sims still step together (Isaac can't shrink the
-    # batch), but only num_trajs trajectories are ever saved — so only the
-    # first rec_envs envs are bookkept/recorded; the rest are simulated and
-    # their output discarded.
-    rec_envs = min(num_trajs, num_envs)
-    import tqdm
     all_states, all_actions, all_pos, all_lengths = [], [], [], []
     if hasattr(skrl_env, "_reset_once"):
         skrl_env._reset_once = True
@@ -284,14 +297,14 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
     state_dim = state_tensor.shape[1]
     u_dim = actions.shape[1]
 
-    ep_states = torch.zeros((rec_envs, T, state_dim), dtype=torch.float32, device=skrl_env.device)
-    ep_actions = torch.zeros((rec_envs, T, u_dim), dtype=torch.float32, device=skrl_env.device)
-    ep_pos = torch.zeros((rec_envs, T, 3), dtype=torch.float32, device=skrl_env.device)
-    step_counts = torch.zeros(rec_envs, dtype=torch.long, device=skrl_env.device)
+    ep_states = torch.zeros((num_envs, T, state_dim), dtype=torch.float32, device=skrl_env.device)
+    ep_actions = torch.zeros((num_envs, T, u_dim), dtype=torch.float32, device=skrl_env.device)
+    ep_pos = torch.zeros((num_envs, T, 3), dtype=torch.float32, device=skrl_env.device)
+    step_counts = torch.zeros(num_envs, dtype=torch.long, device=skrl_env.device)
 
-    pbar = tqdm.tqdm(total=num_trajs, desc="[RefTraj] Collecting")
+    pbar = tqdm.tqdm(total=pool_target, desc="[RefTraj] Collecting candidates")
 
-    while len(all_states) < num_trajs:
+    while len(all_states) < pool_target:
         with torch.no_grad():
             actions, _ = agent.act(obs, None, timestep=0, timesteps=0)
         state_tensor = unwrapped.get_physical_state()
@@ -311,9 +324,7 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
         
         obs_dict, _, terminated, truncated, _ = skrl_env.step(actions)
         obs = _get_obs(obs_dict)
-        # Only the first rec_envs envs are bookkept (see rec_envs above), so
-        # slice done down to match step_counts/ep_* before indexing with it.
-        done = (terminated | truncated).squeeze(-1)[:rec_envs]
+        done = (terminated | truncated).squeeze(-1)
 
         if done.any():
             done_indices = done.nonzero(as_tuple=True)[0]
@@ -336,23 +347,26 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
 
                 # Move to CPU in bounded chunks. Episodes are length-synchronized
                 # (fixed T), so on the first `done` event success_indices can be
-                # ~rec_envs at once — gathering all of them in one fancy-index
-                # allocates a full (len(success_indices), T, dim) CUDA temporary,
-                # which is cheap now that rec_envs caps out at num_trajs but is
-                # kept bounded regardless in case rec_envs == num_envs (num_trajs
-                # >= num_envs).
+                # ~num_envs at once — gathering all of them in one fancy-index
+                # would allocate a full (len(success_indices), T, dim) CUDA
+                # temporary, so keep it chunked regardless of pool size.
+                #
+                # Deliberately don't early-break once len(all_states) hits
+                # pool_target here: this round's successes are already sitting
+                # in GPU memory finished at the same time, so cutting the chunk
+                # loop short would arbitrarily favor low env-index trajectories
+                # over otherwise-equal ones later in `success_indices`. Letting
+                # the whole round in (pool may overshoot pool_target a bit)
+                # keeps every env that finished this round in the running for
+                # the final longest-num_trajs selection.
                 _CHUNK = 256
                 for start in range(0, len(success_indices), _CHUNK):
-                    if len(all_states) >= num_trajs:
-                        break
                     idx = success_indices[start:start + _CHUNK]
                     s_np = ep_states[idx].cpu().numpy()
                     a_np = ep_actions[idx].cpu().numpy()
                     p_np = ep_pos[idx].cpu().numpy()
                     l_np = step_counts[idx].cpu().numpy()
                     for i in range(len(idx)):
-                        if len(all_states) >= num_trajs:
-                            break
                         all_states.append(s_np[i])
                         all_actions.append(a_np[i])
                         all_pos.append(p_np[i])
@@ -363,10 +377,16 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
             step_counts[done_indices] = 0
 
     pbar.close()
-    states_arr = np.stack(all_states[:num_trajs]).astype(np.float32)
-    actions_arr = np.stack(all_actions[:num_trajs]).astype(np.float32)
-    pos_arr = np.stack(all_pos[:num_trajs]).astype(np.float32)
-    lengths_arr = np.asarray(all_lengths[:num_trajs], dtype=np.int64)
+
+    # Keep the num_trajs LONGEST candidates out of the oversampled pool.
+    all_lengths_np = np.asarray(all_lengths, dtype=np.int64)
+    keep = np.argsort(all_lengths_np)[::-1][:num_trajs]
+    print(f"[RefTraj] Pool lengths: min={all_lengths_np.min()}, max={all_lengths_np.max()}, "
+          f"median={int(np.median(all_lengths_np))} (T={T}) — keeping top {num_trajs} by length")
+    states_arr = np.stack([all_states[i] for i in keep]).astype(np.float32)
+    actions_arr = np.stack([all_actions[i] for i in keep]).astype(np.float32)
+    pos_arr = np.stack([all_pos[i] for i in keep]).astype(np.float32)
+    lengths_arr = all_lengths_np[keep]
 
     os.makedirs(out_dir, exist_ok=True)
     
@@ -609,7 +629,7 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, num_grou
         for k in range(T):
             with torch.no_grad():
                 # agent.act() is the uniform interface across every skrl Agent
-                # (PPO/SAC/C3M/TEMP/SDLQR/LQR) — unlike agent.policy.act(...),
+                # (PPO/SAC/C3M/C2RL/SDLQR/LQR) — unlike agent.policy.act(...),
                 # which assumes PPO/SAC's internal attribute names and breaks
                 # on contraction agents. "mean_actions" (present for Gaussian
                 # policies) gives the deterministic action; deterministic
@@ -877,6 +897,12 @@ if _is_classic:
         _wkw = agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})
         _wkw["project"] = args_cli.wandb_project
         _wkw["sync_tensorboard"] = False
+        # Force console capture even when stdout isn't a tty — sweep agents are
+        # launched backgrounded with stdout/stderr redirected to a logfile
+        # (search/run_c3m_sweeps.sh: `wandb agent ... > logfile 2>&1 &`), which
+        # is exactly the case where wandb's tty auto-detection for the Logs tab
+        # can silently fail to capture anything. "wrap" forces it regardless.
+        _wkw["settings"] = _wandb.Settings(console="wrap")
         # Consistent run name: CLI override > YAML-provided name > deterministic
         # default that matches the local log directory (logs/classic/<algo>/<ts>).
         _wkw["name"] = args_cli.wandb_run_name or _wkw.get("name") or f"classic_{algorithm}_{_run_ts}"
@@ -884,7 +910,10 @@ if _is_classic:
         # If a sweep is running, init early to retrieve hyperparams and inject into agent_cfg
         if "WANDB_SWEEP_ID" in os.environ:
             if _wandb.run is None:
-                _wandb.init(project=_wkw["project"], name=_wkw.get("name"), sync_tensorboard=False)
+                _wandb.init(
+                    project=_wkw["project"], name=_wkw.get("name"), sync_tensorboard=False,
+                    settings=_wkw["settings"],
+                )
             for k, v in _wandb.config.items():
                 keys = k.split('.')
                 curr = agent_cfg
@@ -1290,7 +1319,7 @@ else:
         # Best-model evaluation (CAC-dev-style: reward/AUC/contraction-rate/
         # overshoot with 95% CI) applies to PATH-TRACKING envs — that's where
         # a genuine reference-trajectory tracking error is defined and where
-        # C3M/LQR/SD-LQR/TEMP's contraction analysis is meaningful. It also
+        # C3M/LQR/SD-LQR/C2RL's contraction analysis is meaningful. It also
         # runs for VelTracking (which exposes the same get_tracking_error()
         # duck-type against a velocity command instead of a trajectory) since
         # that's used as this quality gate before ref-traj generation.

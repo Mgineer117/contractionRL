@@ -71,7 +71,7 @@ class PathTrackingBase(DirectRLEnv):
         self._dynamics_model = None
 
     # ------------------------------------------------------------------ #
-    # Contraction algorithm interface (C3M / LQR / SD-LQR / TEMP)
+    # Contraction algorithm interface (C3M / LQR / SD-LQR / C2RL)
     # ------------------------------------------------------------------ #
 
     def set_dynamics_model(self, model) -> None:
@@ -82,7 +82,7 @@ class PathTrackingBase(DirectRLEnv):
         """Return (f, B, B_null) for contraction agents.
 
         Delegates to the injected NeuralDynamics model — call
-        ``set_dynamics_model(model)`` before using C3M/LQR/SDLQR/TEMP.
+        ``set_dynamics_model(model)`` before using C3M/LQR/SDLQR/C2RL.
         """
         if self._dynamics_model is None:
             raise RuntimeError(
@@ -243,12 +243,19 @@ class PathTrackingBase(DirectRLEnv):
 
             performance_score = -(auc / steps)
 
+            # convergence score: contraction rate per unit of overshoot — a
+            # single figure-of-merit combining "how fast" (lambda) and "how
+            # clean" (overshoot, penalizing excursions above e(0)). Higher is
+            # better: fast contraction with little to no overshoot.
+            convergence_score = lambda_emp / overshoot.clamp(min=1e-6)
+
             self.extras["log"]["Episode/contraction_flag"] = contraction_flag.mean()
             self.extras["log"]["Episode/performance_score"] = performance_score.mean()
 
             auc_mean, auc_ci95 = mean_confidence_interval(auc.cpu().numpy())
             lbd_mean, lbd_ci95 = mean_confidence_interval(lambda_emp.cpu().numpy())
             os_mean, os_ci95 = mean_confidence_interval(overshoot.cpu().numpy())
+            conv_mean, conv_ci95 = mean_confidence_interval(convergence_score.cpu().numpy())
 
             self.extras["log"]["Stability/auc"] = torch.tensor(auc_mean, device=self.device)
             self.extras["log"]["Stability/auc_ci95"] = torch.tensor(auc_ci95, device=self.device)
@@ -256,6 +263,8 @@ class PathTrackingBase(DirectRLEnv):
             self.extras["log"]["Stability/contraction_rate_ci95"] = torch.tensor(lbd_ci95, device=self.device)
             self.extras["log"]["Stability/overshoot"] = torch.tensor(os_mean, device=self.device)
             self.extras["log"]["Stability/overshoot_ci95"] = torch.tensor(os_ci95, device=self.device)
+            self.extras["log"]["Stability/convergence_score"] = torch.tensor(conv_mean, device=self.device)
+            self.extras["log"]["Stability/convergence_score_ci95"] = torch.tensor(conv_ci95, device=self.device)
 
         # --- wandb trajectory plot for env 0 ---
         env0_done = env_ids is not None and any(int(e) == 0 for e in env_ids)

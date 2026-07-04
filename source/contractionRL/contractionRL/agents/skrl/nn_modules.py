@@ -1,6 +1,6 @@
 """Self-contained neural network modules for contractionRL.
 
-Provides all network building blocks needed by C3M, SD-LQR, LQR, and TEMP with
+Provides all network building blocks needed by C3M, SD-LQR, LQR, and C2RL with
 no mjrl dependency.
 """
 from __future__ import annotations
@@ -65,7 +65,7 @@ class CCM_Generator(nn.Module):
     """Contraction-metric generator W(x) = VᵀV (symmetric PSD by construction).
 
     In stochastic mode, samples from a diagonal Gaussian over the matrix entries
-    and reports entropy for optional regularisation (used in TEMP).
+    and reports entropy for optional regularisation (used in C2RL).
     """
     bounded = False
 
@@ -227,7 +227,7 @@ class NeuralDynamics(nn.Module):
     """Control-affine neural dynamics  ẋ = f(x) + B(x)·u.
 
     Trained online by C3MAgent from trajectory buffer transition data and then
-    loaded by SDLQRAgent / LQRAgent / TEMPAgent via ``NeuralDynamics.load()``.
+    loaded by SDLQRAgent / LQRAgent / C2RLAgent via ``NeuralDynamics.load()``.
     """
 
     _dtype = torch.float32

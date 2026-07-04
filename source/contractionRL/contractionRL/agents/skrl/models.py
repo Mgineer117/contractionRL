@@ -1,7 +1,7 @@
 """skrl-compatible model wrappers for contractionRL custom actors.
 
 CLActorModel: wraps CLActor (C3M_U contracting controller) in the skrl
-GaussianMixin interface so it can be passed to skrl PPO / TEMP runners.
+GaussianMixin interface so it can be passed to skrl PPO / C2RL runners.
 
 Observation layout assumed: [x (x_dim), xref (x_dim), uref (u_dim)]
   → obs_dim = 2*x_dim + u_dim  →  x_dim = (obs_dim - u_dim) / 2
@@ -66,7 +66,7 @@ class CMGModel(Model):
     """CCM_Generator wrapped as a skrl Model for checkpointing.
 
     The underlying CCM_Generator is accessed via ``self.ccm_gen`` by C3MAgent
-    and TEMPAgent for the contraction loss computation.
+    and C2RLAgent for the contraction loss computation.
     """
 
     def __init__(

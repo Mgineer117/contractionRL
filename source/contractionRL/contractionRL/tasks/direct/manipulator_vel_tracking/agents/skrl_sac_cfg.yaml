@@ -12,8 +12,8 @@ models:
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [128, 128]
-        activations: tanh
+        layers: [256, 256]
+        activations: relu
     output: ACTIONS
   critic_1:
     class: DeterministicMixin  # Outputs deterministic continuous values
@@ -21,8 +21,8 @@ models:
     network:
       - name: net
         input: "concatenate([OBSERVATIONS, ACTIONS])"
-        layers: [128, 128]
-        activations: tanh
+        layers: [256, 256]
+        activations: relu
     output: ONE
   critic_2:
     class: DeterministicMixin  # Outputs deterministic continuous values
@@ -30,8 +30,8 @@ models:
     network:
       - name: net
         input: "concatenate([OBSERVATIONS, ACTIONS])"
-        layers: [128, 128]
-        activations: tanh
+        layers: [256, 256]
+        activations: relu
     output: ONE
   target_critic_1:
     class: DeterministicMixin  # Outputs deterministic continuous values
@@ -39,8 +39,8 @@ models:
     network:
       - name: net
         input: "concatenate([OBSERVATIONS, ACTIONS])"
-        layers: [128, 128]
-        activations: tanh
+        layers: [256, 256]
+        activations: relu
     output: ONE
   target_critic_2:
     class: DeterministicMixin  # Outputs deterministic continuous values
@@ -48,23 +48,23 @@ models:
     network:
       - name: net
         input: "concatenate([OBSERVATIONS, ACTIONS])"
-        layers: [128, 128]
-        activations: tanh
+        layers: [256, 256]
+        activations: relu
     output: ONE
 
 memory:
   class: RandomMemory
-  memory_size: 4000   # per-env capacity; total = memory_size * num_envs
+  memory_size: 244  # per-env capacity; total = memory_size * num_envs (244*4096≈999,424, standard ~1M replay buffer)
 
 agent:
   class: SAC
   state_preprocessor: RunningStandardScaler  # Mechanism for normalizing online states
   state_preprocessor_kwargs: null
-  gradient_steps: 1   # UTD~1 already: batch_size (4096) ~= num_envs (4096) new transitions/timestep
-  batch_size: 4096
+  gradient_steps: 1
+  batch_size: 256
   discount_factor: 0.99  # Gamma discount factor weighting future rewards
   polyak: 0.005
-  learning_rate: [3.0e-04, 3.0e-04, 1.0e-04]  # [policy, critic, entropy] — damp entropy lr to reduce runaway risk
+  learning_rate: 3.0e-04  # policy, critic, and entropy coefficient all share the same lr
   learn_entropy: True
   initial_entropy_value: 0.2
   random_timesteps: 80

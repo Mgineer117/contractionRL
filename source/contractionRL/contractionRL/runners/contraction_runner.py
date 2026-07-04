@@ -11,9 +11,9 @@ Algorithm routing
 PPO / SAC (and any other skrl-native algo):
     → skrl Runner  (skrl.utils.runner.torch.Runner)
 
-C3M / LQR / SDLQR / TEMP:
-    → native skrl Agent subclasses (C3MAgent, LQRAgent, SDLQRAgent, TEMPAgent)
-    with custom skrl Trainers (C3MSkrlTrainer, TEMPSkrlTrainer, or
+C3M / LQR / SDLQR / C2RL:
+    → native skrl Agent subclasses (C3MAgent, LQRAgent, SDLQRAgent, C2RLAgent)
+    with custom skrl Trainers (C3MSkrlTrainer, C2RLSkrlTrainer, or
     SequentialTrainer for eval-only analytical agents).
 
 Classic env: internally creates SyncVectorEnv + wrap_env.
@@ -36,7 +36,7 @@ import warnings
 import gymnasium as gym
 
 _SKRL_ALGOS = frozenset({"ppo", "sac", "td3", "ddpg", "amp", "ippo", "mappo"})
-_CONTRACTION_ALGOS = frozenset({"c3m", "lqr", "sdlqr", "temp"})
+_CONTRACTION_ALGOS = frozenset({"c3m", "lqr", "sdlqr", "c2rl"})
 
 
 # ────────────────────────────────────────────────────────────────────────── #
@@ -49,7 +49,7 @@ _ENTRY_KEY: dict[str, str] = {
     "c3m":   "skrl_c3m_cfg_entry_point",
     "lqr":   "skrl_lqr_cfg_entry_point",
     "sdlqr": "skrl_sdlqr_cfg_entry_point",
-    "temp":  "skrl_temp_cfg_entry_point",
+    "c2rl":  "skrl_c2rl_cfg_entry_point",
 }
 
 
@@ -169,7 +169,7 @@ def _make_skrl_env(env, task_id: str | None, num_envs: int, is_classic: bool):
         # the numpy env; observations are re-tensorized onto `device` after).
         # Leaving vec_env.device unset lets GymnasiumWrapper fall back to the
         # global skrl device (cuda:0 when available) — matching Isaac envs and
-        # letting C3M/TEMP's batched Jacobian/backprop math run on GPU instead
+        # letting C3M/C2RL's batched Jacobian/backprop math run on GPU instead
         # of silently pinning the whole classic pipeline (including the neural
         # networks) to CPU.
         return wrap_env(vec_env, wrapper="gymnasium")
@@ -192,7 +192,7 @@ class ContractionRunner:
         ml_framework: ``"torch"`` or ``"jax"`` (skrl-native algos only).
         dynamics_model: optional NeuralDynamics for Isaac envs. Injected into
             the env via ``set_dynamics_model()`` so ``get_f_and_B`` works for
-            C3M / LQR / SD-LQR / TEMP. Classic envs have analytical dynamics
+            C3M / LQR / SD-LQR / C2RL. Classic envs have analytical dynamics
             and do not need this.
     """
 
@@ -239,7 +239,7 @@ class ContractionRunner:
         if anneal and algo == "ppo":
             _patch_ppo_annealing(self._runner)
 
-    # ── contraction agents (C3M/LQR/SDLQR/TEMP) ───────────────────────── #
+    # ── contraction agents (C3M/LQR/SDLQR/C2RL) ───────────────────────── #
 
     def _setup_contraction(self, env, cfg, algo, task_id, num_envs, is_classic, dynamics_model=None):
         from contractionRL.agents.skrl.models import CLActorModel, CMGModel
@@ -248,7 +248,7 @@ class ContractionRunner:
         # Use the wrapped env's device for both classic and Isaac envs. The
         # classic env's own physics step is numpy/CPU-bound regardless (see
         # _make_skrl_env), but the agent's neural networks and gradient math
-        # (C3M/TEMP Jacobians, batched contraction losses) benefit hugely from
+        # (C3M/C2RL Jacobians, batched contraction losses) benefit hugely from
         # GPU — hardcoding CPU here was pinning that compute off the GPU even
         # when one was available. SD-LQR/LQR are unaffected: they pin their own
         # internal `_compute_device = "cpu"` regardless of this value, since
@@ -318,8 +318,8 @@ class ContractionRunner:
         elif algo in ("lqr", "sdlqr"):
             self._setup_sdlqr(skrl_env, device, obs_space, state_space, act_space,
                               agent_cfg, trainer_cfg, models_cfg, get_f_and_B, lqr=(algo == "lqr"), x_dim=x_dim, u_dim=u_dim)
-        elif algo == "temp":
-            self._setup_temp(skrl_env, device, obs_space, state_space, act_space,
+        elif algo == "c2rl":
+            self._setup_c2rl(skrl_env, device, obs_space, state_space, act_space,
                              agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B, x_dim, u_dim)
 
     def _setup_c3m(self, env, device, obs_space, state_space, act_space,
@@ -438,10 +438,10 @@ class ContractionRunner:
         self._env = env
         self._mode = "lqr" if lqr else "sdlqr"
 
-    def _setup_temp(self, env, device, obs_space, state_space, act_space,
+    def _setup_c2rl(self, env, device, obs_space, state_space, act_space,
                     agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None):
         from contractionRL.agents.skrl.models import CLActorModel, CMGModel
-        from contractionRL.agents.skrl.temp import TEMPAgent, TEMPCfg, TEMPSkrlTrainer, TEMPTrainerCfg
+        from contractionRL.agents.skrl.c2rl import C2RLAgent, C2RLCfg, C2RLSkrlTrainer, C2RLTrainerCfg
         from skrl.models.torch import DeterministicMixin, Model
         import dataclasses
 
@@ -476,9 +476,9 @@ class ContractionRunner:
             "cmg": CMGModel(obs_space, act_space, device, hidden_dim=cmg_hd),
         }
 
-        cfg_fields = TEMPCfg.__dataclass_fields__
-        agent = TEMPAgent(
-            cfg=TEMPCfg(**{k: v for k, v in agent_cfg.items() if k in cfg_fields}),
+        cfg_fields = C2RLCfg.__dataclass_fields__
+        agent = C2RLAgent(
+            cfg=C2RLCfg(**{k: v for k, v in agent_cfg.items() if k in cfg_fields}),
             models=models,
             observation_space=obs_space,
             state_space=state_space,
@@ -490,16 +490,16 @@ class ContractionRunner:
         )
         trainer_cfg.setdefault("timesteps", 300000)
         trainer_cfg.setdefault("rollouts", agent_cfg.get("rollouts", 300))
-        tcfg_fields = TEMPTrainerCfg.__dataclass_fields__
-        trainer = TEMPSkrlTrainer(
-            cfg=TEMPTrainerCfg(**{k: v for k, v in trainer_cfg.items() if k in tcfg_fields}),
+        tcfg_fields = C2RLTrainerCfg.__dataclass_fields__
+        trainer = C2RLSkrlTrainer(
+            cfg=C2RLTrainerCfg(**{k: v for k, v in trainer_cfg.items() if k in tcfg_fields}),
             env=env,
             agents=agent,
         )
         self._agent = agent
         self._trainer = trainer
         self._env = env
-        self._mode = "temp"
+        self._mode = "c2rl"
 
     # ── public interface ────────────────────────────────────────────────── #
 

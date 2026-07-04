@@ -12,7 +12,7 @@ models:
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [128, 128]
+        layers: [256, 256]
         activations: relu
     output: ACTIONS
   critic_1:
@@ -21,7 +21,7 @@ models:
     network:
       - name: net
         input: "concatenate([OBSERVATIONS, ACTIONS])"
-        layers: [128, 128]
+        layers: [256, 256]
         activations: relu
     output: ONE
   critic_2:
@@ -30,7 +30,7 @@ models:
     network:
       - name: net
         input: "concatenate([OBSERVATIONS, ACTIONS])"
-        layers: [128, 128]
+        layers: [256, 256]
         activations: relu
     output: ONE
   target_critic_1:
@@ -39,7 +39,7 @@ models:
     network:
       - name: net
         input: "concatenate([OBSERVATIONS, ACTIONS])"
-        layers: [128, 128]
+        layers: [256, 256]
         activations: relu
     output: ONE
   target_critic_2:
@@ -48,13 +48,13 @@ models:
     network:
       - name: net
         input: "concatenate([OBSERVATIONS, ACTIONS])"
-        layers: [128, 128]
+        layers: [256, 256]
         activations: relu
     output: ONE
 
 memory:
   class: RandomMemory
-  memory_size: 250000  # total buffer (single-env mode buffers per env; with 4 envs: 250K/4≈62K each)
+  memory_size: 250000  # per-env capacity; total = memory_size * num_envs (250000*4≈1,000,000, standard ~1M replay buffer)
 
 agent:
   class: SAC
@@ -64,7 +64,7 @@ agent:
   batch_size: 256
   discount_factor: 0.99  # Gamma discount factor weighting future rewards
   polyak: 0.005
-  learning_rate: [3.0e-04, 3.0e-04, 1.0e-04]  # [policy, critic, entropy] — damp entropy lr to reduce runaway risk
+  learning_rate: 3.0e-04  # policy, critic, and entropy coefficient all share the same lr
   learn_entropy: True
   initial_entropy_value: 0.2
   random_timesteps: 1000

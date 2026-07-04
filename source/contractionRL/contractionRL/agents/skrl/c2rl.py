@@ -1,11 +1,11 @@
-"""TEMP — Two-policy contraction-metric synthesis, native skrl Agent.
+"""C2RL — Two-policy contraction-metric synthesis, native skrl Agent.
 
-TEMPAgent alternates between a contracting rollout phase (γ→0) and an optimal
+C2RLAgent alternates between a contracting rollout phase (γ→0) and an optimal
 rollout phase (high γ).  Both PPO-backed policies share a CMG trained with the
 contraction pd-loss.  The Mahalanobis reward ``-||e||²_M / std`` replaces the
 environment reward for both policies.
 
-Training loop (handled by TEMPSkrlTrainer):
+Training loop (handled by C2RLSkrlTrainer):
   1. Collect ``rollout_steps`` transitions with *con_policy* (γ→0).
   2. Inject Mahalanobis rewards → PPO update for con_policy.
   3. Collect ``rollout_steps`` transitions with *opt_policy* (high γ).
@@ -45,7 +45,7 @@ from .math_utils import (
 # ─────────────────────────────────────────────────────────────────────────── #
 
 @dataclass
-class TEMPCfg(AgentCfg):
+class C2RLCfg(AgentCfg):
     # PPO shared config
     rollouts: int = 300
     learning_epochs: int = 8
@@ -59,7 +59,7 @@ class TEMPCfg(AgentCfg):
     value_loss_scale: float = 1.0
     kl_threshold: float = 0.0
     grad_norm_clip: float = 1.0
-    # TEMP-specific
+    # C2RL-specific
     gamma_contracting: float = 0.0
     gamma_optimal: float = 0.99
     con_only: bool = False
@@ -80,7 +80,7 @@ class TEMPCfg(AgentCfg):
 
 
 @dataclass
-class TEMPTrainerCfg(TrainerCfg):
+class C2RLTrainerCfg(TrainerCfg):
     timesteps: int = 300000
     rollouts: int = 300
     con_only: bool = False
@@ -90,8 +90,8 @@ class TEMPTrainerCfg(TrainerCfg):
 # Agent
 # ─────────────────────────────────────────────────────────────────────────── #
 
-class TEMPAgent(Agent):
-    """TEMP agent — native skrl Agent, zero mjrl dependency.
+class C2RLAgent(Agent):
+    """C2RL agent — native skrl Agent, zero mjrl dependency.
 
     Models in ``models`` dict:
       ``"con_policy"`` — CLActorModel (contracting controller, γ→0)
@@ -111,7 +111,7 @@ class TEMPAgent(Agent):
     def __init__(
         self,
         *,
-        cfg: TEMPCfg | dict,
+        cfg: C2RLCfg | dict,
         models: dict,
         memory=None,
         observation_space,
@@ -126,7 +126,7 @@ class TEMPAgent(Agent):
     ) -> None:
         if isinstance(cfg, dict):
             self._raw_cfg = cfg.copy()
-            parsed_cfg = TEMPCfg(**{k: v for k, v in cfg.items() if k in TEMPCfg.__dataclass_fields__})
+            parsed_cfg = C2RLCfg(**{k: v for k, v in cfg.items() if k in C2RLCfg.__dataclass_fields__})
         else:
             self._raw_cfg = cfg.__dict__.copy()
             parsed_cfg = cfg
@@ -159,7 +159,7 @@ class TEMPAgent(Agent):
         # ── Build two RL agents (con + opt) ─────────────────────────────── #
         # Memory tensors are physically allocated at agent.init() below with
         # this num_envs — they cannot be resized later, so it must be correct
-        # up front (see TEMPSkrlTrainer.train, which used to mutate _num_envs
+        # up front (see C2RLSkrlTrainer.train, which used to mutate _num_envs
         # post-hoc; that silently corrupted the con/opt buffers on multi-env
         # Isaac Sim runs since the underlying tensors stayed shape (rollouts, 1, ...)).
         self._num_envs = num_envs
@@ -175,8 +175,8 @@ class TEMPAgent(Agent):
         )
 
         def _make_base_cfg(gamma: float) -> dict:
-            # Project the raw TEMP config down to *only* the base agent's own
-            # fields. Passing TEMP/CMG-specific keys (W_lr, lbd, gamma_*, ...) to
+            # Project the raw C2RL config down to *only* the base agent's own
+            # fields. Passing C2RL/CMG-specific keys (W_lr, lbd, gamma_*, ...) to
             # PPO_CFG(**cfg) / SAC_CFG(**cfg) would raise TypeError, since those
             # are kw_only dataclasses that reject unknown kwargs. Also rebuild
             # `experiment` as a plain dict (the raw value may be an ExperimentCfg
@@ -206,7 +206,7 @@ class TEMPAgent(Agent):
                 "target_q1": models["opt_target_q1"], "target_q2": models["opt_target_q2"]
             } if "opt_policy" in models else {}
         else:
-            raise ValueError(f"[TEMP] Unsupported base_algorithm: {self._base_algorithm}")
+            raise ValueError(f"[C2RL] Unsupported base_algorithm: {self._base_algorithm}")
 
         self._con_agent = BaseRLAgent(
             cfg=_make_base_cfg(parsed_cfg.gamma_contracting),
@@ -228,7 +228,7 @@ class TEMPAgent(Agent):
         if self._opt_agent is not None:
             self._opt_agent.init()
 
-        # ── CMG + TEMP math ───────────────────────────────────────────────── #
+        # ── CMG + C2RL math ───────────────────────────────────────────────── #
         self._ccm_gen = models["cmg"].ccm_gen
         self._con_cl_actor = models["con_policy"].cl_actor
         self._get_f_and_B = get_f_and_B
@@ -237,9 +237,9 @@ class TEMPAgent(Agent):
         self._buffer_size = cfg.buffer_size
 
         self._W_optimizer = torch.optim.Adam(self._ccm_gen.parameters(), lr=cfg.W_lr)
-        self._temp_progress = 0.0
+        self._progress = 0.0
         self._W_lr_scheduler = LambdaLR(
-            self._W_optimizer, lr_lambda=lambda _: max(0.0, 1.0 - self._temp_progress)
+            self._W_optimizer, lr_lambda=lambda _: max(0.0, 1.0 - self._progress)
         )
 
         self._running_reward_var: float | None = None
@@ -281,7 +281,7 @@ class TEMPAgent(Agent):
         super().post_interaction(timestep=timestep, timesteps=timesteps)
 
     def update(self, *, timestep: int, timesteps: int) -> None:
-        # TEMPSkrlTrainer calls update_con / update_opt / update_cmg directly.
+        # C2RLSkrlTrainer calls update_con / update_opt / update_cmg directly.
         pass
 
     # ── Mahalanobis reward ─────────────────────────────────────────────── #
@@ -312,7 +312,7 @@ class TEMPAgent(Agent):
             reward = -cfg.tracking_scaler * quad / std
         return reward
 
-    # ── CMG update (inlined from mjrl TEMP.compute_cmg_loss / update_cmg) ─ #
+    # ── CMG update (inlined from mjrl C2RL.compute_cmg_loss / update_cmg) ─ #
 
     def _compute_cmg_loss(self):
         cfg = self._cfg
@@ -368,7 +368,7 @@ class TEMPAgent(Agent):
         loss = pd_loss + pd_reg - entropy_loss
         return loss, {"pd_loss": pd_loss.item(), "pd_reg": pd_reg.item()}
 
-    # ── TEMP update methods (called by TEMPSkrlTrainer) ──────────────────── #
+    # ── C2RL update methods (called by C2RLSkrlTrainer) ──────────────────── #
 
     def update_con(self, observations: torch.Tensor, *, timestep: int, timesteps: int) -> dict:
         """Inject Mahalanobis rewards into con_memory and run PPO update."""
@@ -377,11 +377,11 @@ class TEMPAgent(Agent):
             r_tensor = self._con_agent.memory.get_tensor_by_name("rewards")
             if r_tensor.shape != maha_r.shape:
                 import skrl
-                skrl.logger.warning(f"[TEMP] Reward shape mismatch in update_con: {r_tensor.shape} != {maha_r.shape}")
+                skrl.logger.warning(f"[C2RL] Reward shape mismatch in update_con: {r_tensor.shape} != {maha_r.shape}")
             r_tensor.copy_(maha_r.view_as(r_tensor))
         except RuntimeError as e:
             import skrl
-            skrl.logger.warning(f"[TEMP] Failed to inject Mahalanobis reward in update_con: {e}")
+            skrl.logger.warning(f"[C2RL] Failed to inject Mahalanobis reward in update_con: {e}")
         self._con_agent.update(timestep=timestep, timesteps=timesteps)
         return {}
 
@@ -394,18 +394,18 @@ class TEMPAgent(Agent):
             r_tensor = self._opt_agent.memory.get_tensor_by_name("rewards")
             if r_tensor.shape != maha_r.shape:
                 import skrl
-                skrl.logger.warning(f"[TEMP] Reward shape mismatch in update_opt: {r_tensor.shape} != {maha_r.shape}")
+                skrl.logger.warning(f"[C2RL] Reward shape mismatch in update_opt: {r_tensor.shape} != {maha_r.shape}")
             r_tensor.copy_(maha_r.view_as(r_tensor))
         except RuntimeError as e:
             import skrl
-            skrl.logger.warning(f"[TEMP] Failed to inject Mahalanobis reward in update_opt: {e}")
+            skrl.logger.warning(f"[C2RL] Failed to inject Mahalanobis reward in update_opt: {e}")
         self._opt_agent.update(timestep=timestep, timesteps=timesteps)
         return {}
 
     def update_cmg(self, *, timestep: int, timesteps: int) -> dict:
         """Refresh data buffer and run CMG contraction pd-loss update."""
         self._data = self._get_rollout(self._buffer_size, "c3m")
-        self._temp_progress = float(timestep) / max(1, timesteps)
+        self._progress = float(timestep) / max(1, timesteps)
         self._ccm_gen.train()
         for _ in range(self._cfg.cmg_updates_per_iter):
             loss, info = self._compute_cmg_loss()
@@ -417,8 +417,8 @@ class TEMPAgent(Agent):
         self._ccm_gen.eval()
 
         loss_dict = {
-            "TEMP/CMG/pd_loss": info["pd_loss"],
-            "TEMP/CMG/pd_reg":  info["pd_reg"],
+            "C2RL/CMG/pd_loss": info["pd_loss"],
+            "C2RL/CMG/pd_reg":  info["pd_reg"],
         }
         for k, v in loss_dict.items():
             self.track_data(f"Loss / {k}", v)
@@ -429,30 +429,30 @@ class TEMPAgent(Agent):
 # Trainer
 # ─────────────────────────────────────────────────────────────────────────── #
 
-class TEMPSkrlTrainer(Trainer):
-    """skrl Trainer for TEMP — alternates con/opt rollouts and CMG updates."""
+class C2RLSkrlTrainer(Trainer):
+    """skrl Trainer for C2RL — alternates con/opt rollouts and CMG updates."""
 
     def train(self) -> None:
-        agent: TEMPAgent = self.agents if not isinstance(self.agents, list) else self.agents[0]
+        agent: C2RLAgent = self.agents if not isinstance(self.agents, list) else self.agents[0]
         env = self.env
         num_envs = env.num_envs
         rollout_steps = self.cfg.rollouts if hasattr(self.cfg, "rollouts") else agent._cfg.rollouts
         timesteps = self.cfg.timesteps
         con_only = agent._con_only
 
-        # con/opt RandomMemory buffers are allocated inside TEMPAgent.__init__ (at
+        # con/opt RandomMemory buffers are allocated inside C2RLAgent.__init__ (at
         # agent.init() there) using the num_envs passed to its constructor — skrl
         # memory tensors are physically sized at creation and cannot be resized
         # afterwards, so num_envs/rollouts must already match here.
         if agent._num_envs != num_envs:
             raise ValueError(
-                f"[TEMP] Agent was constructed with num_envs={agent._num_envs} but the "
+                f"[C2RL] Agent was constructed with num_envs={agent._num_envs} but the "
                 f"environment has num_envs={num_envs}. Pass the correct num_envs to "
-                f"TEMPAgent(...) (ContractionRunner does this automatically)."
+                f"C2RLAgent(...) (ContractionRunner does this automatically)."
             )
         if agent._con_memory.memory_size != rollout_steps:
             raise ValueError(
-                f"[TEMP] Agent con_memory was sized for rollouts={agent._con_memory.memory_size} "
+                f"[C2RL] Agent con_memory was sized for rollouts={agent._con_memory.memory_size} "
                 f"but the trainer is configured for rollouts={rollout_steps}. Keep "
                 f"agent.rollouts and trainer.rollouts in sync in the YAML config."
             )
@@ -464,7 +464,7 @@ class TEMPSkrlTrainer(Trainer):
         global_step = 0
 
         total_iters = timesteps // (rollout_steps * (1 if con_only else 2))
-        pbar = _tqdm.tqdm(range(max(1, total_iters)), desc="TEMP training", file=sys.stdout)
+        pbar = _tqdm.tqdm(range(max(1, total_iters)), desc="C2RL training", file=sys.stdout)
 
         for epoch in pbar:
 
@@ -529,11 +529,11 @@ class TEMPSkrlTrainer(Trainer):
             cmg_dict = agent.update_cmg(timestep=global_step, timesteps=timesteps)
             agent.post_interaction(timestep=global_step, timesteps=timesteps)
 
-            pd_loss = cmg_dict.get("TEMP/CMG/pd_loss", float("nan"))
+            pd_loss = cmg_dict.get("C2RL/CMG/pd_loss", float("nan"))
             pbar.set_postfix(epoch=epoch, pd=f"{pd_loss:.3g}")
 
     def eval(self) -> None:
-        agent: TEMPAgent = self.agents if not isinstance(self.agents, list) else self.agents[0]
+        agent: C2RLAgent = self.agents if not isinstance(self.agents, list) else self.agents[0]
         ppo = agent._opt_agent if (agent._opt_agent and not agent._con_only) else agent._con_agent
         ppo.enable_training_mode(False)
         observations, _ = self.env.reset()

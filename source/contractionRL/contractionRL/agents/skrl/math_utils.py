@@ -1,7 +1,7 @@
 """Pure-PyTorch math utilities for contraction RL algorithms.
 
 These standalone functions provide the Jacobian computations, positive-definiteness
-losses, and metric utilities needed by C3M, SD-LQR, LQR, and TEMP — with no mjrl
+losses, and metric utilities needed by C3M, SD-LQR, LQR, and C2RL — with no mjrl
 dependency.
 """
 from __future__ import annotations

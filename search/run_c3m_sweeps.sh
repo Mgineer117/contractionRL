@@ -22,7 +22,11 @@ for i in "${!ENVS[@]}"; do
 program: scripts/skrl/train.py
 method: bayes
 metric:
-  name: "Reward / Total reward (mean)"
+  # Stability / convergence_score = contraction_rate / overshoot — rewards
+  # fast contraction with little overshoot, higher is better. Requires
+  # eval_interval > 0 in the C3M agent cfg (default 100) so C3MSkrlTrainer.eval()
+  # actually logs it periodically during the sweep.
+  name: "Stability / convergence_score"
   goal: maximize
 
 parameters:

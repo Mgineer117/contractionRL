@@ -192,7 +192,7 @@ class BaseEnv(gym.Env):
 
         ``torch.zeros(shape)`` defaults to CPU regardless of where ``x`` lives,
         so a subsequent ``f[:, i] = x[:, j] * ...`` silently mixes devices and
-        raises once ``x`` is a CUDA tensor (e.g. C3M/TEMP running their
+        raises once ``x`` is a CUDA tensor (e.g. C3M/C2RL running their
         contraction math on GPU). The numpy path (env.step's physics rollout)
         is unaffected since ``np.zeros`` has no device concept.
         """

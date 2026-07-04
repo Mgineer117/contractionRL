@@ -309,7 +309,7 @@ class C3MAgent(Agent):
 
         # Certify the *deterministic* controller: use the mean control, not a
         # noisy rsample. Exploration noise would otherwise perturb A and dot_x
-        # (and hence the contraction condition Cu) — this matches TEMP's CMG loss.
+        # (and hence the contraction condition Cu) — this matches C2RL's CMG loss.
         state = torch.cat([x, xref, uref], dim=1)
         u = self._cl_actor.mean_control(state)
         K = jacobian(u, x)
@@ -456,7 +456,7 @@ class C3MAgent(Agent):
             
         return loss.item()
     def save_dynamics(self, path: str) -> None:
-        """Save NeuralDynamics checkpoint for SDLQR/LQR/TEMP to load."""
+        """Save NeuralDynamics checkpoint for SDLQR/LQR/C2RL to load."""
         if self._neural_dynamics is not None:
             self._neural_dynamics.save(path)
             print(f"[C3M] Saved NeuralDynamics → {path}")
@@ -577,8 +577,10 @@ class C3MSkrlTrainer(Trainer):
             # Evaluate metrics occasionally
             if eval_interval > 0 and (t + 1) % eval_interval == 0:
                 eval_metrics = self.eval()
+                _stability_keys = {"auc", "contraction_rate", "overshoot", "convergence_score"}
                 for k, v in eval_metrics.items():
-                    agent.track_data(f"Eval / {k}", v)
+                    tab = "Stability" if k in _stability_keys else "Reward"
+                    agent.track_data(f"{tab} / {k}", v)
 
             if log_interval and (t + 1) % log_interval == 0:
                 # Read the losses captured on the agent by update(); tracking_data
@@ -605,6 +607,28 @@ class C3MSkrlTrainer(Trainer):
             dyn_path = os.path.join(agent.experiment_dir, "checkpoints", "dynamics.pt")
             agent.save_dynamics(dyn_path)
 
+    def _env_scalar_attr(self, *names):
+        """Fetch a scalar env attribute across both env backends.
+
+        Isaac envs expose it directly on the skrl-wrapped env (shared across
+        the batched sim, e.g. ``max_episode_length``/``step_dt``). Classic
+        envs are N separate Python instances behind a gymnasium
+        ``SyncVectorEnv`` (attr named e.g. ``max_episode_len``/``dt``), which
+        does NOT forward arbitrary attribute access — only ``get_attr(name)``
+        reaches the underlying sub-envs.
+        """
+        for name in names:
+            val = getattr(self.env, name, None)
+            if val is not None:
+                return val
+        if hasattr(self.env, "get_attr"):
+            for name in names:
+                try:
+                    return self.env.get_attr(name)[0]
+                except Exception:
+                    continue
+        raise AttributeError(f"none of {names} found on env {self.env!r}")
+
     def eval(self) -> dict:
         agent = self.agents if not isinstance(self.agents, list) else self.agents[0]
         agent.enable_training_mode(False)
@@ -616,6 +640,9 @@ class C3MSkrlTrainer(Trainer):
         auc_sum = torch.zeros((num_envs, 1), device=self.env.device)
         total_reward = torch.zeros((num_envs, 1), device=self.env.device)
         steps_count = torch.zeros((num_envs, 1), device=self.env.device)
+        e0 = torch.zeros((num_envs, 1), device=self.env.device)
+        e_last = torch.zeros((num_envs, 1), device=self.env.device)
+        e_max = torch.zeros((num_envs, 1), device=self.env.device)
 
         # Envs auto-reset individually on done (DirectRLEnv._reset_idx runs
         # inside step()), and termination is per-env (e.g. a quadruped falling
@@ -625,7 +652,7 @@ class C3MSkrlTrainer(Trainer):
         # bounded number of steps and track which envs have finished their
         # FIRST episode, masking further accumulation for them once they have
         # (mirrors train.py's `_evaluate_best_model` quality-gate loop).
-        max_steps = int(self.env.max_episode_length) + 1
+        max_steps = int(self._env_scalar_attr("max_episode_length", "max_episode_len")) + 1
         finished = torch.zeros(num_envs, dtype=torch.bool, device=self.env.device)
 
         for _ in range(max_steps):
@@ -637,6 +664,10 @@ class C3MSkrlTrainer(Trainer):
             x_ref = observations[:, x_dim:2*x_dim]
             error = torch.norm(x_curr - x_ref, dim=-1, keepdim=True)
             auc_sum += error * active
+            is_first = (steps_count == 0) & (active > 0)
+            e0 = torch.where(is_first, error, e0)
+            e_last = torch.where(active > 0, error, e_last)
+            e_max = torch.where(active > 0, torch.maximum(e_max, error), e_max)
 
             observations, rewards, terminated, truncated, _ = self.env.step(actions)
             total_reward += rewards.view(num_envs, 1) * active
@@ -647,7 +678,23 @@ class C3MSkrlTrainer(Trainer):
                 break
 
         agent.enable_training_mode(True)
+
+        dt = float(self._env_scalar_attr("step_dt", "dt"))
+        e0c = e0.clamp(min=1e-8)
+        eTc = e_last.clamp(min=1e-8)
+        T = steps_count.clamp(min=1)
+        # Empirical contraction rate: e(T) = e(0) * exp(-lambda * T*dt)
+        lambda_emp = -(torch.log(eTc) - torch.log(e0c)) / (T * dt)
+        # Overshoot: peak error relative to the initial error.
+        overshoot = (e_max.clamp(min=1e-8) / e0c).clamp(min=1e-6)
+        # Convergence score: contraction rate per unit of overshoot — higher
+        # is better (fast contraction, little to no overshoot).
+        convergence_score = lambda_emp / overshoot
+
         return {
             "reward_mean": total_reward.mean().item(),
-            "auc": auc_sum.mean().item()
+            "auc": auc_sum.mean().item(),
+            "contraction_rate": lambda_emp.mean().item(),
+            "overshoot": overshoot.mean().item(),
+            "convergence_score": convergence_score.mean().item(),
         }
