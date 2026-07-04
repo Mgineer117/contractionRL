@@ -92,10 +92,14 @@ parser.add_argument("--epochs", type=int, default=None,
                     help="Training epochs override (classic only).")
 
 # Reference trajectory generation (auto-triggered after vel-tracking training)
-parser.add_argument("--ref_num_trajs", type=int, default=2000,
+parser.add_argument("--ref_num_trajs", type=int, default=1000,
                     help="Number of reference trajectories to collect after vel-tracking training.")
 parser.add_argument("--min_ref_quality", type=float, default=None,
                     help="Minimum mean episode reward before generating ref trajs. 0 to skip check.")
+parser.add_argument("--min_ref_traj_length_frac", type=float, default=0.5,
+                    help="Minimum fraction of the max episode length (T) a trajectory must survive "
+                         "to be accepted into dynamics_data.npz. Trajectories shorter than "
+                         "min_ref_traj_length_frac * T are discarded (default 0.5, i.e. half of T).")
 
 if not _is_classic:
     AppLauncher.add_app_launcher_args(parser)
@@ -136,7 +140,21 @@ logger = logging.getLogger(__name__)
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 _VEL_TASK_TO_ROBOT = {"Quadruped": "quadruped", "Humanoid": "humanoid", "Manipulator": "manipulator"}
-_MIN_QUALITY_REWARD = {"quadruped": 750.0, "humanoid": 875.0, "manipulator": 500.0}
+
+
+def _max_step_reward(robot: str, env_cfg) -> float:
+    """Best-case per-step reward for a vel-tracking env's reward function.
+
+    quadruped/humanoid: alive bonus + exp-tracking terms, each of which saturates
+    at its scale when the tracking error is 0; every other term is `nonneg * a
+    non-positive scale`, so its best case is 0. manipulator has no alive bonus
+    and every term is `error * negative_scale`, so its best case is exactly 0.
+    """
+    if robot in ("quadruped", "humanoid"):
+        return env_cfg.rew_alive + env_cfg.rew_lin_vel + env_cfg.rew_yaw_rate
+    if robot == "manipulator":
+        return 0.0
+    raise ValueError(f"no max-reward formula for robot '{robot}'")
 
 
 def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
@@ -150,8 +168,12 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
 
     out_dir = os.path.join(_ROOT, "logs", robot)
     out_path = os.path.join(out_dir, "dynamics_data.npz")
+    T = int(env_cfg.episode_length_s / (env_cfg.sim.dt * env_cfg.decimation))
+    # Quality threshold = half of the theoretical best-case total episode reward
+    # (best-case per-step reward × T), rather than a hand-picked constant — this
+    # tracks whatever the reward scales in env_cfg actually are per task.
     min_reward = args_cli.min_ref_quality if args_cli.min_ref_quality is not None \
-        else _MIN_QUALITY_REWARD.get(robot, 750.0)
+        else 0.5 * _max_step_reward(robot, env_cfg) * T
 
     # Load best checkpoint
     import logging as _logging
@@ -170,13 +192,12 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
         if model is not None:
             model.eval()
 
-    T = int(env_cfg.episode_length_s / (env_cfg.sim.dt * env_cfg.decimation))
+    def _get_obs(o):
+        return o["policy"] if isinstance(o, dict) else o
 
     # Quality gate: 1 full episode across all parallel environments
     if min_reward > 0:
         print(f"\n[RefTraj] Evaluating quality (threshold: mean total reward >= {min_reward}) …")
-        def _get_obs(o):
-            return o["policy"] if isinstance(o, dict) else o
 
         # SkrlVecEnvWrapper auto-resets each env individually on done, so we
         # must NOT mask out rewards after done — the env is already running its
@@ -233,6 +254,11 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
     print(f"[RefTraj] Collecting {num_trajs} trajectories → {out_path}")
     unwrapped = isaac_env.unwrapped
     num_envs = skrl_env.num_envs
+    # All num_envs parallel sims still step together (Isaac can't shrink the
+    # batch), but only num_trajs trajectories are ever saved — so only the
+    # first rec_envs envs are bookkept/recorded; the rest are simulated and
+    # their output discarded.
+    rec_envs = min(num_trajs, num_envs)
     import tqdm
     all_states, all_actions, all_pos, all_lengths = [], [], [], []
     if hasattr(skrl_env, "_reset_once"):
@@ -240,11 +266,14 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
     obs_dict, _ = skrl_env.reset()
     obs = _get_obs(obs_dict)
 
-    # Action-space bounds for clipping. The policy samples with clip_actions
-    # False (clipping inside the actor corrupts the log-prob used by PPO), but
-    # the env/actuators saturate out-of-range commands — so data must record
-    # the *clipped* action, and we step with that same clipped action so the
-    # recorded u is exactly the executed u (unbiased (x, u, x_dot) triples).
+    # Action-space bounds — used ONLY when writing into the saved `u` array
+    # below, never to modify what's stepped through the env. The policy
+    # samples with clip_actions=False (clipping inside the actor corrupts the
+    # log-prob), and the env already enforces action bounds on its own (its
+    # actuator/physics pipeline), so re-clipping before `skrl_env.step()` would
+    # be redundant. But the *saved* dynamics_data.npz must record actions
+    # within the declared action space — an unclipped, possibly out-of-range
+    # sample is not a valid "u" for fitting f(x) + B(x)u.
     _act_low = torch.as_tensor(skrl_env.action_space.low, dtype=torch.float32, device=skrl_env.device)
     _act_high = torch.as_tensor(skrl_env.action_space.high, dtype=torch.float32, device=skrl_env.device)
 
@@ -255,25 +284,26 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
     state_dim = state_tensor.shape[1]
     u_dim = actions.shape[1]
 
-    ep_states = torch.zeros((num_envs, T, state_dim), dtype=torch.float32, device=skrl_env.device)
-    ep_actions = torch.zeros((num_envs, T, u_dim), dtype=torch.float32, device=skrl_env.device)
-    ep_pos = torch.zeros((num_envs, T, 3), dtype=torch.float32, device=skrl_env.device)
-    step_counts = torch.zeros(num_envs, dtype=torch.long, device=skrl_env.device)
+    ep_states = torch.zeros((rec_envs, T, state_dim), dtype=torch.float32, device=skrl_env.device)
+    ep_actions = torch.zeros((rec_envs, T, u_dim), dtype=torch.float32, device=skrl_env.device)
+    ep_pos = torch.zeros((rec_envs, T, 3), dtype=torch.float32, device=skrl_env.device)
+    step_counts = torch.zeros(rec_envs, dtype=torch.long, device=skrl_env.device)
 
     pbar = tqdm.tqdm(total=num_trajs, desc="[RefTraj] Collecting")
 
     while len(all_states) < num_trajs:
         with torch.no_grad():
             actions, _ = agent.act(obs, None, timestep=0, timesteps=0)
-        actions = torch.clamp(actions, _act_low, _act_high)
         state_tensor = unwrapped.get_physical_state()
-        
+
         # Record state and action for envs that are still within T steps
         valid_mask = step_counts < T
         valid_indices = valid_mask.nonzero(as_tuple=True)[0]
-        
+
         ep_states[valid_indices, step_counts[valid_indices]] = state_tensor[valid_indices].float()
-        ep_actions[valid_indices, step_counts[valid_indices]] = actions[valid_indices].float()
+        # Clip only for the SAVED record, not for stepping (see note above).
+        ep_actions[valid_indices, step_counts[valid_indices]] = \
+            torch.clamp(actions[valid_indices], _act_low, _act_high).float()
         if hasattr(unwrapped, "_robot"):
             ep_pos[valid_indices, step_counts[valid_indices]] = unwrapped._robot.data.root_pos_w[valid_indices].float()
         
@@ -281,14 +311,18 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
         
         obs_dict, _, terminated, truncated, _ = skrl_env.step(actions)
         obs = _get_obs(obs_dict)
-        done = (terminated | truncated).squeeze(-1)
-        
+        # Only the first rec_envs envs are bookkept (see rec_envs above), so
+        # slice done down to match step_counts/ep_* before indexing with it.
+        done = (terminated | truncated).squeeze(-1)[:rec_envs]
+
         if done.any():
             done_indices = done.nonzero(as_tuple=True)[0]
-            # Accept trajectories that survived at least half the max length.
-            # This handles policies that fall slightly early but pass the quality gate,
-            # as well as off-by-one errors with Isaac Gym's max_episode_length.
-            success_mask = step_counts[done_indices] >= (T // 2)
+            # Accept trajectories that survived at least min_ref_traj_length_frac
+            # of the max length (default 0.5 = half of T). This handles policies
+            # that fall slightly early but pass the quality gate, as well as
+            # off-by-one errors with Isaac Gym's max_episode_length.
+            min_len = int(args_cli.min_ref_traj_length_frac * T)
+            success_mask = step_counts[done_indices] >= min_len
             success_indices = done_indices[success_mask]
             
             if len(success_indices) > 0:
@@ -299,19 +333,31 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
                         ep_states[i, length:] = ep_states[i, length - 1].clone()
                         ep_actions[i, length:] = ep_actions[i, length - 1].clone()
                         ep_pos[i, length:] = ep_pos[i, length - 1].clone()
-                        
-                s_np = ep_states[success_indices].cpu().numpy()
-                a_np = ep_actions[success_indices].cpu().numpy()
-                p_np = ep_pos[success_indices].cpu().numpy()
-                l_np = step_counts[success_indices].cpu().numpy()
-                for i in range(len(success_indices)):
+
+                # Move to CPU in bounded chunks. Episodes are length-synchronized
+                # (fixed T), so on the first `done` event success_indices can be
+                # ~rec_envs at once — gathering all of them in one fancy-index
+                # allocates a full (len(success_indices), T, dim) CUDA temporary,
+                # which is cheap now that rec_envs caps out at num_trajs but is
+                # kept bounded regardless in case rec_envs == num_envs (num_trajs
+                # >= num_envs).
+                _CHUNK = 256
+                for start in range(0, len(success_indices), _CHUNK):
                     if len(all_states) >= num_trajs:
                         break
-                    all_states.append(s_np[i])
-                    all_actions.append(a_np[i])
-                    all_pos.append(p_np[i])
-                    all_lengths.append(int(l_np[i]))
-                    pbar.update(1)
+                    idx = success_indices[start:start + _CHUNK]
+                    s_np = ep_states[idx].cpu().numpy()
+                    a_np = ep_actions[idx].cpu().numpy()
+                    p_np = ep_pos[idx].cpu().numpy()
+                    l_np = step_counts[idx].cpu().numpy()
+                    for i in range(len(idx)):
+                        if len(all_states) >= num_trajs:
+                            break
+                        all_states.append(s_np[i])
+                        all_actions.append(a_np[i])
+                        all_pos.append(p_np[i])
+                        all_lengths.append(int(l_np[i]))
+                        pbar.update(1)
             
             # Reset the step counts for all finished environments
             step_counts[done_indices] = 0
@@ -379,6 +425,119 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
     print(f"       u       shape: {actions_arr.shape}   (clipped to action-space bounds)")
     print(f"       x_dot   shape: {x_dot_arr.shape}")
     print(f"       lengths shape: {lengths_arr.shape}  (min {lengths_arr.min()}, max {lengths_arr.max()})")
+
+
+def _evaluate_classic_path_tracking(*, task, runner, num_groups: int = 10, episodes_per_group: int = 5):
+    """Post-training evaluation for CLASSIC path-tracking envs (CAC-dev style).
+
+    Classic envs (car/cartpole/segway/turtlebot under tasks/direct/classic/)
+    are plain (non-vectorized) gymnasium Envs, ported directly from CAC-dev's
+    envs/xyD/*.py, with variable-length episodes (BaseEnv.system_reset() can
+    end early) and no early termination (`termination` is always False —
+    episodes only truncate at their sampled length). That means, unlike the
+    Isaac path-tracking rollout, there is no "terminate_on_fall" concept and
+    no vectorized-episode-boundary bookkeeping needed — this mirrors CAC-dev's
+    trainer/evaluator.py directly: a plain python loop over ONE env instance,
+    one episode at a time, using its native `tracking_error`/`dt` step info.
+
+    Reports mean +/- 95% CI of: total reward, error AUC (normalized error,
+    trapezoid), and overshoot C / contraction rate lambda from the minimal-AUC
+    exponential envelope C * exp(-lambda * k * dt).
+    """
+    import json
+
+    import numpy as np
+    import torch
+
+    from contractionRL.agents.skrl.eval_metrics import (
+        fit_exponential_envelope,
+        mean_confidence_interval,
+    )
+
+    probe = gym.make(task)
+    if not hasattr(probe.unwrapped, "xref"):
+        print(f"[Eval] SKIPPED — env {type(probe.unwrapped).__name__} has no reference trajectory (xref).")
+        probe.close()
+        return
+    probe.close()
+
+    agent = runner.agent
+    best_ckpt = os.path.join(agent.experiment_dir, "checkpoints", "best_agent.pt")
+    if os.path.exists(best_ckpt):
+        print(f"[Eval] Loading best checkpoint: {best_ckpt}")
+        agent.load(best_ckpt)
+    else:
+        print("[Eval] WARNING: best_agent.pt not found; evaluating final weights.")
+    for model in agent.models.values():
+        if model is not None:
+            model.eval()
+
+    device = agent.device
+    env = gym.make(task)
+
+    reward_list, auc_list, C_list, lbd_list = [], [], [], []
+    print(f"[Eval] Rolling out {num_groups * episodes_per_group} episodes on {task} …")
+    for _g in range(num_groups):
+        error_trajs = []
+        for _e in range(episodes_per_group):
+            obs, _ = env.reset()
+            done = False
+            ep_reward = 0.0
+            error_traj = []
+            dt = env.unwrapped.dt
+            while not done:
+                obs_t = torch.as_tensor(np.asarray(obs), dtype=torch.float32, device=device).unsqueeze(0)
+                with torch.no_grad():
+                    # see _evaluate_best_model for why agent.act() (not
+                    # agent.policy.act()) is the algorithm-agnostic interface
+                    actions, outputs = agent.act(obs_t, None, timestep=0, timesteps=0)
+                    action = outputs.get("mean_actions", actions)[0].cpu().numpy()
+                obs, reward, terminated, truncated, info = env.step(action)
+                done = bool(terminated or truncated)
+                ep_reward += float(reward)
+                # tracking_error is a squared norm (see BaseEnv.get_rewards);
+                # sqrt to work in the same plain-norm convention as the Isaac
+                # evaluator's get_tracking_error().
+                error_traj.append(float(np.sqrt(max(info["tracking_error"], 0.0))))
+            e0 = max(error_traj[0], 1e-8) if error_traj else 1.0
+            norm_traj = np.asarray(error_traj) / e0
+            error_trajs.append(norm_traj)
+            reward_list.append(ep_reward)
+            auc_list.append(float(np.trapezoid(norm_traj, dx=dt)) if hasattr(np, "trapezoid")
+                             else float(np.trapz(norm_traj, dx=dt)))
+        C, lbd = fit_exponential_envelope(error_trajs, dt)
+        C_list.append(C)
+        lbd_list.append(lbd)
+    env.close()
+
+    rew_mean, rew_ci = mean_confidence_interval(reward_list)
+    auc_mean, auc_ci = mean_confidence_interval(auc_list)
+    C_mean, C_ci = mean_confidence_interval(C_list)
+    lbd_mean, lbd_ci = mean_confidence_interval(lbd_list)
+    results = {
+        "checkpoint": best_ckpt if os.path.exists(best_ckpt) else "final",
+        "num_episodes": num_groups * episodes_per_group,
+        "total_reward_mean": rew_mean, "total_reward_ci95": rew_ci,
+        "auc_mean": auc_mean, "auc_ci95": auc_ci,
+        "overshoot_mean": C_mean, "overshoot_ci95": C_ci,
+        "contraction_rate_mean": lbd_mean, "contraction_rate_ci95": lbd_ci,
+        "num_fit_groups": num_groups,
+    }
+
+    print("[Eval] ── Best-model evaluation (classic path-tracking) ──")
+    print(f"[Eval] total reward     : {rew_mean:.2f} ± {rew_ci:.2f} (95% CI, n={len(reward_list)})")
+    print(f"[Eval] error AUC        : {auc_mean:.4f} ± {auc_ci:.4f}")
+    print(f"[Eval] overshoot C      : {C_mean:.3f} ± {C_ci:.3f}")
+    print(f"[Eval] contraction rate : {lbd_mean:.4f} ± {lbd_ci:.4f}  (C·e^(−λkΔt), min AUC)")
+
+    out_json = os.path.join(agent.experiment_dir, "eval_results.json")
+    with open(out_json, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"[Eval] Saved → {out_json}")
+
+    if not args_cli.no_wandb and "wandb" in sys.modules and sys.modules["wandb"].run is not None:
+        sys.modules["wandb"].log({f"final_eval/{k}": v for k, v in results.items()
+                                  if isinstance(v, (int, float))})
 
 
 def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, num_groups: int = 10):
@@ -449,10 +608,15 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, num_grou
         print(f"[Eval] Rolling out {num_envs} non-terminating episodes of {T} steps …")
         for k in range(T):
             with torch.no_grad():
-                # deterministic (mean) actions, clipped — the deployed controller
-                inputs = {"observations": agent._observation_preprocessor(obs)}
-                _, outputs = agent.policy.act(inputs, role="policy")
-                actions = torch.clamp(outputs["mean_actions"], _act_low, _act_high)
+                # agent.act() is the uniform interface across every skrl Agent
+                # (PPO/SAC/C3M/TEMP/SDLQR/LQR) — unlike agent.policy.act(...),
+                # which assumes PPO/SAC's internal attribute names and breaks
+                # on contraction agents. "mean_actions" (present for Gaussian
+                # policies) gives the deterministic action; deterministic
+                # policies (e.g. C3M's CLDeterministicActorModel) have no
+                # separate mean, so their raw action IS already deterministic.
+                actions, outputs = agent.act(obs, None, timestep=0, timesteps=0)
+                actions = torch.clamp(outputs.get("mean_actions", actions), _act_low, _act_high)
             obs_dict, rewards, terminated, truncated, _ = skrl_env.step(actions)
             obs = obs_dict["policy"] if isinstance(obs_dict, dict) else obs_dict
             total_reward += rewards.squeeze(-1)
@@ -463,8 +627,10 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, num_grou
     err_np = errors.cpu().numpy()  # (N, T+1)
     rew_np = total_reward.cpu().numpy()
 
-    # AUC over the raw error curve (dt-weighted trapezoid), per episode
-    auc_np = np.trapezoid(err_np, dx=dt, axis=1)
+    # AUC over the raw error curve (dt-weighted trapezoid), per episode.
+    # np.trapezoid is numpy>=2 only; env_isaaclab ships numpy 1.26 (trapz).
+    _trapz = getattr(np, "trapezoid", None) or np.trapz
+    auc_np = _trapz(err_np, dx=dt, axis=1)
 
     # Contraction envelope on NORMALIZED error e(t)/e(0) — CAC-dev convention.
     # Envs whose initial error is ~0 (near-zero commanded velocity) carry no
@@ -769,7 +935,9 @@ if _is_classic:
             runner.load(args_cli.checkpoint)
         runner.run()
         env.close()
-        
+
+        _evaluate_classic_path_tracking(task=args_cli.task, runner=runner)
+
         if not args_cli.no_wandb and 'wandb' in sys.modules and sys.modules['wandb'].run is not None:
             sys.modules['wandb'].finish()
 
@@ -788,6 +956,8 @@ if _is_classic:
         if _use_value and algorithm == "ppo":
             _a["value_preprocessor"] = "RunningStandardScaler"
             _a["value_preprocessor_kwargs"] = None
+        _std_dev_annealing = _a.pop("std_dev_annealing", False)
+        _std_dev_annealing_kwargs = _a.pop("std_dev_annealing_kwargs", None)
 
         num_envs = args_cli.num_envs or 4
         vec_env = SyncVectorEnv([lambda: gym.make(args_cli.task)] * num_envs)
@@ -796,11 +966,14 @@ if _is_classic:
         runner = Runner(env, agent_cfg)
         _patch_kl_logging(runner.agent)
         _patch_sac_entropy_clamp(runner.agent)
+        _patch_ppo_std_annealing(runner.agent, _std_dev_annealing, _std_dev_annealing_kwargs)
         if args_cli.checkpoint:
             runner.agent.load(args_cli.checkpoint)
         runner.run()
         env.close()
-        
+
+        _evaluate_classic_path_tracking(task=args_cli.task, runner=runner)
+
         if not args_cli.no_wandb and 'wandb' in sys.modules and sys.modules['wandb'].run is not None:
             sys.modules['wandb'].finish()
 
@@ -1114,14 +1287,24 @@ else:
         if _wandb_video_thread is not None:
             _wandb_video_thread.join(timeout=120)
 
+        # Best-model evaluation (CAC-dev-style: reward/AUC/contraction-rate/
+        # overshoot with 95% CI) applies to PATH-TRACKING envs — that's where
+        # a genuine reference-trajectory tracking error is defined and where
+        # C3M/LQR/SD-LQR/TEMP's contraction analysis is meaningful. It also
+        # runs for VelTracking (which exposes the same get_tracking_error()
+        # duck-type against a velocity command instead of a trajectory) since
+        # that's used as this quality gate before ref-traj generation.
+        # _evaluate_best_model no-ops with a SKIPPED message for any env that
+        # doesn't implement get_tracking_error(), so it's safe to always call.
+        _evaluate_best_model(
+            task=args_cli.task,
+            runner=runner,
+            isaac_env=_isaac_env,
+            skrl_env=env,
+            env_cfg=env_cfg,
+        )
+
         if "VelTracking" in (args_cli.task or ""):
-            _evaluate_best_model(
-                task=args_cli.task,
-                runner=runner,
-                isaac_env=_isaac_env,
-                skrl_env=env,
-                env_cfg=env_cfg,
-            )
             _generate_ref_trajs(
                 task=args_cli.task,
                 runner=runner,

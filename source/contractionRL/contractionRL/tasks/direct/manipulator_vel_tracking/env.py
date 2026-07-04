@@ -11,6 +11,7 @@ from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 
+from ..common.eval_metrics import mean_confidence_interval
 from ..common.vel_commands import VelCommands
 from .env_cfg import ManipulatorVelTrackingEnvCfg
 
@@ -62,7 +63,7 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[])
         self.scene.articulations["robot"] = self._robot
-        light_cfg = sim_utils.DistantLightCfg(intensity=3000.0, color=(1.0, 1.0, 1.0)))
+        light_cfg = sim_utils.DistantLightCfg(intensity=3000.0, color=(1.0, 1.0, 1.0))
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
@@ -149,9 +150,13 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
                 self.extras.setdefault("log", {})
                 mask = auc_vals > 0
                 self.extras["log"]["Episode/auc"] = auc_vals[mask].mean()
-                self.extras["log"]["Episode/discounted_return"] = disc_returns[mask].mean()
-                self.extras["log"]["Episode/undiscounted_return"] = undisc_returns[mask].mean()
-                self.extras["log"]["Episode/avg_reward_per_step"] = (undisc_returns[mask] / lengths[mask]).mean()
+                self.extras["log"]["Reward/discounted_return"] = disc_returns[mask].mean()
+                self.extras["log"]["Reward/avg_reward_per_step"] = (undisc_returns[mask] / lengths[mask]).mean()
+                # undiscounted_return is dropped here — it's the same quantity skrl
+                # already tracks as "Reward / Total reward (mean)"; only its 95% CI
+                # (not available from skrl's tracker) is worth adding.
+                _, reward_ci95 = mean_confidence_interval(undisc_returns[mask].cpu().numpy())
+                self.extras["log"]["Reward/total_reward_ci95"] = torch.tensor(reward_ci95, device=self.device)
             
             self._episode_discounted_returns[env_ids] = 0.0
             self._episode_undiscounted_returns[env_ids] = 0.0

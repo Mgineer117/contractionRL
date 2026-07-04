@@ -19,7 +19,7 @@ class ManipulatorVelTrackingEnvCfg(DirectRLEnvCfg):
     num_envs = 4096
     # env — EE Cartesian velocity tracking task
     decimation = 2
-    episode_length_s = 5.0
+    episode_length_s = 15.0
 
     # Franka Panda: 7 arm joints (finger joints excluded from control)
     # state:  joint_pos(7) + joint_vel(7) + ee_pos_local(3)

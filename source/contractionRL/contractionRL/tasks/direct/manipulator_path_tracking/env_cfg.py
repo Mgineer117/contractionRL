@@ -16,7 +16,7 @@ from isaaclab.utils import configclass
 class ManipulatorPathTrackingEnvCfg(DirectRLEnvCfg):
     num_envs = 4096
     decimation = 2
-    episode_length_s = 5.0
+    episode_length_s = 15.0
 
     # state_dim = 21, action_dim = 7
     # obs: x(21) + x_ref(21) + u_ref(7) = 49

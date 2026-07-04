@@ -10,8 +10,9 @@ from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from isaaclab.utils.math import quat_apply
 
+from ..common.eval_metrics import mean_confidence_interval
 from ..common.vel_commands import VelCommands
 from .env_cfg import HumanoidVelTrackingEnvCfg
 
@@ -104,22 +105,50 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
         rew_yaw = torch.exp(-yaw_err / 0.1) * self.cfg.rew_yaw_rate
 
         rew_z = torch.square(self._robot.data.root_lin_vel_b[:, 2]) * self.cfg.rew_z_vel
-        rew_axy = torch.sum(torch.square(self._robot.data.root_ang_vel_b[:, :2]), dim=1) * self.cfg.rew_ang_vel_xy
-        rew_up = torch.sum(torch.square(self._robot.data.projected_gravity_b[:, :2]), dim=1) * self.cfg.rew_upright
-        rew_tau = torch.sum(torch.square(self._robot.data.applied_torque), dim=1) * self.cfg.rew_torques
+        rew_rp = torch.sum(torch.square(self._robot.data.root_ang_vel_b[:, :2]), dim=1) * self.cfg.rew_roll_pitch
+        rew_flat = torch.sum(torch.square(self._robot.data.projected_gravity_b[:, :2]), dim=1) * self.cfg.rew_flat_orientation
+        rew_tau = torch.sum(torch.square(self._robot.data.applied_torque), dim=1) * self.cfg.rew_torque
         rew_ar = torch.sum(torch.square(self._actions - self._prev_actions), dim=1) * self.cfg.rew_action_rate
-        
-        vel_err_vec = torch.cat([
-            cmds[:, :2] - self._robot.data.root_lin_vel_b[:, :2],
-            (cmds[:, 3] - self._robot.data.root_ang_vel_b[:, 2]).unsqueeze(-1),
-        ], dim=-1)
+
+        vel_err_vec = cmds[:, :2] - self._robot.data.root_lin_vel_b[:, :2]
         self._episode_vel_auc += torch.norm(vel_err_vec, dim=-1)
 
-        return rew_lin + rew_yaw + rew_z + rew_axy + rew_up + rew_tau + rew_ar + rew_alive
+        total_reward = self.cfg.rew_alive + rew_lin + rew_yaw + rew_flat + rew_z + rew_rp + rew_tau + rew_ar
+
+        if not hasattr(self, "_episode_discounted_returns"):
+            self._episode_discounted_returns = torch.zeros(self.num_envs, device=self.device)
+            self._current_discounts = torch.ones(self.num_envs, device=self.device)
+            self._episode_undiscounted_returns = torch.zeros(self.num_envs, device=self.device)
+            self._episode_lengths_custom = torch.zeros(self.num_envs, device=self.device)
+
+        self._episode_discounted_returns += self._current_discounts * total_reward
+        self._episode_undiscounted_returns += total_reward
+        self._episode_lengths_custom += 1.0
+        self._current_discounts *= 0.99
+
+        return total_reward
+
+    def get_tracking_error(self) -> torch.Tensor:
+        """Current velocity-tracking error norm per env, (N,).
+
+        Same integrand as the Episode/auc metric: body-frame xy velocity error
+        against the commanded velocity. Used by the post-training evaluator to
+        fit the exponential contraction envelope.
+        """
+        t = self.episode_length_buf.float() * self.step_dt
+        cmds = self._cmd.get(t)
+        return torch.norm(cmds[:, :2] - self._robot.data.root_lin_vel_b[:, :2], dim=-1)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        fell = self._robot.data.root_pos_w[:, 2] < self.cfg.base_height_min
+        # Fall = base dropped too low OR body tilted past the limit. projected
+        # gravity z is -1 upright and rises toward 0/+1 as the base tilts, so
+        # ``> fall_grav_z_max`` (default -0.71) fires at ~>45 deg from upright.
+        too_low = self._robot.data.root_pos_w[:, 2] < self.cfg.base_height_min
+        tilted = self._robot.data.projected_gravity_b[:, 2] > self.cfg.fall_grav_z_max
+        fell = too_low | tilted
+        if not getattr(self.cfg, "terminate_on_fall", True):
+            fell = torch.zeros_like(time_out)
         return fell, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
@@ -136,9 +165,13 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
                 self.extras.setdefault("log", {})
                 mask = auc_vals > 0
                 self.extras["log"]["Episode/auc"] = auc_vals[mask].mean()
-                self.extras["log"]["Episode/discounted_return"] = disc_returns[mask].mean()
-                self.extras["log"]["Episode/undiscounted_return"] = undisc_returns[mask].mean()
-                self.extras["log"]["Episode/avg_reward_per_step"] = (undisc_returns[mask] / lengths[mask]).mean()
+                self.extras["log"]["Reward/discounted_return"] = disc_returns[mask].mean()
+                self.extras["log"]["Reward/avg_reward_per_step"] = (undisc_returns[mask] / lengths[mask]).mean()
+                # undiscounted_return is dropped here — it's the same quantity skrl
+                # already tracks as "Reward / Total reward (mean)"; only its 95% CI
+                # (not available from skrl's tracker) is worth adding.
+                _, reward_ci95 = mean_confidence_interval(undisc_returns[mask].cpu().numpy())
+                self.extras["log"]["Reward/total_reward_ci95"] = torch.tensor(reward_ci95, device=self.device)
             
             self._episode_discounted_returns[env_ids] = 0.0
             self._episode_undiscounted_returns[env_ids] = 0.0
@@ -178,35 +211,79 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
     # ------------------------------------------------------------------ #
-    # Debug visualisation: blue = command vel, green = current vel
+    # Debug visualisation: blue = command vel, green = current vel, yellow = yaw rate
+    #
+    # Arrows are built from two 3D primitives (cylinder shaft + cone head,
+    # both axis="X") rather than a flat arrow mesh — a flat mesh looks like a
+    # thin line (direction ambiguous) from many camera angles, while a
+    # cylinder+cone is a real 3D solid, recognizable from any angle.
     # ------------------------------------------------------------------ #
+
+    _ARROW_SHAFT_LEN = 0.4
+    _ARROW_SHAFT_RADIUS = 0.02
+    _ARROW_HEAD_LEN = 0.2
+    _ARROW_HEAD_RADIUS = 0.05
+
+    def _make_arrow_markers_cfg(self, prim_path: str, color: tuple[float, float, float]) -> VisualizationMarkersCfg:
+        material = sim_utils.PreviewSurfaceCfg(diffuse_color=color)
+        return VisualizationMarkersCfg(
+            prim_path=prim_path,
+            markers={
+                "shaft": sim_utils.CylinderCfg(
+                    radius=self._ARROW_SHAFT_RADIUS, height=self._ARROW_SHAFT_LEN,
+                    axis="X", visual_material=material,
+                ),
+                "head": sim_utils.ConeCfg(
+                    radius=self._ARROW_HEAD_RADIUS, height=self._ARROW_HEAD_LEN,
+                    axis="X", visual_material=material,
+                ),
+            },
+        )
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:
             if not hasattr(self, "_cmd_vel_marker"):
-                _arrow = f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd"
-                cmd_cfg = VisualizationMarkersCfg(
-                    prim_path="/Visuals/HumanoidVelCmd",
-                    markers={"arrow": sim_utils.UsdFileCfg(
-                        usd_path=_arrow, scale=(0.6, 0.06, 0.06),
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 1.0)),
-                    )},
-                )
-                cur_cfg = VisualizationMarkersCfg(
-                    prim_path="/Visuals/HumanoidVelCur",
-                    markers={"arrow": sim_utils.UsdFileCfg(
-                        usd_path=_arrow, scale=(0.6, 0.06, 0.06),
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0)),
-                    )},
-                )
+                cmd_cfg = self._make_arrow_markers_cfg("/Visuals/HumanoidVelCmd", (0.0, 0.0, 1.0))
+                cur_cfg = self._make_arrow_markers_cfg("/Visuals/HumanoidVelCur", (0.0, 1.0, 0.0))
+                yaw_cfg = self._make_arrow_markers_cfg("/Visuals/HumanoidYawCmd", (1.0, 0.9, 0.0))
                 self._cmd_vel_marker = VisualizationMarkers(cmd_cfg)
                 self._cur_vel_marker = VisualizationMarkers(cur_cfg)
+                self._yaw_cmd_marker = VisualizationMarkers(yaw_cfg)
             self._cmd_vel_marker.set_visibility(True)
             self._cur_vel_marker.set_visibility(True)
+            self._yaw_cmd_marker.set_visibility(True)
         else:
             if hasattr(self, "_cmd_vel_marker"):
                 self._cmd_vel_marker.set_visibility(False)
                 self._cur_vel_marker.set_visibility(False)
+                self._yaw_cmd_marker.set_visibility(False)
+
+    def _arrow_parts(self, base_pos: torch.Tensor, quat: torch.Tensor, scale_len: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build (translations, orientations, marker_indices) for a shaft+head arrow at base_pos, pointing along quat."""
+        n = base_pos.shape[0]
+        if scale_len is None:
+            scale_len = torch.ones(n, device=self.device)
+
+        s = scale_len.unsqueeze(-1)
+        shaft_offset = torch.tensor(
+            [self._ARROW_SHAFT_LEN / 2, 0.0, 0.0], device=self.device
+        ).expand(n, -1) * s
+        head_offset = torch.tensor(
+            [self._ARROW_SHAFT_LEN, 0.0, 0.0], device=self.device
+        ).expand(n, -1) * s + torch.tensor(
+            [self._ARROW_HEAD_LEN / 2, 0.0, 0.0], device=self.device
+        ).expand(n, -1)
+
+        shaft_pos = base_pos + quat_apply(quat, shaft_offset)
+        head_pos = base_pos + quat_apply(quat, head_offset)
+
+        translations = torch.cat([shaft_pos, head_pos], dim=0)
+        orientations = torch.cat([quat, quat], dim=0)
+        marker_indices = torch.cat([
+            torch.zeros(n, dtype=torch.int32, device=self.device),  # 0 -> "shaft"
+            torch.ones(n, dtype=torch.int32, device=self.device),   # 1 -> "head"
+        ], dim=0)
+        return translations, orientations, marker_indices
 
     def _debug_vis_callback(self, event):
         # event stream can fire before the scene is ready or during teardown
@@ -215,28 +292,61 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
         t = self.episode_length_buf.float() * self.step_dt
         cmds = self._cmd.get(t)  # (N, 4): [vx_b, vy_b, vz, yaw]
 
-        base_pos = self._robot.data.root_pos_w  # (N, 3)
-        cmd_pos = base_pos.clone(); cmd_pos[:, 2] += 1.5
-        cur_pos = base_pos.clone(); cur_pos[:, 2] += 1.1
+        cmd_pos = self._robot.data.root_pos_w.clone(); cmd_pos[:, 2] += 1.5
+        cur_pos = self._robot.data.root_pos_w.clone(); cur_pos[:, 2] += 1.1
 
-        cmd_quat = self._vel_body_xy_to_arrow(cmds[:, :2])
-        cur_quat = self._vel_body_xy_to_arrow(self._robot.data.root_lin_vel_b[:, :2])
-
-        fixed_scale = torch.ones(self.num_envs, 3, device=self.device)
-        proto = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
-        self._cmd_vel_marker.visualize(translations=cmd_pos, orientations=cmd_quat, scales=fixed_scale, marker_indices=proto)
-        self._cur_vel_marker.visualize(translations=cur_pos, orientations=cur_quat, scales=fixed_scale, marker_indices=proto)
-
-    def _vel_body_xy_to_arrow(self, vel_body_xy: torch.Tensor) -> torch.Tensor:
-        """Body-frame XY velocity → world-frame arrow quaternion (wxyz)."""
-        q = self._robot.data.root_quat_w  # (N, 4) w,x,y,z
-        yaw = torch.atan2(
-            2.0 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
-            1.0 - 2.0 * (q[:, 2] ** 2 + q[:, 3] ** 2),
+        # commands are body-frame: rotate into world (yaw only) for display
+        w, x, y, z = self._robot.data.root_quat_w.unbind(-1)
+        yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
+        cmd_xy_w = torch.stack(
+            [cos_y * cmds[:, 0] - sin_y * cmds[:, 1],
+             sin_y * cmds[:, 0] + cos_y * cmds[:, 1]], dim=-1
         )
-        cy, sy = torch.cos(yaw), torch.sin(yaw)
-        vx_w = cy * vel_body_xy[:, 0] - sy * vel_body_xy[:, 1]
-        vy_w = sy * vel_body_xy[:, 0] + cy * vel_body_xy[:, 1]
-        angle = torch.atan2(vy_w, vx_w)
+        cmd_quat = self._vel_world_xy_to_arrow(cmd_xy_w)
+        cur_quat = self._vel_world_xy_to_arrow(self._robot.data.root_lin_vel_w[:, :2])
+
+        cmd_mag = torch.clamp(torch.norm(cmd_xy_w, dim=-1), min=0.01)
+        cur_mag = torch.clamp(torch.norm(self._robot.data.root_lin_vel_w[:, :2], dim=-1), min=0.01)
+
+        cmd_translations, cmd_orientations, cmd_indices = self._arrow_parts(cmd_pos, cmd_quat, cmd_mag)
+        cur_translations, cur_orientations, cur_indices = self._arrow_parts(cur_pos, cur_quat, cur_mag)
+
+        cmd_scale = torch.ones(2 * self.num_envs, 3, device=self.device)
+        cmd_scale[:self.num_envs, 0] = cmd_mag  # scale shaft length
+        cmd_scale[:, 1:] = 1.5  # Make command arrow 50% thicker
+
+        cur_scale = torch.ones(2 * self.num_envs, 3, device=self.device)
+        cur_scale[:self.num_envs, 0] = cur_mag  # scale shaft length
+        cur_scale[:, 1:] = 0.7  # Make current arrow thinner
+
+        self._cmd_vel_marker.visualize(
+            translations=cmd_translations, orientations=cmd_orientations, scales=cmd_scale, marker_indices=cmd_indices
+        )
+        self._cur_vel_marker.visualize(
+            translations=cur_translations, orientations=cur_orientations, scales=cur_scale, marker_indices=cur_indices
+        )
+
+        # Yaw-rate arrow (yellow): tangential to heading, showing which way the
+        # nose is commanded to swing. Anchored at the nose, above the vel arrows.
+        yaw_rate = cmds[:, 3]
+        yaw_vec_w = torch.stack([-sin_y * yaw_rate, cos_y * yaw_rate], dim=-1)
+        yaw_quat = self._vel_world_xy_to_arrow(yaw_vec_w)
+        yaw_mag = torch.clamp(yaw_rate.abs() * 2.0, min=0.05)
+        nose = self._robot.data.root_pos_w.clone()
+        nose[:, 0] += 0.3 * cos_y
+        nose[:, 1] += 0.3 * sin_y
+        nose[:, 2] += 1.9
+        yaw_translations, yaw_orientations, yaw_indices = self._arrow_parts(nose, yaw_quat, yaw_mag)
+        yaw_scale = torch.ones(2 * self.num_envs, 3, device=self.device)
+        yaw_scale[:self.num_envs, 0] = yaw_mag
+        yaw_scale[:, 1:] = 1.2
+        self._yaw_cmd_marker.visualize(
+            translations=yaw_translations, orientations=yaw_orientations, scales=yaw_scale, marker_indices=yaw_indices
+        )
+
+    def _vel_world_xy_to_arrow(self, vel_world_xy: torch.Tensor) -> torch.Tensor:
+        """World-frame XY velocity → world-frame arrow quaternion (wxyz)."""
+        angle = torch.atan2(vel_world_xy[:, 1], vel_world_xy[:, 0])
         ha = angle * 0.5
         return torch.stack([torch.cos(ha), torch.zeros_like(ha), torch.zeros_like(ha), torch.sin(ha)], dim=-1)

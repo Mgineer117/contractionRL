@@ -36,7 +36,7 @@ ENV_CONFIG = {
     "angle_idx": ANGLE_IDX,
     "uref_min": UREF_MIN, "uref_max": UREF_MAX,
     "num_dim_x": 4, "num_dim_control": 2, "pos_dimension": 2,
-    "dt": 0.03, "time_bound": 9.0,
+    "dt": 0.03, "time_bound": 15.0,
     "q": 1.0, "r": 0.0,
 }
 

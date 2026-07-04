@@ -4,7 +4,7 @@ models:
   separate: True
   policy:
     class: GaussianMixin  # Uses a Gaussian distribution for continuous actions
-    backbone: mlp
+    backbone: mlp  # mlp (default, stock skrl gaussian_model) | control (CLActor — requires obs = [x, xref, uref])
     clip_actions: True  # Clip actions to the environment action space limits
     clip_log_std: True  # Clip the log standard deviation of the policy distribution
     min_log_std: -20.0  # Lower bound for log standard deviation
@@ -70,6 +70,14 @@ agent:
   random_timesteps: 80
   learning_starts: 80
   grad_norm_clip: 1.0  # Maximum permitted magnitude for gradients (prevents exploding gradients)
+  # Manual log_std annealing (off by default — SAC's learn_entropy above already
+  # auto-tunes exploration; only enable this AS WELL AS setting
+  # learn_entropy: False, otherwise the two exploration controls fight).
+  std_dev_annealing: False
+  std_dev_annealing_kwargs:
+    schedule: linear        # linear | exponential | cosine
+    final_log_std: -2.0     # target log_std at the end of training
+    power: 5.0              # exponential schedule only: progress**power
   experiment:
     directory: "quadruped_vel_tracking_sac"
     experiment_name: ""

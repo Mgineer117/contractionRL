@@ -16,7 +16,7 @@ from isaaclab.utils import configclass
 class HumanoidPathTrackingEnvCfg(DirectRLEnvCfg):
     num_envs = 4096
     decimation = 4
-    episode_length_s = 10.0
+    episode_length_s = 40.0
 
     # state_dim = 41: proj_gravity_b(3) + joint_pos_rel(19) + joint_vel(19)
     # obs: x(41) + x_ref(41) + u_ref(19) = 101
@@ -30,6 +30,7 @@ class HumanoidPathTrackingEnvCfg(DirectRLEnvCfg):
 
     action_scale = 0.25
     traj_path: str = "logs/humanoid/dynamics_data.npz"
+    terminate_on_fall: bool = True
     base_height_min = 0.50
 
     # uniform joint-position noise added to x_ref[0] at reset [rad]

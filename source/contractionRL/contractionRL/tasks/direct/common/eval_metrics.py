@@ -70,3 +70,14 @@ def batch_episode_metrics(
     results = [episode_metrics(row, dt) for row in error_norms_batch]
     keys = results[0].keys()
     return {k: float(np.mean([r[k] for r in results])) for k in keys}
+
+
+def mean_confidence_interval(data, confidence: float = 0.95) -> tuple[float, float]:
+    """Mean and 95% CI half-width (1.96 * standard error of the mean)."""
+    data = np.asarray(data, dtype=np.float64)
+    n = len(data)
+    mean = float(np.mean(data)) if n > 0 else 0.0
+    if n < 2:
+        return mean, 0.0
+    sem = float(np.std(data, ddof=1) / np.sqrt(n))
+    return mean, 1.96 * sem

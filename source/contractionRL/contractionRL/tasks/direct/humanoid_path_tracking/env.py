@@ -61,6 +61,8 @@ class HumanoidPathTrackingEnv(PathTrackingBase):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         fell = self._robot.data.root_pos_w[:, 2] < self.cfg.base_height_min
+        if not getattr(self.cfg, "terminate_on_fall", True):
+            fell = torch.zeros_like(time_out)
         return fell, time_out
 
     def _set_robot_state_from_ref(self, env_ids: torch.Tensor, x_ref_init: torch.Tensor) -> None:

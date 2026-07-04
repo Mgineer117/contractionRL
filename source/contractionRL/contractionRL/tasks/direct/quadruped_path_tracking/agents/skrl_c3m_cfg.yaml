@@ -5,7 +5,7 @@ models:
   policy:
     class: DeterministicMixin  # Outputs deterministic continuous values
     backbone: contraction
-    clip_actions: True  # Clip actions to the environment action space limits
+    clip_actions: False  # Clip actions to the environment action space limits
     network:
       - name: net
         input: OBSERVATIONS
@@ -24,8 +24,8 @@ models:
     network:
       - name: net
         input: STATE_ACTION
-        layers: [256, 256]
-        activations: relu
+        layers: [512, 512, 512, 512]
+        activations: leakyrelu
 memory:
   class: RandomMemory
   memory_size: 131072  # Capacity of the experience replay buffer (-1 means dynamic/infinite)
@@ -64,6 +64,6 @@ agent:
 
 trainer:
   class: C3MTrainer
-  timesteps: 1000  # Total number of environment steps to train for
-  eval_interval: 100  # Frequency of running evaluation rollouts
+  timesteps: 100  # Total number of environment steps to train for
+  eval_interval: 2  # Frequency of running evaluation rollouts
   environment_info: log  # Type of environment information to record (e.g., log)

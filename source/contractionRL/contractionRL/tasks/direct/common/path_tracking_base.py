@@ -21,6 +21,7 @@ import torch
 
 from isaaclab.envs import DirectRLEnv
 
+from .eval_metrics import mean_confidence_interval
 from .traj_buffer import TrajectoryBuffer
 
 # wandb is optional; only used when a run is active
@@ -57,6 +58,7 @@ class PathTrackingBase(DirectRLEnv):
         self._episode_contraction_steps = torch.zeros(n, dtype=torch.long, device=self.device)
         self._episode_first_error = torch.zeros(n, device=self.device)
         self._episode_last_error = torch.zeros(n, device=self.device)
+        self._episode_max_error = torch.zeros(n, device=self.device)
         self._prev_error_norm = torch.full((n,), float("inf"), device=self.device)
         self._episode_steps = torch.zeros(n, dtype=torch.long, device=self.device)
 
@@ -137,6 +139,15 @@ class PathTrackingBase(DirectRLEnv):
             "x_dot": x_dot.cpu().numpy().astype(np.float32),
         }
 
+    def get_tracking_error(self) -> torch.Tensor:
+        """Current ||x - x_ref|| per env, (N,).
+
+        Shared across all path-tracking envs (quadruped/humanoid/manipulator) —
+        used by the post-training evaluator to fit the exponential contraction
+        envelope C * exp(-lambda * k * dt) bounding the error curve.
+        """
+        return torch.norm(self._get_physical_state() - self._x_ref, dim=-1)
+
     @property
     def x_dim(self) -> int:
         return self._traj_buf.state_dim
@@ -182,6 +193,7 @@ class PathTrackingBase(DirectRLEnv):
         is_first = (self._episode_steps == 0)
         self._episode_first_error = torch.where(is_first, error_norm, self._episode_first_error)
         self._episode_last_error = error_norm
+        self._episode_max_error = torch.maximum(self._episode_max_error, error_norm)
 
         # contraction flag: count steps where error strictly decreased (skip step 0)
         contracting = (~is_first) & (error_norm < self._prev_error_norm)
@@ -214,11 +226,16 @@ class PathTrackingBase(DirectRLEnv):
             steps = self._episode_steps[finished].float().clamp(min=1)
             e0 = self._episode_first_error[finished].float().clamp(min=1e-8)
             eT = self._episode_last_error[finished].float().clamp(min=1e-8)
+            e_max = self._episode_max_error[finished].float().clamp(min=1e-8)
             T = steps
             dt = self.step_dt
 
-            # empirical contraction rate
+            # empirical contraction rate: e(T) = e(0) * exp(-lambda * T*dt)
             lambda_emp = -(torch.log(eT) - torch.log(e0)) / (T * dt)
+
+            # overshoot: peak error relative to the initial error — a contracting
+            # trajectory should never exceed e(0), so overshoot > 1 flags excursions
+            overshoot = e_max / e0
 
             # contraction flag: fraction of contracting steps (skip step 0)
             valid_steps = (steps - 1).clamp(min=1)
@@ -226,10 +243,19 @@ class PathTrackingBase(DirectRLEnv):
 
             performance_score = -(auc / steps)
 
-            self.extras["log"]["Episode/auc"] = auc.mean().item()
-            self.extras["log"]["Episode/lambda_emp"] = lambda_emp.mean().item()
-            self.extras["log"]["Episode/contraction_flag"] = contraction_flag.mean().item()
-            self.extras["log"]["Episode/performance_score"] = performance_score.mean().item()
+            self.extras["log"]["Episode/contraction_flag"] = contraction_flag.mean()
+            self.extras["log"]["Episode/performance_score"] = performance_score.mean()
+
+            auc_mean, auc_ci95 = mean_confidence_interval(auc.cpu().numpy())
+            lbd_mean, lbd_ci95 = mean_confidence_interval(lambda_emp.cpu().numpy())
+            os_mean, os_ci95 = mean_confidence_interval(overshoot.cpu().numpy())
+
+            self.extras["log"]["Stability/auc"] = torch.tensor(auc_mean, device=self.device)
+            self.extras["log"]["Stability/auc_ci95"] = torch.tensor(auc_ci95, device=self.device)
+            self.extras["log"]["Stability/contraction_rate"] = torch.tensor(lbd_mean, device=self.device)
+            self.extras["log"]["Stability/contraction_rate_ci95"] = torch.tensor(lbd_ci95, device=self.device)
+            self.extras["log"]["Stability/overshoot"] = torch.tensor(os_mean, device=self.device)
+            self.extras["log"]["Stability/overshoot_ci95"] = torch.tensor(os_ci95, device=self.device)
 
         # --- wandb trajectory plot for env 0 ---
         env0_done = env_ids is not None and any(int(e) == 0 for e in env_ids)
@@ -256,6 +282,7 @@ class PathTrackingBase(DirectRLEnv):
         self._episode_contraction_steps[env_ids] = 0
         self._episode_first_error[env_ids] = 0.0
         self._episode_last_error[env_ids] = 0.0
+        self._episode_max_error[env_ids] = 0.0
         self._prev_error_norm[env_ids] = float("inf")
         self._episode_steps[env_ids] = 0
 

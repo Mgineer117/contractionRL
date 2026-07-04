@@ -22,7 +22,7 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
 
     num_envs = 4096
     decimation = 4
-    episode_length_s = 20.0
+    episode_length_s = 40.0
 
     # Unitree Go2: 12 joints (3 per leg × 4 legs)
     # state:   base_lin_vel(3) + base_ang_vel(3) + proj_gravity(3)
@@ -59,20 +59,20 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
         resolution=(1920, 1080),
     )
 
-    # velocity commands: forward speed along the *current heading* + a sinusoidal
-    # yaw rate. The command distribution has exactly two sampled dimensions —
-    # forward speed (vx) and yaw-rate amplitude (yaw_A). vy/vz are pinned to 0 so
-    # the linear command is purely along heading, and the yaw frequency is fixed
-    # to EXACTLY one full sine cycle per episode (omega = 2*pi/T), phase 0. Over
-    # one cycle the yaw integrates to zero, so the robot weaves left-then-right
-    # (an S) and returns to its initial heading.
+    # velocity commands: forward speed along the *current heading* + a yaw rate
+    # that is, per episode, either held at 0 (omega=0, straight-line heading) or
+    # sinusoidal (omega = 2*pi/T, one full cycle per episode), chosen 50/50 via
+    # yaw_omega_binary. vy/vz are pinned to 0 so the linear command is purely
+    # along heading. With phase fixed at 0, the sinusoidal case starts and ends
+    # each episode at zero yaw rate, so the robot weaves left-then-right (an S)
+    # and returns to its initial heading over exactly one cycle.
     vel_cmd: VelCmdCfg = VelCmdCfg(
-        vx_range=(0.0, 0.5),        # forward speed [m/s] — sampled
+        vx_range=(1.0, 2.0),        # forward speed [m/s] — sampled
         vy_range=(0.0, 0.0),        # no lateral component: velocity is along heading
         vz_range=(0.0, 0.0),
-        yaw_A_range=(0.0, 0.3),     # yaw-rate amplitude [rad/s] — sampled
-        yaw_omega_range=(2 * math.pi / episode_length_s, 2 * math.pi / episode_length_s),  # fixed: one cycle/episode
-        yaw_omega_binary=False,
+        yaw_A_range=(0.0, 0.5),     # yaw-rate amplitude [rad/s] — sampled
+        yaw_omega_range=(0.0, 2 * math.pi / episode_length_s),  # binary: constant vs. one cycle/episode
+        yaw_omega_binary=True,
         yaw_phase_range=(0.0, 0.0),  # start each episode at zero yaw rate
     )
 

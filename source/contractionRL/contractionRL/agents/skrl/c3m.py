@@ -69,6 +69,18 @@ class C3MCfg(AgentCfg):
     # initial metric before the double-backward Ṁ term (numerically the most
     # fragile part of the loss) starts shaping both networks jointly.
     detach_warmup_frac: float = 1.0 / 3.0
+    # Random directions sampled per loss_pos_matrix_random_sampling() call (the
+    # PD-violation hinge loss for pd_loss/c1_loss/os_loss). This is a pure
+    # statistical-coverage knob — it does NOT affect numerical stability
+    # (unlike an eigenvalue-decomposition loss, this method never
+    # differentiates through an eigendecomposition at ANY sample count).
+    # The reference script used 1024, but that's overkill for a loss called
+    # every SGD step (not a one-shot certificate): for low-dimensional systems
+    # (x_dim ~4-6, e.g. classic car/cartpole/segway/turtlebot) 1024 directions
+    # measured ~13x slower per call than the old eigvalsh-based loss it
+    # replaced, for negligible extra coverage. 128 stays comfortably above
+    # every x_dim in this repo (~4-33) while costing only ~2x eigvalsh.
+    pd_loss_num_samples: int = 128
     use_analytical_dynamics: bool = False
     learning_rate_scheduler: str = ""
     learning_rate_scheduler_kwargs: dict = field(default_factory=dict)
@@ -341,15 +353,20 @@ class C3MAgent(Agent):
         # through an eigendecomposition, unlike an exact eigenvalue loss — keeps
         # the (already double-differentiated, via weighted_gradients) contraction
         # term numerically stable instead of NaN-ing out.
-        pd_loss = loss_pos_matrix_random_sampling(-Cu_reg)
-        c1_loss = loss_pos_matrix_random_sampling(-C1_reg)
+        n_samp = cfg.pd_loss_num_samples
+        pd_loss = loss_pos_matrix_random_sampling(-Cu_reg, num_samples=n_samp)
+        c1_loss = loss_pos_matrix_random_sampling(-C1_reg, num_samples=n_samp)
 
         if bounded:
+            # BoundedCCM_Generator already hard-bounds W's eigenvalues into
+            # [w_lb, w_ub] via sigmoid in its forward pass — no soft penalty needed.
             os_loss = torch.zeros((), device=device)
         else:
+            # Only an upper-bound penalty is needed: W = VᵀV + w_lb·I is bounded
+            # BELOW by construction (bound_W), so a lower-bound loss on it would
+            # be a permanent zero-gradient no-op (zᵀ(VᵀV)z = ‖Vz‖² ≥ 0 always).
             overshoot = W - cfg.w_ub * I
-            undershoot = cfg.w_lb * I - W
-            os_loss = loss_pos_matrix_random_sampling(-overshoot) + loss_pos_matrix_random_sampling(-undershoot)
+            os_loss = loss_pos_matrix_random_sampling(-overshoot, num_samples=n_samp)
 
         loss = os_loss + pd_loss + c1_loss + c2_loss
         return loss, {"pd_loss": pd_loss.item(), "c1_loss": c1_loss.item(), "c2_loss": c2_loss.item(), "os_loss": os_loss.item() if not bounded else 0.0}
@@ -593,28 +610,41 @@ class C3MSkrlTrainer(Trainer):
         agent.enable_training_mode(False)
         observations, infos = self.env.reset()
         states = self.env.state() if hasattr(self.env, "state") else None
-        
-        x_dim = agent._x_dim
-        auc_sum = torch.zeros((self.env.num_envs, 1), device=self.env.device)
-        total_reward = torch.zeros((self.env.num_envs, 1), device=self.env.device)
-        steps_count = torch.zeros((self.env.num_envs, 1), device=self.env.device)
 
-        done = False
-        while not done:
+        x_dim = agent._x_dim
+        num_envs = self.env.num_envs
+        auc_sum = torch.zeros((num_envs, 1), device=self.env.device)
+        total_reward = torch.zeros((num_envs, 1), device=self.env.device)
+        steps_count = torch.zeros((num_envs, 1), device=self.env.device)
+
+        # Envs auto-reset individually on done (DirectRLEnv._reset_idx runs
+        # inside step()), and termination is per-env (e.g. a quadruped falling
+        # early) — so envs desynchronize and `(terminated | truncated).all()`
+        # on a single step may never be true again once even one env has
+        # reset off-cycle, hanging this loop indefinitely. Instead, run a
+        # bounded number of steps and track which envs have finished their
+        # FIRST episode, masking further accumulation for them once they have
+        # (mirrors train.py's `_evaluate_best_model` quality-gate loop).
+        max_steps = int(self.env.max_episode_length) + 1
+        finished = torch.zeros(num_envs, dtype=torch.bool, device=self.env.device)
+
+        for _ in range(max_steps):
             with torch.no_grad():
                 actions, _ = agent.act(observations, states, timestep=0, timesteps=1)
-                
+
+            active = (~finished).unsqueeze(-1).float()
             x_curr = observations[:, :x_dim]
             x_ref = observations[:, x_dim:2*x_dim]
             error = torch.norm(x_curr - x_ref, dim=-1, keepdim=True)
-            auc_sum += error
-            
+            auc_sum += error * active
+
             observations, rewards, terminated, truncated, _ = self.env.step(actions)
-            total_reward += rewards.view(self.env.num_envs, 1)
-            steps_count += 1
-            # Only stop once *every* env has finished, so per-env metrics are not
-            # truncated by whichever env happens to terminate first.
-            done = bool((terminated | truncated).all())
+            total_reward += rewards.view(num_envs, 1) * active
+            steps_count += active
+
+            finished |= (terminated | truncated).view(num_envs)
+            if finished.all():
+                break
 
         agent.enable_training_mode(True)
         return {

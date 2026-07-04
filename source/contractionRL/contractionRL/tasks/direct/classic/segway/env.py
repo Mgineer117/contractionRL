@@ -47,7 +47,7 @@ ENV_CONFIG = {
     "num_dim_control": 1,
     "pos_dimension": 1,
     "dt": 0.03,
-    "time_bound": 6.0,
+    "time_bound": 15.0,
     "q": 1.0,
     "r": 0.0,
 }
