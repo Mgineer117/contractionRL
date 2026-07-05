@@ -221,48 +221,68 @@ class BaseEnv(gym.Env):
         Bbot = np.concatenate((np.eye(eye_dims), np.zeros(zero_dims)), axis=0)
         return np.repeat(Bbot[np.newaxis, :, :], n, axis=0)
 
+    # NOTE: each of f_func/B_func/B_null squeezes the batch dim back out ONLY
+    # when it added one for a 1-D input (``added_batch``). Squeezing
+    # unconditionally (the old behavior) also collapsed a genuine batch of size
+    # 1: a (1, x_dim) input returned a (x_dim,) result, so a downstream
+    # ``jacobian(f, x)`` — which indexes ``f[:, i]`` — crashed with "too many
+    # indices for tensor of dimension 1". That's exactly the single-env eval
+    # path for SD-LQR/LQR (batch=1), which never showed up in training (num_envs
+    # > 1). The 1-D physics path in get_dynamics/env.step still gets its 1-D
+    # result back, so both callers are satisfied.
     def f_func(self, x):
         if isinstance(x, torch.Tensor):
             lib = torch
-            if x.dim() == 1:
+            added_batch = x.dim() == 1
+            if added_batch:
                 x = x.unsqueeze(0)
         else:
             lib = np
-            if x.ndim == 1:
+            added_batch = x.ndim == 1
+            if added_batch:
                 x = x[np.newaxis, :]
         result = self._f_logic(x, lib)
-        try:
-            return result.squeeze(0)
-        except Exception:
-            return result
+        if added_batch:
+            try:
+                return result.squeeze(0)
+            except Exception:
+                return result
+        return result
 
     def B_func(self, x):
         if isinstance(x, torch.Tensor):
             lib = torch
-            if x.dim() == 1:
+            added_batch = x.dim() == 1
+            if added_batch:
                 x = x.unsqueeze(0)
         else:
             lib = np
-            if x.ndim == 1:
+            added_batch = x.ndim == 1
+            if added_batch:
                 x = x[np.newaxis, :]
         result = self._B_logic(x, lib)
-        try:
-            return result.squeeze(0)
-        except Exception:
-            return result
+        if added_batch:
+            try:
+                return result.squeeze(0)
+            except Exception:
+                return result
+        return result
 
     def B_null(self, x):
         if isinstance(x, torch.Tensor):
             lib = torch
-            n = 1 if x.dim() == 1 else x.shape[0]
+            added_batch = x.dim() == 1
         else:
             lib = np
-            n = 1 if x.ndim == 1 else x.shape[0]
+            added_batch = x.ndim == 1
+        n = 1 if added_batch else x.shape[0]
         result = self._B_null_logic(x, n, lib)
-        try:
-            return result.squeeze(0)
-        except Exception:
-            return result
+        if added_batch:
+            try:
+                return result.squeeze(0)
+            except Exception:
+                return result
+        return result
 
     def define_initial_state(self):
         xref_0 = self.XREF_INIT_MIN + np.random.rand(len(self.XREF_INIT_MIN)) * (

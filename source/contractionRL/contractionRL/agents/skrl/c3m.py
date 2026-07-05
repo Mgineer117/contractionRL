@@ -11,6 +11,40 @@ Contraction conditions verified jointly:
   Cu = Ṁ + 2·sym(M(A+BK)) + 2λM ≺ 0     (closed-loop)
   C1 = Bᗩᵀ(-Ẇ_f + 2·sym(Df/Dx·W) + 2λW)Bᗩ ≺ 0
   C2 = Bᗩᵀ(Ẇ_b - 2·sym(∂B/∂x·W))Bᗩ = 0
+
+Per-``update()`` workflow (called once per ``timestep`` by C3MSkrlTrainer,
+see ``update()`` and ``_learn()`` below):
+
+  1. **Dynamics** (skipped when ``use_analytical_dynamics``) — draw a fresh
+     ``(x, u, x_dot)`` batch via ``get_rollout(..., "dynamics")`` and take one
+     MSE gradient step on ``NeuralDynamics`` (``ẋ = f_net(x) + B_net(x)·u``).
+     Isaac envs always use this path (no closed-form dynamics available);
+     classic envs may instead set ``use_analytical_dynamics: true`` to use the
+     env's own exact ``get_f_and_B(x)``, skipping this step entirely.
+  2. Anneal ``policy.cl_actor``'s exploration ``log_std`` by training progress.
+  3. **``_learn()``** — one full pass over ``self._data`` (a static/periodically
+     -refreshed buffer of ``(x, xref, uref)`` triples from
+     ``get_rollout(..., "c3m")``) in ``batch_size`` chunks. For each chunk:
+       a. ``cmg_updates_per_policy_update`` gradient steps on the CMG
+          (``_ccm_gen``) ALONE, controller held fixed (``_optimize_params``
+          zeroes both optimizers but only steps ``_w_optimizer``).
+       b. One gradient step on the controller (``_cl_actor``) ALONE, metric
+          held fixed (steps ``_u_optimizer`` only).
+     Both directions optimise the SAME combined loss (``pd_loss + c1_loss +
+     c2_loss (+ os_loss)``, see ``_compute_loss``) — alternating which
+     parameter group actually receives the gradient step is what keeps the
+     joint (metric, controller) optimization stable (mirrors CAC-dev).
+
+Normalization: **none**. Unlike C2RL, C3M's policy/CMG are bare
+``nn.Module``s wrapped directly in skrl ``Model``s — they are never wrapped in
+a ``PPO``/``SAC`` base agent, so there is no ``observation_preprocessor``/
+``value_preprocessor`` anywhere in this file. Every network call
+(``_compute_loss``, ``_train_dynamics``) sees the SAME raw ``(x, xref, uref)``
+physical-unit values everywhere, at both training and eval time (``eval()``
+below, and ``C3MSkrlTrainer.eval()``) — there is no train/eval or
+loss-vs-inference input-distribution gap to worry about (contrast with
+C2RL's CMG-loss vs. policy-training normalization mismatch, documented in
+c2rl.py).
 """
 
 from __future__ import annotations

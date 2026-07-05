@@ -860,7 +860,7 @@ if _is_classic:
         from contractionRL.agents.skrl.runner import CLActorRunner as Runner
 
         _a = agent_cfg["agent"]
-        _use_state = _a.pop("use_state_norm", True)
+        _use_state = _a.pop("use_state_norm", False)  # OFF by default (see agent configs / c2rl.py docstring)
         _use_value = _a.pop("use_value_norm", True)
         if _use_state:
             _a["state_preprocessor"] = "RunningStandardScaler"
@@ -1154,7 +1154,7 @@ else:
 
         _a = agent_cfg["agent"]
         _alg = _a.get("class", "").lower()
-        _use_state = _a.pop("use_state_norm", True)
+        _use_state = _a.pop("use_state_norm", False)  # OFF by default (see agent configs / c2rl.py docstring)
         _use_value = _a.pop("use_value_norm", True)
         if _use_state:
             _a["observation_preprocessor"] = "RunningStandardScaler"

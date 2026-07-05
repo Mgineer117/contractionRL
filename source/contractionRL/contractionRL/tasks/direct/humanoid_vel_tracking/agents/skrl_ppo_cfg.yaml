@@ -10,25 +10,18 @@ models:
     max_log_std: 2.0
     initial_log_std: 0.0
     network:
-    - name: net
-      input: OBSERVATIONS
-      layers:
-      - 128
-      - 128
-      - 128
-      activations: tanh
+      - name: net
+        input: OBSERVATIONS
+        layers: [128, 128, 128]
+        activations: tanh
     output: ACTIONS
   value:
     class: DeterministicMixin
-    clip_actions: false
     network:
-    - name: net
-      input: OBSERVATIONS
-      layers:
-      - 128
-      - 128
-      - 128
-      activations: tanh
+      - name: net
+        input: OBSERVATIONS
+        layers: [128, 128, 128]
+        activations: tanh
     output: ONE
 memory:
   class: RandomMemory
@@ -65,7 +58,7 @@ agent:
     checkpoint_interval: auto
   gae_lambda: 0.95
   use_state_norm: false
-  use_value_norm: false
+  use_value_norm: true
 trainer:
   class: SequentialTrainer
   timesteps: 50000

@@ -11,6 +11,30 @@ LQRAgent: linearises at the *reference* xref.
 
 Both solve the continuous-time algebraic Riccati equation (CARE) to get the
 optimal gain K and apply u = uref - K·(x - xref).
+
+Per-``act()`` workflow (there is no training loop — every step is this,
+see ``_compute_action``):
+
+  1. Split the raw observation into ``(x, xref, uref)``.
+  2. Autodiff ``get_f_and_B`` (analytical, classic envs, or a loaded
+     ``NeuralDynamics.get_f_and_B`` pretrained by C3M — see
+     ``C3MAgent.save_dynamics``) at the linearization point (``x`` for
+     SD-LQR, ``xref`` for LQR) to get ``f, B`` and their Jacobians
+     ``∂f/∂x, ∂B/∂x``.
+  3. Form ``A = ∂f/∂x + Σⱼ uref_j·∂Bⱼ/∂x`` per-environment (batched).
+  4. Solve the CARE (``scipy.linalg.solve_continuous_are``, CPU-only, one
+     linear system per environment in a Python loop — see ``_care_gain``) for
+     the gain ``K = R⁻¹BᵀP``; falls back to zero feedback (``u = uref``) if
+     ``(A, B)`` isn't stabilizable at that linearization point rather than
+     aborting the batch.
+  5. Apply ``u = uref - K·(x - xref)``.
+
+Normalization: **none**, and none is meaningful here — there are no learned
+weights whose input distribution could drift, only a per-step closed-form
+solve on the raw physical state. ``_compute_device = "cpu"`` is unrelated to
+normalization: it exists only because ``scipy``'s CARE solver requires CPU
+numpy arrays, so the Jacobian computation for this step is done on CPU
+regardless of the environment's own device.
 """
 
 from __future__ import annotations

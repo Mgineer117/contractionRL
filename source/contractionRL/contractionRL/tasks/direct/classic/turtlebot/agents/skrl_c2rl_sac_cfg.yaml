@@ -58,9 +58,11 @@ agent:
   rollouts: 300  # steps collected per con/opt rollout phase each epoch; MUST match trainer.rollouts
                          # below. NOT a real SAC_CFG field — for SAC the con/opt replay buffer is sized
                          # by memory_size above (persistent), not by rollouts.
-  use_state_norm: true  # Applies RunningStandardScaler to con/opt policy observations (see _make_base_cfg) —
-                         # standalone PPO/SAC get this automatically via train.py; c2rl builds its PPO/SAC
-                         # sub-agents directly, so it's replicated explicitly here instead
+  use_state_norm: false  # OFF by default: keeping observations raw makes the CMG contraction loss
+                         # (which evaluates con_policy on RAW obs to get K = du/dx — see _compute_cmg_loss)
+                         # consistent with how con_policy is actually trained/deployed. If set true, C2RL
+                         # now routes con_agent's SAME RunningStandardScaler through the CMG loss so the
+                         # certified Jacobian still matches the deployed (normalized-input) controller.
   # SAC shared config (con_policy/opt_policy each get their own SAC sub-agent).
   # Standard robotics SAC defaults (see skrl_sac_cfg.yaml across this repo):
   # batch_size 256, [256,256] ReLU critics, ~1M-transition replay target.

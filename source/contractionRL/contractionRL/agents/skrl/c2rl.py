@@ -1,16 +1,111 @@
 """C2RL — Two-policy contraction-metric synthesis, native skrl Agent.
 
-C2RLAgent alternates between a contracting rollout phase (γ→0) and an optimal
-rollout phase (high γ).  Both PPO-backed policies share a CMG trained with the
-contraction pd-loss.  The Mahalanobis reward ``-||e||²_M / std`` replaces the
-environment reward for both policies.
+C2RLAgent trains TWO independent policies against the SAME environment and the
+SAME shared CMG (contraction-metric generator), on top of a chosen base
+algorithm (``base_algorithm="PPO"`` → two skrl ``PPO`` sub-agents,
+``base_algorithm="SAC"`` → two skrl ``SAC`` sub-agents):
 
-Training loop (handled by C2RLSkrlTrainer):
-  1. Collect ``rollout_steps`` transitions with *con_policy* (γ→0).
-  2. Inject Mahalanobis rewards → PPO update for con_policy.
-  3. Collect ``rollout_steps`` transitions with *opt_policy* (high γ).
-  4. Inject Mahalanobis rewards → PPO update for opt_policy.
-  5. CMG update with contraction pd-loss (random data from get_rollout).
+  * ``con_policy`` ("contracting") — discount ``gamma_contracting`` (≈0, a
+    near-per-step objective) — optimises the Mahalanobis tracking reward
+    ``-tracking_scaler·||e||²_M/std - control_scaler·||u-uref||²/std``,
+    where ``M(x) = W(x)⁻¹`` is the CMG's CURRENT metric. This is what actually
+    shapes the CMG (see ``update_cmg``/``_compute_cmg_loss``): con_policy's
+    mean control and its state-Jacobian ``K = du/dx`` feed the contraction
+    condition ``Cu ≺ 0`` directly.
+  * ``opt_policy`` ("optimal") — discount ``gamma_optimal`` (e.g. 0.99) —
+    optimises the SAME Mahalanobis reward, just under a standard RL discount
+    instead of a near-zero one. This is the policy actually DEPLOYED at
+    inference (``act()``) unless ``con_only=True``.
+
+Both policies share one replay/rollout mechanism per epoch (each gets its OWN
+memory buffer — con_memory/opt_memory — but the alternation is what makes them
+"share" the environment: opt_policy picks up wherever con_policy's rollout
+left the env). Every epoch (``C2RLSkrlTrainer.train``):
+
+  1. **Con rollout** — ``rollout_steps`` env steps with *con_policy* acting,
+     recorded into ``con_memory`` with the environment's OWN reward (it gets
+     overwritten in step 2).
+  2. **update_con** — recompute the Mahalanobis reward from the RAW observations
+     just collected and inject it in place of the environment reward, then run
+     one PPO/SAC gradient update for con_policy (PPO: explicit ``update()``
+     call here, since the base agent's own ``rollouts``-cadence hook never
+     fires — one call site drives it manually. SAC: the reward is
+     recomputed on the fly by a monkey-patched ``memory.sample()`` — see
+     below — and the actual gradient step is deferred to
+     ``con_agent.post_interaction()``, called right after, which is what
+     respects ``learning_starts``).
+  3. **Opt rollout** — same as step 1, with *opt_policy* acting (skipped if
+     ``con_only``).
+  4. **update_opt** — same as step 2, for opt_policy.
+  5. **update_cmg** — refresh the CMG training buffer via ``get_rollout`` and
+     run ``cmg_updates_per_iter`` contraction pd-loss gradient steps, evaluated
+     using con_policy's mean control/Jacobian (NOT opt_policy's).
+
+Normalization (see ``_make_base_cfg``, ``_compute_mahalanobis_reward``,
+``_compute_cmg_loss``):
+
+  * **Observation normalization** — controlled by ``use_state_norm``, which
+    now defaults to **False** in every shipped config (see the note below and
+    the yaml comments). When enabled, con_agent and opt_agent EACH get their
+    own independent ``RunningStandardScaler`` (per-dimension running mean/std
+    over the full ``[x, xref, uref]`` observation vector), exactly like
+    standalone PPO/SAC get via ``train.py``. Being independent instances,
+    con_agent's scaler is fit to the state distribution *con_policy* visits
+    (γ→0 rollouts) and opt_agent's to what *opt_policy* visits — these can
+    diverge over training. The scaler is applied (not updated) inside ``act()``
+    and updated (``train=True``) inside each sub-agent's own
+    ``update()``/gradient step — standard skrl behavior, inherited for free
+    since con_agent/opt_agent are real ``PPO``/``SAC`` instances.
+
+    NOTE the residual-control interaction: the ``control``/``mlp`` backbones
+    compute ``u = uref + feedback`` by slicing ``uref`` out of the observation
+    they receive. If that observation is normalized, the sliced ``uref`` is the
+    *normalized* uref, so the applied control law becomes ``uref_norm +
+    feedback`` rather than ``uref + feedback`` — the reference-tracking
+    residual is distorted. This (not just the CMG caveat) is a second reason
+    ``use_state_norm`` now defaults off for these backbones; keep it off unless
+    you deliberately want normalized-uref behavior.
+  * **Value normalization** (PPO only) — when ``use_value_norm`` (default
+    True), a separate ``RunningStandardScaler(size=1)`` normalizes the value
+    function's target/output, per sub-agent. SAC has no state-value network,
+    so this is a no-op there.
+  * **Reward normalization** — UNRELATED to the two preprocessors above. The
+    Mahalanobis tracking term and the (optional) control-effort term are each
+    divided by the sqrt of their own EMA'd batch variance
+    (``reward_norm_beta``, independent running stats per term, both persisted
+    on the OUTER C2RLAgent — not per sub-agent), so their relative scale
+    stays roughly stationary even as the CMG (and hence ``M(x)``) changes
+    shape during training. This plays the role of skrl's own
+    ``rewards_shaper`` but is C2RL-specific and always active; the yaml
+    ``rewards_shaper_scale`` (skrl's own, a flat multiplicative constant) can
+    still be layered on top.
+  * **The CMG metric M(x) and the Mahalanobis reward always use RAW
+    observations** — ``_compute_mahalanobis_reward`` and the ``M(x)``/``e``
+    parts of ``_compute_cmg_loss`` read straight from ``get_rollout``/the
+    just-collected rollout tensors, NEVER through any preprocessor. This is
+    required: ``M(x)`` and the tracking error ``e = x - xref`` are defined in
+    raw physical coordinates, and per-dimension normalization would scale ``x``
+    and ``xref`` independently (they occupy different observation indices with
+    their own running stats), distorting ``e`` into the wrong quantity.
+  * **The certified POLICY Jacobian tracks whatever the policy is trained on**
+    — the one part of ``_compute_cmg_loss`` that touches the policy network
+    (``K = du/dx``, con_policy's control sensitivity) routes its input through
+    ``con_agent``'s OWN observation preprocessor (``self._con_obs_preprocessor``)
+    before calling ``con_policy_model.compute()``:
+      - ``use_state_norm`` off (the default): that preprocessor is skrl's
+        identity ``_empty_preprocessor`` → the policy sees raw obs and ``K`` is
+        the raw-coordinate Jacobian, same as always.
+      - ``use_state_norm`` on: the policy sees the SAME ``RunningStandardScaler``
+        -normalized obs it was actually optimized/deployed on, and because the
+        normalization is kept in the autograd graph (``no_grad=False``) while
+        ``jacobian(u, x)`` still differentiates w.r.t. raw ``x``, ``K`` is the
+        true sensitivity of the DEPLOYED control to the raw state (it absorbs
+        the ``1/std`` factor). So the contraction certificate is always
+        consistent with the network's actual input distribution — there is no
+        longer a raw-vs-normalized gap between the CMG loss and how con_policy
+        is trained. (This is the "consistent state norm across all networks"
+        guarantee; C3M never had the gap because its policy is never wrapped in
+        an observation-normalizing base agent — see c3m.py.)
 """
 
 from __future__ import annotations
@@ -75,7 +170,8 @@ class C2RLPPOCfg(AgentCfg):
     kl_threshold: float = 0.0
     grad_norm_clip: float = 0.5
     time_limit_bootstrap: bool = False
-    use_state_norm: bool = True
+    use_state_norm: bool = False  # off by default — see module docstring (residual-uref distortion
+                                  # + CMG-certificate consistency); every shipped config sets it too
     use_value_norm: bool = True
     # C2RL-specific
     gamma_contracting: float = 0.0
@@ -114,7 +210,8 @@ class C2RLSACCfg(AgentCfg):
     grad_norm_clip: float = 0.0
     learn_entropy: bool = True
     initial_entropy_value: float = 0.2
-    use_state_norm: bool = True
+    use_state_norm: bool = False  # off by default — see module docstring (residual-uref distortion
+                                  # + CMG-certificate consistency); every shipped config sets it too
     # C2RL-specific
     gamma_contracting: float = 0.0
     gamma_optimal: float = 0.99
@@ -329,7 +426,10 @@ class C2RLAgent(Agent):
             # opt-out flags, and note the field is "observation_preprocessor"
             # (NOT "state_preprocessor", which is a different, unused-in-this-
             # repo field for asymmetric actor-critic "state" input).
-            if self._raw_cfg.get("use_state_norm", True):
+            # Default OFF (see the C2RLPPOCfg/C2RLSACCfg field defaults and the
+            # module docstring): a config that omits the key gets no observation
+            # normalization, matching every shipped config's explicit `false`.
+            if self._raw_cfg.get("use_state_norm", False):
                 from skrl.resources.preprocessors.torch import RunningStandardScaler
                 d["observation_preprocessor"] = RunningStandardScaler
                 d["observation_preprocessor_kwargs"] = {"size": observation_space, "device": device}
@@ -450,6 +550,16 @@ class C2RLAgent(Agent):
         # so this works whether con_policy is CLActorModel (backbone: control)
         # or MLPResidualActorModel (backbone: mlp) — both return uref + feedback.
         self._con_policy_model = models["con_policy"]
+        # con_agent's OWN observation preprocessor (RunningStandardScaler when
+        # use_state_norm, else skrl's identity _empty_preprocessor). The CMG loss
+        # routes the policy input through THIS SAME preprocessor (see
+        # _compute_cmg_loss) so the certified Jacobian K = du/dx is taken of the
+        # ACTUAL deployed controller — con_agent.act()/update() only ever feed
+        # con_policy normalized obs, so evaluating it on raw obs in the loss (as
+        # this used to) would certify a different function than the one deployed.
+        # With use_state_norm off (the default now) this is the identity and the
+        # policy sees raw obs everywhere, so there is nothing to reconcile.
+        self._con_obs_preprocessor = getattr(self._con_agent, "_observation_preprocessor", None)
         self._get_f_and_B = get_f_and_B
         self._data = get_rollout(parsed_cfg.buffer_size, "c3m")
         self._get_rollout = get_rollout
@@ -584,8 +694,28 @@ class C2RLAgent(Agent):
         xref = torch.from_numpy(buf["xref"][idx]).float().to(device)
         uref = torch.from_numpy(buf["uref"][idx]).float().to(device)
 
+        # NOTE on normalization: x/xref/uref are RAW physical-unit values (that's
+        # required — M(x) and e = x - xref below are defined in raw coordinates,
+        # and per-dim normalization would scale x and xref independently,
+        # distorting e). The POLICY, however, is trained/deployed on whatever
+        # con_agent's observation preprocessor produces, so we route the policy
+        # input (and only the policy input) through that SAME preprocessor:
+        #   - use_state_norm off (default): identity → policy sees raw obs, and
+        #     K = du/dx is the raw-coordinate Jacobian — exactly as before.
+        #   - use_state_norm on: RunningStandardScaler → the policy sees the same
+        #     normalized obs it was optimized on. no_grad=False keeps the (x-mean)/std
+        #     map in the autograd graph, so jacobian(u, x) below still differentiates
+        #     w.r.t. RAW x and correctly absorbs the 1/std factor — i.e. K is the
+        #     true sensitivity of the DEPLOYED control to the raw state, keeping the
+        #     certificate consistent with the network's actual input distribution.
+        #     train=False so this forward never updates the scaler's running stats
+        #     (only con_agent's own act()/update() should move those).
         state = torch.cat([x, xref, uref], dim=1)
-        u, _ = self._con_policy_model.compute({"observations": state}, role="policy")
+        policy_obs = (
+            self._con_obs_preprocessor(state, train=False, no_grad=False)
+            if self._con_obs_preprocessor is not None else state
+        )
+        u, _ = self._con_policy_model.compute({"observations": policy_obs}, role="policy")
         K = jacobian(u, x, create_graph=False)
         u = u.detach()
         K = K.detach()
@@ -648,10 +778,16 @@ class C2RLAgent(Agent):
         if self._base_algorithm == "PPO":
             maha_r = self._compute_mahalanobis_reward(observations, actions)
             try:
+                # con_memory's "rewards" tensor is (rollouts, num_envs, 1) — the
+                # step-major/env-minor layout it was filled in during the
+                # rollout loop — while maha_r is (rollouts*num_envs, 1), flat,
+                # from torch.cat'ing the same step-major/env-minor obs list.
+                # .shape therefore never matches even on the happy path (a 3D
+                # vs. a 2D tensor); only .numel() need agree for view_as() to
+                # be a valid reshape (previously this ALWAYS logged a false
+                # "mismatch" warning every epoch, PPO-only — SAC's memory.sample
+                # patch never hits this code path).
                 r_tensor = self._con_agent.memory.get_tensor_by_name("rewards")
-                if r_tensor.shape != maha_r.shape:
-                    import skrl
-                    skrl.logger.warning(f"[C2RL] Reward shape mismatch in update_con: {r_tensor.shape} != {maha_r.shape}")
                 r_tensor.copy_(maha_r.view_as(r_tensor))
             except RuntimeError as e:
                 import skrl
@@ -676,10 +812,10 @@ class C2RLAgent(Agent):
         if self._base_algorithm == "PPO":
             maha_r = self._compute_mahalanobis_reward(observations, actions)
             try:
+                # See the matching comment in update_con — .shape legitimately
+                # differs ((rollouts, num_envs, 1) vs. flat (rollouts*num_envs,
+                # 1)); only .numel() need agree for view_as() to reshape correctly.
                 r_tensor = self._opt_agent.memory.get_tensor_by_name("rewards")
-                if r_tensor.shape != maha_r.shape:
-                    import skrl
-                    skrl.logger.warning(f"[C2RL] Reward shape mismatch in update_opt: {r_tensor.shape} != {maha_r.shape}")
                 r_tensor.copy_(maha_r.view_as(r_tensor))
             except RuntimeError as e:
                 import skrl

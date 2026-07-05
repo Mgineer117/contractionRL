@@ -518,8 +518,27 @@ For classic C3M runs specifically, `Stability/*` (and `Reward/reward_mean`) come
 
 ### PPO / SAC
 
-Standard skrl implementations. See [skrl docs](https://skrl.readthedocs.io) for full parameter reference.
-Configs: `agents/skrl_ppo_cfg.yaml`, `agents/skrl_sac_cfg.yaml`.
+Standard skrl implementations (real `skrl.agents.torch.ppo.PPO` / `skrl.agents.torch.sac.SAC`,
+built through `CLActorRunner`, see [Action convention](#action-convention) for the `backbone:`
+choices). See [skrl docs](https://skrl.readthedocs.io) for the full training-loop/parameter
+reference. Configs: `agents/skrl_ppo_cfg.yaml`, `agents/skrl_sac_cfg.yaml`.
+
+**Normalization**: every shipped config now sets **`use_state_norm: false`** and (PPO only)
+**`use_value_norm: true`** — observations are left raw, value targets are normalized. When
+`use_state_norm` is enabled, `train.py` wires a `RunningStandardScaler` observation preprocessor
+into the agent config before construction (`observation_preprocessor` for Isaac envs, remapped
+from the legacy `state_preprocessor` yaml key for classic envs — see
+[skrl's `Runner._process_cfg`](https://skrl.readthedocs.io)); it's applied (not updated) inside
+`act()` and updated (`train=True`) inside `update()`'s gradient step, over the FULL observation
+vector `[x, xref, uref]` (path-tracking envs) with no special-casing of any sub-range. Value
+normalization (`use_value_norm`, PPO only — SAC has no state-value network) adds a separate
+`RunningStandardScaler(size=1)` on the value output.
+
+Why state norm is off by default: on the residual backbones (`control`/`mlp`, which compute
+`u = uref + feedback` by slicing `uref` out of the observation), normalizing the observation also
+normalizes the sliced `uref`, so the control law silently becomes `uref_norm + feedback` — the
+reference-tracking residual is distorted. Keeping observations raw avoids this and (for C2RL) keeps
+the contraction certificate consistent with the deployed controller (see the C2RL section).
 
 ---
 
@@ -537,10 +556,25 @@ Three matrix-valued conditions must hold everywhere in state space:
 On Isaac envs, `NeuralDynamics` (`ẋ = f_net(x) + B_net(x)·u`) is trained online from trajectory data.
 On classic envs with `use_analytical_dynamics: true`, the env's exact `get_f_and_B(x)` is used.
 
+**Per-update workflow** (`C3MAgent.update()`, once per training `timestep`):
+
+1. **Dynamics** — one MSE gradient step on `NeuralDynamics` from a fresh `(x, u, x_dot)` batch
+   (skipped entirely when `use_analytical_dynamics: true`).
+2. Anneal the controller's exploration `log_std` by training progress.
+3. **One full pass over the training buffer** (`(x, xref, uref)` triples from `get_rollout`), in
+   `batch_size` chunks; each chunk does `cmg_updates_per_policy_update` CMG-only gradient steps
+   (controller frozen) followed by ONE controller-only gradient step (CMG frozen) — both directions
+   optimise the same `pd_loss + c1_loss + c2_loss (+ os_loss)`, alternating which side actually
+   receives the gradient is what keeps the joint (metric, controller) optimization stable.
+
 `cfg.lbd` is the *certified/target* contraction rate baked into the training loss; the
 `Stability/contraction_rate` W&B metric is the *empirically measured* rate on rollouts — they
 are related but not the same number, and `Stability/convergence_score` (`=contraction_rate/overshoot`)
 is what the hyperparameter sweep in `search/run_c3m_sweeps.sh` actually optimizes.
+
+**Normalization**: none. The policy/CMG networks are bare `nn.Module`s, never wrapped in a
+PPO/SAC base agent, so there is no observation/value preprocessor anywhere — every network call
+sees the same raw physical-unit `(x, xref, uref)` at both training and eval time.
 
 | Param | Default | Notes |
 |-------|---------|-------|
@@ -555,7 +589,15 @@ is what the hyperparameter sweep in `search/run_c3m_sweeps.sh` actually optimize
 ### SD-LQR (State-Dependent LQR)
 
 Linearises `ẋ = f(x) + B(x)u` at the **current state** `x`, solves CARE, applies `u = uref − K(x)·e`.
-No training — analytical per-step computation. Jacobians via autograd through `NeuralDynamics`.
+No training — analytical per-step computation (`update()` is a no-op). Every `act()` call:
+autodiff `get_f_and_B` (analytical for classic envs, or a `NeuralDynamics` checkpoint pretrained
+by C3M for Isaac envs) at the linearization point to get `f, B` and their Jacobians, form
+`A = ∂f/∂x + Σⱼ uref_j·∂Bⱼ/∂x`, solve the CARE per-environment (`scipy`, CPU-only — falls back to
+zero feedback if `(A, B)` isn't stabilizable at that point rather than aborting the batch), then
+apply the gain.
+
+**Normalization**: none — there are no learned weights whose input distribution could drift, only
+a per-step closed-form solve on the raw physical state.
 
 | Param | Default | Notes |
 |-------|---------|-------|
@@ -574,18 +616,67 @@ Applies `u = uref − K(x_ref)·e`.
 ### C2RL (Contraction-Certified RL)
 
 Two-policy architecture, built on top of a chosen base algorithm (`c2rl-ppo` uses two official
-skrl `PPO` sub-agents, `c2rl-sac` uses two official skrl `SAC` sub-agents):
-- **Contracting policy** (γ→0): optimises Mahalanobis tracking reward `−‖e‖²_M / std`
-- **Optimal policy** (γ→0.99): optimises environment reward
+skrl `PPO` sub-agents, `c2rl-sac` uses two official skrl `SAC` sub-agents) that share one CMG:
 
-CMG (CCM generator, same as C3M) is trained concurrently to shape the Mahalanobis metric.
+- **con_policy** ("contracting", `gamma_contracting` ≈ 0) and **opt_policy** ("optimal",
+  `gamma_optimal`, e.g. 0.99) optimise the **same** Mahalanobis tracking reward
+  `−tracking_scaler·‖e‖²_M/std − control_scaler·‖u−uref‖²/std` (`M(x)` = the CMG's current metric)
+  — they differ ONLY in discount factor, not in reward. opt_policy is what's actually deployed at
+  inference unless `con_only: true`.
+- con_policy's mean control and its state-Jacobian `K = du/dx` are what the CMG (CCM generator,
+  same architecture as C3M) is trained against — opt_policy plays no role in shaping the metric.
+
+**Per-epoch workflow** (`C2RLSkrlTrainer.train()`, one iteration of the outer loop):
+
+1. **Con rollout** — collect `rollouts` env steps with con_policy acting (its own replay/rollout
+   buffer — PPO: reset every epoch; SAC: a persistent replay buffer, sized independently via
+   `memory_size`).
+2. **update_con** — recompute the Mahalanobis reward from the RAW just-collected observations and
+   overwrite the environment reward with it, then take one PPO/SAC gradient step for con_policy
+   (PPO updates explicitly here; SAC recomputes the reward per-minibatch inside a patched
+   `memory.sample()` and defers the actual gradient step to `con_agent.post_interaction()`, so
+   `learning_starts` is still respected).
+3. **Opt rollout** — same as step 1, with opt_policy acting (skipped if `con_only`).
+4. **update_opt** — same as step 2, for opt_policy.
+5. **update_cmg** — refresh the CMG training buffer (fresh `(x, xref, uref)` from `get_rollout`)
+   and take `cmg_updates_per_iter` contraction pd-loss gradient steps against con_policy's mean
+   control/Jacobian.
+
+**Normalization**:
+
+- **Observations** — `use_state_norm: false` in every shipped config (see the PPO/SAC
+  normalization note above for why: with `control`/`mlp` residual backbones, normalizing the obs
+  also normalizes the sliced `uref`, distorting the `u = uref + feedback` law). When enabled,
+  con_agent and opt_agent EACH get their own independent `RunningStandardScaler` over
+  `[x, xref, uref]` — con_agent's fit to the states con_policy visits, opt_agent's to opt_policy's,
+  and the two can diverge over training. PPO additionally normalizes its value function per
+  sub-agent when `use_value_norm: true`.
+- **Reward** — a *separate* mechanism from the above: the Mahalanobis term (and the optional
+  control-effort term) are each divided by the sqrt of their own EMA'd batch variance
+  (`reward_norm_beta`), tracked on the outer C2RL agent (not per sub-agent), so their scale stays
+  roughly stationary as the CMG's metric shape changes during training.
+- **CMG metric `M(x)` + Mahalanobis reward always use RAW observations** — both read straight from
+  the rollout/`get_rollout` tensors, never through a preprocessor. This is deliberate: `M(x)` and
+  `e = x − xref` are physical quantities, and per-dimension normalization would scale `x` and
+  `xref` independently (different observation indices, independent running stats), distorting `e`.
+- **The certified policy Jacobian stays consistent with the deployed policy** — the one part of the
+  CMG loss that touches the policy network (`K = du/dx`) now routes its input through con_agent's
+  *own* observation preprocessor before calling con_policy. With state norm off (the default) that's
+  the identity, so `K` is the raw Jacobian as before; with state norm on, con_policy sees the same
+  normalized obs it was trained/deployed on, and because the normalization stays in the autograd
+  graph while `jacobian(u, x)` still differentiates w.r.t. raw `x`, `K` correctly absorbs the
+  `1/std` factor — the certificate always matches the network's actual input distribution. (This
+  resolves the earlier raw-vs-normalized caveat; C3M never had it, since its policy is never wrapped
+  in an observation-normalizing base agent.)
 
 | Param | Default | Notes |
 |-------|---------|-------|
-| `gamma_contracting` | 0.0 | Discount for contracting policy |
-| `gamma_optimal` | 0.99 | Discount for optimal policy |
-| `tracking_scaler` | 1.0 | Mahalanobis reward scale |
-| `cmg_updates_per_iter` | 3 | CMG gradient steps per rollout |
+| `gamma_contracting` | 0.0 | Discount for the contracting policy |
+| `gamma_optimal` | 0.99 | Discount for the optimal policy (the one deployed, unless `con_only`) |
+| `tracking_scaler` | 1.0 | Mahalanobis reward scale (Q, shared by both policies) |
+| `control_scaler` | 0.0 | Control-effort penalty weight (R, shared by both policies; 0 = disabled) |
+| `reward_norm_beta` | 0.99 | EMA momentum for the reward-variance normalisation |
+| `cmg_updates_per_iter` | 3 | CMG gradient steps per epoch |
 
 ---
 

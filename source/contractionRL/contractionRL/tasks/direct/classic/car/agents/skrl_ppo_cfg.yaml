@@ -18,7 +18,6 @@ models:
     output: ACTIONS
   value:
     class: DeterministicMixin  # Outputs deterministic continuous values
-    clip_actions: False
     network:
       - name: net
         input: OBSERVATIONS

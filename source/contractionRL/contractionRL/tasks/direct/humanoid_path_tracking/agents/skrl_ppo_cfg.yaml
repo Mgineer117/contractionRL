@@ -33,7 +33,6 @@ models:
     output: ACTIONS
   value:  # see deterministic_model parameters
     class: DeterministicMixin
-    clip_actions: False
     network:
       - name: net
         input: OBSERVATIONS
@@ -62,7 +61,7 @@ agent:
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.008
-  use_state_norm: true
+  use_state_norm: false
   use_value_norm: true
   random_timesteps: 0
   learning_starts: 0

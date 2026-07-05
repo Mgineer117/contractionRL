@@ -77,9 +77,11 @@ agent:
   time_limit_bootstrap: true  # Bootstrap value at episode truncation instead of treating it as terminal
                                # (path-tracking episodes truncate at a fixed length; without this the
                                # value function is biased into treating "ran out of time" as "episode over")
-  use_state_norm: true  # Applies RunningStandardScaler to con/opt policy observations (see _make_base_cfg) —
-                         # standalone PPO/SAC get this automatically via train.py; c2rl builds its PPO/SAC
-                         # sub-agents directly, so it's replicated explicitly here instead
+  use_state_norm: false  # OFF by default: keeping observations raw makes the CMG contraction loss
+                         # (which evaluates con_policy on RAW obs to get K = du/dx — see _compute_cmg_loss)
+                         # consistent with how con_policy is actually trained/deployed. If set true, C2RL
+                         # now routes con_agent's SAME RunningStandardScaler through the CMG loss so the
+                         # certified Jacobian still matches the deployed (normalized-input) controller.
   use_value_norm: true  # Same, but for the value function's output (PPO only — SAC has no value net)
   # C2RL-specific
   gamma_contracting: 0.0  # con_policy's discount factor (near-zero: approximates a hard per-step constraint)
