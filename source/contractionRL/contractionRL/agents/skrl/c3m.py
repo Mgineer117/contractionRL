@@ -580,7 +580,13 @@ class C3MSkrlTrainer(Trainer):
                 _stability_keys = {"auc", "contraction_rate", "overshoot", "convergence_score"}
                 for k, v in eval_metrics.items():
                     tab = "Stability" if k in _stability_keys else "Reward"
-                    agent.track_data(f"{tab} / {k}", v)
+                    # No space around "/" — must match path_tracking_base.py's
+                    # own "Stability/..."/"Reward/..." keys exactly, or PPO/SAC
+                    # (whose Stability metrics come from the env) and C3M
+                    # (whose Stability metrics come from here) end up on two
+                    # different wandb tabs ("Stability" vs "Stability ") for
+                    # what should be the same metric.
+                    agent.track_data(f"{tab}/{k}", v)
 
             if log_interval and (t + 1) % log_interval == 0:
                 # Read the losses captured on the agent by update(); tracking_data
@@ -683,8 +689,10 @@ class C3MSkrlTrainer(Trainer):
         e0c = e0.clamp(min=1e-8)
         eTc = e_last.clamp(min=1e-8)
         T = steps_count.clamp(min=1)
-        # Empirical contraction rate: e(T) = e(0) * exp(-lambda * T*dt)
-        lambda_emp = -(torch.log(eTc) - torch.log(e0c)) / (T * dt)
+        # Empirical contraction rate: e(T) = e(0) * exp(-lambda * T*dt). Clamped
+        # to >= 0 — a negative raw value just means the error grew instead of
+        # decaying (no contraction observed), not a valid "rate".
+        lambda_emp = (-(torch.log(eTc) - torch.log(e0c)) / (T * dt)).clamp(min=0.0)
         # Overshoot: peak error relative to the initial error.
         overshoot = (e_max.clamp(min=1e-8) / e0c).clamp(min=1e-6)
         # Convergence score: contraction rate per unit of overshoot — higher

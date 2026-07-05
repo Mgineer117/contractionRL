@@ -28,7 +28,7 @@ parser.add_argument("--classic", action="store_true", default=False,
 parser.add_argument("--task", type=str, default=None, help="Environment ID.")
 parser.add_argument(
     "--algorithm", "--algo", type=str, default="PPO",
-    help="Algorithm: ppo | sac | c3m | lqr | sdlqr | c2rl | AMP | DDPG | TD3 | …"
+    help="Algorithm: ppo | sac | c3m | lqr | sdlqr | c2rl-ppo | c2rl-sac | AMP | DDPG | TD3 | …"
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of parallel environments.")
 parser.add_argument("--seed", type=int, default=None, help="Random seed.")
@@ -136,7 +136,7 @@ import gymnasium as gym
 import yaml
 
 algorithm = args_cli.algorithm.lower()
-_CONTRACTION_ALGOS = {"c3m", "lqr", "sdlqr", "c2rl"}
+_CONTRACTION_ALGOS = {"c3m", "lqr", "sdlqr", "c2rl-ppo", "c2rl-sac"}
 
 seed = args_cli.seed if args_cli.seed is not None else random.randint(0, 10000)
 
@@ -428,6 +428,7 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
         states_arr = states_arr[valid_mask]
         actions_arr = actions_arr[valid_mask]
         x_dot_arr = x_dot_arr[valid_mask]
+        pos_arr = pos_arr[valid_mask]
         lengths_arr = lengths_arr[valid_mask]
 
     # Single unified file: reference trajectories ARE the (x, u) part of the
@@ -436,14 +437,20 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
     #                          (the last valid state repeated, keeping x_dot ~ 0)
     #   u       (N, T, u_dim)  executed (clipped) actions, same padding rule
     #   x_dot   (N, T, x_dim)  4th-order central differences of x
+    #   pos     (N, T, 3)      world-frame [x, y, z] root position — VISUALIZATION ONLY, not
+    #                          part of the dynamics; consumers that fit f(x)/B(x)
+    #                          (e.g. C3M's NeuralDynamics pretraining) must read
+    #                          only x/u/x_dot/lengths from this file and ignore
+    #                          this key, exactly like they already do today.
     #   lengths (N,)           number of VALID steps per trajectory — consumers
     #                          mask with arange(T) < lengths[:, None]
     dyn_path = os.path.join(out_dir, "dynamics_data.npz")
-    np.savez_compressed(dyn_path, x=states_arr, u=actions_arr, x_dot=x_dot_arr, lengths=lengths_arr)
+    np.savez_compressed(dyn_path, x=states_arr, u=actions_arr, x_dot=x_dot_arr, pos=pos_arr, lengths=lengths_arr)
     print(f"[RefTraj] Saved dynamics  → {dyn_path}")
     print(f"       x       shape: {states_arr.shape}")
     print(f"       u       shape: {actions_arr.shape}   (clipped to action-space bounds)")
     print(f"       x_dot   shape: {x_dot_arr.shape}")
+    print(f"       pos     shape: {pos_arr.shape}   (visualization only)")
     print(f"       lengths shape: {lengths_arr.shape}  (min {lengths_arr.min()}, max {lengths_arr.max()})")
 
 
@@ -704,130 +711,6 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, num_grou
                                   if isinstance(v, (int, float))})
 
 
-def _patch_kl_logging(agent) -> None:
-    """Log per-epoch approximate KL divergence to 'Policy / KL divergence'.
-
-    skrl's PPO computes KL every epoch to drive KLAdaptiveLR but never records
-    it, so early-stop events (kl_threshold) are invisible in tensorboard/wandb
-    even though they silently truncate — and thus deflate — the averaged
-    Loss/Policy loss, Loss/Value loss, Loss/Entropy loss for that update
-    (skrl divides by the full learning_epochs*mini_batches regardless of how
-    many minibatches actually ran before the break). No-ops for agents without
-    a KLAdaptiveLR scheduler (SAC, contraction agents, PPO with scheduler=null).
-    """
-    import skrl.resources.schedulers.torch as _sched
-
-    scheduler = getattr(agent, "scheduler", None)
-    if not isinstance(scheduler, _sched.KLAdaptiveLR):
-        return
-
-    _orig_step = scheduler.step
-
-    def _step(kl=None, *, epoch=None):
-        if kl is not None:
-            agent.track_data("Policy / KL divergence", float(kl))
-        _orig_step(kl, epoch=epoch)
-
-    scheduler.step = _step
-
-
-def _patch_sac_entropy_clamp(agent, min_log_alpha: float = -5.0, max_log_alpha: float = 2.0) -> None:
-    """Clamp log_entropy_coefficient in-place after every entropy optimizer step.
-
-    skrl's SAC applies grad_norm_clip to the policy and critic optimizers but
-    NOT to entropy_optimizer, and _entropy_coefficient = exp(log_entropy_coefficient)
-    is exponentiated with no bound. A noisy/undertrained critic can push this
-    single scalar's gradient large, and exponentiation turns even a moderate
-    excursion into a runaway entropy coefficient that then dominates both the
-    critic target and the policy loss — a textbook SAC divergence mechanism.
-    Bounds exp(log_alpha) to roughly [0.0067, 7.39], mirroring the clip_log_std
-    bounds skrl already applies to GaussianMixin policies elsewhere. No-op for
-    agents without learn_entropy (PPO, contraction agents, SAC with learn_entropy=False).
-    """
-    import torch
-
-    entropy_optimizer = getattr(agent, "entropy_optimizer", None)
-    log_alpha = getattr(agent, "log_entropy_coefficient", None)
-    if entropy_optimizer is None or log_alpha is None:
-        return
-
-    _orig_step = entropy_optimizer.step
-
-    def _step(*args, **kwargs):
-        result = _orig_step(*args, **kwargs)
-        with torch.no_grad():
-            log_alpha.clamp_(min_log_alpha, max_log_alpha)
-        return result
-
-    entropy_optimizer.step = _step
-
-def _patch_ppo_std_annealing(agent, std_dev_annealing: bool, kwargs: dict | None = None) -> None:
-    """Adds manual standard deviation annealing to SKRL's PPO policy.
-
-    If `std_dev_annealing` is True, this disables the entropy loss entirely
-    (setting entropy_loss_scale to 0.0) and anneals the policy's
-    log_std_parameter from its initial value down to `final_log_std` over the
-    total training timesteps, following the chosen schedule.
-
-    YAML usage::
-
-        agent:
-          std_dev_annealing: True
-          std_dev_annealing_kwargs:
-            schedule: exponential   # linear | exponential | cosine
-            final_log_std: -2.3     # target log_std (std ~= 0.1)
-            power: 5.0              # exponential only: progress**power
-
-    Schedules (p = timestep/timesteps in [0, 1]):
-      linear:       log_std = init + p * (final - init)
-      exponential:  log_std = init + p**power * (final - init)  — slow early,
-                    fast late; keeps exploration wide for most of training
-      cosine:       log_std = init + (1 - cos(pi*p))/2 * (final - init)
-    """
-    if not std_dev_annealing:
-        return
-    kwargs = dict(kwargs or {})
-    schedule = str(kwargs.pop("schedule", "linear")).lower()
-    final_log_std = float(kwargs.pop("final_log_std", -2.0))
-    power = float(kwargs.pop("power", 5.0))
-    if kwargs:
-        logger.warning(f"std_dev_annealing_kwargs: ignoring unknown keys {sorted(kwargs)}")
-
-    # Ignore entropy: annealing and entropy bonus fight each other
-    if hasattr(agent, "_cfg") and isinstance(agent._cfg, dict):
-        agent._cfg["entropy_loss_scale"] = 0.0
-    if hasattr(agent, "cfg"):
-        if isinstance(agent.cfg, dict):
-            agent.cfg["entropy_loss_scale"] = 0.0
-        else:
-            setattr(agent.cfg, "entropy_loss_scale", 0.0)
-
-    if not hasattr(agent, "policy") or not hasattr(agent.policy, "log_std_parameter"):
-        return
-
-    # Disable gradients on log_std_parameter because we update it manually
-    agent.policy.log_std_parameter.requires_grad_(False)
-
-    import math as _math
-    initial_log_std = agent.policy.log_std_parameter.mean().item()
-
-    def _ratio(p: float) -> float:
-        if schedule == "exponential":
-            return p ** power
-        if schedule == "cosine":
-            return (1.0 - _math.cos(_math.pi * p)) / 2.0
-        return p  # linear
-
-    _orig_post = agent.post_interaction
-
-    def _annealed_post(*, timestep: int, timesteps: int) -> None:
-        progress = min(1.0, max(0.0, timestep / max(1, timesteps)))
-        current_log_std = initial_log_std + _ratio(progress) * (final_log_std - initial_log_std)
-        agent.policy.log_std_parameter.data.fill_(current_log_std)
-        _orig_post(timestep=timestep, timesteps=timesteps)
-
-    agent.post_interaction = _annealed_post
-
 # ══════════════════════════════════════════════════════════════════════════════
 # CLASSIC ROUTE  (--classic flag)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -871,7 +754,7 @@ if _is_classic:
         with open(cfg_path) as f:
             return yaml.safe_load(f)
 
-    entry_key = f"skrl_{algorithm}_cfg_entry_point"
+    entry_key = f"skrl_{algorithm.replace('-', '_')}_cfg_entry_point"
     agent_cfg = _load_cfg(entry_key, args_cli.cfg)
     agent_cfg["seed"] = seed
 
@@ -985,6 +868,8 @@ if _is_classic:
         if _use_value and algorithm == "ppo":
             _a["value_preprocessor"] = "RunningStandardScaler"
             _a["value_preprocessor_kwargs"] = None
+        _a.pop("anneal_stddev", None)   # no longer a PPO_CFG field; handled below
+        _a.pop("anneal_log_std", None)  # legacy alias, superseded by std_dev_annealing
         _std_dev_annealing = _a.pop("std_dev_annealing", False)
         _std_dev_annealing_kwargs = _a.pop("std_dev_annealing_kwargs", None)
 
@@ -993,6 +878,11 @@ if _is_classic:
         env = wrap_env(vec_env, wrapper="gymnasium")
 
         runner = Runner(env, agent_cfg)
+        from contractionRL.agents.skrl.agent_patches import (
+            patch_kl_logging as _patch_kl_logging,
+            patch_ppo_std_annealing as _patch_ppo_std_annealing,
+            patch_sac_entropy_clamp as _patch_sac_entropy_clamp,
+        )
         _patch_kl_logging(runner.agent)
         _patch_sac_entropy_clamp(runner.agent)
         _patch_ppo_std_annealing(runner.agent, _std_dev_annealing, _std_dev_annealing_kwargs)
@@ -1048,14 +938,23 @@ else:
     import contractionRL.tasks  # noqa: F401
 
     if args_cli.agent is None:
-        agent_cfg_entry_point = f"skrl_{algorithm}_cfg_entry_point"
+        agent_cfg_entry_point = f"skrl_{algorithm.replace('-', '_')}_cfg_entry_point"
     else:
         agent_cfg_entry_point = args_cli.agent
         algorithm = agent_cfg_entry_point.split("_cfg")[0].split("skrl_")[-1].lower()
 
     @hydra_task_config(args_cli.task, agent_cfg_entry_point)
     def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict):
-        env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+        # Algorithm-aware num_envs defaults: off-policy SAC-based algorithms
+        # need far fewer parallel envs (large replay buffer >> many envs),
+        # while on-policy PPO-based algorithms benefit from massively parallel
+        # envs.  The user can always override with --num_envs.
+        _SAC_ALGOS = {"sac", "c2rl-sac", "c2rl_sac"}
+        _DEFAULT_NUM_ENVS_SAC = 64
+        if args_cli.num_envs is not None:
+            env_cfg.scene.num_envs = args_cli.num_envs
+        elif algorithm.lower() in _SAC_ALGOS:
+            env_cfg.scene.num_envs = _DEFAULT_NUM_ENVS_SAC
         env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
         if args_cli.distributed and args_cli.device is not None and "cpu" in args_cli.device:
@@ -1291,6 +1190,14 @@ else:
         else:
             runner = Runner(env, agent_cfg)
 
+        from contractionRL.agents.skrl.agent_patches import (
+            patch_kl_logging as _patch_kl_logging,
+            patch_ppo_std_annealing as _patch_ppo_std_annealing,
+            patch_sac_entropy_clamp as _patch_sac_entropy_clamp,
+        )
+        # No-ops for C2RL's outer agent (it has no .policy/.scheduler/.entropy_optimizer
+        # of its own) — C2RLAgent applies these directly to its con_agent/opt_agent
+        # sub-agents internally (see c2rl.py), which is where they actually matter.
         _patch_kl_logging(runner.agent)
         _patch_sac_entropy_clamp(runner.agent)
         _patch_ppo_std_annealing(runner.agent, _std_dev_annealing, _std_dev_annealing_kwargs)

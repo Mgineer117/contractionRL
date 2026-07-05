@@ -3,7 +3,7 @@
 from contractionRL.agents.skrl.models import CLActorModel, CMGModel
 from contractionRL.agents.skrl.c3m import C3MAgent, C3MCfg, C3MSkrlTrainer
 from contractionRL.agents.skrl.sdlqr import SDLQRAgent, LQRAgent, SDLQRCfg, LQRCfg
-from contractionRL.agents.skrl.c2rl import C2RLAgent, C2RLCfg, C2RLSkrlTrainer
+from contractionRL.agents.skrl.c2rl import C2RLAgent, C2RLPPOCfg, C2RLSACCfg, C2RLSkrlTrainer
 from contractionRL.agents.skrl.runner import CLActorRunner
 
 __all__ = [
@@ -17,7 +17,8 @@ __all__ = [
     "SDLQRCfg",
     "LQRCfg",
     "C2RLAgent",
-    "C2RLCfg",
+    "C2RLPPOCfg",
+    "C2RLSACCfg",
     "C2RLSkrlTrainer",
     "CLActorRunner",
 ]

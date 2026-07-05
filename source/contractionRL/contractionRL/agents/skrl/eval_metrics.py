@@ -74,7 +74,7 @@ def mean_confidence_interval(data, confidence: float = 0.95) -> tuple[float, flo
     """Mean and 95% CI half-width (1.96 * standard error of the mean)."""
     data = np.asarray(data, dtype=np.float64)
     n = len(data)
-    mean = float(np.mean(data))
+    mean = float(np.mean(data)) if n > 0 else 0.0
     if n < 2:
         return mean, 0.0
     sem = float(np.std(data, ddof=1) / np.sqrt(n))

@@ -11,10 +11,13 @@ Algorithm routing
 PPO / SAC (and any other skrl-native algo):
     → skrl Runner  (skrl.utils.runner.torch.Runner)
 
-C3M / LQR / SDLQR / C2RL:
+C3M / LQR / SDLQR / C2RL-PPO / C2RL-SAC:
     → native skrl Agent subclasses (C3MAgent, LQRAgent, SDLQRAgent, C2RLAgent)
     with custom skrl Trainers (C3MSkrlTrainer, C2RLSkrlTrainer, or
-    SequentialTrainer for eval-only analytical agents).
+    SequentialTrainer for eval-only analytical agents). C2RL-PPO/C2RL-SAC are
+    the SAME C2RLAgent class — the algo string just selects which
+    base_algorithm (PPO or SAC) its con_policy/opt_policy are built on; see
+    _setup_c2rl.
 
 Classic env: internally creates SyncVectorEnv + wrap_env.
 Isaac env:   env is already a SkrlVecEnvWrapper — passed through.
@@ -36,7 +39,7 @@ import warnings
 import gymnasium as gym
 
 _SKRL_ALGOS = frozenset({"ppo", "sac", "td3", "ddpg", "amp", "ippo", "mappo"})
-_CONTRACTION_ALGOS = frozenset({"c3m", "lqr", "sdlqr", "c2rl"})
+_CONTRACTION_ALGOS = frozenset({"c3m", "lqr", "sdlqr", "c2rl-ppo", "c2rl-sac"})
 
 
 # ────────────────────────────────────────────────────────────────────────── #
@@ -49,7 +52,8 @@ _ENTRY_KEY: dict[str, str] = {
     "c3m":   "skrl_c3m_cfg_entry_point",
     "lqr":   "skrl_lqr_cfg_entry_point",
     "sdlqr": "skrl_sdlqr_cfg_entry_point",
-    "c2rl":  "skrl_c2rl_cfg_entry_point",
+    "c2rl-ppo": "skrl_c2rl_ppo_cfg_entry_point",
+    "c2rl-sac": "skrl_c2rl_sac_cfg_entry_point",
 }
 
 
@@ -70,6 +74,30 @@ def _filter_cfg_fields(cfg_dict: dict, dataclass_type, *, context: str) -> dict:
             stacklevel=2,
         )
     return {k: v for k, v in cfg_dict.items() if k in fields}
+
+
+def _make_cmg_bounds_fn(cmg_model, w_lb: float):
+    """Build the (x_batch) -> (m_bar, m_underbar) closure a path-tracking env's
+    PathTracking figure uses to draw its theoretical exponential bound (see
+    PathTrackingBase.set_contraction_certificate) — the CURRENT contraction
+    metric's eigenvalue extremes over a batch of states, not the static
+    w_lb/w_ub config bounds.
+    """
+    from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
+
+    ccm_gen = cmg_model.ccm_gen
+    x_dim = cmg_model.x_dim
+
+    def _bounds_fn(x_batch):
+        import torch
+        with torch.no_grad():
+            raw_W, _ = ccm_gen(x_batch)
+            W = bound_W(raw_W, w_lb, x_dim)
+            M = spd_inverse(W)
+            eigvals = torch.linalg.eigvalsh(M)
+        return float(eigvals.max().item()), float(eigvals.min().clamp(min=1e-12).item())
+
+    return _bounds_fn
 
 
 def load_agent_cfg(task_id: str, algorithm: str, custom_path: str | None = None) -> dict:
@@ -311,6 +339,7 @@ class ContractionRunner:
             u_dim = getattr(first_env, "u_dim", None)
 
         models_cfg = copy.deepcopy(cfg.get("models", {}))
+        memory_cfg = copy.deepcopy(cfg.get("memory", {}))
 
         if algo in ("c3m",):
             self._setup_c3m(skrl_env, device, obs_space, state_space, act_space,
@@ -318,9 +347,13 @@ class ContractionRunner:
         elif algo in ("lqr", "sdlqr"):
             self._setup_sdlqr(skrl_env, device, obs_space, state_space, act_space,
                               agent_cfg, trainer_cfg, models_cfg, get_f_and_B, lqr=(algo == "lqr"), x_dim=x_dim, u_dim=u_dim)
-        elif algo == "c2rl":
+        elif algo in ("c2rl-ppo", "c2rl-sac"):
+            # base_algorithm is derived from the algo string itself (i.e. which
+            # entry point / yaml you used), not a config toggle — see
+            # C2RLAgent's base_algorithm constructor kwarg.
             self._setup_c2rl(skrl_env, device, obs_space, state_space, act_space,
-                             agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B, x_dim, u_dim)
+                             agent_cfg, trainer_cfg, models_cfg, memory_cfg, get_rollout, get_f_and_B, x_dim, u_dim,
+                             base_algorithm=("PPO" if algo == "c2rl-ppo" else "SAC"))
 
     def _setup_c3m(self, env, device, obs_space, state_space, act_space,
                    agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None):
@@ -402,6 +435,16 @@ class ContractionRunner:
         self._env = env
         self._mode = "c3m"
 
+        # C3M has no discounting (no_op discount_factor=None) — its certificate
+        # is a hard per-step LMI, not a discounted-objective approximation.
+        if hasattr(env, "set_contraction_certificate"):
+            env.set_contraction_certificate(
+                agent_cfg.get("lbd"),
+                discount_factor=None,
+                static_metric_bounds=(1.0 / w_lb, 1.0 / w_ub),
+                cmg_bounds_fn=_make_cmg_bounds_fn(models["cmg"], w_lb),
+            )
+
     def _setup_sdlqr(self, env, device, obs_space, state_space, act_space,
                      agent_cfg, trainer_cfg, models_cfg, get_f_and_B, lqr: bool = False, x_dim=None, u_dim=None):
         from contractionRL.agents.skrl.sdlqr import SDLQRAgent, LQRAgent, SDLQRCfg, LQRCfg
@@ -439,46 +482,149 @@ class ContractionRunner:
         self._mode = "lqr" if lqr else "sdlqr"
 
     def _setup_c2rl(self, env, device, obs_space, state_space, act_space,
-                    agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None):
-        from contractionRL.agents.skrl.models import CLActorModel, CMGModel
-        from contractionRL.agents.skrl.c2rl import C2RLAgent, C2RLCfg, C2RLSkrlTrainer, C2RLTrainerCfg
-        from skrl.models.torch import DeterministicMixin, Model
-        import dataclasses
+                    agent_cfg, trainer_cfg, models_cfg, memory_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None,
+                    base_algorithm: str = "PPO"):
+        from contractionRL.agents.skrl.models import CMGModel
+        from contractionRL.agents.skrl.c2rl import C2RLAgent, C2RLSkrlTrainer, C2RLTrainerCfg
+        from contractionRL.agents.skrl.runner import _gaussian_factory
 
-        hd = agent_cfg.pop("hidden_dim", [128, 128])
-        cmg_hd = agent_cfg.pop("cmg_hidden_dim", hd)
+        base_algorithm = base_algorithm.upper()
+        con_only = bool(agent_cfg.get("con_only", False))
 
-        def _make_value_model():
-            """Standard MLP value function for PPO sub-agents."""
+        # For PPO, con_memory/opt_memory hold exactly one rollout epoch's transitions
+        # and are reset every epoch. For SAC, they act as persistent replay buffers.
+        mem_size = memory_cfg.get("memory_size", -1)
+        rollouts = agent_cfg.get("rollouts", 300)
+        if base_algorithm == "PPO" and mem_size not in (-1, rollouts):
+            raise ValueError(
+                f"[C2RL] memory.memory_size={mem_size} must be -1 (automatically "
+                f"determined, same as agent:rollouts) or exactly match agent.rollouts "
+                f"({rollouts}) for PPO."
+            )
+        
+        # We pass mem_size via memory_cfg into C2RLAgent constructor
+
+        # con_policy/opt_policy: same backbone dispatch PPO/SAC path-tracking
+        # configs use (control -> CLActorModel, mlp -> MLPResidualActorModel,
+        # both u = uref + feedback) — see runner.py's _gaussian_factory.
+        def _build_policy(block_name):
+            spec = models_cfg.get(block_name, {}).copy()
+            spec.pop("class", None)
+            backbone = spec.pop("backbone", "control")
+            spec.setdefault("clip_log_std", True)
+            spec.setdefault("min_log_std", -4.605)
+            spec.setdefault("max_log_std", 2.0)
+            # agent_class lets _gaussian_factory reject unbounded backbones for
+            # C2RL-SAC (divergence) and squashed backbones for C2RL-PPO.
+            return _gaussian_factory(obs_space, state_space, act_space, device,
+                                     backbone=backbone, agent_class=f"C2RL-{base_algorithm}",
+                                     **spec)
+
+        con_policy = _build_policy("con_policy")
+        opt_policy = None if con_only else _build_policy("opt_policy")
+
+        cmg_net = models_cfg.get("cmg", {}).get("network", [{}])
+        cmg_hd = cmg_net[0].get("layers", [256, 256]) if cmg_net else [256, 256]
+        cmg_act = cmg_net[0].get("activations", "tanh") if cmg_net else "tanh"
+        constrain_eigenvalues = cmg_net[0].get("constrain_eigenvalues", False) if cmg_net else False
+        w_lb = agent_cfg.get("w_lb", 0.1)
+        w_ub = agent_cfg.get("w_ub", 10.0)
+        cmg_model = CMGModel(
+            obs_space, act_space, device, hidden_dim=cmg_hd, activation=cmg_act,
+            x_dim=x_dim, constrain_eigenvalues=constrain_eigenvalues, w_lb=w_lb, w_ub=w_ub,
+        )
+
+        # con_critic/opt_critic: algorithm-agnostic network spec — used as a
+        # single value function V(obs) for PPO, or as the architecture shared
+        # by all 4 twin-Q networks for SAC (critic_1/critic_2 + their targets).
+        def _critic_spec(block_name):
+            net = models_cfg.get(block_name, {}).get("network", [{}])
+            hd = net[0].get("layers", [256, 256]) if net else [256, 256]
+            act = net[0].get("activations", "tanh") if net else "tanh"
+            return hd, act
+
+        def _act_module(activation: str):
+            import torch.nn as nn
+            return {"tanh": nn.Tanh, "relu": nn.ReLU}[activation.lower()]
+
+        def _make_value_model(hidden_dim, activation):
+            """MLP value function V(obs) -> scalar (PPO critic)."""
             import torch.nn as nn
             from skrl.models.torch import DeterministicMixin, Model
+            act_cls = _act_module(activation)
 
             class _ValueModel(DeterministicMixin, Model):
                 def __init__(self, obs_space, act_space, dev):
                     Model.__init__(self, observation_space=obs_space, action_space=act_space, device=dev)
                     DeterministicMixin.__init__(self, clip_actions=False)
-                    n_obs = int(obs_space.shape[0])
-                    self._net = nn.Sequential(
-                        nn.Linear(n_obs, 256), nn.Tanh(),
-                        nn.Linear(256, 256), nn.Tanh(),
-                        nn.Linear(256, 1),
-                    )
+                    dims = [int(obs_space.shape[0])] + list(hidden_dim)
+                    layers = []
+                    for a, b in zip(dims[:-1], dims[1:]):
+                        layers += [nn.Linear(a, b), act_cls()]
+                    layers.append(nn.Linear(dims[-1], 1))
+                    self._net = nn.Sequential(*layers)
+
                 def compute(self, inputs, role="value"):
                     return self._net(inputs["observations"]), {}
 
             return _ValueModel(obs_space, act_space, device)
 
-        models = {
-            "con_policy": CLActorModel(obs_space, act_space, device, hidden_dim=hd),
-            "con_value": _make_value_model(),
-            "opt_policy": CLActorModel(obs_space, act_space, device, hidden_dim=hd),
-            "opt_value": _make_value_model(),
-            "cmg": CMGModel(obs_space, act_space, device, hidden_dim=cmg_hd),
-        }
+        def _make_q_model(hidden_dim, activation):
+            """MLP Q(obs, action) -> scalar (SAC critic_1/critic_2/targets)."""
+            import torch
+            import torch.nn as nn
+            from skrl.models.torch import DeterministicMixin, Model
+            act_cls = _act_module(activation)
+            n_act = int(act_space.shape[0])
 
-        cfg_fields = C2RLCfg.__dataclass_fields__
+            class _QModel(DeterministicMixin, Model):
+                def __init__(self, obs_space, act_space, dev):
+                    Model.__init__(self, observation_space=obs_space, action_space=act_space, device=dev)
+                    DeterministicMixin.__init__(self, clip_actions=False)
+                    dims = [int(obs_space.shape[0]) + n_act] + list(hidden_dim)
+                    layers = []
+                    for a, b in zip(dims[:-1], dims[1:]):
+                        layers += [nn.Linear(a, b), act_cls()]
+                    layers.append(nn.Linear(dims[-1], 1))
+                    self._net = nn.Sequential(*layers)
+
+                def compute(self, inputs, role="critic"):
+                    x = torch.cat([inputs["observations"], inputs["taken_actions"]], dim=-1)
+                    return self._net(x), {}
+
+            return _QModel(obs_space, act_space, device)
+
+        models = {"con_policy": con_policy, "cmg": cmg_model}
+        if opt_policy is not None:
+            models["opt_policy"] = opt_policy
+
+        if base_algorithm == "PPO":
+            con_hd, con_act = _critic_spec("con_critic")
+            models["con_value"] = _make_value_model(con_hd, con_act)
+            if opt_policy is not None:
+                opt_hd, opt_act = _critic_spec("opt_critic")
+                models["opt_value"] = _make_value_model(opt_hd, opt_act)
+        elif base_algorithm == "SAC":
+            con_hd, con_act = _critic_spec("con_critic")
+            for key in ("con_critic_1", "con_critic_2", "con_target_critic_1", "con_target_critic_2"):
+                models[key] = _make_q_model(con_hd, con_act)
+            if opt_policy is not None:
+                opt_hd, opt_act = _critic_spec("opt_critic")
+                for key in ("opt_critic_1", "opt_critic_2", "opt_target_critic_1", "opt_target_critic_2"):
+                    models[key] = _make_q_model(opt_hd, opt_act)
+        else:
+            raise ValueError(f"[C2RL] Unsupported base_algorithm: {base_algorithm}")
+
+        # Pass the RAW agent_cfg dict (not a pre-parsed C2RLPPOCfg/C2RLSACCfg) —
+        # C2RLAgent keeps the full dict in self._raw_cfg, which is what
+        # _make_base_cfg() later filters against PPO_CFG/SAC_CFG. Pre-parsing
+        # first would silently drop any PPO- or SAC-specific field not ALSO
+        # declared on the matching C2RL cfg dataclass (this bit us for
+        # base_algorithm before it became an explicit constructor kwarg — see
+        # C2RLAgent.__init__).
+        agent_cfg["memory_size"] = mem_size
         agent = C2RLAgent(
-            cfg=C2RLCfg(**{k: v for k, v in agent_cfg.items() if k in cfg_fields}),
+            cfg=agent_cfg,
             models=models,
             observation_space=obs_space,
             state_space=state_space,
@@ -486,13 +632,15 @@ class ContractionRunner:
             device=device,
             get_rollout=get_rollout,
             get_f_and_B=get_f_and_B,
+            base_algorithm=base_algorithm,
+            x_dim=x_dim,
+            u_dim=u_dim,
             num_envs=env.num_envs,
         )
         trainer_cfg.setdefault("timesteps", 300000)
         trainer_cfg.setdefault("rollouts", agent_cfg.get("rollouts", 300))
-        tcfg_fields = C2RLTrainerCfg.__dataclass_fields__
         trainer = C2RLSkrlTrainer(
-            cfg=C2RLTrainerCfg(**{k: v for k, v in trainer_cfg.items() if k in tcfg_fields}),
+            cfg=C2RLTrainerCfg(**_filter_cfg_fields(trainer_cfg, C2RLTrainerCfg, context="trainer")),
             env=env,
             agents=agent,
         )
@@ -500,6 +648,18 @@ class ContractionRunner:
         self._trainer = trainer
         self._env = env
         self._mode = "c2rl"
+
+        # C2RL's certificate is trained against con_policy (gamma_contracting);
+        # the PathTracking figure shows whichever policy act() actually deploys
+        # — opt_policy (gamma_optimal) unless con_only.
+        deployed_gamma = agent_cfg.get("gamma_contracting", 0.0) if con_only else agent_cfg.get("gamma_optimal", 0.99)
+        if hasattr(env, "set_contraction_certificate"):
+            env.set_contraction_certificate(
+                agent_cfg.get("lbd"),
+                discount_factor=deployed_gamma,
+                static_metric_bounds=(1.0 / w_lb, 1.0 / w_ub),
+                cmg_bounds_fn=_make_cmg_bounds_fn(cmg_model, w_lb),
+            )
 
     # ── public interface ────────────────────────────────────────────────── #
 

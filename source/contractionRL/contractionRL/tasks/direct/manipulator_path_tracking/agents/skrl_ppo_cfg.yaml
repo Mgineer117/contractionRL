@@ -3,10 +3,12 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 #
-# Verbatim copy of the official Isaac Lab Unitree Go2 flat-terrain skrl PPO
-# config (isaaclab_tasks/manager_based/locomotion/velocity/config/go2/agents/
-# skrl_flat_ppo_cfg.yaml @ isaaclab_tasks 0.11.12, skrl 2.1.0); only
-# experiment.directory was renamed for this task.
+# Adapted from the official Isaac Lab Unitree Go2 flat-terrain skrl PPO config
+# (isaaclab_tasks/manager_based/locomotion/velocity/config/go2/agents/
+# skrl_flat_ppo_cfg.yaml @ isaaclab_tasks 0.11.12), updated for the skrl 2.1.0
+# PPO_CFG field names actually installed here (gae_lambda, no
+# clip_predicted_values) and this repo's use_state_norm/use_value_norm
+# convention; experiment.directory was renamed for this task.
 
 seed: 42
 
@@ -17,7 +19,7 @@ models:
   separate: True
   policy:  # see gaussian_model parameters
     class: GaussianMixin
-    backbone: control  # mlp (default, stock skrl gaussian_model) | control (CLActor — requires obs = [x, xref, uref])
+    backbone: control  # mlp (plain MLP, u = uref + MLP(obs)) | control (CLActor, u = uref + feedback(x-xref))
     clip_actions: False
     clip_log_std: True
     min_log_std: -20.0
@@ -55,21 +57,18 @@ agent:
   learning_epochs: 5
   mini_batches: 4
   discount_factor: 0.99
-  lambda: 0.95
+  gae_lambda: 0.95
   learning_rate: 1.0e-03
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.008
-  state_preprocessor: null
-  state_preprocessor_kwargs: null
-  value_preprocessor: null
-  value_preprocessor_kwargs: null
+  use_state_norm: true
+  use_value_norm: true
   random_timesteps: 0
   learning_starts: 0
   grad_norm_clip: 0.5
   ratio_clip: 0.2
   value_clip: 0.0
-  clip_predicted_values: False
   entropy_loss_scale: 0.01
   value_loss_scale: 0.5
   kl_threshold: 0.016

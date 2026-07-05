@@ -97,7 +97,7 @@ python scripts/list_envs.py --keyword classic
 
 Every path-tracking environment (Isaac and classic) shares the same contraction-compatible
 observation layout `obs = [x, x_ref, u_ref]` and quadratic tracking reward `r = -‖x - x_ref‖²`,
-so all six algorithms (PPO, SAC, C3M, LQR, SD-LQR, C2RL) can train/evaluate in any of them.
+so all seven algorithms (PPO, SAC, C3M, LQR, SD-LQR, C2RL-PPO, C2RL-SAC) can train/evaluate in any of them.
 
 ### Velocity-tracking (Isaac)
 
@@ -180,7 +180,7 @@ that need to track `u_ref` (CLActor for C3M/C2RL, LQR/SD-LQR) fold it into their
 
 #### Supported algorithms
 
-All six algorithms work in every path-tracking env:
+All seven algorithms work in every path-tracking env:
 
 | Algorithm | Entry point key |
 |-----------|----------------|
@@ -189,7 +189,8 @@ All six algorithms work in every path-tracking env:
 | C3M | `skrl_c3m_cfg_entry_point` |
 | LQR | `skrl_lqr_cfg_entry_point` |
 | SD-LQR | `skrl_sdlqr_cfg_entry_point` |
-| C2RL | `skrl_c2rl_cfg_entry_point` |
+| C2RL-PPO | `skrl_c2rl_ppo_cfg_entry_point` |
+| C2RL-SAC | `skrl_c2rl_sac_cfg_entry_point` |
 
 ---
 
@@ -261,8 +262,11 @@ Instead, it's the **agent** that folds `u_ref` into its own output where relevan
 - `CLActor` (used by C3M/C2RL): `mu = uref + w2 · l1(x, xref)` — feedback added on top of `uref`,
   sliced out of the observation.
 - `LQR` / `SD-LQR`: `u = uref - K·(x - xref)`.
-- PPO/SAC/plain MLP policies: must learn the full control `u` from scratch (`uref` is only
-  available to them as part of the observation, not auto-added).
+- PPO/SAC on **all** path-tracking envs (Isaac and classic) default to `models.policy.backbone:
+  control` in their yaml — this swaps the stock skrl Gaussian MLP for `CLActorModel`, so their
+  policy mean is *also* `uref + feedback`, not a from-scratch `u`. Set `backbone: mlp` explicitly
+  to opt out and have the policy learn the full control (this is the only option for
+  vel-tracking envs, which have no `u_ref` to fold in).
 
 ---
 
@@ -329,15 +333,16 @@ python scripts/skrl/train.py --task Quadruped-PathTracking-v0 --algorithm c3m --
 python scripts/skrl/train.py --task Quadruped-PathTracking-v0 --algorithm sdlqr --headless
 python scripts/skrl/train.py --task Quadruped-PathTracking-v0 --algorithm lqr --headless
 
-# C2RL — quadruped (two-policy online RL)
-python scripts/skrl/train.py --task Quadruped-PathTracking-v0 --algorithm c2rl --headless
+# C2RL — quadruped (two-policy online RL, on top of PPO or SAC)
+python scripts/skrl/train.py --task Quadruped-PathTracking-v0 --algorithm c2rl-ppo --headless
+python scripts/skrl/train.py --task Quadruped-PathTracking-v0 --algorithm c2rl-sac --headless
 
 # PPO baseline
 python scripts/skrl/train.py --task Quadruped-PathTracking-v0 --algorithm ppo --headless
 
 # Same for humanoid / manipulator
 python scripts/skrl/train.py --task Humanoid-PathTracking-v0 --algorithm c3m --headless
-python scripts/skrl/train.py --task Manipulator-PathTracking-v0 --algorithm c2rl --headless
+python scripts/skrl/train.py --task Manipulator-PathTracking-v0 --algorithm c2rl-ppo --headless
 ```
 
 ### Classic environments
@@ -349,7 +354,8 @@ count (plain Python instances via `gymnasium.vector.SyncVectorEnv`), not GPU-bat
 python scripts/skrl/train.py --classic --task classic-car-v0 --algorithm c3m --num_envs 4
 python scripts/skrl/train.py --classic --task classic-car-v0 --algorithm lqr --num_envs 4
 python scripts/skrl/train.py --classic --task classic-car-v0 --algorithm sdlqr --num_envs 4
-python scripts/skrl/train.py --classic --task classic-car-v0 --algorithm c2rl --num_envs 4
+python scripts/skrl/train.py --classic --task classic-car-v0 --algorithm c2rl-ppo --num_envs 4
+python scripts/skrl/train.py --classic --task classic-car-v0 --algorithm c2rl-sac --num_envs 4
 python scripts/skrl/train.py --classic --task classic-car-v0 --algorithm ppo --num_envs 4
 python scripts/skrl/train.py --classic --task classic-car-v0 --algorithm sac --num_envs 4
 
@@ -567,7 +573,8 @@ Applies `u = uref − K(x_ref)·e`.
 
 ### C2RL (Contraction-Certified RL)
 
-Two-PPO architecture:
+Two-policy architecture, built on top of a chosen base algorithm (`c2rl-ppo` uses two official
+skrl `PPO` sub-agents, `c2rl-sac` uses two official skrl `SAC` sub-agents):
 - **Contracting policy** (γ→0): optimises Mahalanobis tracking reward `−‖e‖²_M / std`
 - **Optimal policy** (γ→0.99): optimises environment reward
 
@@ -589,24 +596,28 @@ Each environment owns its own agent configs, stored alongside the environment:
 ```
 tasks/direct/
   quadruped_vel_tracking/agents/      skrl_ppo_cfg.yaml   skrl_sac_cfg.yaml
-  quadruped_path_tracking/agents/     skrl_ppo_cfg.yaml   skrl_sac_cfg.yaml
-                                      skrl_c3m_cfg.yaml   skrl_lqr_cfg.yaml
-                                      skrl_sdlqr_cfg.yaml skrl_c2rl_cfg.yaml
+  quadruped_path_tracking/agents/     skrl_ppo_cfg.yaml       skrl_sac_cfg.yaml
+                                      skrl_c3m_cfg.yaml       skrl_lqr_cfg.yaml
+                                      skrl_sdlqr_cfg.yaml     skrl_c2rl_ppo_cfg.yaml
+                                      skrl_c2rl_sac_cfg.yaml
   humanoid_vel_tracking/agents/        skrl_ppo_cfg.yaml   skrl_sac_cfg.yaml
-  humanoid_path_tracking/agents/       skrl_ppo_cfg.yaml   skrl_sac_cfg.yaml
-                                      skrl_c3m_cfg.yaml   skrl_lqr_cfg.yaml
-                                      skrl_sdlqr_cfg.yaml skrl_c2rl_cfg.yaml
+  humanoid_path_tracking/agents/       skrl_ppo_cfg.yaml       skrl_sac_cfg.yaml
+                                      skrl_c3m_cfg.yaml       skrl_lqr_cfg.yaml
+                                      skrl_sdlqr_cfg.yaml     skrl_c2rl_ppo_cfg.yaml
+                                      skrl_c2rl_sac_cfg.yaml
   manipulator_vel_tracking/agents/     skrl_ppo_cfg.yaml   skrl_sac_cfg.yaml
-  manipulator_path_tracking/agents/    skrl_ppo_cfg.yaml   skrl_sac_cfg.yaml
-                                      skrl_c3m_cfg.yaml   skrl_lqr_cfg.yaml
-                                      skrl_sdlqr_cfg.yaml skrl_c2rl_cfg.yaml
+  manipulator_path_tracking/agents/    skrl_ppo_cfg.yaml       skrl_sac_cfg.yaml
+                                      skrl_c3m_cfg.yaml       skrl_lqr_cfg.yaml
+                                      skrl_sdlqr_cfg.yaml     skrl_c2rl_ppo_cfg.yaml
+                                      skrl_c2rl_sac_cfg.yaml
   cartpole/agents/                    skrl_ppo_cfg.yaml   skrl_sac_cfg.yaml
-  classic/car/agents/                 skrl_ppo_cfg.yaml   skrl_sac_cfg.yaml
-                                      skrl_c3m_cfg.yaml   skrl_lqr_cfg.yaml
-                                      skrl_sdlqr_cfg.yaml skrl_c2rl_cfg.yaml
-  classic/cartpole/agents/            (same 6 as car)
-  classic/segway/agents/              (same 6 as car)
-  classic/turtlebot/agents/           (same 6 as car)
+  classic/car/agents/                 skrl_ppo_cfg.yaml       skrl_sac_cfg.yaml
+                                      skrl_c3m_cfg.yaml       skrl_lqr_cfg.yaml
+                                      skrl_sdlqr_cfg.yaml     skrl_c2rl_ppo_cfg.yaml
+                                      skrl_c2rl_sac_cfg.yaml
+  classic/cartpole/agents/            (same 7 as car)
+  classic/segway/agents/              (same 7 as car)
+  classic/turtlebot/agents/           (same 7 as car)
 ```
 
 ---

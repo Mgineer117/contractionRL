@@ -15,6 +15,7 @@ Training loop (handled by C2RLSkrlTrainer):
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass, field
 from typing import Callable
@@ -44,21 +45,76 @@ from .math_utils import (
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────── #
 
+# NOTE: base_algorithm is NOT a field on either cfg below — it's an explicit
+# C2RLAgent constructor kwarg (see ContractionRunner._setup_c2rl), set by
+# which entry point you use (skrl_c2rl_ppo_cfg.yaml / skrl_c2rl_sac_cfg.yaml).
+# Each cfg's base-algorithm fields mirror the REAL skrl PPO_CFG/SAC_CFG field
+# names and defaults 1:1 (not a generic PPO-shaped stand-in used for both),
+# so a c2rl-sac.yaml actually validates against SAC's own parameter names.
+# _make_base_cfg() still reads from the raw yaml dict (self._raw_cfg) and
+# filters against whichever of PPO_CFG/SAC_CFG actually applies, so any valid
+# PPO_CFG/SAC_CFG field works from yaml even if not declared below — these
+# dataclasses exist for typed access to the commonly-tuned fields (via
+# self._cfg.<field>) and self-documentation, not as an exhaustive passthrough.
+
 @dataclass
-class C2RLCfg(AgentCfg):
-    # PPO shared config
-    rollouts: int = 300
+class C2RLPPOCfg(AgentCfg):
+    """C2RL config for base_algorithm="PPO". PPO fields mirror skrl's PPO_CFG."""
+    # PPO shared config (see skrl.agents.torch.ppo.PPO_CFG) — con_policy/
+    # opt_policy each get their own PPO sub-agent built from this.
+    rollouts: int = 16
     learning_epochs: int = 8
-    mini_batches: int = 4
-    discount_factor: float = 0.99
+    mini_batches: int = 2
     gae_lambda: float = 0.95
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-3
+    learning_rate_scheduler: type | None = None
     ratio_clip: float = 0.2
     value_clip: float = 0.2
     entropy_loss_scale: float = 0.0
-    value_loss_scale: float = 1.0
+    value_loss_scale: float = 2.5
     kl_threshold: float = 0.0
-    grad_norm_clip: float = 1.0
+    grad_norm_clip: float = 0.5
+    time_limit_bootstrap: bool = False
+    use_state_norm: bool = True
+    use_value_norm: bool = True
+    # C2RL-specific
+    gamma_contracting: float = 0.0
+    gamma_optimal: float = 0.99
+    con_only: bool = False
+    # CMG
+    W_lr: float = 3e-4
+    w_ub: float = 10.0
+    w_lb: float = 0.1
+    lbd: float = 1e-2
+    eps: float = 1e-2
+    W_entropy_scaler: float = 1e-3
+    cmg_updates_per_iter: int = 1
+    cmg_minibatch_size: int = 1024
+    buffer_size: int = 2048
+    # reward normalisation
+    reward_norm_beta: float = 0.99
+    tracking_scaler: float = 1.0
+    control_scaler: float = 0.0
+
+
+@dataclass
+class C2RLSACCfg(AgentCfg):
+    """C2RL config for base_algorithm="SAC". SAC fields mirror skrl's SAC_CFG."""
+    # SAC shared config (see skrl.agents.torch.sac.SAC_CFG) — con_policy/
+    # opt_policy each get their own SAC sub-agent built from this.
+    rollouts: int = 16  # not a real SAC_CFG field — sizes the con/opt RandomMemory
+                        # buffers C2RL refills every epoch (see C2RLSkrlTrainer)
+    gradient_steps: int = 1
+    batch_size: int = 64
+    polyak: float = 0.005
+    learning_rate: float = 1e-3
+    learning_rate_scheduler: type | None = None
+    random_timesteps: int = 0
+    learning_starts: int = 0
+    grad_norm_clip: float = 0.0
+    learn_entropy: bool = True
+    initial_entropy_value: float = 0.2
+    use_state_norm: bool = True
     # C2RL-specific
     gamma_contracting: float = 0.0
     gamma_optimal: float = 0.99
@@ -83,7 +139,6 @@ class C2RLCfg(AgentCfg):
 class C2RLTrainerCfg(TrainerCfg):
     timesteps: int = 300000
     rollouts: int = 300
-    con_only: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -93,11 +148,22 @@ class C2RLTrainerCfg(TrainerCfg):
 class C2RLAgent(Agent):
     """C2RL agent — native skrl Agent, zero mjrl dependency.
 
-    Models in ``models`` dict:
-      ``"con_policy"`` — CLActorModel (contracting controller, γ→0)
-      ``"con_value"``  — DeterministicMixin Model (value fn for con PPO)
-      ``"opt_policy"`` — CLActorModel (optimal controller, high γ)
-      ``"opt_value"``  — DeterministicMixin Model (value fn for opt PPO)
+    Models in ``models`` dict — con_policy/opt_policy are CLActorModel or
+    MLPResidualActorModel (backbone: control | mlp, both u = uref + feedback);
+    the rest depend on ``base_algorithm``:
+
+    base_algorithm: PPO (default)
+      ``"con_policy"`` — contracting controller (γ→0)
+      ``"con_value"``  — DeterministicMixin value fn for con PPO
+      ``"opt_policy"`` — optimal controller (high γ)
+      ``"opt_value"``  — DeterministicMixin value fn for opt PPO
+
+    base_algorithm: SAC
+      ``"con_policy"``, ``"opt_policy"`` — same as above
+      ``"con_critic_1"``/``"con_critic_2"``/``"con_target_critic_1"``/``"con_target_critic_2"``
+      ``"opt_critic_1"``/``"opt_critic_2"``/``"opt_target_critic_1"``/``"opt_target_critic_2"``
+
+    Both:
       ``"cmg"``        — CMGModel wrapping CCM_Generator
 
     Extra constructor kwargs:
@@ -111,7 +177,7 @@ class C2RLAgent(Agent):
     def __init__(
         self,
         *,
-        cfg: C2RLCfg | dict,
+        cfg: C2RLPPOCfg | C2RLSACCfg | dict,
         models: dict,
         memory=None,
         observation_space,
@@ -120,13 +186,15 @@ class C2RLAgent(Agent):
         device,
         get_rollout: Callable,
         get_f_and_B: Callable,
+        base_algorithm: str = "PPO",
         x_dim: int | None = None,
         u_dim: int | None = None,
         num_envs: int = 1,
     ) -> None:
+        CfgCls = C2RLSACCfg if base_algorithm.upper() == "SAC" else C2RLPPOCfg
         if isinstance(cfg, dict):
             self._raw_cfg = cfg.copy()
-            parsed_cfg = C2RLCfg(**{k: v for k, v in cfg.items() if k in C2RLCfg.__dataclass_fields__})
+            parsed_cfg = CfgCls(**{k: v for k, v in cfg.items() if k in CfgCls.__dataclass_fields__})
         else:
             self._raw_cfg = cfg.__dict__.copy()
             parsed_cfg = cfg
@@ -154,7 +222,7 @@ class C2RLAgent(Agent):
         self._device = device
         self._cfg = parsed_cfg
         self._con_only = parsed_cfg.con_only
-        self._base_algorithm = self._raw_cfg.get("base_algorithm", "PPO").upper()
+        self._base_algorithm = base_algorithm.upper()
 
         # ── Build two RL agents (con + opt) ─────────────────────────────── #
         # Memory tensors are physically allocated at agent.init() below with
@@ -164,8 +232,51 @@ class C2RLAgent(Agent):
         # Isaac Sim runs since the underlying tensors stayed shape (rollouts, 1, ...)).
         self._num_envs = num_envs
         rollouts = self._raw_cfg.get("rollouts", 300)
-        con_memory = RandomMemory(memory_size=rollouts, num_envs=num_envs, device=device)
-        opt_memory = RandomMemory(memory_size=rollouts, num_envs=num_envs, device=device)
+        if self._base_algorithm == "PPO":
+            mem_size = rollouts
+        else:
+            mem_size = self._raw_cfg.get("memory_size", 1000000)
+            if mem_size == -1:
+                mem_size = 1000000
+                
+        con_memory = RandomMemory(memory_size=mem_size, num_envs=num_envs, device=device)
+        opt_memory = RandomMemory(memory_size=mem_size, num_envs=num_envs, device=device)
+
+        # For SAC, monkey-patch the sample() method on the persistent replay buffers
+        # so that it intercepts the mini-batch and recomputes the Mahalanobis rewards
+        # on the fly using the latest CMG contraction metric.
+        if self._base_algorithm == "SAC":
+            def _patch_sample(mem):
+                orig_sample = mem.sample
+                def _dynamic_maha_sample(names, batch_size, mini_batches=1, sequence_length=1):
+                    batches = orig_sample(names, batch_size=batch_size, mini_batches=mini_batches, sequence_length=sequence_length)
+                    # names is a list of strings like ["observations", "actions", "rewards", ...]
+                    try:
+                        obs_idx = names.index("observations") if "observations" in names else names.index("states")
+                        act_idx = names.index("actions")
+                        rew_idx = names.index("rewards")
+                        for b in batches:
+                            obs = b[obs_idx]
+                            act = b[act_idx]
+                            # Compute the Mahalanobis reward on the RAW stored
+                            # observations — NOT the network-preprocessed ones.
+                            # The CMG metric M(x) is trained on raw x (see
+                            # _compute_cmg_loss / get_rollout), and the PPO reward
+                            # path (update_con/update_opt) also uses raw obs.
+                            # Applying the obs preprocessor here would evaluate M
+                            # and the tracking error e = x - xref in normalized
+                            # coordinates — and since RunningStandardScaler scales
+                            # every obs dim independently, x and xref would get
+                            # different scales, distorting e into a wrong reward.
+                            maha_r = self._compute_mahalanobis_reward(obs, act)
+                            b[rew_idx] = maha_r
+                    except ValueError:
+                        pass # if rewards isn't requested, don't modify
+                    return batches
+                mem.sample = _dynamic_maha_sample
+                
+            _patch_sample(con_memory)
+            _patch_sample(opt_memory)
 
         rl_kwargs = dict(
             observation_space=observation_space,
@@ -174,7 +285,7 @@ class C2RLAgent(Agent):
             device=device,
         )
 
-        def _make_base_cfg(gamma: float) -> dict:
+        def _make_base_cfg(gamma: float, name: str) -> dict:
             # Project the raw C2RL config down to *only* the base agent's own
             # fields. Passing C2RL/CMG-specific keys (W_lr, lbd, gamma_*, ...) to
             # PPO_CFG(**cfg) / SAC_CFG(**cfg) would raise TypeError, since those
@@ -188,7 +299,62 @@ class C2RLAgent(Agent):
             valid = _BaseCfg.__dataclass_fields__
             d = {k: v for k, v in self._raw_cfg.items() if k in valid and k != "experiment"}
             d["discount_factor"] = gamma
-            d["experiment"] = {"write_interval": 0, "checkpoint_interval": 0}
+
+            # Resolve a string "learning_rate_scheduler" (e.g. "KLAdaptiveLR",
+            # yaml's usual way of naming it) to the real class — skrl's Runner
+            # does this via _process_cfg's eval(), which doesn't run here since
+            # con_agent/opt_agent bypass Runner entirely.
+            if isinstance(d.get("learning_rate_scheduler"), str):
+                from skrl.resources.schedulers.torch import KLAdaptiveLR  # noqa: F401 (used by eval below)
+                d["learning_rate_scheduler"] = eval(d["learning_rate_scheduler"])
+            if d.get("learning_rate_scheduler_kwargs") is None:
+                d["learning_rate_scheduler_kwargs"] = {}
+
+            # "rewards_shaper_scale" is a yaml convenience (same as skrl's own
+            # Runner._process_cfg) for the real PPO_CFG/SAC_CFG field
+            # "rewards_shaper", a Callable — translate it here since con_agent/
+            # opt_agent bypass Runner entirely. 1.0 (or unset) is a no-op.
+            rewards_shaper_scale = self._raw_cfg.get("rewards_shaper_scale")
+            if rewards_shaper_scale is not None and rewards_shaper_scale != 1.0:
+                d["rewards_shaper"] = lambda rewards, *a, scale=rewards_shaper_scale, **kw: rewards * scale
+
+            # Standalone PPO/SAC get observation (and, for PPO, value)
+            # normalization automatically — train.py's use_state_norm/
+            # use_value_norm, applied via skrl's Runner._process_cfg (which
+            # resolves the "RunningStandardScaler" string to the real class
+            # and, for the legacy "state_preprocessor" yaml key specifically,
+            # remaps it to "observation_preprocessor"). None of that runs here
+            # — con_agent/opt_agent are built directly, bypassing Runner
+            # entirely — so replicate it explicitly: same class, same
+            # opt-out flags, and note the field is "observation_preprocessor"
+            # (NOT "state_preprocessor", which is a different, unused-in-this-
+            # repo field for asymmetric actor-critic "state" input).
+            if self._raw_cfg.get("use_state_norm", True):
+                from skrl.resources.preprocessors.torch import RunningStandardScaler
+                d["observation_preprocessor"] = RunningStandardScaler
+                d["observation_preprocessor_kwargs"] = {"size": observation_space, "device": device}
+            if self._base_algorithm == "PPO" and self._raw_cfg.get("use_value_norm", True):
+                from skrl.resources.preprocessors.torch import RunningStandardScaler
+                d["value_preprocessor"] = RunningStandardScaler
+                d["value_preprocessor_kwargs"] = {"size": 1, "device": device}
+            # write_interval=1 so a SummaryWriter gets created (below) — the
+            # actual flush cadence is driven explicitly by C2RLSkrlTrainer
+            # (once per rollout epoch), not by skrl's own interval logic, since
+            # post_interaction() here is only called once per epoch anyway.
+            # checkpoint_interval stays 0: checkpointing is handled by the
+            # OUTER C2RLAgent (see self.checkpoint_modules below), so these
+            # inner agents don't need their own redundant checkpoint files.
+            # experiment.wandb is deliberately omitted (defaults False) so
+            # these inner agents never call wandb.init() themselves — the
+            # OUTER agent (or train.py, for a sweep) is the sole wandb.init()
+            # caller; their own scalars still reach the SAME active run
+            # because skrl's SummaryWriter.add_scalar is monkey-patched
+            # process-wide by train.py's wandb hookup.
+            d["experiment"] = {
+                "directory": os.path.join(self.experiment_dir, name),
+                "write_interval": 1,
+                "checkpoint_interval": 0,
+            }
             return d
 
         if self._base_algorithm == "PPO":
@@ -197,29 +363,78 @@ class C2RLAgent(Agent):
             opt_models = {"policy": models["opt_policy"], "value": models["opt_value"]} if "opt_policy" in models else {}
         elif self._base_algorithm == "SAC":
             from skrl.agents.torch.sac import SAC as BaseRLAgent
+            # skrl's SAC reads self.models["critic_1"/"critic_2"/"target_critic_1"/
+            # "target_critic_2"] specifically (see SAC.__init__) — NOT "q1"/"q2".
             con_models = {
-                "policy": models["con_policy"], "q1": models["con_q1"], "q2": models["con_q2"],
-                "target_q1": models["con_target_q1"], "target_q2": models["con_target_q2"]
+                "policy": models["con_policy"], "critic_1": models["con_critic_1"], "critic_2": models["con_critic_2"],
+                "target_critic_1": models["con_target_critic_1"], "target_critic_2": models["con_target_critic_2"],
             }
             opt_models = {
-                "policy": models["opt_policy"], "q1": models["opt_q1"], "q2": models["opt_q2"],
-                "target_q1": models["opt_target_q1"], "target_q2": models["opt_target_q2"]
+                "policy": models["opt_policy"], "critic_1": models["opt_critic_1"], "critic_2": models["opt_critic_2"],
+                "target_critic_1": models["opt_target_critic_1"], "target_critic_2": models["opt_target_critic_2"],
             } if "opt_policy" in models else {}
         else:
             raise ValueError(f"[C2RL] Unsupported base_algorithm: {self._base_algorithm}")
 
         self._con_agent = BaseRLAgent(
-            cfg=_make_base_cfg(parsed_cfg.gamma_contracting),
+            cfg=_make_base_cfg(parsed_cfg.gamma_contracting, "con"),
             models=con_models,
             memory=con_memory,
             **rl_kwargs,
         )
         self._opt_agent = BaseRLAgent(
-            cfg=_make_base_cfg(parsed_cfg.gamma_optimal),
+            cfg=_make_base_cfg(parsed_cfg.gamma_optimal, "opt"),
             models=opt_models,
             memory=opt_memory,
             **rl_kwargs,
         ) if not parsed_cfg.con_only else None
+
+        # Prefix every metric key these inner agents log with "Con /"/"Opt /"
+        # so both policies' logs land on distinct wandb panels instead of
+        # colliding under the same key. Can't just wrap track_data(): skrl's
+        # base Agent.record_transition() writes "Reward / ..."/"Episode / ..."
+        # DIRECTLY into self.tracking_data, bypassing track_data() entirely —
+        # only their OWN PPO/SAC loss terms go through it. Wrapping
+        # write_tracking_data() instead catches both, since it re-keys
+        # whatever ended up in tracking_data right before it's flushed.
+        def _prefix_on_write(agent, prefix):
+            import collections
+            orig_write = agent.write_tracking_data
+            def _wrapped(*, timestep, timesteps):
+                # Re-key into a FRESH defaultdict(list) — tracking_data must stay
+                # a defaultdict (skrl's own record_transition relies on that
+                # auto-vivifying behavior), not a plain dict, or the NEXT
+                # epoch's record_transition raises KeyError on first append.
+                prefixed = collections.defaultdict(list)
+                for k, v in agent.tracking_data.items():
+                    prefixed[k if k.startswith(prefix) else f"{prefix}{k}"] = v
+                agent.tracking_data = prefixed
+                orig_write(timestep=timestep, timesteps=timesteps)
+            agent.write_tracking_data = _wrapped
+
+        _prefix_on_write(self._con_agent, "Con / ")
+        if self._opt_agent is not None:
+            _prefix_on_write(self._opt_agent, "Opt / ")
+
+        # Standalone PPO/SAC get these applied to runner.agent by train.py — but
+        # for a contraction algorithm, runner.agent is this OUTER C2RLAgent,
+        # which has no .policy/.scheduler/.entropy_optimizer of its own, so
+        # train.py's patching there is a no-op. Apply directly to the real base
+        # agents instead, reading std_dev_annealing straight from raw_cfg since
+        # train.py never gets a chance to pop/forward it for con_agent/opt_agent.
+        from contractionRL.agents.skrl.agent_patches import (
+            patch_kl_logging,
+            patch_ppo_std_annealing,
+            patch_sac_entropy_clamp,
+        )
+        _std_dev_annealing = self._raw_cfg.get("std_dev_annealing", False)
+        _std_dev_annealing_kwargs = self._raw_cfg.get("std_dev_annealing_kwargs")
+        for _agent in (self._con_agent, self._opt_agent):
+            if _agent is None:
+                continue
+            patch_kl_logging(_agent)
+            patch_sac_entropy_clamp(_agent)
+            patch_ppo_std_annealing(_agent, _std_dev_annealing, _std_dev_annealing_kwargs)
 
         self._con_memory = con_memory
         self._opt_memory = opt_memory
@@ -230,26 +445,38 @@ class C2RLAgent(Agent):
 
         # ── CMG + C2RL math ───────────────────────────────────────────────── #
         self._ccm_gen = models["cmg"].ccm_gen
-        self._con_cl_actor = models["con_policy"].cl_actor
+        # con_policy's mean control, used for the CMG Jacobian below. Read via
+        # the common GaussianMixin .compute() interface (not .cl_actor.mean_control)
+        # so this works whether con_policy is CLActorModel (backbone: control)
+        # or MLPResidualActorModel (backbone: mlp) — both return uref + feedback.
+        self._con_policy_model = models["con_policy"]
         self._get_f_and_B = get_f_and_B
-        self._data = get_rollout(cfg.buffer_size, "c3m")
+        self._data = get_rollout(parsed_cfg.buffer_size, "c3m")
         self._get_rollout = get_rollout
-        self._buffer_size = cfg.buffer_size
+        self._buffer_size = parsed_cfg.buffer_size
 
-        self._W_optimizer = torch.optim.Adam(self._ccm_gen.parameters(), lr=cfg.W_lr)
+        self._W_optimizer = torch.optim.Adam(self._ccm_gen.parameters(), lr=parsed_cfg.W_lr)
         self._progress = 0.0
         self._W_lr_scheduler = LambdaLR(
             self._W_optimizer, lr_lambda=lambda _: max(0.0, 1.0 - self._progress)
         )
 
         self._running_reward_var: float | None = None
+        self._running_control_var: float | None = None
 
+        checkpoint_extra = (
+            {"con_value": models["con_value"], "opt_value": models.get("opt_value")}
+            if self._base_algorithm == "PPO" else
+            {
+                "con_critic_1": models["con_critic_1"], "con_critic_2": models["con_critic_2"],
+                "opt_critic_1": models.get("opt_critic_1"), "opt_critic_2": models.get("opt_critic_2"),
+            }
+        )
         self.checkpoint_modules.update({
             "con_policy": models["con_policy"],
-            "con_value":  models["con_value"],
             "opt_policy": models.get("opt_policy"),
-            "opt_value":  models.get("opt_value"),
             "cmg":        models["cmg"],
+            **checkpoint_extra,
         })
 
     # ── skrl Agent interface ────────────────────────────────────────────── #
@@ -286,8 +513,22 @@ class C2RLAgent(Agent):
 
     # ── Mahalanobis reward ─────────────────────────────────────────────── #
 
-    def _compute_mahalanobis_reward(self, observations: torch.Tensor) -> torch.Tensor:
-        """Compute -||e||²_M / std  (normalised Riemannian tracking energy)."""
+    def _compute_mahalanobis_reward(
+        self, observations: torch.Tensor, actions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute -(tracking_scaler * ||e||²_M + control_scaler * ||u - uref||²),
+        each term normalised by its own running variance.
+
+        tracking_scaler/control_scaler play the role of Q/R exactly like
+        SD-LQR/LQR's Q_scaler/R_scaler (sdlqr.py): tracking_scaler weights the
+        state error under the CURRENT contraction metric M(x), control_scaler
+        weights control effort. The control term penalizes the FEEDBACK
+        component (action - uref), not the total applied control, matching
+        LQR's R term (which weights the closed-loop gain's contribution, not
+        uref itself — uref alone isn't "effort", it's just following the
+        reference). control_scaler defaults to 0.0 (no control penalty) for
+        backward compatibility; pass ``actions`` to enable it.
+        """
         cfg = self._cfg
         x_dim = self._x_dim
         dtype = torch.float32
@@ -302,14 +543,28 @@ class C2RLAgent(Agent):
             M = spd_inverse(W)
             quad = (e.transpose(1, 2) @ M @ e).squeeze(-1)
 
-            batch_var = quad.var(unbiased=False).item()
             beta = cfg.reward_norm_beta
+            batch_var = quad.var(unbiased=False).item()
             if self._running_reward_var is None:
                 self._running_reward_var = batch_var + 1e-8
             else:
                 self._running_reward_var = beta * self._running_reward_var + (1 - beta) * batch_var
             std = self._running_reward_var ** 0.5 + 1e-8
             reward = -cfg.tracking_scaler * quad / std
+
+            if actions is not None and cfg.control_scaler > 0:
+                u_dim = self._u_dim
+                uref = observations[:, 2 * x_dim : 2 * x_dim + u_dim].to(dtype)
+                feedback = actions.to(dtype) - uref
+                control_cost = (feedback ** 2).sum(dim=-1, keepdim=True)
+
+                control_batch_var = control_cost.var(unbiased=False).item()
+                if self._running_control_var is None:
+                    self._running_control_var = control_batch_var + 1e-8
+                else:
+                    self._running_control_var = beta * self._running_control_var + (1 - beta) * control_batch_var
+                control_std = self._running_control_var ** 0.5 + 1e-8
+                reward = reward - cfg.control_scaler * control_cost / control_std
         return reward
 
     # ── CMG update (inlined from mjrl C2RL.compute_cmg_loss / update_cmg) ─ #
@@ -330,7 +585,7 @@ class C2RLAgent(Agent):
         uref = torch.from_numpy(buf["uref"][idx]).float().to(device)
 
         state = torch.cat([x, xref, uref], dim=1)
-        u = self._con_cl_actor.mean_control(state)
+        u, _ = self._con_policy_model.compute({"observations": state}, role="policy")
         K = jacobian(u, x, create_graph=False)
         u = u.detach()
         K = K.detach()
@@ -370,36 +625,66 @@ class C2RLAgent(Agent):
 
     # ── C2RL update methods (called by C2RLSkrlTrainer) ──────────────────── #
 
-    def update_con(self, observations: torch.Tensor, *, timestep: int, timesteps: int) -> dict:
-        """Inject Mahalanobis rewards into con_memory and run PPO update."""
-        maha_r = self._compute_mahalanobis_reward(observations)
-        try:
-            r_tensor = self._con_agent.memory.get_tensor_by_name("rewards")
-            if r_tensor.shape != maha_r.shape:
+    def update_con(
+        self, observations: torch.Tensor, actions: torch.Tensor | None = None,
+        *, timestep: int, timesteps: int,
+    ) -> dict:
+        """Inject Mahalanobis rewards into con_memory and drive the base update.
+
+        PPO: overwrite the just-collected rollout's rewards with the Mahalanobis
+        reward, then run PPO.update() once on that batch (PPO.post_interaction
+        only fires every ``rollouts`` epochs, so the explicit call here is what
+        actually drives on-policy learning).
+
+        SAC: the reward is recomputed per mini-batch inside the patched
+        memory.sample(), and the single gradient update is driven by
+        ``_con_agent.post_interaction()`` (called by the trainer immediately
+        after this) — which respects ``learning_starts``. Calling update() here
+        as well would DOUBLE SAC's gradient steps per epoch and bypass
+        ``learning_starts``, breaking parity with standalone SAC. So for SAC this
+        method only refreshes rewards (implicitly, via the sample patch) and
+        returns without updating.
+        """
+        if self._base_algorithm == "PPO":
+            maha_r = self._compute_mahalanobis_reward(observations, actions)
+            try:
+                r_tensor = self._con_agent.memory.get_tensor_by_name("rewards")
+                if r_tensor.shape != maha_r.shape:
+                    import skrl
+                    skrl.logger.warning(f"[C2RL] Reward shape mismatch in update_con: {r_tensor.shape} != {maha_r.shape}")
+                r_tensor.copy_(maha_r.view_as(r_tensor))
+            except RuntimeError as e:
                 import skrl
-                skrl.logger.warning(f"[C2RL] Reward shape mismatch in update_con: {r_tensor.shape} != {maha_r.shape}")
-            r_tensor.copy_(maha_r.view_as(r_tensor))
-        except RuntimeError as e:
-            import skrl
-            skrl.logger.warning(f"[C2RL] Failed to inject Mahalanobis reward in update_con: {e}")
-        self._con_agent.update(timestep=timestep, timesteps=timesteps)
+                skrl.logger.warning(f"[C2RL] Failed to inject Mahalanobis reward in update_con: {e}")
+            self._con_agent.update(timestep=timestep, timesteps=timesteps)
         return {}
 
-    def update_opt(self, observations: torch.Tensor, *, timestep: int, timesteps: int) -> dict:
-        """Inject Mahalanobis rewards into opt_memory and run PPO update."""
+    def update_opt(
+        self, observations: torch.Tensor, actions: torch.Tensor | None = None,
+        *, timestep: int, timesteps: int,
+    ) -> dict:
+        """Inject Mahalanobis rewards into opt_memory and drive the base update.
+
+        Same PPO-vs-SAC split as ``update_con``: PPO updates explicitly here on
+        the fresh rollout; SAC's single update is driven by
+        ``_opt_agent.post_interaction()`` (respecting ``learning_starts``), so we
+        must NOT also update here or SAC would train twice per epoch.
+        """
         if self._con_only or self._opt_agent is None:
             return {}
-        maha_r = self._compute_mahalanobis_reward(observations)
-        try:
-            r_tensor = self._opt_agent.memory.get_tensor_by_name("rewards")
-            if r_tensor.shape != maha_r.shape:
+
+        if self._base_algorithm == "PPO":
+            maha_r = self._compute_mahalanobis_reward(observations, actions)
+            try:
+                r_tensor = self._opt_agent.memory.get_tensor_by_name("rewards")
+                if r_tensor.shape != maha_r.shape:
+                    import skrl
+                    skrl.logger.warning(f"[C2RL] Reward shape mismatch in update_opt: {r_tensor.shape} != {maha_r.shape}")
+                r_tensor.copy_(maha_r.view_as(r_tensor))
+            except RuntimeError as e:
                 import skrl
-                skrl.logger.warning(f"[C2RL] Reward shape mismatch in update_opt: {r_tensor.shape} != {maha_r.shape}")
-            r_tensor.copy_(maha_r.view_as(r_tensor))
-        except RuntimeError as e:
-            import skrl
-            skrl.logger.warning(f"[C2RL] Failed to inject Mahalanobis reward in update_opt: {e}")
-        self._opt_agent.update(timestep=timestep, timesteps=timesteps)
+                skrl.logger.warning(f"[C2RL] Failed to inject Mahalanobis reward in update_opt: {e}")
+            self._opt_agent.update(timestep=timestep, timesteps=timesteps)
         return {}
 
     def update_cmg(self, *, timestep: int, timesteps: int) -> dict:
@@ -450,7 +735,13 @@ class C2RLSkrlTrainer(Trainer):
                 f"environment has num_envs={num_envs}. Pass the correct num_envs to "
                 f"C2RLAgent(...) (ContractionRunner does this automatically)."
             )
-        if agent._con_memory.memory_size != rollout_steps:
+        # PPO's con/opt memory IS the per-epoch rollout buffer (reset & refilled
+        # every epoch), so its size must equal rollout_steps. SAC's con/opt
+        # memory is a PERSISTENT replay buffer whose size (memory_size, e.g. 1M)
+        # is deliberately independent of rollout_steps — so this invariant only
+        # applies to PPO. (Applying it to SAC always raised, since a replay
+        # buffer never equals the rollout length — C2RL-SAC never got past here.)
+        if agent._base_algorithm == "PPO" and agent._con_memory.memory_size != rollout_steps:
             raise ValueError(
                 f"[C2RL] Agent con_memory was sized for rollouts={agent._con_memory.memory_size} "
                 f"but the trainer is configured for rollouts={rollout_steps}. Keep "
@@ -470,8 +761,9 @@ class C2RLSkrlTrainer(Trainer):
 
             # ── Phase 1: contracting rollout ──────────────────────────── #
             agent._con_agent.enable_training_mode(True)
-            agent._con_agent.memory.reset()
-            con_obs_list = []
+            if agent._base_algorithm == "PPO":
+                agent._con_agent.memory.reset()
+            con_obs_list, con_act_list = [], []
 
             for step in range(rollout_steps):
                 agent._con_agent.pre_interaction(timestep=global_step, timesteps=timesteps)
@@ -482,6 +774,7 @@ class C2RLSkrlTrainer(Trainer):
                 next_obs, rewards, terminated, truncated, infos = env.step(actions)
                 next_states = env.state() if hasattr(env, "state") else None
                 con_obs_list.append(observations.clone())
+                con_act_list.append(actions.clone())
                 agent._con_agent.record_transition(
                     observations=observations, states=states, actions=actions,
                     rewards=rewards, next_observations=next_obs, next_states=next_states,
@@ -493,14 +786,18 @@ class C2RLSkrlTrainer(Trainer):
                 global_step += 1
 
             con_obs_tensor = torch.cat(con_obs_list, dim=0)
-            agent.update_con(con_obs_tensor, timestep=global_step, timesteps=timesteps)
+            con_act_tensor = torch.cat(con_act_list, dim=0)
+            agent.update_con(con_obs_tensor, con_act_tensor, timestep=global_step, timesteps=timesteps)
             agent._con_agent.post_interaction(timestep=global_step, timesteps=timesteps)
+            if getattr(agent._con_agent, "writer", None) is not None:
+                agent._con_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
 
             # ── Phase 2: optimal rollout ──────────────────────────────── #
             if not con_only and agent._opt_agent is not None:
                 agent._opt_agent.enable_training_mode(True)
-                agent._opt_agent.memory.reset()
-                opt_obs_list = []
+                if agent._base_algorithm == "PPO":
+                    agent._opt_agent.memory.reset()
+                opt_obs_list, opt_act_list = [], []
 
                 for step in range(rollout_steps):
                     agent._opt_agent.pre_interaction(timestep=global_step, timesteps=timesteps)
@@ -511,6 +808,7 @@ class C2RLSkrlTrainer(Trainer):
                     next_obs, rewards, terminated, truncated, infos = env.step(actions)
                     next_states = env.state() if hasattr(env, "state") else None
                     opt_obs_list.append(observations.clone())
+                    opt_act_list.append(actions.clone())
                     agent._opt_agent.record_transition(
                         observations=observations, states=states, actions=actions,
                         rewards=rewards, next_observations=next_obs, next_states=next_states,
@@ -522,8 +820,11 @@ class C2RLSkrlTrainer(Trainer):
                     global_step += 1
 
                 opt_obs_tensor = torch.cat(opt_obs_list, dim=0)
-                agent.update_opt(opt_obs_tensor, timestep=global_step, timesteps=timesteps)
+                opt_act_tensor = torch.cat(opt_act_list, dim=0)
+                agent.update_opt(opt_obs_tensor, opt_act_tensor, timestep=global_step, timesteps=timesteps)
                 agent._opt_agent.post_interaction(timestep=global_step, timesteps=timesteps)
+                if getattr(agent._opt_agent, "writer", None) is not None:
+                    agent._opt_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
 
             # ── CMG update ────────────────────────────────────────────── #
             cmg_dict = agent.update_cmg(timestep=global_step, timesteps=timesteps)
