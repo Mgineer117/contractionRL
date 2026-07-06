@@ -26,6 +26,12 @@ from .nn_modules import CCM_Generator, BoundedCCM_Generator, CLActor, MLP, Neura
 
 _MIN_LOG_STD = math.log(0.01)  # ≈ -4.605; matches CLActor annealing floor
 
+# Sentinel distinguishing "caller didn't pass x_dim" (fall back to the
+# dimension-parity guess) from "caller passed x_dim=None" (an env that
+# reliably reports no x_dim, e.g. vel-tracking, meaning definitely NOT
+# path-tracking — see SquashedGaussianActorModel / EmbeddedDeterministicModel).
+_X_DIM_UNSET = object()
+
 
 class CLDeterministicActorModel(DeterministicMixin, Model):
     """Contracting C3M_U actor wrapped as a skrl Deterministic policy model."""
@@ -514,6 +520,7 @@ class SquashedGaussianActorModel(_TanhSquashMixin, GaussianMixin, Model):
         max_log_std: float = 2.0,
         hidden_dim: list | None = None,
         activation: str = "relu",
+        x_dim: int | None = _X_DIM_UNSET,
         angle_idx: list | None = None,
         **kwargs,
     ):
@@ -529,12 +536,26 @@ class SquashedGaussianActorModel(_TanhSquashMixin, GaussianMixin, Model):
 
         obs_dim = int(self.observation_space.shape[0])
         act_dim = int(self.action_space.shape[0])
-        remainder = obs_dim - act_dim
-        # Same layout check as MLPResidualActorModel: [x, xref, uref] means
-        # obs_dim = 2*x_dim + u_dim, i.e. remainder is even and positive.
-        is_path_tracking = remainder > 0 and remainder % 2 == 0
+        if x_dim is _X_DIM_UNSET:
+            # Caller passed nothing (e.g. the classic CLActorRunner/yaml path,
+            # which has no such signal) — fall back to the dimension-parity
+            # guess. Same layout check as MLPResidualActorModel: [x, xref,
+            # uref] means obs_dim = 2*x_dim + u_dim, i.e. remainder is even
+            # and positive. This is a heuristic: an env whose obs_dim - act_dim
+            # happens to be even and positive for reasons unrelated to a
+            # uref layout (e.g. a flat velocity-tracking obs) would be
+            # misclassified — pass x_dim explicitly (even x_dim=None, for "no,
+            # definitely not path-tracking") to avoid this.
+            remainder = obs_dim - act_dim
+            is_path_tracking = remainder > 0 and remainder % 2 == 0
+            x_dim = remainder // 2 if is_path_tracking else None
+        else:
+            # Caller already knows the layout (e.g. contraction_runner.py's
+            # raw_env.x_dim, which is None for envs like vel-tracking that
+            # never declare it) — trust it instead of guessing from dimensions.
+            is_path_tracking = x_dim is not None
         self._u_dim = act_dim if is_path_tracking else None
-        self._x_dim = remainder // 2 if is_path_tracking else None
+        self._x_dim = x_dim if is_path_tracking else None
         # angle_idx only makes sense (and is only ever passed) when the layout
         # has a known x/xref split; vel-tracking's flat obs has none.
         self._angle_idx = (angle_idx or []) if is_path_tracking else []
@@ -698,6 +719,7 @@ class EmbeddedDeterministicModel(DeterministicMixin, Model):
         network: list | None = None,
         hidden_dim: list | None = None,
         activation: str = "tanh",
+        x_dim: int | None = _X_DIM_UNSET,
         angle_idx: list | None = None,
         use_actions: bool = False,
         **kwargs,
@@ -711,9 +733,22 @@ class EmbeddedDeterministicModel(DeterministicMixin, Model):
 
         obs_dim = int(self.observation_space.shape[0])
         act_dim = int(self.action_space.shape[0])
-        remainder = obs_dim - act_dim
-        is_path_tracking = remainder > 0 and remainder % 2 == 0
-        self._x_dim = remainder // 2 if is_path_tracking else None
+        if x_dim is _X_DIM_UNSET:
+            # Caller passed nothing (e.g. the classic CLActorRunner/yaml path) —
+            # fall back to the dimension-parity guess. Heuristic: an env whose
+            # obs_dim - act_dim happens to be even and positive for reasons
+            # unrelated to a uref layout (e.g. a flat velocity-tracking obs)
+            # would be misclassified — pass x_dim explicitly (even x_dim=None,
+            # for "no, definitely not path-tracking") to avoid this.
+            remainder = obs_dim - act_dim
+            is_path_tracking = remainder > 0 and remainder % 2 == 0
+            x_dim = remainder // 2 if is_path_tracking else None
+        else:
+            # Caller already knows the layout (e.g. contraction_runner.py's
+            # raw_env.x_dim, which is None for envs like vel-tracking that
+            # never declare it) — trust it instead of guessing from dimensions.
+            is_path_tracking = x_dim is not None
+        self._x_dim = x_dim if is_path_tracking else None
         self._u_dim = act_dim if is_path_tracking else None
         self._angle_idx = (angle_idx or []) if is_path_tracking else []
         self._use_actions = use_actions

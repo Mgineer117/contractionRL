@@ -5,7 +5,7 @@ models:
   policy:
     class: DeterministicMixin  # Outputs deterministic continuous values
     backbone: contraction
-    clip_actions: True  # Clip actions to the environment action space limits — matches
+    clip_actions: False  # Clip actions to the environment action space limits — matches
                         # every other env's C3M cfg (this one was the sole outlier)
     network:
       - name: net

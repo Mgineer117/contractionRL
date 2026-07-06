@@ -296,7 +296,7 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
           f"(oversample x{args_cli.ref_oversample_factor:g}), keeping the longest {num_trajs} → {out_path}")
     unwrapped = isaac_env.unwrapped
     num_envs = skrl_env.num_envs
-    all_states, all_actions, all_pos, all_lengths = [], [], [], []
+    all_states, all_actions, all_lengths = [], [], []
     if hasattr(skrl_env, "_reset_once"):
         skrl_env._reset_once = True
     obs_dict, _ = skrl_env.reset()
@@ -322,7 +322,6 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
 
     ep_states = torch.zeros((num_envs, T, state_dim), dtype=torch.float32, device=skrl_env.device)
     ep_actions = torch.zeros((num_envs, T, u_dim), dtype=torch.float32, device=skrl_env.device)
-    ep_pos = torch.zeros((num_envs, T, 3), dtype=torch.float32, device=skrl_env.device)
     step_counts = torch.zeros(num_envs, dtype=torch.long, device=skrl_env.device)
 
     pbar = tqdm.tqdm(total=pool_target, desc="[RefTraj] Collecting candidates")
@@ -340,8 +339,6 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
         # Clip only for the SAVED record, not for stepping (see note above).
         ep_actions[valid_indices, step_counts[valid_indices]] = \
             torch.clamp(actions[valid_indices], _act_low, _act_high).float()
-        if hasattr(unwrapped, "_robot"):
-            ep_pos[valid_indices, step_counts[valid_indices]] = unwrapped._robot.data.root_pos_w[valid_indices].float()
         
         step_counts[valid_indices] += 1
         
@@ -366,7 +363,6 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
                     if length < T and length > 0:
                         ep_states[i, length:] = ep_states[i, length - 1].clone()
                         ep_actions[i, length:] = ep_actions[i, length - 1].clone()
-                        ep_pos[i, length:] = ep_pos[i, length - 1].clone()
 
                 # Move to CPU in bounded chunks. Episodes are length-synchronized
                 # (fixed T), so on the first `done` event success_indices can be
@@ -387,12 +383,10 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
                     idx = success_indices[start:start + _CHUNK]
                     s_np = ep_states[idx].cpu().numpy()
                     a_np = ep_actions[idx].cpu().numpy()
-                    p_np = ep_pos[idx].cpu().numpy()
                     l_np = step_counts[idx].cpu().numpy()
                     for i in range(len(idx)):
                         all_states.append(s_np[i])
                         all_actions.append(a_np[i])
-                        all_pos.append(p_np[i])
                         all_lengths.append(int(l_np[i]))
                         pbar.update(1)
             
@@ -408,7 +402,6 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
           f"median={int(np.median(all_lengths_np))} (T={T}) — keeping top {num_trajs} by length")
     states_arr = np.stack([all_states[i] for i in keep]).astype(np.float32)
     actions_arr = np.stack([all_actions[i] for i in keep]).astype(np.float32)
-    pos_arr = np.stack([all_pos[i] for i in keep]).astype(np.float32)
     lengths_arr = all_lengths_np[keep]
 
     os.makedirs(out_dir, exist_ok=True)
@@ -418,10 +411,10 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
         import matplotlib.pyplot as plt
         plt.figure(figsize=(8, 8))
         for i in range(min(10, num_trajs)):
-            plt.plot(pos_arr[i, :, 0], pos_arr[i, :, 1], label=f"Traj {i+1}")
-        plt.xlabel("X Position (m)")
-        plt.ylabel("Y Position (m)")
-        plt.title("Sampled Reference Trajectories (Absolute Position)")
+            plt.plot(states_arr[i, :, 0], states_arr[i, :, 1], label=f"Traj {i+1}")
+        plt.xlabel("X Position (m, relative)")
+        plt.ylabel("Y Position (m, relative)")
+        plt.title("Sampled Reference Trajectories (Relative Position)")
         plt.legend()
         plot_path = os.path.join(out_dir, "position_plot.png")
         plt.savefig(plot_path)
@@ -466,7 +459,6 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
         states_arr = states_arr[valid_mask]
         actions_arr = actions_arr[valid_mask]
         x_dot_arr = x_dot_arr[valid_mask]
-        pos_arr = pos_arr[valid_mask]
         lengths_arr = lengths_arr[valid_mask]
 
     # Single unified file: reference trajectories ARE the (x, u) part of the
@@ -475,20 +467,14 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
     #                          (the last valid state repeated, keeping x_dot ~ 0)
     #   u       (N, T, u_dim)  executed (clipped) actions, same padding rule
     #   x_dot   (N, T, x_dim)  4th-order central differences of x
-    #   pos     (N, T, 3)      world-frame [x, y, z] root position — VISUALIZATION ONLY, not
-    #                          part of the dynamics; consumers that fit f(x)/B(x)
-    #                          (e.g. C3M's NeuralDynamics pretraining) must read
-    #                          only x/u/x_dot/lengths from this file and ignore
-    #                          this key, exactly like they already do today.
     #   lengths (N,)           number of VALID steps per trajectory — consumers
     #                          mask with arange(T) < lengths[:, None]
     dyn_path = os.path.join(out_dir, "dynamics_data.npz")
-    np.savez_compressed(dyn_path, x=states_arr, u=actions_arr, x_dot=x_dot_arr, pos=pos_arr, lengths=lengths_arr)
+    np.savez_compressed(dyn_path, x=states_arr, u=actions_arr, x_dot=x_dot_arr, lengths=lengths_arr)
     print(f"[RefTraj] Saved dynamics  → {dyn_path}")
     print(f"       x       shape: {states_arr.shape}")
     print(f"       u       shape: {actions_arr.shape}   (clipped to action-space bounds)")
     print(f"       x_dot   shape: {x_dot_arr.shape}")
-    print(f"       pos     shape: {pos_arr.shape}   (visualization only)")
     print(f"       lengths shape: {lengths_arr.shape}  (min {lengths_arr.min()}, max {lengths_arr.max()})")
 
 
@@ -1296,6 +1282,7 @@ else:
             patch_kl_logging as _patch_kl_logging,
             patch_ppo_std_annealing as _patch_ppo_std_annealing,
             patch_sac_entropy_clamp as _patch_sac_entropy_clamp,
+            patch_auc_checkpoint as _patch_auc_checkpoint,
         )
         # No-ops for C2RL's outer agent (it has no .policy/.scheduler/.entropy_optimizer
         # of its own) — C2RLAgent applies these directly to its con_agent/opt_agent
@@ -1303,6 +1290,9 @@ else:
         _patch_kl_logging(runner.agent)
         _patch_sac_entropy_clamp(runner.agent)
         _patch_ppo_std_annealing(runner.agent, _std_dev_annealing, _std_dev_annealing_kwargs)
+        
+        # All agents should use AUC if available.
+        _patch_auc_checkpoint(runner.agent)
 
         if _is_contraction and hasattr(runner.agent, "policy") and hasattr(runner.agent.policy, "cl_actor"):
             _orig_post = runner.agent.post_interaction

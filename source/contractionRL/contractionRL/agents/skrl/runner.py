@@ -126,6 +126,14 @@ def _gaussian_factory(observation_space, state_space, action_space, device,
     # (unbounded + SAC → divergence; squashed + PPO → no analytic entropy).
     _assert_backbone_algo_compatible(backbone, agent_class)
 
+    # x_dim: explicit ground truth for the [x, xref, uref] path-tracking
+    # split, set by callers that know it (e.g. contraction_runner.py's
+    # raw_env.x_dim). Popped once here so it never leaks into skrl's stock
+    # gaussian_model below, which has no such kwarg. Backbones with no
+    # reliable source for it (the classic CLActorRunner/yaml path) get None
+    # and fall back to each model's own dimension-parity guess.
+    x_dim = kwargs.pop("x_dim", None)
+
     # "control" is the preferred spelling for the CLActor backbone;
     # "contraction" is kept as a backward-compatible alias.
     if backbone in ("control", "contraction"):
@@ -146,9 +154,6 @@ def _gaussian_factory(observation_space, state_space, action_space, device,
         hidden_dim = network[0].get("layers", [128, 128]) if network else [128, 128]
         kwargs.pop("output", None)
         kwargs.pop("initial_log_std", None)
-
-        # Try to extract x_dim if available
-        x_dim = kwargs.pop("x_dim", None)
 
         return CLActorModel(
             observation_space=observation_space,
@@ -173,7 +178,6 @@ def _gaussian_factory(observation_space, state_space, action_space, device,
         network = kwargs.pop("network", [{}])
         hidden_dim = network[0].get("layers", [128, 128]) if network else [128, 128]
         kwargs.pop("output", None)
-        x_dim = kwargs.pop("x_dim", None)
         return SquashedCLActorModel(
             observation_space=observation_space,
             action_space=action_space,
@@ -200,6 +204,7 @@ def _gaussian_factory(observation_space, state_space, action_space, device,
             device=device,
             hidden_dim=hidden_dim,
             activation=activation,
+            x_dim=x_dim,
             **kwargs,
         )
 

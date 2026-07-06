@@ -10,6 +10,7 @@ from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
 from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectRLEnvCfg, ViewerCfg
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim import SimulationCfg, PhysxCfg
 from isaaclab.utils import configclass
 
@@ -30,9 +31,12 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     # commands: vx,vy,vz,yaw_rate + A,omega,sin(phase),cos(phase) = 8 (see
     #           VelCommands.get() — the last 4 make the yaw-rate generator's
     #           own future Markov, not just its instantaneous value)
-    # obs:     state(33) + commands(8) + prev_actions(12) = 53
+    # gait:    sin(gait_phase), cos(gait_phase) = 2 — the phase-clock signal the
+    #           trot reward is scheduled against; MUST be observable or the
+    #           phase-locked gait reward is non-Markov and unlearnable.
+    # obs:     state(33) + commands(8) + gait(2) + prev_actions(12) = 55
     action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(12,), dtype=np.float32)
-    observation_space = 53
+    observation_space = 55
     state_space = 0
 
     sim: SimulationCfg = SimulationCfg(dt=1 / 200, render_interval=decimation, physx=PhysxCfg(enable_external_forces_every_iteration=True, min_velocity_iteration_count=1))
@@ -40,6 +44,17 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     # damping=0.5) — zero gains produce zero torque regardless of position target.
     robot_cfg: ArticulationCfg = UNITREE_GO2_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=num_envs, env_spacing=2.5, replicate_physics=True)
+
+    # Contact sensor on the four feet — force-based contact (net force magnitude
+    # > force_threshold) and per-foot air-time tracking. Robust and terrain-
+    # independent, unlike a geometric foot-height proxy. track_air_time gives
+    # data.last_air_time + compute_first_contact() used by the feet-air-time reward.
+    contact_sensor: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/Robot/.*_foot",
+        history_length=3,
+        track_air_time=True,
+        force_threshold=1.0,
+    )
 
     # video/viewport camera: the default ViewerCfg is a *static, world-fixed*
     # camera far from any particular robot (eye=(7.5,7.5,7.5), lookat=(0,0,0)),
@@ -87,6 +102,7 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     # evaluator flips this to False at runtime so episodes always run the full
     # length (metrics comparable across policies regardless of fall behavior).
     terminate_on_fall: bool = True
+    target_base_height = 0.34
     base_height_min = 0.20     # [m] terminate if base drops below this
     # -0.71 ≈ -cos(45°): terminate beyond ~45° tilt. The previous -0.5 (~60°)
     # left a loophole — a robot crouched at 40-55° never terminated and sat
@@ -112,5 +128,32 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     rew_flat_orientation = -0.5  # on sum(projected_gravity_b[:, :2]**2)
     rew_z_vel = -0.5
     rew_roll_pitch = -0.05
-    rew_torque = -1e-5
     rew_action_rate = -0.01
+    rew_base_height = -10.0
+
+    # ── trot gait (phase-clock) ──────────────────────────────────────────────
+    # A per-env gait phase advances at `gait_freq` full cycles/sec. The two
+    # diagonal pairs (FL+RR, FR+RL) are scheduled a half-cycle apart; each foot
+    # is scheduled STANCE for `gait_duty` of its cycle and SWING otherwise. The
+    # reward matches actual (force-based) contact against this schedule, so —
+    # unlike a diagonal-symmetry penalty — standing and pronking are NOT
+    # zero-penalty: their swing-scheduled feet mismatch.
+    #
+    # gait_duty > 0.5 makes the two diagonals' stance windows OVERLAP, giving a
+    # double-support ("all four allowed down") buffer around each diagonal swap
+    # — what makes this a walk, not an instantaneous-swap run. At duty=0.6 that
+    # buffer is 20% of the cycle (two ~0.1 s windows at 1 Hz) with no flight
+    # phase. The cost: standing's schedule-match rises from 0.5 to ~0.6 (a small
+    # positive score), but forward-velocity tracking already makes standing
+    # non-viable, and a true trot still scores strictly higher.
+    #
+    # step_dt = sim.dt * decimation = 0.02 s, so gait_freq=1.0 → one cycle / 50
+    # steps (1.0 s), ~1 footfall/sec per foot — a walking (not running) cadence.
+    gait_freq = 1.0      # [Hz] gait cycles per second
+    gait_duty = 0.6      # stance fraction per foot (>0.5 → double-support buffer)
+    rew_gait = 2.0       # scale on the centered [-1, 1] schedule-match score
+    # Half-width [rad] of the smoothstep ramp at each stance↔swing edge. The
+    # desired-contact schedule ramps over this band instead of stepping, so the
+    # reward has no cliff at the swap — this is the de-jitter knob. ~0.4 rad ≈
+    # 0.064 s per side at 1 Hz; larger = smoother/softer gait, smaller = crisper.
+    gait_transition_band = 0.4

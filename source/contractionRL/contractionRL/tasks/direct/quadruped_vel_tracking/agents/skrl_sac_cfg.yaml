@@ -82,5 +82,5 @@ agent:
   use_state_norm: false
 trainer:
   class: SequentialTrainer
-  timesteps: 100000
+  timesteps: 300000
   environment_info: log

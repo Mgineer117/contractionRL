@@ -137,3 +137,24 @@ def patch_ppo_std_annealing(agent, std_dev_annealing: bool, kwargs: dict | None 
         _orig_post(timestep=timestep, timesteps=timesteps)
 
     agent.post_interaction = _annealed_post
+
+def patch_auc_checkpoint(agent) -> None:
+    """Override agent.post_interaction to save the best checkpoint using AUC.
+    
+    skrl natively saves best_agent.pt by tracking the highest 'Reward / Total reward (mean)'.
+    This patch replaces that reward score with the negative AUC (so lower AUC is treated as
+    better reward) and logs it so SKRL triggers the best checkpoint saving correctly.
+    """
+    _orig_post = getattr(agent, "post_interaction", None)
+    if _orig_post is None:
+        return
+
+    def _auc_post(*, timestep: int, timesteps: int) -> None:
+        # Prioritize Stability/auc (path tracking) over Episode/auc (velocity tracking)
+        # Note: We negate it because SKRL saves checkpoints for the MAXIMIZED reward, and we want to MINIMIZE AUC.
+        score_list = agent.tracking_data.get("Stability/auc") or agent.tracking_data.get("Episode/auc")
+        if score_list:
+            agent.track_data("Reward / Total reward (mean)", -score_list[-1])
+        _orig_post(timestep=timestep, timesteps=timesteps)
+
+    agent.post_interaction = _auc_post

@@ -9,6 +9,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+from isaaclab.sensors import ContactSensor
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import euler_xyz_from_quat, quat_apply
 
@@ -38,19 +39,67 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
         self._joint_ids, _ = self._robot.find_joints([".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"])
+        # Feet ordering/contact come from the ContactSensor (force-based), not the
+        # articulation — see _setup_scene. find_bodies indexes into the sensor's
+        # tracked bodies, so contact/air-time columns line up with _feet_names.
+        self._feet_ids, self._feet_names = self._contact_sensor.find_bodies(".*_foot")
+
+        # Per-foot indices for the trot schedule. Guarded so a robot whose feet
+        # aren't named FL/FR/RL/RR fails loudly at init instead of StopIteration
+        # deep in a generator (or, worse, silently mis-indexing the gait reward).
+        self._fl_idx = self._foot_index("FL")
+        self._fr_idx = self._foot_index("FR")
+        self._rl_idx = self._foot_index("RL")
+        self._rr_idx = self._foot_index("RR")
+
         self._actions = torch.zeros(self.num_envs, len(self._joint_ids), device=self.device)
         self._prev_actions = torch.zeros_like(self._actions)
+        self._prev_joint_vel = torch.zeros(self.num_envs, len(self._joint_ids), device=self.device)
+        # Gait phase (rad) per env — advanced in _pre_physics_step, observed as
+        # (sin, cos) so the phase-clock trot reward is Markov/learnable.
+        self._gait_phase = torch.zeros(self.num_envs, device=self.device)
         self._cmd = VelCommands(self.num_envs, self.device, self.cfg.vel_cmd)
         self._episode_vel_auc = torch.zeros(self.num_envs, device=self.device)
+        self._episode_vel_initial = torch.zeros(self.num_envs, device=self.device)
+
+    def _foot_index(self, key: str) -> int:
+        """Position of the foot whose body name contains ``key`` within _feet_names."""
+        for i, n in enumerate(self._feet_names):
+            if key in n:
+                return i
+        raise ValueError(
+            f"[QuadrupedVelTracking] no foot body matching '{key}' in {self._feet_names}; "
+            "the trot gait reward assumes FL/FR/RL/RR foot naming."
+        )
+
+    def _stance_prob(self, foot_phase: torch.Tensor) -> torch.Tensor:
+        """Smooth desired-stance probability in [0, 1] for a foot at ``foot_phase`` (rad).
+
+        Trapezoidal window: ~1 across the stance arc [0, 2π·duty), ~0 across the
+        swing arc, with smoothstep ramps of half-width ``gait_transition_band``
+        at each edge. Ramping the schedule (instead of a hard step) removes the
+        reward cliff at the stance↔swing swap that makes the policy snap feet
+        up/down — the main source of clocked-gait leg jitter.
+        """
+        two_pi = 2.0 * math.pi
+        half = math.pi * self.cfg.gait_duty       # half-width of the stance arc
+        band = self.cfg.gait_transition_band
+        # wrapped signed distance from the stance-window center (φ = half), in [-π, π]
+        delta = torch.remainder(foot_phase - half + math.pi, two_pi) - math.pi
+        # 0 inside (|δ| ≤ half−band) → prob 1;  1 outside (|δ| ≥ half+band) → prob 0
+        x = ((delta.abs() - (half - band)) / (2.0 * band)).clamp(0.0, 1.0)
+        return 1.0 - x * x * (3.0 - 2.0 * x)      # smoothstep
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot_cfg)
+        self._contact_sensor = ContactSensor(self.cfg.contact_sensor)
         # Standard Isaac Sim ground plane (grey grid texture)
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[])
         self.scene.articulations["robot"] = self._robot
+        self.scene.sensors["contact_sensor"] = self._contact_sensor
         # Distant light gives directional sunlight with shadows — the standard
         # Isaac Sim look. DomeLightCfg was washing everything to flat white.
         light_cfg = sim_utils.DistantLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
@@ -61,6 +110,11 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         self._actions = actions.clone()
         default_pos = self._robot.data.default_joint_pos[:, self._joint_ids]
         self._joint_targets = default_pos + self.cfg.action_scale * self._actions
+        # Advance the gait phase once per control step. Kept in [0, 2π) so
+        # (sin, cos) in the observation are the sole Markov phase signal; the
+        # same buffer drives this step's reward and this step's observation.
+        dphi = 2.0 * math.pi * self.cfg.gait_freq * self.step_dt
+        self._gait_phase = torch.remainder(self._gait_phase + dphi, 2.0 * math.pi)
 
     def _apply_action(self) -> None:
         self._robot.set_joint_position_target(self._joint_targets, joint_ids=self._joint_ids)
@@ -106,7 +160,8 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
             ],
             dim=-1,
         )
-        obs = torch.cat([full_state, cmds, self._prev_actions], dim=-1)
+        gait = torch.stack([torch.sin(self._gait_phase), torch.cos(self._gait_phase)], dim=-1)
+        obs = torch.cat([full_state, cmds, gait, self._prev_actions], dim=-1)
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
@@ -127,7 +182,11 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         rew_yaw = torch.exp(-yaw_err / 0.25) * self.cfg.rew_yaw_rate
 
         vel_err_vec = cmds[:, :2] - self._robot.data.root_lin_vel_b[:, :2]
-        self._episode_vel_auc += torch.norm(vel_err_vec, dim=-1)
+        err_norm = torch.norm(vel_err_vec, dim=-1)
+        self._episode_vel_auc += err_norm
+        
+        is_first_step = self.episode_length_buf <= 1
+        self._episode_vel_initial[is_first_step] = err_norm[is_first_step]
 
         # flat-orientation penalty: projected gravity xy is ~0 upright, ~1 on
         # the side/back. With no fall termination, this is what makes lying
@@ -136,9 +195,41 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
 
         rew_z = torch.square(self._robot.data.root_lin_vel_b[:, 2]) * self.cfg.rew_z_vel
         rew_rp = torch.sum(torch.square(self._robot.data.root_ang_vel_b[:, :2]), dim=1) * self.cfg.rew_roll_pitch
-        rew_tau = torch.sum(torch.square(self._robot.data.applied_torque), dim=1) * self.cfg.rew_torque
-        rew_act = torch.sum(torch.square(self._actions - self._prev_actions), dim=1) * self.cfg.rew_action_rate
-        total_reward = self.cfg.rew_alive + rew_lin + rew_yaw + rew_flat + rew_z + rew_rp + rew_tau + rew_act
+        rew_act_rate = torch.sum(torch.square(self._actions - self._prev_actions), dim=1) * self.cfg.rew_action_rate
+
+        rew_height = torch.square(self._robot.data.root_pos_w[:, 2] - getattr(self.cfg, "target_base_height", 0.34)) * getattr(self.cfg, "rew_base_height", -10.0)
+
+        # Force-based foot contact + air time from the ContactSensor (robust,
+        # terrain-independent — see env_cfg.contact_sensor).
+        net_forces = self._contact_sensor.data.net_forces_w[:, self._feet_ids]  # (N, 4, 3)
+        contact = net_forces.norm(dim=-1) > self.cfg.contact_sensor.force_threshold  # (N, 4) bool
+        cmd_norm = torch.norm(cmds[:, :2], dim=1)
+        moving = (cmd_norm > 0.1).float()
+
+        # Phase-clock trot reward (smoothed). Diagonal pairs (FL+RR, FR+RL) are
+        # scheduled a half-cycle apart; each foot's desired-stance probability
+        # d(φ) ∈ [0,1] ramps smoothly across the stance↔swing swap (see
+        # _stance_prob), so the reward has no cliff there — this is what de-jitters
+        # the gait. Reward = mean over feet of agreement 1−|contact−d|, centered
+        # to [-1, 1]. Standing (all-stance) and pronking (all-together) both
+        # disagree with their swing-scheduled feet, so neither is zero-penalty.
+        stance_A = self._stance_prob(self._gait_phase)            # FL, RR
+        stance_B = self._stance_prob(self._gait_phase + math.pi)  # FR, RL
+        d = torch.zeros_like(contact, dtype=torch.float32)
+        d[:, self._fl_idx] = stance_A
+        d[:, self._rr_idx] = stance_A
+        d[:, self._fr_idx] = stance_B
+        d[:, self._rl_idx] = stance_B
+        c = contact.float()
+        match = (1.0 - (c - d).abs()).mean(dim=1)                 # [0, 1]
+        # When standing is commanded, a trot schedule is wrong — reward full
+        # stance instead so the robot isn't pushed to step in place.
+        stand_score = c.mean(dim=1)                               # 1.0 iff all four down
+        gait_score = torch.where(moving > 0, match, stand_score)
+        rew_gait = (2.0 * gait_score - 1.0) * self.cfg.rew_gait
+
+        total_reward = (self.cfg.rew_alive + rew_lin + rew_yaw + rew_flat + rew_z + rew_rp +
+                        rew_height + rew_gait + rew_act_rate)
         
         if not hasattr(self, "_episode_discounted_returns"):
             self._episode_discounted_returns = torch.zeros(self.num_envs, device=self.device)
@@ -190,7 +281,9 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
             if (auc_vals > 0).any():
                 self.extras.setdefault("log", {})
                 mask = auc_vals > 0
-                self.extras["log"]["Episode/auc"] = auc_vals[mask].mean()
+                init_costs = self._episode_vel_initial[env_ids]
+                init_cost = torch.clamp(init_costs[mask], min=1e-6)
+                self.extras["log"]["Episode/auc"] = (auc_vals[mask] / init_cost).mean()
                 self.extras["log"]["Reward/discounted_return"] = disc_returns[mask].mean()
                 self.extras["log"]["Reward/avg_reward_per_step"] = (undisc_returns[mask] / lengths[mask]).mean()
                 # undiscounted_return is dropped here — it's the same quantity skrl
@@ -205,9 +298,12 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
             self._current_discounts[env_ids] = 1.0
             
         self._episode_vel_auc[env_ids] = 0.0
+        self._episode_vel_initial[env_ids] = 0.0
 
         self._actions[env_ids] = 0.0
         self._prev_actions[env_ids] = 0.0
+        self._prev_joint_vel[env_ids] = 0.0
+        self._gait_phase[env_ids] = 0.0
         self._cmd.reset(env_ids)
 
         joint_pos = self._robot.data.default_joint_pos[env_ids].clone()

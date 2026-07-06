@@ -52,6 +52,7 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
         self._prev_actions = torch.zeros_like(self._actions)
         self._cmd = VelCommands(self.num_envs, self.device, self.cfg.vel_cmd)
         self._episode_vel_auc = torch.zeros(self.num_envs, device=self.device)
+        self._episode_vel_initial = torch.zeros(self.num_envs, device=self.device)
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot_cfg)
@@ -120,7 +121,14 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
             ee_lin_vel - cmds[:, :3],
             (ee_yaw_vel - cmds[:, 3]).unsqueeze(-1),
         ], dim=-1)
-        self._episode_vel_auc += torch.norm(vel_err_vec, dim=-1)
+        err_norm = torch.norm(vel_err_vec, dim=-1)
+        self._episode_vel_auc += err_norm
+        
+        # episode_length_buf is incremented to 1 BEFORE _get_rewards runs (see
+        # DirectRLEnv.step), so it is never 0 here — use <= 1 to capture the
+        # first reward step. Matches quadruped_vel_tracking.
+        is_first_step = self.episode_length_buf <= 1
+        self._episode_vel_initial[is_first_step] = err_norm[is_first_step]
 
         # soft joint-limit penalty: penalise if |q - q_mid| > 0.9 * half_range
         limits = self._robot.data.soft_joint_pos_limits[:, self._arm_ids, :]
@@ -149,7 +157,9 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
             if (auc_vals > 0).any():
                 self.extras.setdefault("log", {})
                 mask = auc_vals > 0
-                self.extras["log"]["Episode/auc"] = auc_vals[mask].mean()
+                init_costs = self._episode_vel_initial[env_ids]
+                init_cost = torch.clamp(init_costs[mask], min=1e-6)
+                self.extras["log"]["Episode/auc"] = (auc_vals[mask] / init_cost).mean()
                 self.extras["log"]["Reward/discounted_return"] = disc_returns[mask].mean()
                 self.extras["log"]["Reward/avg_reward_per_step"] = (undisc_returns[mask] / lengths[mask]).mean()
                 # undiscounted_return is dropped here — it's the same quantity skrl
@@ -164,6 +174,7 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
             self._current_discounts[env_ids] = 1.0
             
         self._episode_vel_auc[env_ids] = 0.0
+        self._episode_vel_initial[env_ids] = 0.0
 
         self._actions[env_ids] = 0.0
         self._prev_actions[env_ids] = 0.0

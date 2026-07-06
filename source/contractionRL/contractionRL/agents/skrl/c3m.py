@@ -536,7 +536,6 @@ class C3MSkrlTrainer(Trainer):
         for t in pbar:
             agent.pre_interaction(timestep=t, timesteps=timesteps)
             agent.update(timestep=t, timesteps=timesteps)
-            agent.post_interaction(timestep=t, timesteps=timesteps)
 
             # Evaluate metrics occasionally
             if eval_interval > 0 and (t + 1) % eval_interval == 0:
@@ -551,6 +550,8 @@ class C3MSkrlTrainer(Trainer):
                     # different wandb tabs ("Stability" vs "Stability ") for
                     # what should be the same metric.
                     agent.track_data(f"{tab}/{k}", v)
+
+            agent.post_interaction(timestep=t, timesteps=timesteps)
 
             if log_interval and (t + 1) % log_interval == 0:
                 # Read the losses captured on the agent by update(); tracking_data

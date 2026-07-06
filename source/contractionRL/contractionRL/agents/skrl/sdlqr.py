@@ -49,6 +49,7 @@ from torch.linalg import solve
 
 from skrl.agents.torch.base import Agent, AgentCfg
 
+from .angle_utils import wrap_diff
 from .math_utils import b_jacobian, jacobian
 
 
@@ -120,6 +121,7 @@ class SDLQRAgent(Agent):
         get_f_and_B: Callable,
         x_dim: int | None = None,
         u_dim: int | None = None,
+        angle_idx: list | None = None,
     ) -> None:
         if isinstance(cfg, dict):
             cfg = SDLQRCfg(**{k: v for k, v in cfg.items() if k in SDLQRCfg.__dataclass_fields__})
@@ -143,6 +145,7 @@ class SDLQRAgent(Agent):
 
         self._x_dim = x_dim
         self._u_dim = u_dim
+        self._angle_idx = angle_idx or []
         self._cfg = cfg
         self._get_f_and_B = get_f_and_B
         self._compute_device = "cpu"  # Jacobians must be on CPU for scipy CARE
@@ -169,13 +172,14 @@ class SDLQRAgent(Agent):
         A_batch = DfDx + torch.einsum('bxyu,bu->bxy', DBDx, uref)
         
         actions = torch.zeros(batch_size, u_dim, device=self._compute_device)
+        e_batch = wrap_diff(x - xref, self._angle_idx)
         
         for i in range(batch_size):
             A = A_batch[i]
             B_mat = B[i]
 
             K = _care_gain(A, B_mat, cfg.Q_scaler, cfg.R_scaler, x_dim, u_dim)
-            e = x[i] - xref[i]
+            e = e_batch[i]
             u = uref[i] - K @ e
             actions[i] = u
 
@@ -237,6 +241,7 @@ class LQRAgent(Agent):
         get_f_and_B: Callable,
         x_dim: int | None = None,
         u_dim: int | None = None,
+        angle_idx: list | None = None,
     ) -> None:
         if isinstance(cfg, dict):
             cfg = LQRCfg(**{k: v for k, v in cfg.items() if k in LQRCfg.__dataclass_fields__})
@@ -260,6 +265,7 @@ class LQRAgent(Agent):
 
         self._x_dim = x_dim
         self._u_dim = u_dim
+        self._angle_idx = angle_idx or []
         self._cfg = cfg
         self._get_f_and_B = get_f_and_B
         self._compute_device = "cpu"
@@ -285,13 +291,14 @@ class LQRAgent(Agent):
         A_batch = DfDx + torch.einsum('bxyu,bu->bxy', DBDx, uref)
         
         actions = torch.zeros(batch_size, u_dim, device=self._compute_device)
+        e_batch = wrap_diff(x - xref, self._angle_idx)
 
         for i in range(batch_size):
             A = A_batch[i]
             B_mat = B_xref[i]
 
             K = _care_gain(A, B_mat, cfg.Q_scaler, cfg.R_scaler, x_dim, u_dim)
-            e = x[i] - xref[i]
+            e = e_batch[i]
             u = uref[i] - K @ e
             actions[i] = u
             

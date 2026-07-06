@@ -658,12 +658,12 @@ class C2RLAgent(Agent):
                 "opt_critic_1": models.get("opt_critic_1"), "opt_critic_2": models.get("opt_critic_2"),
             }
         )
-        self.checkpoint_modules.update({
+        self.checkpoint_modules.update({k: v for k, v in {
             "con_policy": models["con_policy"],
             "opt_policy": models.get("opt_policy"),
             "cmg":        models["cmg"],
             **checkpoint_extra,
-        })
+        }.items() if v is not None})
         if self._neural_dynamics is not None:
             self.checkpoint_modules["dynamics"] = self._neural_dynamics
 
@@ -727,7 +727,13 @@ class C2RLAgent(Agent):
 
         with torch.no_grad():
             raw_W, _ = self._ccm_gen(x)
-            W = bound_W(raw_W, cfg.w_lb, x_dim)
+            # Pass the CMG's `bounded` flag so a BoundedCCM_Generator (whose
+            # eigenvalues are ALREADY in [w_lb, w_ub]) isn't shifted by an extra
+            # +w_lb·I here — that would move the metric off the [w_lb, w_ub]
+            # bounds the contraction certificate (set_contraction_certificate)
+            # advertises. Mirrors c3m.py's bound_W call.
+            bounded = getattr(self._ccm_gen, "bounded", False)
+            W = bound_W(raw_W, cfg.w_lb, x_dim, bounded)
             M = spd_inverse(W)
             quad = (e.transpose(1, 2) @ M @ e).squeeze(-1)
 
@@ -799,7 +805,11 @@ class C2RLAgent(Agent):
         K = K.detach()
 
         raw_W, info_W = self._ccm_gen(x)
-        W = bound_W(raw_W, cfg.w_lb, x_dim)
+        # See _compute_mahalanobis_reward: honor the CMG's `bounded` flag so a
+        # BoundedCCM_Generator isn't double-bounded (extra +w_lb·I), which would
+        # certify a different metric than the one actually used/deployed.
+        bounded = getattr(self._ccm_gen, "bounded", False)
+        W = bound_W(raw_W, cfg.w_lb, x_dim, bounded)
         M = spd_inverse(W)
 
         with torch.enable_grad():
@@ -917,8 +927,16 @@ class C2RLAgent(Agent):
             loss, info = self._compute_cmg_loss()
             self._W_optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self._ccm_gen.parameters(), 10.0)
-            self._W_optimizer.step()
+            # Guard against NaN/Inf grads (occasionally caused by eigvalsh or
+            # numerical edge cases in the contraction metric) reaching the CMG
+            # weights — same protection C3M's _optimize_params and this
+            # class's own _train_dynamics already apply. Without it, a single
+            # bad step can NaN the CMG, and every later spd_inverse(W) call
+            # (Mahalanobis reward, next CMG loss) crashes on a non-finite
+            # Cholesky decomposition instead of just skipping this step.
+            if all(torch.isfinite(p.grad).all() for p in self._ccm_gen.parameters() if p.grad is not None):
+                torch.nn.utils.clip_grad_norm_(self._ccm_gen.parameters(), 10.0)
+                self._W_optimizer.step()
         self._W_lr_scheduler.step()
         self._ccm_gen.eval()
 

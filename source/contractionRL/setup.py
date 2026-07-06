@@ -19,7 +19,7 @@ EXTENSION_TOML_DATA = toml.load(os.path.join(EXTENSION_PATH, "config", "extensio
 INSTALL_REQUIRES = [
     "psutil",
     "torch",
-    "skrl",
+    "skrl>=2.1.0",
     "wandb",
     "gymnasium",
     "scipy",

@@ -145,7 +145,6 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     # Pre-allocate (num_trajs, T, dim) on GPU
     states_buf  = torch.zeros(num_envs, T, state_dim,  device=device)
     actions_buf = torch.zeros(num_envs, T, action_dim, device=device)
-    poses_buf   = torch.zeros(num_envs, T, 3, device=device)  # [x, y, yaw]
     ever_done   = torch.zeros(num_envs, dtype=torch.bool, device=device)
 
     print(f"[INFO] Collecting {num_envs} trajectories in parallel over {T} steps …")
@@ -157,13 +156,6 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
             actions, _ = runner.agent.act(obs, None, timestep=0, timesteps=0)
         states_buf[:, t]  = getattr(unwrapped, _STATE_METHOD)()
         actions_buf[:, t] = actions
-        pos_w = unwrapped._robot.data.root_pos_w          # (N, 3)
-        q     = unwrapped._robot.data.root_quat_w          # (N, 4) wxyz
-        yaw   = torch.atan2(2*(q[:, 0]*q[:, 3] + q[:, 1]*q[:, 2]),
-                             1 - 2*(q[:, 2]**2 + q[:, 3]**2))
-        poses_buf[:, t, 0] = pos_w[:, 0]
-        poses_buf[:, t, 1] = pos_w[:, 1]
-        poses_buf[:, t, 2] = yaw
         obs_dict, _, terminated, truncated, _ = env.step(actions)
         obs = _get_obs(obs_dict)
         ever_done |= terminated.squeeze(-1)  # only early falls, not natural time-limit truncation
@@ -175,7 +167,6 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
 
     states_arr  = states_buf[good].cpu().numpy().astype(np.float32)
     actions_arr = actions_buf[good].cpu().numpy().astype(np.float32)
-    poses_np    = poses_buf[good].cpu().numpy()   # (n_good, T, 3): [x, y, yaw]
 
     # Dynamics: x_dot via 4th-order finite differences
     dt = env_cfg.sim.dt * env_cfg.decimation
@@ -196,7 +187,18 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
         d[:,-1] = (3*x[:,-5] - 16*x[:,-4] + 36*x[:,-3] - 48*x[:,-2] + 25*x[:,-1]) / (12*h)
         return d
 
-    x_dot_arr = _fd4(states_arr, dt)
+    # angle_idx columns (e.g. yaw) wrap at ±pi in states_arr — a raw finite
+    # difference across that wrap would spike x_dot by ~2*pi/dt for one sample,
+    # corrupting the NeuralDynamics fit on the angle dimension. Difference an
+    # UNWRAPPED copy instead (np.unwrap makes each angle continuous over time);
+    # the SAVED states_arr stays wrapped (that's the physical observation), so
+    # this is purely a finite-difference cleanup, not a change to x. Mirrors
+    # train.py's _generate_ref_trajs.
+    angle_idx = list(getattr(unwrapped, "angle_idx", []) or [])
+    diff_states = states_arr.copy()
+    for idx in angle_idx:
+        diff_states[:, :, idx] = np.unwrap(diff_states[:, :, idx], axis=1)
+    x_dot_arr = _fd4(diff_states, dt)
 
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -213,7 +215,7 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     print(f"       u      shape: {actions_arr.shape}")
     print(f"       x_dot  shape: {x_dot_arr.shape}")
 
-    # Visualization: 20 random trajectories — absolute XY positions
+    # Visualization: 20 random trajectories — XY positions (from states_arr relative position)
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -224,13 +226,13 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
 
     fig, ax = plt.subplots(figsize=(8, 8))
     for k, i in enumerate(chosen):
-        xy = poses_np[i, :, :2]
+        xy = states_arr[i, :, :2]
         ax.plot(xy[:, 0], xy[:, 1], color=colors[k], linewidth=1, alpha=0.8)
         ax.plot(xy[0,  0], xy[0,  1], "o", color=colors[k], markersize=6)
         ax.plot(xy[-1, 0], xy[-1, 1], "x", color=colors[k], markersize=8, markeredgewidth=2)
-    ax.set_xlabel("x [m]")
-    ax.set_ylabel("y [m]")
-    ax.set_title("Reference trajectories — absolute position  (o = start,  × = end)")
+    ax.set_xlabel("x [m, relative]")
+    ax.set_ylabel("y [m, relative]")
+    ax.set_title("Reference trajectories — relative position  (o = start,  × = end)")
     ax.set_aspect("equal")
     ax.grid(True, alpha=0.3)
 

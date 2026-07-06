@@ -92,7 +92,11 @@ def _make_cmg_bounds_fn(cmg_model, w_lb: float):
         import torch
         with torch.no_grad():
             raw_W, _ = ccm_gen(x_batch)
-            W = bound_W(raw_W, w_lb, x_dim)
+            # Honor the CMG's `bounded` flag so a BoundedCCM_Generator (already
+            # eigenvalue-bounded) isn't double-bounded by an extra +w_lb·I —
+            # otherwise the plotted contraction envelope would use a different
+            # metric than the deployed one. Mirrors c2rl.py's bound_W calls.
+            W = bound_W(raw_W, w_lb, x_dim, getattr(ccm_gen, "bounded", False))
             M = spd_inverse(W)
             eigvals = torch.linalg.eigvalsh(M)
         return float(eigvals.max().item()), float(eigvals.min().clamp(min=1e-12).item())
@@ -386,7 +390,7 @@ class ContractionRunner:
             # an externally-loaded NeuralDynamics whose angle_idx was already
             # baked in when IT was trained) — nothing here to embed.
             self._setup_sdlqr(skrl_env, device, obs_space, state_space, act_space,
-                              agent_cfg, trainer_cfg, models_cfg, get_f_and_B, lqr=(algo == "lqr"), x_dim=x_dim, u_dim=u_dim)
+                              agent_cfg, trainer_cfg, models_cfg, get_f_and_B, lqr=(algo == "lqr"), x_dim=x_dim, u_dim=u_dim, angle_idx=angle_idx)
         elif algo in ("c2rl-ppo", "c2rl-sac"):
             # base_algorithm is derived from the algo string itself (i.e. which
             # entry point / yaml you used), not a config toggle — see
@@ -489,7 +493,7 @@ class ContractionRunner:
             )
 
     def _setup_sdlqr(self, env, device, obs_space, state_space, act_space,
-                     agent_cfg, trainer_cfg, models_cfg, get_f_and_B, lqr: bool = False, x_dim=None, u_dim=None):
+                     agent_cfg, trainer_cfg, models_cfg, get_f_and_B, lqr: bool = False, x_dim=None, u_dim=None, angle_idx=None):
         from contractionRL.agents.skrl.sdlqr import SDLQRAgent, LQRAgent, SDLQRCfg, LQRCfg
         from skrl.trainers.torch import SequentialTrainer
         import dataclasses
@@ -509,6 +513,7 @@ class ContractionRunner:
             get_f_and_B=get_f_and_B,
             x_dim=x_dim,
             u_dim=u_dim,
+            angle_idx=angle_idx,
         )
         # SequentialTrainer for eval — no gradient updates
         valid_keys = TrainerCfg.__dataclass_fields__
@@ -559,6 +564,11 @@ class ContractionRunner:
             spec.setdefault("min_log_std", -4.605)
             spec.setdefault("max_log_std", 2.0)
             spec.setdefault("angle_idx", angle_idx)
+            # x_dim is already known from raw_env.x_dim (see top of _setup_c2rl) —
+            # pass it explicitly so backbones like mlp-squashed, which see both
+            # path-tracking and vel-tracking layouts, don't have to guess the
+            # [x, xref, uref] split from obs_dim/act_dim parity alone.
+            spec.setdefault("x_dim", x_dim)
             # agent_class lets _gaussian_factory reject unbounded backbones for
             # C2RL-SAC (divergence) and squashed backbones for C2RL-PPO.
             return _gaussian_factory(obs_space, state_space, act_space, device,
@@ -598,14 +608,14 @@ class ContractionRunner:
             """V(obs) -> scalar (PPO critic)."""
             return EmbeddedDeterministicModel(
                 obs_space, act_space, device, hidden_dim=hidden_dim, activation=activation,
-                angle_idx=angle_idx, use_actions=False,
+                x_dim=x_dim, angle_idx=angle_idx, use_actions=False,
             )
 
         def _make_q_model(hidden_dim, activation):
             """Q(obs, action) -> scalar (SAC critic_1/critic_2/targets)."""
             return EmbeddedDeterministicModel(
                 obs_space, act_space, device, hidden_dim=hidden_dim, activation=activation,
-                angle_idx=angle_idx, use_actions=True,
+                x_dim=x_dim, angle_idx=angle_idx, use_actions=True,
             )
 
         models = {"con_policy": con_policy, "cmg": cmg_model}
