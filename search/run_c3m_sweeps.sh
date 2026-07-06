@@ -38,11 +38,11 @@ for i in "${!ENVS[@]}"; do
 program: scripts/skrl/train.py
 method: bayes
 metric:
-  # Stability / convergence_score = contraction_rate / overshoot — rewards
+  # Stability / contraction_score = contraction_rate / overshoot — rewards
   # fast contraction with little overshoot, higher is better. Requires
-  # eval_interval > 0 in the C3M agent cfg (default 100) so C3MSkrlTrainer.eval()
+  # eval_interval > 0 in the C3M agent cfg (default 10) so C3MSkrlTrainer.eval()
   # actually logs it periodically during the sweep.
-  name: "Stability / convergence_score"
+  name: "Stability/contraction_score"
   goal: maximize
 
 parameters:
@@ -65,7 +65,7 @@ parameters:
   agent.actor_architecture:  # policy (CLActor w1/w2) hidden layers
     values: [[64, 64], [128, 128], [256, 256], [128, 128, 128]]
   agent.cmg_updates_per_policy_update:
-    values: [1, 5, 10, 30]
+    values: [1, 10]
 
 command:
   - \${env}

@@ -13,5 +13,6 @@ from . import car  # noqa: F401  registers classic-car-v0
 from . import cartpole  # noqa: F401 registers classic-cartpole-v0
 from . import turtlebot  # noqa: F401 registers classic-turtlebot-v0
 from . import segway  # noqa: F401 registers classic-segway-v0
+from . import quadrotor  # noqa: F401 registers classic-quadrotor-v0
 
-__all__ = ["car", "cartpole", "turtlebot", "segway"]
+__all__ = ["car", "cartpole", "turtlebot", "segway", "quadrotor"]

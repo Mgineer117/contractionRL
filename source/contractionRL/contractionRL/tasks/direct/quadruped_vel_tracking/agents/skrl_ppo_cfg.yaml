@@ -31,7 +31,7 @@ agent:
   rollouts: 24
   learning_epochs: 5
   mini_batches: 4
-  discount_factor: 0.99
+  discount_factor: 0.999
   learning_rate: 0.001
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
@@ -61,5 +61,5 @@ agent:
   use_value_norm: true
 trainer:
   class: SequentialTrainer
-  timesteps: 30000
+  timesteps: 50000
   environment_info: log

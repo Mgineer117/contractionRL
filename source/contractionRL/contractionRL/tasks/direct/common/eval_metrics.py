@@ -88,55 +88,82 @@ def fit_exponential_envelope(
     dt: float,
     num_c_candidates: int = 100,
     eps: float = 1e-6,
-) -> tuple[float, float]:
-    """Fit C, lambda minimizing AUC (= C/lambda) of the bounding exponential.
+) -> tuple[float, np.ndarray]:
+    """Convergence rate (lambda) and overshoot (C), exactly per the paper.
 
-    Ported from CAC-dev's evaluator (see agents/skrl/eval_metrics.py, which
-    historically carried this same function for the post-training evaluator —
-    duplicated here so the env layer (this module) doesn't have to import
-    from the agent layer).
+    Each error curve is first normalized by its initial value e(0) so it starts
+    at 1 and C >= 1 is a pure overshoot factor (xe(t) <= C * exp(-lambda * t)).
+    Then, following the paper's "Convergence rate" procedure verbatim:
 
-    For a candidate C, the tightest valid rate is
-        lambda(C) = min over all samples of (ln C - ln e_i) / t_i
-    (the bound must hold at every point of every trajectory). C is searched on
-    a grid from the peak observed error to 10x that peak, and the (C, lambda)
-    pair with the smallest C/lambda wins.
+      (1) The curve with the HIGHEST OVERSHOOT (largest peak of the normalized
+          error) is selected. On that curve ALONE we search the convergence
+          rate lambda > 0 and overshoot C >= 1 such that xe(t) <= C*exp(-lambda*t)
+          for all t in [0, T] and the AUC of C*exp(-lambda*t) over [0, T] is
+          minimized. This fixes C = C*.
+      (2) With C* fixed, the convergence rate lambda is computed for EACH curve
+          as the tightest rate that keeps it under the C* envelope:
+              lambda_j = min_t (ln C* - ln xe_j(t)) / t.
+
+    Kept identical to agents/skrl/eval_metrics.fit_exponential_envelope (the env
+    layer duplicates it so it need not import from the agent layer).
 
     Args:
-        error_trajectories: list of 1-D arrays of (typically normalized)
-            tracking errors; sample i of a trajectory is at time (i+1)*dt.
+        error_trajectories: list of 1-D arrays of RAW tracking-error norms
+            (normalization by e(0) is done here); sample i is at time (i+1)*dt.
         dt: environment step time [s].
 
     Returns:
-        (C, lambda). lambda == 0.0 signals that no decaying envelope fits
-        (error never decays); C then falls back to the peak error.
+        (C_star, lambdas). C_star is the single fixed overshoot (>= 1). lambdas
+        is a 1-D array with one convergence rate per input curve (0.0 where no
+        positive decaying rate bounds that curve). If no curve carries usable
+        error information, returns (1.0, zeros(len(error_trajectories))).
     """
-    ts, es = [], []
+    # Normalize each curve by e(0); keep (t, e) with e > eps at t = (i+1)*dt.
+    norm_curves: list[tuple[np.ndarray, np.ndarray]] = []
+    peaks = []  # peak normalized error (overshoot) per curve; -inf if unusable
     for traj in error_trajectories:
         traj = np.asarray(traj, dtype=np.float64).reshape(-1)
-        t = dt * np.arange(1, len(traj) + 1)  # (i+1)*dt: avoids divide-by-zero
-        keep = traj > eps
-        ts.append(t[keep])
-        es.append(traj[keep])
-    if not ts or sum(len(t) for t in ts) == 0:
-        return 1.0, 0.0
-    t_all = np.concatenate(ts)
-    e_all = np.concatenate(es)
+        if traj.size == 0 or traj[0] <= eps:
+            norm_curves.append((np.empty(0), np.empty(0)))
+            peaks.append(-np.inf)
+            continue
+        e = traj / traj[0]
+        t = dt * np.arange(1, traj.size + 1)  # (i+1)*dt: avoids divide-by-zero
+        keep = np.isfinite(e) & (e > eps)  # drop NaN/Inf from any diverged step
+        t, e = t[keep], e[keep]
+        norm_curves.append((t, e))
+        peaks.append(float(e.max()) if e.size else -np.inf)
 
-    global_max_err = float(e_all.max())
-    start_C = max(1.0, global_max_err)
+    peaks = np.asarray(peaks)
+    if not np.any(np.isfinite(peaks)):
+        return 1.0, np.zeros(len(error_trajectories))
+
+    # (1) Highest-overshoot curve → search C* minimizing the envelope's
+    #     [0, T] AUC = C*(1 - exp(-lambda*T)) / lambda.
+    t_star, e_star = norm_curves[int(np.argmax(peaks))]
+    log_e_star = np.log(e_star)
+    T_star = float(t_star.max())
+    peak_star = float(e_star.max())
+    start_C = max(1.0, peak_star)
     c_candidates = np.linspace(start_C, start_C * 10.0, num=num_c_candidates)
 
-    log_e = np.log(e_all)
-    best_C, best_lbd, min_auc = start_C, 0.0, float("inf")
+    C_star, min_auc = start_C, float("inf")
     for C_test in c_candidates:
-        if global_max_err > C_test:
+        if peak_star > C_test:  # envelope must sit above the curve's peak
             continue
-        lbd = float(np.min((np.log(C_test) - log_e) / t_all))
+        lbd = float(np.min((np.log(C_test) - log_e_star) / t_star))
         if lbd <= 0:
             continue
-        auc = C_test / lbd
+        auc = C_test * (1.0 - np.exp(-lbd * T_star)) / lbd
         if auc < min_auc:
-            min_auc, best_C, best_lbd = auc, float(C_test), lbd
+            min_auc, C_star = auc, float(C_test)
 
-    return best_C, best_lbd
+    # (2) Fix C*, compute the tightest lambda for each curve.
+    log_C = np.log(C_star)
+    lambdas = np.zeros(len(error_trajectories))
+    for j, (t, e) in enumerate(norm_curves):
+        if t.size == 0:
+            continue
+        lambdas[j] = max(float(np.min((log_C - np.log(e)) / t)), 0.0)
+
+    return C_star, lambdas

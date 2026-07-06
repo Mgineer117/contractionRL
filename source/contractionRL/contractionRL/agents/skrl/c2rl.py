@@ -45,26 +45,33 @@ Normalization (see ``_make_base_cfg``, ``_compute_mahalanobis_reward``,
 ``_compute_cmg_loss``):
 
   * **Observation normalization** — controlled by ``use_state_norm``, which
-    now defaults to **False** in every shipped config (see the note below and
-    the yaml comments). When enabled, con_agent and opt_agent EACH get their
-    own independent ``RunningStandardScaler`` (per-dimension running mean/std
-    over the full ``[x, xref, uref]`` observation vector), exactly like
-    standalone PPO/SAC get via ``train.py``. Being independent instances,
-    con_agent's scaler is fit to the state distribution *con_policy* visits
-    (γ→0 rollouts) and opt_agent's to what *opt_policy* visits — these can
-    diverge over training. The scaler is applied (not updated) inside ``act()``
-    and updated (``train=True``) inside each sub-agent's own
-    ``update()``/gradient step — standard skrl behavior, inherited for free
-    since con_agent/opt_agent are real ``PPO``/``SAC`` instances.
+    defaults to **False** in every shipped config (see the yaml comments).
+    When enabled, con_agent and opt_agent EACH get their own independent
+    ``PathTrackingObservationScaler`` (see ``preprocessors.py``) — a
+    ``RunningStandardScaler`` restricted to the ``x``/``xref`` blocks of the
+    ``[x, xref, uref]`` observation, with ``uref`` and any ``angle_idx``
+    columns of ``x``/``xref`` passed through UNNORMALIZED. Being independent
+    instances, con_agent's scaler is fit to the state distribution
+    *con_policy* visits (γ→0 rollouts) and opt_agent's to what *opt_policy*
+    visits — these can diverge over training. The scaler is applied (not
+    updated) inside ``act()`` and updated (``train=True``) inside each
+    sub-agent's own ``update()``/gradient step — standard skrl behavior,
+    inherited for free since con_agent/opt_agent are real ``PPO``/``SAC``
+    instances.
 
-    NOTE the residual-control interaction: the ``control``/``mlp`` backbones
-    compute ``u = uref + feedback`` by slicing ``uref`` out of the observation
-    they receive. If that observation is normalized, the sliced ``uref`` is the
-    *normalized* uref, so the applied control law becomes ``uref_norm +
-    feedback`` rather than ``uref + feedback`` — the reference-tracking
-    residual is distorted. This (not just the CMG caveat) is a second reason
-    ``use_state_norm`` now defaults off for these backbones; keep it off unless
-    you deliberately want normalized-uref behavior.
+    Why ``uref`` and ``angle_idx`` are excluded (both are correctness bugs,
+    not just style, if normalized):
+      - ``uref``: the ``control``/``mlp`` backbones (squashed or not) compute
+        ``u = uref + feedback`` by slicing ``uref`` straight out of the
+        observation. A normalized ``uref`` would make the applied law
+        ``uref_norm + feedback`` instead of ``uref + feedback``, distorting
+        the reference-tracking residual.
+      - ``angle_idx``: ``models.py`` replaces each such column with
+        ``(cos(theta), sin(theta))`` via ``embed_angles`` so the network sees
+        a continuous, periodic input. Standardizing the raw angle first
+        (``(theta - mean) / std``) breaks that periodicity — the network
+        would see ``cos``/``sin`` of a shifted-and-rescaled quantity that no
+        longer wraps at ``+-pi`` the way the physical angle does.
   * **Value normalization** (PPO only) — when ``use_value_norm`` (default
     True), a separate ``RunningStandardScaler(size=1)`` normalizes the value
     function's target/output, per sub-agent. SAC has no state-value network,
@@ -95,7 +102,7 @@ Normalization (see ``_make_base_cfg``, ``_compute_mahalanobis_reward``,
       - ``use_state_norm`` off (the default): that preprocessor is skrl's
         identity ``_empty_preprocessor`` → the policy sees raw obs and ``K`` is
         the raw-coordinate Jacobian, same as always.
-      - ``use_state_norm`` on: the policy sees the SAME ``RunningStandardScaler``
+      - ``use_state_norm`` on: the policy sees the SAME ``PathTrackingObservationScaler``
         -normalized obs it was actually optimized/deployed on, and because the
         normalization is kept in the autograd graph (``no_grad=False``) while
         ``jacobian(u, x)`` still differentiates w.r.t. raw ``x``, ``K`` is the
@@ -126,6 +133,7 @@ from skrl.agents.torch.base import Agent, AgentCfg
 from skrl.memories.torch import RandomMemory
 from skrl.trainers.torch.base import Trainer, TrainerCfg
 
+from .angle_utils import wrap_diff
 from .math_utils import (
     b_jacobian,
     bound_W,
@@ -191,6 +199,16 @@ class C2RLPPOCfg(AgentCfg):
     reward_norm_beta: float = 0.99
     tracking_scaler: float = 1.0
     control_scaler: float = 0.0
+    # Dynamics — learned NeuralDynamics (ẋ = f(x) + B(x)·u) unless
+    # use_analytical_dynamics=True (classic envs only). Same mechanism as C3M:
+    # pretrained offline/online before training, then refined online each epoch.
+    use_analytical_dynamics: bool = False
+    dynamics_lr: float = 1e-3
+    dynamics_lr_scheduler: str = ""
+    dynamics_lr_scheduler_kwargs: dict = field(default_factory=dict)
+    dynamics_batch_size: int = 4096
+    dynamics_pretrain_epochs: int = 5
+    dynamics_pretrain_data_path: str = ""
 
 
 @dataclass
@@ -230,6 +248,16 @@ class C2RLSACCfg(AgentCfg):
     reward_norm_beta: float = 0.99
     tracking_scaler: float = 1.0
     control_scaler: float = 0.0
+    # Dynamics — learned NeuralDynamics (ẋ = f(x) + B(x)·u) unless
+    # use_analytical_dynamics=True (classic envs only). Same mechanism as C3M:
+    # pretrained offline/online before training, then refined online each epoch.
+    use_analytical_dynamics: bool = False
+    dynamics_lr: float = 1e-3
+    dynamics_lr_scheduler: str = ""
+    dynamics_lr_scheduler_kwargs: dict = field(default_factory=dict)
+    dynamics_batch_size: int = 4096
+    dynamics_pretrain_epochs: int = 5
+    dynamics_pretrain_data_path: str = ""
 
 
 @dataclass
@@ -287,7 +315,9 @@ class C2RLAgent(Agent):
         x_dim: int | None = None,
         u_dim: int | None = None,
         num_envs: int = 1,
+        angle_idx: list | None = None,
     ) -> None:
+        self._angle_idx = list(angle_idx or [])
         CfgCls = C2RLSACCfg if base_algorithm.upper() == "SAC" else C2RLPPOCfg
         if isinstance(cfg, dict):
             self._raw_cfg = cfg.copy()
@@ -332,9 +362,15 @@ class C2RLAgent(Agent):
         if self._base_algorithm == "PPO":
             mem_size = rollouts
         else:
-            mem_size = self._raw_cfg.get("memory_size", 1000000)
+            # 10_000 (not skrl's usual 1M-ish default) — this buffer is allocated
+            # PER PARALLEL ENV ((memory_size, num_envs, ...), see RandomMemory
+            # above), and Isaac Sim runs routinely use 1000+ envs, where a
+            # 1,000,000 default would try to allocate a buffer sized for a
+            # billion+ transitions and OOM the machine. Configs that need a
+            # bigger/smaller buffer should set `memory_size` explicitly.
+            mem_size = self._raw_cfg.get("memory_size", 10000)
             if mem_size == -1:
-                mem_size = 1000000
+                mem_size = 10000
                 
         con_memory = RandomMemory(memory_size=mem_size, num_envs=num_envs, device=device)
         opt_memory = RandomMemory(memory_size=mem_size, num_envs=num_envs, device=device)
@@ -430,9 +466,15 @@ class C2RLAgent(Agent):
             # module docstring): a config that omits the key gets no observation
             # normalization, matching every shipped config's explicit `false`.
             if self._raw_cfg.get("use_state_norm", False):
-                from skrl.resources.preprocessors.torch import RunningStandardScaler
-                d["observation_preprocessor"] = RunningStandardScaler
-                d["observation_preprocessor_kwargs"] = {"size": observation_space, "device": device}
+                from contractionRL.agents.skrl.preprocessors import PathTrackingObservationScaler
+                d["observation_preprocessor"] = PathTrackingObservationScaler
+                d["observation_preprocessor_kwargs"] = {
+                    "size": observation_space,
+                    "x_dim": self._x_dim,
+                    "u_dim": self._u_dim,
+                    "angle_idx": self._angle_idx,
+                    "device": device,
+                }
             if self._base_algorithm == "PPO" and self._raw_cfg.get("use_value_norm", True):
                 from skrl.resources.preprocessors.torch import RunningStandardScaler
                 d["value_preprocessor"] = RunningStandardScaler
@@ -560,7 +602,41 @@ class C2RLAgent(Agent):
         # With use_state_norm off (the default now) this is the identity and the
         # policy sees raw obs everywhere, so there is nothing to reconcile.
         self._con_obs_preprocessor = getattr(self._con_agent, "_observation_preprocessor", None)
-        self._get_f_and_B = get_f_and_B
+
+        # ── Dynamics: analytical or learned online (same mechanism as C3M) ── #
+        # use_analytical_dynamics=True uses the env's exact get_f_and_B (classic
+        # only). Otherwise a NeuralDynamics model is pretrained/refined online and
+        # its get_f_and_B feeds the CMG contraction loss — Isaac envs always take
+        # this path (no closed-form dynamics available).
+        if parsed_cfg.use_analytical_dynamics:
+            if get_f_and_B is None:
+                raise ValueError(
+                    "C2RL: use_analytical_dynamics=True requires a get_f_and_B callable "
+                    "(classic envs only). Isaac Sim envs have no analytical dynamics."
+                )
+            self._get_f_and_B = get_f_and_B
+            self._neural_dynamics = None
+            self._dynamics_optimizer = None
+            self._dynamics_lr_scheduler = None
+        else:
+            self._neural_dynamics = models.get("dynamics", None)
+            if self._neural_dynamics is None:
+                raise ValueError(
+                    "C2RL requires a 'dynamics' model in the models dict when "
+                    "use_analytical_dynamics=False (add a models.dynamics block to the config)."
+                )
+            self._get_f_and_B = self._neural_dynamics.get_f_and_B
+            self._dynamics_optimizer = torch.optim.Adam(
+                self._neural_dynamics.parameters(), lr=parsed_cfg.dynamics_lr
+            )
+            if parsed_cfg.dynamics_lr_scheduler:
+                sched_cls = getattr(torch.optim.lr_scheduler, parsed_cfg.dynamics_lr_scheduler)
+                self._dynamics_lr_scheduler = sched_cls(
+                    self._dynamics_optimizer, **parsed_cfg.dynamics_lr_scheduler_kwargs
+                )
+            else:
+                self._dynamics_lr_scheduler = None
+
         self._data = get_rollout(parsed_cfg.buffer_size, "c3m")
         self._get_rollout = get_rollout
         self._buffer_size = parsed_cfg.buffer_size
@@ -588,6 +664,8 @@ class C2RLAgent(Agent):
             "cmg":        models["cmg"],
             **checkpoint_extra,
         })
+        if self._neural_dynamics is not None:
+            self.checkpoint_modules["dynamics"] = self._neural_dynamics
 
     # ── skrl Agent interface ────────────────────────────────────────────── #
 
@@ -645,7 +723,7 @@ class C2RLAgent(Agent):
 
         x    = observations[:, :x_dim].to(dtype)
         xref = observations[:, x_dim : 2 * x_dim].to(dtype)
-        e = (x - xref).unsqueeze(-1)
+        e = wrap_diff(x - xref, self._angle_idx).unsqueeze(-1)
 
         with torch.no_grad():
             raw_W, _ = self._ccm_gen(x)
@@ -824,7 +902,14 @@ class C2RLAgent(Agent):
         return {}
 
     def update_cmg(self, *, timestep: int, timesteps: int) -> dict:
-        """Refresh data buffer and run CMG contraction pd-loss update."""
+        """Refresh data buffer, refine learned dynamics, run CMG pd-loss update."""
+        # Online NeuralDynamics refinement (skipped when analytical) — one MSE
+        # step per epoch on fresh (x, u, x_dot) data, mirroring C3M.update().
+        if self._neural_dynamics is not None:
+            dyn_data = self._get_rollout(self._cfg.dynamics_batch_size, "dynamics")
+            dyn_loss = self._train_dynamics(dyn_data)
+            self.track_data("Loss / C2RL/dynamics/mse", dyn_loss)
+
         self._data = self._get_rollout(self._buffer_size, "c3m")
         self._progress = float(timestep) / max(1, timesteps)
         self._ccm_gen.train()
@@ -844,6 +929,30 @@ class C2RLAgent(Agent):
         for k, v in loss_dict.items():
             self.track_data(f"Loss / {k}", v)
         return loss_dict
+
+    def _train_dynamics(self, data: dict) -> float:
+        """MSE training of NeuralDynamics on (x, u, x_dot) data (same as C3M)."""
+        dev = self._neural_dynamics.device
+        x     = torch.as_tensor(data["x"], dtype=torch.float32, device=dev)
+        u     = torch.as_tensor(data["u"], dtype=torch.float32, device=dev)
+        x_dot = torch.as_tensor(data["x_dot"], dtype=torch.float32, device=dev)
+
+        pred = self._neural_dynamics.predict_x_dot(x, u)
+        loss = nn.functional.mse_loss(pred, x_dot)
+
+        self._dynamics_optimizer.zero_grad()
+        loss.backward()
+        # Guard against NaN/Inf grads from occasional huge MSE spikes.
+        if all(torch.isfinite(p.grad).all() for p in self._neural_dynamics.parameters() if p.grad is not None):
+            torch.nn.utils.clip_grad_norm_(self._neural_dynamics.parameters(), 1.0)
+            self._dynamics_optimizer.step()
+        return loss.item()
+
+    def save_dynamics(self, path: str) -> None:
+        """Save NeuralDynamics checkpoint (for SDLQR/LQR reuse or inspection)."""
+        if self._neural_dynamics is not None:
+            self._neural_dynamics.save(path)
+            print(f"[C2RL] Saved NeuralDynamics → {path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -873,7 +982,7 @@ class C2RLSkrlTrainer(Trainer):
             )
         # PPO's con/opt memory IS the per-epoch rollout buffer (reset & refilled
         # every epoch), so its size must equal rollout_steps. SAC's con/opt
-        # memory is a PERSISTENT replay buffer whose size (memory_size, e.g. 1M)
+        # memory is a PERSISTENT replay buffer whose size (memory_size, e.g. 10k)
         # is deliberately independent of rollout_steps — so this invariant only
         # applies to PPO. (Applying it to SAC always raised, since a replay
         # buffer never equals the rollout length — C2RL-SAC never got past here.)
@@ -885,6 +994,19 @@ class C2RLSkrlTrainer(Trainer):
             )
 
         agent.init(trainer_cfg=self.cfg)
+
+        # Pretrain the learned NeuralDynamics before RL (same mechanism as C3M);
+        # no-op for analytical dynamics or dynamics_pretrain_epochs<=0. The helper
+        # derives its own wandb flush cadence from the epoch count (the training
+        # write_interval is ~timesteps//100, far too coarse for pretraining).
+        from .dynamics_pretrain import pretrain_dynamics
+        pretrain_dynamics(
+            agent,
+            epochs=getattr(agent._cfg, "dynamics_pretrain_epochs", 0),
+            data_path=getattr(agent._cfg, "dynamics_pretrain_data_path", "") or None,
+            timesteps=timesteps,
+            tag="[C2RL]",
+        )
 
         observations, infos = env.reset()
         states = env.state() if hasattr(env, "state") else None
@@ -968,6 +1090,12 @@ class C2RLSkrlTrainer(Trainer):
 
             pd_loss = cmg_dict.get("C2RL/CMG/pd_loss", float("nan"))
             pbar.set_postfix(epoch=epoch, pd=f"{pd_loss:.3g}")
+
+        # Persist the learned dynamics for reuse/inspection (matches C3M).
+        if agent._neural_dynamics is not None:
+            dyn_path = os.path.join(agent.experiment_dir, "checkpoints", "dynamics.pt")
+            os.makedirs(os.path.dirname(dyn_path), exist_ok=True)
+            agent.save_dynamics(dyn_path)
 
     def eval(self) -> None:
         agent: C2RLAgent = self.agents if not isinstance(self.agents, list) else self.agents[0]

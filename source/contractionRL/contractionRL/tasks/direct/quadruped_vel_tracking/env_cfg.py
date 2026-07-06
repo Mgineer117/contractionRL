@@ -27,9 +27,12 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     # Unitree Go2: 12 joints (3 per leg × 4 legs)
     # state:   base_lin_vel(3) + base_ang_vel(3) + proj_gravity(3)
     #          + joint_pos_rel(12) + joint_vel(12)  = 33
-    # obs:     state(33) + commands(4) + prev_actions(12) = 49
+    # commands: vx,vy,vz,yaw_rate + A,omega,sin(phase),cos(phase) = 8 (see
+    #           VelCommands.get() — the last 4 make the yaw-rate generator's
+    #           own future Markov, not just its instantaneous value)
+    # obs:     state(33) + commands(8) + prev_actions(12) = 53
     action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(12,), dtype=np.float32)
-    observation_space = 49
+    observation_space = 53
     state_space = 0
 
     sim: SimulationCfg = SimulationCfg(dt=1 / 200, render_interval=decimation, physx=PhysxCfg(enable_external_forces_every_iteration=True, min_velocity_iteration_count=1))
@@ -67,7 +70,7 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     # each episode at zero yaw rate, so the robot weaves left-then-right (an S)
     # and returns to its initial heading over exactly one cycle.
     vel_cmd: VelCmdCfg = VelCmdCfg(
-        vx_range=(1.0, 2.0),        # forward speed [m/s] — sampled
+        vx_range=(0.5, 1.5),        # forward speed [m/s] — sampled
         vy_range=(0.0, 0.0),        # no lateral component: velocity is along heading
         vz_range=(0.0, 0.0),
         yaw_A_range=(0.0, 0.5),     # yaw-rate amplitude [rad/s] — sampled
@@ -103,7 +106,7 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     # the small flat-orientation term is smooth shaping toward upright — kept
     # mild because a large one creates reward cliffs near falls, whose
     # heavy-tailed advantages spike PPO's KL and crash the adaptive LR.
-    rew_alive = 0.5
+    rew_alive = 0.1
     rew_lin_vel = 2.0
     rew_yaw_rate = 0.5
     rew_flat_orientation = -0.5  # on sum(projected_gravity_b[:, :2]**2)

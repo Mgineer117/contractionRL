@@ -81,7 +81,11 @@ class CarEnv(BaseEnv):
         for i, _t in enumerate(self.t):
             uref_t = self.sample_reference_controls(freqs, weights, _t, {"xref_0": xref_0})
             xref_t, xref_wrapped_t, term, trunc, _ = self.get_transition(xref_list[-1].copy(), uref_t)
-            xref_list.append(xref_t)
+            # Carry forward the wrapped+clipped state (same fix as BaseEnv.step's
+            # self.x_t) — using raw xref_t here let non-angle/non-position dims
+            # drift unbounded across iterations before reset()'s final np.clip.
+            xref_wrapped_t = np.clip(xref_wrapped_t, self.X_MIN.flatten(), self.X_MAX.flatten())
+            xref_list.append(xref_wrapped_t)
             xref_wrapped_list.append(xref_wrapped_t)
             uref_list.append(uref_t)
             if term or trunc:

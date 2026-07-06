@@ -7,6 +7,16 @@ straight lines, giving richer coverage of the state space.
     yaw_rate(t) = A * sin(omega * t + phi)
 
 where A, omega, phi are sampled uniformly at reset.
+
+Markov note: ``get()`` also returns (A, omega, sin(phase), cos(phase)) — the
+scalar yaw_rate VALUE alone does not determine its own future (the same value
+is consistent with many (A, omega, phase) combinations, and even knowing all
+three, a single sin() value has two solutions per period with opposite
+derivative sign). Exposing the full generator (continuously embedded via
+sin/cos, matching this repo's angle-embedding convention, rather than a raw
+ever-growing `phase`) makes the observation Markov w.r.t. the command's own
+future — needed for GAE/Q-learning value estimates to be well-defined, even
+though the reward itself only ever needs the instantaneous value.
 """
 from __future__ import annotations
 
@@ -49,7 +59,7 @@ class VelCommands:
 
     In _get_observations (or _get_rewards):
         t = self.episode_length_buf.float() * self.step_dt   # seconds
-        cmds = self._cmd.get(t)   # (N, 4): [vx, vy, vz, yaw_rate]
+        cmds = self._cmd.get(t)   # (N, 8): [vx, vy, vz, yaw_rate, A, omega, sin(phase), cos(phase)]
     """
 
     def __init__(self, num_envs: int, device: str, cfg: VelCmdCfg):
@@ -92,7 +102,16 @@ class VelCommands:
         Args:
             episode_time: (N,) seconds elapsed since last reset per env.
         Returns:
-            (N, 4) tensor: [vx, vy, vz, yaw_rate]
+            (N, 8) tensor: [vx, vy, vz, yaw_rate, A, omega, sin(phase), cos(phase)]
+            The last 4 fully determine the yaw-rate generator's future (A,
+            omega fixed per episode; sin/cos of the current phase resolve the
+            "which side of the sine curve" ambiguity a raw yaw_rate value
+            can't) — see module docstring's Markov note.
         """
-        yaw_rate = self.yaw_A * torch.sin(self.yaw_omega * episode_time + self.yaw_phi)
-        return torch.stack([self.vx, self.vy, self.vz, yaw_rate], dim=-1)
+        phase = self.yaw_omega * episode_time + self.yaw_phi
+        yaw_rate = self.yaw_A * torch.sin(phase)
+        return torch.stack(
+            [self.vx, self.vy, self.vz, yaw_rate,
+             self.yaw_A, self.yaw_omega, torch.sin(phase), torch.cos(phase)],
+            dim=-1,
+        )

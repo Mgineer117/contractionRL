@@ -3,12 +3,8 @@ models:
   separate: true
   policy:
     class: GaussianMixin
-    backbone: mlp-squashed  # tanh-squashed Gaussian (SquashedGaussianActorModel) — required
-                        # for SAC on this bounded [-1, 1] action space (no uref here, so this
-                        # is a plain squashed MLP); skrl's stock unbounded GaussianMixin +
-                        # clip_actions is NOT equivalent (clip never reaches log_prob, so the
-                        # entropy-coefficient tuning has no fixed point and diverges — see
-                        # models.py's SquashedGaussianActorModel docstring)
+    backbone: control-squashed  # tanh-squashed CLActor — SAC needs a bounded action distribution (unbounded control/contraction has no entropy fixed point → diverges); see models.py SquashedCLActorModel
+    clip_actions: false
     clip_log_std: true
     min_log_std: -20.0
     max_log_std: 2.0
@@ -16,7 +12,7 @@ models:
       - name: net
         input: OBSERVATIONS
         layers: [256, 256]
-        activations: tanh
+        activations: relu
     output: ACTIONS
   critic_1:
     class: DeterministicMixin
@@ -24,7 +20,7 @@ models:
       - name: net
         input: concatenate([OBSERVATIONS, ACTIONS])
         layers: [256, 256]
-        activations: tanh
+        activations: relu
     output: ONE
   critic_2:
     class: DeterministicMixin
@@ -32,7 +28,7 @@ models:
       - name: net
         input: concatenate([OBSERVATIONS, ACTIONS])
         layers: [256, 256]
-        activations: tanh
+        activations: relu
     output: ONE
   target_critic_1:
     class: DeterministicMixin
@@ -40,7 +36,7 @@ models:
       - name: net
         input: concatenate([OBSERVATIONS, ACTIONS])
         layers: [256, 256]
-        activations: tanh
+        activations: relu
     output: ONE
   target_critic_2:
     class: DeterministicMixin
@@ -48,30 +44,25 @@ models:
       - name: net
         input: concatenate([OBSERVATIONS, ACTIONS])
         layers: [256, 256]
-        activations: tanh
+        activations: relu
     output: ONE
 memory:
   class: RandomMemory
-  memory_size: 10000
+  memory_size: 250000
 agent:
   class: SAC
-  gradient_steps: 6
-  batch_size: 512
-  discount_factor: 0.999
+  gradient_steps: 1
+  batch_size: 256
+  discount_factor: 0.99
   polyak: 0.005
-  learning_rate: 0.0001
+  learning_rate: 0.0003
   learn_entropy: true
   initial_entropy_value: 0.2
-  random_timesteps: 10000
-  learning_starts: 10000
+  random_timesteps: 1000
+  learning_starts: 1000
   grad_norm_clip: 1.0
-  std_dev_annealing: false
-  std_dev_annealing_kwargs:
-    schedule: linear
-    final_log_std: -2.0
-    power: 5.0
   experiment:
-    directory: quadruped_vel_tracking_sac
+    directory: quadrotor_sac
     experiment_name: ''
     write_interval: auto
     checkpoint_interval: auto
@@ -82,5 +73,5 @@ agent:
   use_state_norm: false
 trainer:
   class: SequentialTrainer
-  timesteps: 100000
+  timesteps: 600000
   environment_info: log

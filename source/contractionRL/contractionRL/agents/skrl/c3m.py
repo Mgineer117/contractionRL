@@ -518,89 +518,19 @@ class C3MSkrlTrainer(Trainer):
         agent.init(trainer_cfg=self.cfg)
         agent.enable_training_mode(True)
 
-        # Pretrain dynamics if needed
-        epochs = getattr(agent.cfg, "dynamics_pretrain_epochs", 5)
-        data_path = getattr(agent.cfg, "dynamics_pretrain_data_path", None)
-
-        if agent._neural_dynamics is not None and epochs > 0:
-            dev = agent._neural_dynamics.device
-            if data_path:
-                print(f"[C3M] Loading dynamics pretrain data from {data_path}")
-                npz = np.load(data_path)
-                
-                # Check for NaNs in current offline data
-                nan_mask = np.isnan(npz["x"]).any(axis=(1, 2)) | np.isnan(npz["u"]).any(axis=(1, 2)) | np.isnan(npz["x_dot"]).any(axis=(1, 2))
-                lengths_arr = npz["lengths"] if "lengths" in npz else None
-                if nan_mask.any():
-                    num_nans = nan_mask.sum()
-                    print(f"[C3M] WARNING: Found NaNs in {num_nans} offline episodes! Filtering them out...")
-                    valid_mask = ~nan_mask
-                    x_arr = npz["x"][valid_mask]
-                    u_arr = npz["u"][valid_mask]
-                    x_dot_arr = npz["x_dot"][valid_mask]
-                    if lengths_arr is not None:
-                        lengths_arr = lengths_arr[valid_mask]
-                else:
-                    x_arr = npz["x"]
-                    u_arr = npz["u"]
-                    x_dot_arr = npz["x_dot"]
-
-                # Unpack (N, T, S) trajectories into flat (n, S) samples. When a
-                # `lengths` array is present, steps >= lengths[n] are padding
-                # (the last valid state repeated) — mask them out so the
-                # dynamics fit isn't biased toward artificial x_dot ~ 0 samples.
-                if lengths_arr is not None:
-                    T_len = x_arr.shape[1]
-                    step_mask = np.arange(T_len)[None, :] < lengths_arr[:, None]  # (N, T)
-                    x_arr = x_arr[step_mask]          # (sum(lengths), x_dim)
-                    u_arr = u_arr[step_mask]
-                    x_dot_arr = x_dot_arr[step_mask]
-                    print(f"[C3M] Unpacked {step_mask.sum()} valid samples from {step_mask.shape[0]} trajectories (padding masked)")
-
-                x = torch.from_numpy(x_arr).reshape(-1, x_arr.shape[-1]).to(torch.float32).to(dev)
-                u = torch.from_numpy(u_arr).reshape(-1, u_arr.shape[-1]).to(torch.float32).to(dev)
-                x_dot = torch.from_numpy(x_dot_arr).reshape(-1, x_dot_arr.shape[-1]).to(torch.float32).to(dev)
-                n = x.shape[0]
-                
-                dbz = agent._cfg.dynamics_batch_size
-                batches_per_epoch = max(1, n // dbz)
-            else:
-                x = u = x_dot = n = None
-                batches_per_epoch = 1
-
-            dyn_pbar = _tqdm.tqdm(range(epochs), desc="Pretraining dynamics", file=sys.stdout)
-            for epoch in dyn_pbar:
-                if x is not None:
-                    # Offline pretraining: iterate over all batches in the epoch
-                    for _ in range(batches_per_epoch):
-                        dbz = min(agent._cfg.dynamics_batch_size, n)
-                        idx = torch.randint(0, n, (dbz,), device=dev)
-                        batch_data = {
-                            "x": x[idx],
-                            "u": u[idx],
-                            "x_dot": x_dot[idx]
-                        }
-                        loss_val = agent._train_dynamics(batch_data)
-                else:
-                    # Online pretraining using rolling data (1 rollout = 1 epoch)
-                    dyn_data = agent._get_rollout(agent._cfg.dynamics_batch_size, "dynamics")
-                    loss_val = agent._train_dynamics(dyn_data)
-                    
-                dyn_pbar.set_postfix(loss=f"{loss_val:.3g}")
-                
-                # Step the LR scheduler every epoch
-                if getattr(agent, "_dynamics_lr_scheduler", None) is not None:
-                    agent._dynamics_lr_scheduler.step()
-                
-                # Log to wandb
-                agent.track_data("Loss / Pretrain/dynamics_mse", loss_val)
-                if getattr(agent, "_dynamics_lr_scheduler", None) is not None:
-                    agent.track_data("C3M/lr/dynamics_lr", agent._dynamics_lr_scheduler.get_last_lr()[0])
-                else:
-                    agent.track_data("C3M/lr/dynamics_lr", agent._dynamics_optimizer.param_groups[0]["lr"])
-                    
-                if (epoch + 1) % log_interval == 0 and getattr(agent, "writer", None) is not None:
-                    agent.write_tracking_data(timestep=epoch - epochs, timesteps=timesteps)
+        # Pretrain the learned NeuralDynamics before RL (same mechanism as
+        # C2RL — see dynamics_pretrain.py; kept in one place so the two agents'
+        # pretraining behavior can't drift apart). No-op for analytical
+        # dynamics or dynamics_pretrain_epochs<=0.
+        from .dynamics_pretrain import pretrain_dynamics
+        pretrain_dynamics(
+            agent,
+            epochs=getattr(agent.cfg, "dynamics_pretrain_epochs", 5),
+            data_path=getattr(agent.cfg, "dynamics_pretrain_data_path", None),
+            timesteps=timesteps,
+            log_interval=log_interval,
+            tag="[C3M]",
+        )
 
         pbar = _tqdm.tqdm(range(timesteps), desc="C3M training", file=sys.stdout)
         for t in pbar:
@@ -611,7 +541,7 @@ class C3MSkrlTrainer(Trainer):
             # Evaluate metrics occasionally
             if eval_interval > 0 and (t + 1) % eval_interval == 0:
                 eval_metrics = self.eval()
-                _stability_keys = {"auc", "contraction_rate", "overshoot", "convergence_score"}
+                _stability_keys = {"auc", "contraction_rate", "overshoot", "contraction_score"}
                 for k, v in eval_metrics.items():
                     tab = "Stability" if k in _stability_keys else "Reward"
                     # No space around "/" — must match path_tracking_base.py's
@@ -729,14 +659,14 @@ class C3MSkrlTrainer(Trainer):
         lambda_emp = (-(torch.log(eTc) - torch.log(e0c)) / (T * dt)).clamp(min=0.0)
         # Overshoot: peak error relative to the initial error.
         overshoot = (e_max.clamp(min=1e-8) / e0c).clamp(min=1e-6)
-        # Convergence score: contraction rate per unit of overshoot — higher
+        # Contraction score: contraction rate per unit of overshoot — higher
         # is better (fast contraction, little to no overshoot).
-        convergence_score = lambda_emp / overshoot
+        contraction_score = lambda_emp / overshoot
 
         return {
             "reward_mean": total_reward.mean().item(),
             "auc": auc_sum.mean().item(),
             "contraction_rate": lambda_emp.mean().item(),
             "overshoot": overshoot.mean().item(),
-            "convergence_score": convergence_score.mean().item(),
+            "contraction_score": contraction_score.mean().item(),
         }

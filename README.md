@@ -155,28 +155,33 @@ PPO/SAC baselines.
 ```
 Episode reset:
   1. Sample a reference trajectory xref[0..T], uref[0..T] from the .npz buffer
-  2. Initialise the robot to xref[0]
+  2. Initialise the robot to xref[0] (+ small noise so e(0) != 0)
 
 Each step t:
   obs    = [x_current, x_ref[t], u_ref[t]]
-  reward = -‖x_current - x_ref[t]‖²
+  error  = wrap_diff(x_current - x_ref[t], angle_idx)   ← shortest-angle on yaw, raw elsewhere
+  reward = -‖error‖²
   u_applied = action              ← the env applies the policy's action DIRECTLY
 ```
 
 See [Action convention](#action-convention) — the env never adds `u_ref` back in; algorithms
 that need to track `u_ref` (CLActor for C3M/C2RL, LQR/SD-LQR) fold it into their own output.
 
+Quadruped/humanoid use **"Option A"**: the state is the world SE(2) pose `(xy, yaw)` — the raw
+angle, cyclic w.r.t. the dynamics, so it only appears in the state to be *tracked*, never in
+f(x)/B(x) — plus body-frame twist and joint state. `yaw` is embedded as `(cos, sin)` at every
+network's input (`agents/skrl/angle_utils.py`); the env/error/dynamics stay in raw radians.
+
 | | Quadruped | Humanoid | Manipulator |
 |---|---|---|---|
-| **state_dim** (exported physical state, drops body velocities) | `proj_gravity_b(3)+joint_pos_rel(12)+joint_vel(12)` = **27** | `proj_gravity_b(3)+joint_pos_rel(19)+joint_vel(19)` = **41** | `joint_pos(7)+joint_vel(7)+ee_pos_local(3)` = **17→21†** |
-| **Obs** = x + x_ref + u_ref | 27+27+12 = **66** | 41+41+19 = **101** | 21+21+7 = **49** |
+| **state_dim** (exported physical state) | `xy_rel(2)+yaw(1)+proj_gravity_b(3)+joint_pos_rel(12)+base_lin_vel_b(3)+base_ang_vel_b(3)+joint_vel(12)` = **36** | same layout, 19 joints = **50** | `joint_pos(7)+joint_vel(7)+ee_pos_local(3)+ee_lin_vel(3)+ee_yaw_vel(1)` = **21** |
+| **angle_idx** (raw angle → (cos,sin) embedded at every network's input) | `[2]` (yaw) | `[2]` (yaw) | `[]` (none) |
+| **Obs** = x + x_ref + u_ref | 36+36+12 = **84** | 50+50+19 = **119** | 21+21+7 = **49** |
 | **Action** | 12: `default_pos + 0.25·action` | 19: `default_pos + 0.25·action` | 7: soft-limit midpoint form |
-| **Termination** | fall: `base_height < 0.20 m` | fall: `base_height < 0.50 m` | time-out only |
+| **Termination** | non-terminating by default (`terminate_on_fall: False`) — episodes always run full length; the fall check (`base_height < 0.20/0.50 m`) still resets on divergence (NaN/exploded state) regardless | non-terminating by default, same divergence-reset | time-out only |
 | **Decimation / control freq** | 4 @ 1/200s → **50 Hz** | 4 @ 1/200s → **50 Hz** | 2 @ 1/120s → **60 Hz** |
 | **Episode length** | `episode_length_s=40.0` → **2000 steps** | `episode_length_s=40.0` → **2000 steps** | `episode_length_s=15.0` → **900 steps** |
 | **Reference file** | `logs/quadruped/dynamics_data.npz` | `logs/humanoid/dynamics_data.npz` | `logs/manipulator/dynamics_data.npz` |
-
-† manipulator's exported state is 21-dim per the current `traj_buffer`/env code (`joint_pos(7)+joint_vel(7)+ee_pos_local(3)+ee_lin_vel(3)+ee_yaw_vel(1)`), matching its vel-tracking physical-state layout.
 
 #### Supported algorithms
 
@@ -267,6 +272,14 @@ Instead, it's the **agent** that folds `u_ref` into its own output where relevan
   policy mean is *also* `uref + feedback`, not a from-scratch `u`. Set `backbone: mlp` explicitly
   to opt out and have the policy learn the full control (this is the only option for
   vel-tracking envs, which have no `u_ref` to fold in).
+
+**Bound note:** `uref` ranges over the same declared `action_space` as the feedback term (both
+`[UREF_MIN, UREF_MAX]` on classic envs), so `uref + feedback` can reach up to 2x that range.
+PPO/C3M backbones handle this via `clip_actions: True` (skrl's stock post-sample clamp — log_prob
+is computed on the pre-clamp sample, same as any unbounded-Gaussian clip_actions setup). Squashed
+SAC backbones (`control-squashed`/`mlp-squashed`) clamp `uref + rescale(tanh(u))` to the action
+space directly inside `_TanhSquashMixin.act()` *after* computing log_prob/entropy — tanh-squashing
+alone only bounds the feedback term, not the sum once a residual is added.
 
 ---
 
@@ -372,7 +385,7 @@ python scripts/skrl/train.py --classic --task classic-car-v0 --algorithm sac --n
 ./search/run_c3m_sweeps.sh          # or: ./search/run_c3m_sweeps.sh <num-agents-per-env>
 ```
 
-This sweep optimizes **`Stability / convergence_score`** (`= contraction_rate / overshoot`,
+This sweep optimizes **`Stability / contraction_score`** (`= contraction_rate / overshoot`,
 higher is better — see [W&B Logging](#wb-logging)), not raw reward, since maximizing reward
 alone doesn't guarantee the certified contraction property C3M is meant to produce.
 
@@ -498,7 +511,7 @@ visually-identical-but-distinct duplicate tab.
 | Tab | Contents |
 |---|---|
 | `Reward` | skrl's own `Reward / Total reward (max/min/mean)`, plus (vel-tracking envs) `discounted_return`, `avg_reward_per_step`, `total_reward_ci95` (95% CI of total reward — `undiscounted_return` itself is intentionally **not** logged again, since it's the same quantity as skrl's own total reward). Classic C3M's periodic eval also reports `Reward / reward_mean` here. |
-| `Stability` | *(path-tracking envs only)* per-episode contraction diagnostics + their 95% CIs: `auc` (Σ‖error‖ over the episode), `contraction_rate` (empirical λ, fit as `e(T)=e(0)·exp(-λT)`), `overshoot` (peak error / initial error — 1.0 = no overshoot), and **`convergence_score = contraction_rate / overshoot`** (higher is better: fast contraction with little to no overshoot). Classic C3M's periodic eval reports the same four keys here too. |
+| `Stability` | *(path-tracking envs only)* per-episode contraction diagnostics + their 95% CIs: `auc` (Σ‖error‖ over the episode), `contraction_rate` (empirical λ, fit as `e(T)=e(0)·exp(-λT)`), `overshoot` (peak error / initial error — 1.0 = no overshoot), and **`contraction_score = contraction_rate / overshoot`** (higher is better: fast contraction with little to no overshoot). Classic C3M's periodic eval reports the same four keys here too. |
 | `Episode` | skrl's own `Episode / Total timesteps (...)`, plus `contraction_flag` (fraction of steps where error strictly decreased) and `performance_score` (-mean error) for path-tracking envs, and `auc` (velocity-tracking error AUC) for vel-tracking envs. |
 | `Loss` | C3M's `Loss / C3M/loss/*`, `Loss / C3M/dynamics/mse`, `Loss / Pretrain/dynamics_mse`, PPO/SAC's own loss terms. |
 | `Eval` | Isaac path-tracking evaluator output (`reward_mean`, `auc`, ...) from `train.py`'s post-training evaluation. |
@@ -510,7 +523,7 @@ if you add new per-episode metrics to an env's `_reset_idx`.
 For classic C3M runs specifically, `Stability/*` (and `Reward/reward_mean`) come from
 `C3MSkrlTrainer.eval()`, called every `eval_interval` training steps (default 100 in each
 `skrl_c3m_cfg.yaml`) — this is also what `search/run_c3m_sweeps.sh`'s sweep optimizes
-(`Stability / convergence_score`, `goal: maximize`).
+(`Stability / contraction_score`, `goal: maximize`).
 
 ---
 
@@ -569,7 +582,7 @@ On classic envs with `use_analytical_dynamics: true`, the env's exact `get_f_and
 
 `cfg.lbd` is the *certified/target* contraction rate baked into the training loss; the
 `Stability/contraction_rate` W&B metric is the *empirically measured* rate on rollouts — they
-are related but not the same number, and `Stability/convergence_score` (`=contraction_rate/overshoot`)
+are related but not the same number, and `Stability/contraction_score` (`=contraction_rate/overshoot`)
 is what the hyperparameter sweep in `search/run_c3m_sweeps.sh` actually optimizes.
 
 **Normalization**: none. The policy/CMG networks are bare `nn.Module`s, never wrapped in a
@@ -719,7 +732,7 @@ tasks/direct/
 contractionRL/
 ├── search/
 │   └── run_c3m_sweeps.sh             # Launches classic C3M W&B bayes sweeps across GPUs
-│                                     #   (optimizes Stability / convergence_score)
+│                                     #   (optimizes Stability / contraction_score)
 ├── scripts/
 │   ├── list_envs.py                  # List all envs without Isaac Sim
 │   ├── generate_ref_traj.py          # Manually generate reference trajectories

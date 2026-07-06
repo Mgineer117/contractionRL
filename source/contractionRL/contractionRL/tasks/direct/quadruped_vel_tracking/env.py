@@ -10,7 +10,7 @@ from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.math import quat_apply
+from isaaclab.utils.math import euler_xyz_from_quat, quat_apply
 
 from ..common.eval_metrics import mean_confidence_interval
 from ..common.vel_commands import VelCommands
@@ -21,13 +21,18 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
     """Unitree Go2 velocity-tracking environment.
 
     Commands: constant body-frame (vx, vy) + sinusoidal yaw rate.
-    State for path-tracking export:
-        proj_gravity_b(3) + joint_pos_rel(12) + joint_vel(12)  → 27 dims
+    State for path-tracking export (matches quadruped_path_tracking's Option A
+    layout exactly, so trajectories recorded here are directly usable as
+    quadruped_path_tracking's reference data):
+        xy_rel(2) + yaw(1) + proj_gravity_b(3) + joint_pos_rel(12)
+        + base_lin_vel_b(3) + base_ang_vel_b(3) + joint_vel(12)  → 36 dims
     """
 
     cfg: QuadrupedVelTrackingEnvCfg
 
-    STATE_DIM = 27   # dims recorded as reference state for path tracking
+    STATE_DIM = 36   # dims recorded as reference state for path tracking
+    angle_idx = [2]  # yaw — matches quadruped_path_tracking's angle_idx; read by
+                     # _generate_ref_trajs (train.py) to unwrap before finite-differencing
 
     def __init__(self, cfg: QuadrupedVelTrackingEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
@@ -65,16 +70,23 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
     # ------------------------------------------------------------------ #
 
     def get_physical_state(self) -> torch.Tensor:
-        """Returns (N, 27) physical state without commands or actions.
+        """Returns (N, 36) physical state without commands or actions.
 
-        Layout: [proj_gravity_b(3), joint_pos_rel(12), joint_vel(12)]
-        Linear and angular body velocities are excluded so the state is
-        purely proprioceptive and matches the path-tracking observation.
+        Layout: [xy_rel(2), yaw(1), proj_gravity_b(3), joint_pos_rel(12),
+        base_lin_vel_b(3), base_ang_vel_b(3), joint_vel(12)] — identical to
+        quadruped_path_tracking's Option A state (see that env's docstring),
+        so recordings from here can be replayed as path-tracking references.
         """
+        xy_rel = self._robot.data.root_pos_w[:, :2] - self.scene.env_origins[:, :2]
+        _, _, yaw = euler_xyz_from_quat(self._robot.data.root_quat_w)
         return torch.cat(
             [
+                xy_rel,
+                yaw.unsqueeze(-1),
                 self._robot.data.projected_gravity_b,
                 self._robot.data.joint_pos[:, self._joint_ids] - self._robot.data.default_joint_pos[:, self._joint_ids],
+                self._robot.data.root_lin_vel_b,
+                self._robot.data.root_ang_vel_b,
                 self._robot.data.joint_vel[:, self._joint_ids],
             ],
             dim=-1,
@@ -82,7 +94,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
 
     def _get_observations(self) -> dict:
         t = self.episode_length_buf.float() * self.step_dt
-        cmds = self._cmd.get(t)  # (N, 4)
+        cmds = self._cmd.get(t)  # (N, 8): [vx, vy, vz, yaw_rate, A, omega, sin(phase), cos(phase)]
         # Full 33-dim state for the locomotion policy (needs velocities to track commands)
         full_state = torch.cat(
             [
@@ -137,7 +149,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         self._episode_discounted_returns += self._current_discounts * total_reward
         self._episode_undiscounted_returns += total_reward
         self._episode_lengths_custom += 1.0
-        self._current_discounts *= 0.99
+        self._current_discounts *= 0.999  # matches agent discount_factor (PPO/SAC = 0.999)
         
         return total_reward 
 
@@ -313,7 +325,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         if not hasattr(self, "scene") or not self._robot.is_initialized:
             return
         t = self.episode_length_buf.float() * self.step_dt
-        cmds = self._cmd.get(t)  # (N, 4): [vx_b, vy_b, vz, yaw]
+        cmds = self._cmd.get(t)  # (N, 8): [vx_b, vy_b, vz, yaw, ...]
 
         base_pos = self._robot.data.root_pos_w  # (N, 3)
         cmd_pos = self._robot.data.root_pos_w.clone()

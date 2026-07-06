@@ -29,10 +29,13 @@ class HumanoidVelTrackingEnvCfg(DirectRLEnvCfg):
     #   feet:  2 ankle = 2
     #   arms:  2 shoulder_pitch + 2 shoulder_roll + 2 shoulder_yaw + 2 elbow = 8
     # state (path-tracking export): proj_gravity(3) + joint_pos_rel(19) + joint_vel(19) = 41
-    # obs:     full_state(47) + commands(4) + prev_actions(19) = 70
+    # commands: vx,vy,vz,yaw_rate + A,omega,sin(phase),cos(phase) = 8 (see
+    #           VelCommands.get() — the last 4 make the yaw-rate generator's
+    #           own future Markov, not just its instantaneous value)
+    # obs:     full_state(47) + commands(8) + prev_actions(19) = 74
     #   (full_state still includes lin_vel_b+ang_vel_b for the locomotion policy to use)
     action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(19,), dtype=np.float32)
-    observation_space = 70
+    observation_space = 74
     state_space = 0
 
     sim: SimulationCfg = SimulationCfg(dt=1 / 200, render_interval=decimation, physx=PhysxCfg(enable_external_forces_every_iteration=True, min_velocity_iteration_count=1))

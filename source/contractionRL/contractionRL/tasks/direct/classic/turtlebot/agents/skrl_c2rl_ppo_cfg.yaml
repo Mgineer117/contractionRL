@@ -5,7 +5,8 @@ models:
   con_policy:  # contracting policy (gamma_contracting, near-zero) — trains the CMG's certificate
     class: GaussianMixin
     backbone: control  # mlp (plain MLP, u = uref + MLP(obs)) | control (CLActor, u = uref + feedback(x-xref))
-    clip_actions: False
+    clip_actions: True  # PPO is unbounded; uref+feedback can exceed the declared action space
+                        # (both range over it), so this clip is not redundant here
     clip_log_std: True
     min_log_std: -4.605
     max_log_std: 2.0
@@ -18,7 +19,8 @@ models:
   opt_policy:  # optimal policy (gamma_optimal) — the one actually deployed unless con_only
     class: GaussianMixin
     backbone: control
-    clip_actions: False
+    clip_actions: True  # PPO is unbounded; uref+feedback can exceed the declared action space
+                        # (both range over it), so this clip is not redundant here
     clip_log_std: True
     min_log_std: -4.605
     max_log_std: 2.0
@@ -46,6 +48,14 @@ models:
         layers: [128, 128]
         activations: tanh
         constrain_eigenvalues: True
+
+  dynamics:
+    class: NeuralDynamics
+    network:
+      - name: net
+        input: STATE_ACTION
+        layers: [128, 128]
+        activations: relu
 
 memory:
   class: RandomMemory
@@ -105,6 +115,17 @@ agent:
   reward_norm_beta: 0.99  # Moving average momentum for both terms' running-variance normalisation
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0  # R: control-effort weight (0 = disabled, matches previous default)
+  # Dynamics — learn NeuralDynamics (ẋ = f(x) + B(x)·u) unless
+  # --use_analytical_dynamics is passed (classic envs only). Same
+  # pretraining + online-refinement mechanism as C3M.
+  use_analytical_dynamics: false
+  dynamics_lr: 1.0e-3
+  dynamics_lr_scheduler: "StepLR"
+  dynamics_lr_scheduler_kwargs:
+    step_size: 1  # anneal every epoch
+    gamma: 0.99
+  dynamics_batch_size: 4096
+  dynamics_pretrain_epochs: 200  # offline-data epochs, or online rollouts when no data path
   experiment:
     directory: "turtlebot_c2rl_ppo"
     experiment_name: ""

@@ -230,11 +230,46 @@ def _gaussian_factory(observation_space, state_space, action_space, device,
             )
 
     from skrl.utils.model_instantiators.torch import gaussian_model
+    kwargs.pop("angle_idx", None)
     return gaussian_model(
         observation_space=observation_space,
         state_space=state_space,
         action_space=action_space,
         device=device,
+        **kwargs,
+    )
+
+
+def _deterministic_factory(observation_space, state_space, action_space, device, **kwargs):
+    """DeterministicMixin (value/critic) factory — the EmbeddedDeterministicModel
+    counterpart to ``_gaussian_factory`` above.
+
+    Value/critic networks see the SAME observation as the policy (including any
+    angle-bearing x/xref blocks), so they need the same continuous embedding —
+    skrl's stock ``deterministic_model`` instantiator has no notion of this
+    (it's vendored library code). This factory reads the same yaml ``network``/
+    ``angle_idx`` keys the policy factories do and builds
+    ``EmbeddedDeterministicModel`` instead. When ``angle_idx`` is empty (the
+    common case for envs with no wrapping angle in their state), this reduces
+    to a plain MLP over the observation (+ actions, for a Q-model) — the same
+    architecture stock ``deterministic_model`` would have built.
+    """
+    from contractionRL.agents.skrl.models import EmbeddedDeterministicModel
+
+    network = kwargs.pop("network", [{}])
+    kwargs.pop("output", None)
+    net_spec = network[0] if network else {}
+    use_actions = "ACTIONS" in str(net_spec.get("input", "OBSERVATIONS"))
+    hidden_dim = net_spec.get("layers", [256, 256])
+    activation = net_spec.get("activations", "tanh")
+
+    return EmbeddedDeterministicModel(
+        observation_space=observation_space,
+        action_space=action_space,
+        device=device,
+        hidden_dim=hidden_dim,
+        activation=activation,
+        use_actions=use_actions,
         **kwargs,
     )
 
@@ -256,4 +291,6 @@ class CLActorRunner(Runner):
                 return _gaussian_factory(*args, agent_class=agent_class, **kw)
 
             return _factory
+        if name.lower() == "deterministicmixin":
+            return _deterministic_factory
         return super()._component(name)

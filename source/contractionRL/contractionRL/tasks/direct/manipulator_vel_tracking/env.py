@@ -95,7 +95,7 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
 
     def _get_observations(self) -> dict:
         t = self.episode_length_buf.float() * self.step_dt
-        cmds = self._cmd.get(t)                   # (N, 4): [vx, vy, vz, yaw_rate]
+        cmds = self._cmd.get(t)                   # (N, 8): [vx, vy, vz, yaw_rate, A, omega, sin(phase), cos(phase)]
         state = self.get_physical_state()          # (N, 21)
         obs = torch.cat([state, cmds, self._prev_actions], dim=-1)
         return {"policy": obs}
@@ -215,7 +215,7 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
         if not hasattr(self, "scene") or not self._robot.is_initialized:
             return
         t = self.episode_length_buf.float() * self.step_dt
-        cmds = self._cmd.get(t)  # (N, 4): [vx, vy, vz, yaw] in world frame
+        cmds = self._cmd.get(t)  # (N, 8): [vx, vy, vz, yaw, ...] in world frame
 
         ee_pos = self._robot.data.body_pos_w[:, self._ee_id[0], :]  # (N, 3) world
         cmd_pos = ee_pos.clone(); cmd_pos[:, 2] += 0.15

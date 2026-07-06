@@ -21,6 +21,7 @@ try:
 except ImportError:
     raise ImportError("skrl is required. Install it or use the local developer copy.")
 
+from .angle_utils import embed_angles, embedded_dim
 from .nn_modules import CCM_Generator, BoundedCCM_Generator, CLActor, MLP, NeuralDynamics
 
 _MIN_LOG_STD = math.log(0.01)  # ≈ -4.605; matches CLActor annealing floor
@@ -38,6 +39,7 @@ class CLDeterministicActorModel(DeterministicMixin, Model):
         hidden_dim: list | None = None,
         activation: str = "tanh",
         x_dim: int | None = None,
+        angle_idx: list | None = None,
         **kwargs,
     ):
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
@@ -55,6 +57,7 @@ class CLDeterministicActorModel(DeterministicMixin, Model):
             anneal_stddev=False,
             hidden_dim=hidden_dim or [128, 128],
             activation=activation,
+            angle_idx=angle_idx or [],
         )
 
         self.to(self.device)
@@ -80,6 +83,7 @@ class CMGModel(Model):
         hidden_dim: list | None = None,
         activation: str = "tanh",
         x_dim: int | None = None,
+        angle_idx: list | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -93,9 +97,10 @@ class CMGModel(Model):
         if x_dim is None:
             x_dim = (self.obs_dim - self.u_dim) // 2
         self.x_dim = x_dim
+        angle_idx = angle_idx or []
 
         constrain_eigenvalues = kwargs.get("constrain_eigenvalues", False)
-        
+
         if constrain_eigenvalues:
             w_lb = kwargs.get("w_lb", 0.1)
             w_ub = kwargs.get("w_ub", 10.0)
@@ -107,6 +112,7 @@ class CMGModel(Model):
                 w_lb=w_lb,
                 w_ub=w_ub,
                 device=str(device) if not isinstance(device, str) else device,
+                angle_idx=angle_idx,
             )
         else:
             self.ccm_gen = CCM_Generator(
@@ -115,6 +121,7 @@ class CMGModel(Model):
                 activation=activation,
                 mode=mode,
                 device=str(device) if not isinstance(device, str) else device,
+                angle_idx=angle_idx,
             )
 
     def compute(self, inputs: dict, role: str = "cmg"):
@@ -158,6 +165,7 @@ class CLActorModel(GaussianMixin, Model):
         initial_log_std: float = 0.0,
         hidden_dim: list | None = None,
         activation: str = "tanh",
+        angle_idx: list | None = None,
         **kwargs,
     ):
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
@@ -180,6 +188,7 @@ class CLActorModel(GaussianMixin, Model):
             anneal_stddev=True,
             hidden_dim=hidden_dim or [128, 128],
             activation=activation,
+            angle_idx=angle_idx or [],
         )
         self.log_std_parameter = self.cl_actor.logstd
 
@@ -225,6 +234,7 @@ class MLPResidualActorModel(GaussianMixin, Model):
         initial_log_std: float = 0.0,
         hidden_dim: list | None = None,
         activation: str = "tanh",
+        angle_idx: list | None = None,
         **kwargs,
     ):
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
@@ -245,10 +255,14 @@ class MLPResidualActorModel(GaussianMixin, Model):
                 f"layout [x, xref, uref]), got obs_dim={obs_dim}, act_dim={u_dim}."
             )
         self._u_dim = u_dim
+        self._x_dim = remainder // 2
+        self._angle_idx = angle_idx or []
 
         act_module = {"tanh": nn.Tanh(), "relu": nn.ReLU()}[activation.lower()] \
             if isinstance(activation, str) else activation
-        self.net = MLP(obs_dim, list(hidden_dim or [128, 128]), u_dim, activation=act_module)
+        # net sees the x/xref blocks CONTINUOUSLY embedded + the raw uref tail.
+        net_in_dim = 2 * embedded_dim(self._x_dim, self._angle_idx) + u_dim
+        self.net = MLP(net_in_dim, list(hidden_dim or [128, 128]), u_dim, activation=act_module)
 
         self.log_std_parameter = nn.Parameter(torch.full((u_dim,), float(initial_log_std)))
 
@@ -256,8 +270,13 @@ class MLPResidualActorModel(GaussianMixin, Model):
 
     def compute(self, inputs: dict, role: str = "policy"):
         obs = inputs["observations"]
+        x = obs[:, : self._x_dim]
+        xref = obs[:, self._x_dim : 2 * self._x_dim]
         uref = obs[:, -self._u_dim:]  # last u_dim entries of [x, xref, uref]
-        mean = uref + self.net(obs)
+        net_in = torch.cat(
+            [embed_angles(x, self._angle_idx), embed_angles(xref, self._angle_idx), uref], dim=-1
+        )
+        mean = uref + self.net(net_in)
         return mean, {"log_std": self.log_std_parameter}
 
 
@@ -305,18 +324,35 @@ class _TanhSquashMixin:
     Residual (uref) handling — the ``residual`` key in ``compute``'s output
     dict, if present, is added to the action AFTER squashing:
 
-        action = residual + rescale(tanh(u)),   u ~ Normal(mean, std)
+        action = residual + rescale_residual(tanh(u), residual),   u ~ Normal(mean, std)
 
     so the residual control law ``u = uref + bounded_feedback`` is preserved
     exactly. Adding uref to ``mean`` (i.e. BEFORE tanh) instead would give
     ``rescale(tanh(uref + feedback))`` — a *saturated* uref, not ``uref +
     feedback`` (at zero feedback it returns ``rescale(tanh(uref))``, not
     ``uref``), silently destroying the reference-tracking structure that
-    ``control`` / ``mlp`` are built on. Because the residual is constant with
-    respect to the sampled noise ``u``, the change-of-variables Jacobian for
-    ``action = residual + f(u)`` is the same as for ``f(u)`` alone (unit shift),
-    so log_prob is UNCHANGED by it — SAC's entropy fixed-point argument is
-    unaffected (the tanh still bounds log_prob regardless of uref).
+    ``control`` / ``mlp`` are built on.
+
+    ``rescale_residual`` (see below) is an ASYMMETRIC rescale: it maps
+    ``tanh(u) >= 0`` into ``[0, high - residual]`` and ``tanh(u) < 0`` into
+    ``[-(residual - low), 0]``, using a different per-sample scale for each
+    side (``residual`` varies per state, so these two half-widths do too).
+    This guarantees, for EVERY value of ``residual`` in ``[low, high]``:
+      - ``tanh(u) == 0  =>  action == residual`` exactly (feedback=0 preserves
+        the reference law), and
+      - ``action = residual + feedback`` lands in ``(low, high)`` for every
+        ``u``, with NO post-hoc clamping ever required — unlike a single
+        constant rescale-then-add-then-clamp, which can push the sum outside
+        ``[low, high]`` whenever ``residual`` is off-center, silently
+        decoupling the clamped action from the log_prob computed for the
+        unclamped one (SAC's entropy term would then score the wrong sample).
+      Because the two half-scales are still just POSITIVE CONSTANTS from
+      ``u``'s point of view (each is a function of ``residual``/state only,
+      not of the sampled noise), the change-of-variables Jacobian is exactly
+      as simple as the fixed-scale case — merely swap in the applicable
+      half-scale for the log-det correction (see ``act()`` below). So this is
+      an EXACT closed-form log_prob for the actually-applied, always-in-bounds
+      action, not an approximation.
 
     act() is overridden entirely (not just compute()): the squash-then-
     correct-log_prob step happens between sampling and log_prob, which is not
@@ -329,6 +365,8 @@ class _TanhSquashMixin:
     log_prob (SAC), never an analytic-entropy bonus (e.g. PPO's
     entropy_loss_scale > 0).
     """
+
+    _RESCALE_EPS = 1e-6  # keeps half-scales/atanh args away from 0 / +-1 (log(0)/atanh divergence)
 
     def _init_tanh_squash_bounds(self) -> None:
         if self._g_min_actions is None or self._g_max_actions is None:
@@ -349,6 +387,28 @@ class _TanhSquashMixin:
         frac = (action - self._action_low) / (self._action_high - self._action_low)
         return torch.clamp(2.0 * frac - 1.0, -1.0 + 1e-6, 1.0 - 1e-6)
 
+    def _rescale_residual(self, tanh_u: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(-1, 1) -> (low, high) via an asymmetric, residual-centered rescale.
+
+        Returns ``(action, scale)`` where ``scale`` is the per-sample,
+        per-side half-width used (needed for the log-det correction in
+        ``act()``). See the class docstring for why this is exact and
+        clamp-free, unlike a fixed-scale rescale-then-add.
+        """
+        s_hi = torch.clamp(self._action_high - residual, min=self._RESCALE_EPS)
+        s_lo = torch.clamp(residual - self._action_low, min=self._RESCALE_EPS)
+        scale = torch.where(tanh_u >= 0, s_hi, s_lo)
+        return residual + tanh_u * scale, scale
+
+    def _unrescale_residual(self, action: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Inverse of ``_rescale_residual``: action -> (tanh_u in (-1, 1), scale)."""
+        feedback = action - residual
+        s_hi = torch.clamp(self._action_high - residual, min=self._RESCALE_EPS)
+        s_lo = torch.clamp(residual - self._action_low, min=self._RESCALE_EPS)
+        scale = torch.where(feedback >= 0, s_hi, s_lo)
+        tanh_u = torch.clamp(feedback / scale, -1.0 + self._RESCALE_EPS, 1.0 - self._RESCALE_EPS)
+        return tanh_u, scale
+
     def act(self, inputs: dict, *, role: str = "") -> tuple[torch.Tensor, dict]:
         mean, outputs = self.compute(inputs, role)
         log_std = outputs["log_std"]
@@ -360,8 +420,9 @@ class _TanhSquashMixin:
 
         # Optional post-squash residual (e.g. uref for the [x, xref, uref]
         # path-tracking layout). Added to the action AFTER squashing — see the
-        # class docstring for why (residual law preservation + log_prob
-        # invariance). Popped so it doesn't leak into the returned outputs dict.
+        # class docstring for why (residual law preservation + exact,
+        # clamp-free log_prob). Popped so it doesn't leak into the returned
+        # outputs dict.
         residual = outputs.pop("residual", None)
 
         taken_actions = inputs.get("taken_actions")
@@ -370,21 +431,31 @@ class _TanhSquashMixin:
             # post-residual) action — e.g. an on-policy update replaying stored
             # actions. SAC itself never hits this path (it always samples fresh).
             actions = taken_actions
-            feedback = actions if residual is None else actions - residual
-            u = torch.atanh(self._unrescale(feedback))
+            if residual is None:
+                tanh_u = self._unrescale(actions)
+                scale = 0.5 * (self._action_high - self._action_low)
+            else:
+                tanh_u, scale = self._unrescale_residual(actions, residual)
+            u = torch.atanh(tanh_u)
         else:
             u = self._g_distribution.rsample()
-            feedback = self._rescale(torch.tanh(u))
-            actions = feedback if residual is None else residual + feedback
+            tanh_u = torch.tanh(u)
+            if residual is None:
+                actions = self._rescale(tanh_u)
+                scale = 0.5 * (self._action_high - self._action_low)
+            else:
+                actions, scale = self._rescale_residual(tanh_u, residual)
 
         log_prob = self._g_distribution.log_prob(u)
         # Change-of-variables correction for y = tanh(u), stable form of
         # log(1 - tanh(u)^2) (Haarnoja et al. 2018, eq. 21).
         log_prob = log_prob - 2.0 * (math.log(2.0) - u - F.softplus(-2.0 * u))
-        # Second correction for the affine rescale (-1, 1) -> [low, high]:
-        # d(action)/d(tanh_u) = (high - low)/2 per dimension. (The residual
-        # shift is unit-Jacobian, so it needs no correction here.)
-        log_prob = log_prob - torch.log(0.5 * (self._action_high - self._action_low))
+        # Second correction for the rescale tanh_u -> action: d(action)/d(tanh_u)
+        # is `scale` per dimension — a CONSTANT half-width (0.5*(high-low)) with
+        # no residual, or the residual-dependent half-width from
+        # _rescale_residual/_unrescale_residual above. Either way this is exact
+        # for the action actually returned below (no clamping follows).
+        log_prob = log_prob - torch.log(scale)
 
         if self._g_reduction is not None:
             log_prob = self._g_reduction(log_prob, dim=-1)
@@ -392,8 +463,10 @@ class _TanhSquashMixin:
             log_prob = log_prob.unsqueeze(-1)
 
         outputs["log_prob"] = log_prob
-        mean_action = self._rescale(torch.tanh(mean))
-        outputs["mean_actions"] = mean_action if residual is None else residual + mean_action
+        tanh_mean = torch.tanh(mean)
+        mean_action = self._rescale(tanh_mean) if residual is None else self._rescale_residual(tanh_mean, residual)[0]
+
+        outputs["mean_actions"] = mean_action
         return actions, outputs
 
     def get_entropy(self, *, role: str = ""):
@@ -441,6 +514,7 @@ class SquashedGaussianActorModel(_TanhSquashMixin, GaussianMixin, Model):
         max_log_std: float = 2.0,
         hidden_dim: list | None = None,
         activation: str = "relu",
+        angle_idx: list | None = None,
         **kwargs,
     ):
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
@@ -458,11 +532,20 @@ class SquashedGaussianActorModel(_TanhSquashMixin, GaussianMixin, Model):
         remainder = obs_dim - act_dim
         # Same layout check as MLPResidualActorModel: [x, xref, uref] means
         # obs_dim = 2*x_dim + u_dim, i.e. remainder is even and positive.
-        self._u_dim = act_dim if (remainder > 0 and remainder % 2 == 0) else None
+        is_path_tracking = remainder > 0 and remainder % 2 == 0
+        self._u_dim = act_dim if is_path_tracking else None
+        self._x_dim = remainder // 2 if is_path_tracking else None
+        # angle_idx only makes sense (and is only ever passed) when the layout
+        # has a known x/xref split; vel-tracking's flat obs has none.
+        self._angle_idx = (angle_idx or []) if is_path_tracking else []
 
         act_module = {"tanh": nn.Tanh(), "relu": nn.ReLU()}[activation.lower()] \
             if isinstance(activation, str) else activation
-        self.net = MLP(obs_dim, list(hidden_dim or [256, 256]), output_dim=None, activation=act_module)
+        net_in_dim = (
+            2 * embedded_dim(self._x_dim, self._angle_idx) + self._u_dim
+            if is_path_tracking else obs_dim
+        )
+        self.net = MLP(net_in_dim, list(hidden_dim or [256, 256]), output_dim=None, activation=act_module)
         trunk_dim = self.net.output_dim
         self.mean_head = nn.Linear(trunk_dim, act_dim)
         self.log_std_head = nn.Linear(trunk_dim, act_dim)
@@ -475,7 +558,16 @@ class SquashedGaussianActorModel(_TanhSquashMixin, GaussianMixin, Model):
 
     def compute(self, inputs: dict, role: str = "policy"):
         obs = inputs["observations"]
-        features = self.net(obs)
+        if self._u_dim is not None:
+            x = obs[:, : self._x_dim]
+            xref = obs[:, self._x_dim : 2 * self._x_dim]
+            uref = obs[:, -self._u_dim:]
+            net_in = torch.cat(
+                [embed_angles(x, self._angle_idx), embed_angles(xref, self._angle_idx), uref], dim=-1
+            )
+        else:
+            net_in = obs
+        features = self.net(net_in)
         mean = self.mean_head(features)  # pre-squash FEEDBACK mean (no uref)
         outputs = {"log_std": self.log_std_head(features)}
         if self._u_dim is not None:
@@ -532,6 +624,7 @@ class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
         hidden_dim: list | None = None,
         activation: str = "tanh",
         x_dim: int | None = None,
+        angle_idx: list | None = None,
         **kwargs,
     ):
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
@@ -554,6 +647,7 @@ class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
             u_dim=u_dim,
             mode="stochastic",
             anneal_stddev=False,  # see class docstring — SAC learns log_std via gradients
+            angle_idx=angle_idx or [],
             hidden_dim=hidden_dim or [128, 128],
             activation=activation,
         )
@@ -575,3 +669,81 @@ class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
         # exactly in the subtraction, leaving W2 @ tanh(W1 @ (x - xref)).)
         feedback = self.cl_actor.mean_control(state) - uref
         return feedback, {"log_std": self.log_std_parameter, "residual": uref}
+
+
+class EmbeddedDeterministicModel(DeterministicMixin, Model):
+    """Value/critic MLP with angle-embedded input — the DeterministicMixin
+    counterpart to MLPResidualActorModel/SquashedGaussianActorModel.
+
+    skrl's own model-instantiator DSL (``deterministic_model``, driven by the
+    yaml ``network: input: OBSERVATIONS`` / ``concatenate([OBSERVATIONS,
+    ACTIONS])`` keys) is vendored library code — it has no notion of an
+    angle-bearing state, so a value/critic built through it would see the RAW
+    (discontinuous-at-+-pi) angle. This class is this repo's drop-in
+    replacement, wired in by CLActorRunner._component for "deterministicmixin"
+    (see runner.py) whenever the env carries a non-empty angle_idx.
+
+    Only the path-tracking observation layout ([x, xref, uref], obs_dim =
+    2*x_dim + u_dim) has a known x/xref split to embed; for any other layout
+    (e.g. velocity-tracking's flat obs) this reduces to a plain MLP over the
+    raw observation (+ actions, for a critic) — identical to what skrl's stock
+    deterministic_model would have built.
+    """
+
+    def __init__(
+        self,
+        observation_space,
+        action_space,
+        device,
+        network: list | None = None,
+        hidden_dim: list | None = None,
+        activation: str = "tanh",
+        angle_idx: list | None = None,
+        use_actions: bool = False,
+        **kwargs,
+    ):
+        Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
+        DeterministicMixin.__init__(self, clip_actions=False)
+
+        net_spec = (network or [{}])[0] if network else {}
+        hidden_dim = hidden_dim or net_spec.get("layers", [256, 256])
+        activation = net_spec.get("activations", activation)
+
+        obs_dim = int(self.observation_space.shape[0])
+        act_dim = int(self.action_space.shape[0])
+        remainder = obs_dim - act_dim
+        is_path_tracking = remainder > 0 and remainder % 2 == 0
+        self._x_dim = remainder // 2 if is_path_tracking else None
+        self._u_dim = act_dim if is_path_tracking else None
+        self._angle_idx = (angle_idx or []) if is_path_tracking else []
+        self._use_actions = use_actions
+
+        act_module = {"tanh": nn.Tanh(), "relu": nn.ReLU()}[activation.lower()] \
+            if isinstance(activation, str) else activation
+
+        obs_in_dim = (
+            2 * embedded_dim(self._x_dim, self._angle_idx) + self._u_dim
+            if is_path_tracking else obs_dim
+        )
+        net_in_dim = obs_in_dim + (act_dim if use_actions else 0)
+        self.net = MLP(net_in_dim, list(hidden_dim), 1, activation=act_module)
+
+        self.to(self.device)
+
+    def _embed_obs(self, obs: torch.Tensor) -> torch.Tensor:
+        if self._u_dim is None:
+            return obs
+        x = obs[:, : self._x_dim]
+        xref = obs[:, self._x_dim : 2 * self._x_dim]
+        uref = obs[:, -self._u_dim:]
+        return torch.cat(
+            [embed_angles(x, self._angle_idx), embed_angles(xref, self._angle_idx), uref], dim=-1
+        )
+
+    def compute(self, inputs: dict, role: str = "value"):
+        obs_emb = self._embed_obs(inputs["observations"])
+        if self._use_actions:
+            net_in = torch.cat([obs_emb, inputs["taken_actions"]], dim=-1)
+        else:
+            net_in = obs_emb
+        return self.net(net_in), {}

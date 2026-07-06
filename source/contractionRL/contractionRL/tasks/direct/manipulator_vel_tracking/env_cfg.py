@@ -24,9 +24,12 @@ class ManipulatorVelTrackingEnvCfg(DirectRLEnvCfg):
     # Franka Panda: 7 arm joints (finger joints excluded from control)
     # state:  joint_pos(7) + joint_vel(7) + ee_pos_local(3)
     #         + ee_lin_vel(3) + ee_yaw_vel(1)  = 21
-    # obs:    state(21) + commands(4) + prev_actions(7) = 32
+    # commands: vx,vy,vz,yaw_rate + A,omega,sin(phase),cos(phase) = 8 (see
+    #           VelCommands.get() — the last 4 make the yaw-rate generator's
+    #           own future Markov, not just its instantaneous value)
+    # obs:    state(21) + commands(8) + prev_actions(7) = 36
     action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(7,), dtype=np.float32)
-    observation_space = 32
+    observation_space = 36
     state_space = 0
 
     sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation, physx=PhysxCfg(enable_external_forces_every_iteration=True, min_velocity_iteration_count=1))

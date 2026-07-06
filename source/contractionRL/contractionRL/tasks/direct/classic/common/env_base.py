@@ -118,7 +118,13 @@ class BaseEnv(gym.Env):
         next_x, next_x_wrapped, termination, truncation, _ = self.get_transition(self.x_t, u)
         next_x_wrapped = np.clip(next_x_wrapped, self.X_MIN.flatten(), self.X_MAX.flatten())
         state = self.construct_state(next_x_wrapped)
-        self.x_t = next_x
+        # Carry forward the WRAPPED+CLIPPED state, not the raw `next_x` — the
+        # observation the agent sees is built from next_x_wrapped, so self.x_t
+        # (which drives the NEXT get_dynamics()/get_rewards() call) must match
+        # it exactly. Using raw next_x here let non-angle, non-position state
+        # dims (e.g. velocity) drift silently outside [X_MIN, X_MAX] — bounded
+        # in what the agent observes, unbounded in what actually evolves.
+        self.x_t = next_x_wrapped
         return (
             state,
             reward,

@@ -10,7 +10,7 @@ from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.math import quat_apply
+from isaaclab.utils.math import euler_xyz_from_quat, quat_apply
 
 from ..common.eval_metrics import mean_confidence_interval
 from ..common.vel_commands import VelCommands
@@ -20,13 +20,17 @@ from .env_cfg import HumanoidVelTrackingEnvCfg
 class HumanoidVelTrackingEnv(DirectRLEnv):
     """Unitree H1 humanoid velocity-tracking environment.
 
-    State for path-tracking export (41 dims):
-        proj_gravity_b(3) + joint_pos_rel(19) + joint_vel(19)
+    State for path-tracking export (50 dims — matches humanoid_path_tracking's
+    Option A layout exactly, see that env's docstring):
+        xy_rel(2) + yaw(1) + proj_gravity_b(3) + joint_pos_rel(19)
+        + base_lin_vel_b(3) + base_ang_vel_b(3) + joint_vel(19)
     """
 
     cfg: HumanoidVelTrackingEnvCfg
 
-    STATE_DIM = 41
+    STATE_DIM = 50
+    angle_idx = [2]  # yaw — matches humanoid_path_tracking's angle_idx; read by
+                     # _generate_ref_trajs (train.py) to unwrap before finite-differencing
 
     def __init__(self, cfg: HumanoidVelTrackingEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
@@ -64,14 +68,21 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
         self._robot.set_joint_position_target(self._joint_targets, joint_ids=self._joint_ids)
 
     def get_physical_state(self) -> torch.Tensor:
-        """Returns (N, 41) physical state without commands/actions.
+        """Returns (N, 50) physical state without commands/actions.
 
-        Layout: [proj_gravity_b(3), joint_pos_rel(19), joint_vel(19)]
+        Layout: [xy_rel(2), yaw(1), proj_gravity_b(3), joint_pos_rel(19),
+        base_lin_vel_b(3), base_ang_vel_b(3), joint_vel(19)]
         """
+        xy_rel = self._robot.data.root_pos_w[:, :2] - self.scene.env_origins[:, :2]
+        _, _, yaw = euler_xyz_from_quat(self._robot.data.root_quat_w)
         return torch.cat(
             [
+                xy_rel,
+                yaw.unsqueeze(-1),
                 self._robot.data.projected_gravity_b,
                 self._robot.data.joint_pos[:, self._joint_ids] - self._robot.data.default_joint_pos[:, self._joint_ids],
+                self._robot.data.root_lin_vel_b,
+                self._robot.data.root_ang_vel_b,
                 self._robot.data.joint_vel[:, self._joint_ids],
             ],
             dim=-1,
@@ -79,7 +90,7 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
 
     def _get_observations(self) -> dict:
         t = self.episode_length_buf.float() * self.step_dt
-        cmds = self._cmd.get(t)  # (N, 4)
+        cmds = self._cmd.get(t)  # (N, 8): [vx, vy, vz, yaw_rate, A, omega, sin(phase), cos(phase)]
         # Full 47-dim state for the locomotion policy (needs velocities to track commands)
         full_state = torch.cat(
             [
@@ -290,7 +301,7 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
         if not hasattr(self, "scene") or not self._robot.is_initialized:
             return
         t = self.episode_length_buf.float() * self.step_dt
-        cmds = self._cmd.get(t)  # (N, 4): [vx_b, vy_b, vz, yaw]
+        cmds = self._cmd.get(t)  # (N, 8): [vx_b, vy_b, vz, yaw, ...]
 
         cmd_pos = self._robot.data.root_pos_w.clone(); cmd_pos[:, 2] += 1.5
         cur_pos = self._robot.data.root_pos_w.clone(); cur_pos[:, 2] += 1.1

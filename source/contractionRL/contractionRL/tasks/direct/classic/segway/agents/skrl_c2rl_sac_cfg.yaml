@@ -47,6 +47,14 @@ models:
         activations: tanh
         constrain_eigenvalues: True
 
+  dynamics:
+    class: NeuralDynamics
+    network:
+      - name: net
+        input: STATE_ACTION
+        layers: [128, 128]
+        activations: relu
+
 memory:
   class: RandomMemory
   memory_size: 250000  # con/opt SAC replay buffer size (rows); total capacity = memory_size * num_envs.
@@ -97,6 +105,17 @@ agent:
   reward_norm_beta: 0.99  # Moving average momentum for both terms' running-variance normalisation
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0  # R: control-effort weight (0 = disabled, matches previous default)
+  # Dynamics — learn NeuralDynamics (ẋ = f(x) + B(x)·u) unless
+  # --use_analytical_dynamics is passed (classic envs only). Same
+  # pretraining + online-refinement mechanism as C3M.
+  use_analytical_dynamics: false
+  dynamics_lr: 1.0e-3
+  dynamics_lr_scheduler: "StepLR"
+  dynamics_lr_scheduler_kwargs:
+    step_size: 1  # anneal every epoch
+    gamma: 0.99
+  dynamics_batch_size: 4096
+  dynamics_pretrain_epochs: 200  # offline-data epochs, or online rollouts when no data path
   experiment:
     directory: "segway_c2rl_sac"
     experiment_name: ""

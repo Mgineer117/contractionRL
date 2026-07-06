@@ -253,6 +253,34 @@ class ContractionRunner:
         skrl_cfg, anneal = _prepare_skrl_cfg(cfg, algo)
         skrl_cfg["trainer"]["close_environment_at_exit"] = False
 
+        # Unwrap to the deepest raw env to check for angle_idx
+        raw_env = env
+        seen = set()
+        while True:
+            rid = id(raw_env)
+            if rid in seen:
+                break
+            seen.add(rid)
+            inner = getattr(raw_env, "unwrapped", None) or getattr(raw_env, "env", None)
+            if inner is None or inner is raw_env:
+                break
+            raw_env = inner
+
+        angle_idx = list(getattr(raw_env, "angle_idx", []) or [])
+        if not angle_idx and hasattr(raw_env, "envs") and len(raw_env.envs) > 0:
+            first_env = raw_env.envs[0]
+            if hasattr(first_env, "unwrapped"):
+                first_env = first_env.unwrapped
+            angle_idx = list(getattr(first_env, "angle_idx", []) or [])
+
+        if skrl_cfg.get("agent", {}).get("observation_preprocessor") == "RunningStandardScaler" and angle_idx:
+            raise ValueError(
+                "use_state_norm=True (RunningStandardScaler) is fundamentally incompatible "
+                "with environments that expose angle_idx. Normalizing raw angles linearly "
+                "destroys the periodicity required by embed_angles(cos, sin). "
+                "Disable use_state_norm or use a custom scaler."
+            )
+
         skrl_env = _make_skrl_env(env, task_id, num_envs, is_classic)
 
         if ml_framework.startswith("torch"):
@@ -331,20 +359,32 @@ class ContractionRunner:
             
         x_dim = getattr(raw_env, "x_dim", None)
         u_dim = getattr(raw_env, "u_dim", None)
+        # angle_idx: indices within an x-block that hold a raw (wrapping) angle.
+        # Every network built below embeds these as (cos, sin) at its input —
+        # see angle_utils.py / models.py — while the env/loss/error math keeps
+        # using the RAW state. Defaults to [] (no angle dims) for envs that
+        # don't declare it.
+        angle_idx = list(getattr(raw_env, "angle_idx", []) or [])
         if x_dim is None and hasattr(raw_env, "envs") and len(raw_env.envs) > 0:
             first_env = raw_env.envs[0]
             if hasattr(first_env, "unwrapped"):
                 first_env = first_env.unwrapped
             x_dim = getattr(first_env, "x_dim", None)
             u_dim = getattr(first_env, "u_dim", None)
+            if not angle_idx:
+                angle_idx = list(getattr(first_env, "angle_idx", []) or [])
 
         models_cfg = copy.deepcopy(cfg.get("models", {}))
         memory_cfg = copy.deepcopy(cfg.get("memory", {}))
 
         if algo in ("c3m",):
             self._setup_c3m(skrl_env, device, obs_space, state_space, act_space,
-                            agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B, x_dim, u_dim)
+                            agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B, x_dim, u_dim,
+                            angle_idx=angle_idx)
         elif algo in ("lqr", "sdlqr"):
+            # LQR/SD-LQR build no networks (get_f_and_B is either analytical or
+            # an externally-loaded NeuralDynamics whose angle_idx was already
+            # baked in when IT was trained) — nothing here to embed.
             self._setup_sdlqr(skrl_env, device, obs_space, state_space, act_space,
                               agent_cfg, trainer_cfg, models_cfg, get_f_and_B, lqr=(algo == "lqr"), x_dim=x_dim, u_dim=u_dim)
         elif algo in ("c2rl-ppo", "c2rl-sac"):
@@ -353,10 +393,12 @@ class ContractionRunner:
             # C2RLAgent's base_algorithm constructor kwarg.
             self._setup_c2rl(skrl_env, device, obs_space, state_space, act_space,
                              agent_cfg, trainer_cfg, models_cfg, memory_cfg, get_rollout, get_f_and_B, x_dim, u_dim,
-                             base_algorithm=("PPO" if algo == "c2rl-ppo" else "SAC"))
+                             base_algorithm=("PPO" if algo == "c2rl-ppo" else "SAC"), angle_idx=angle_idx)
 
     def _setup_c3m(self, env, device, obs_space, state_space, act_space,
-                   agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None):
+                   agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None,
+                   angle_idx=None):
+        angle_idx = list(angle_idx or [])
         from contractionRL.agents.skrl.models import CLActorModel, CMGModel
         from contractionRL.agents.skrl.c3m import C3MAgent, C3MCfg, C3MSkrlTrainer, C3MTrainerCfg
         import dataclasses
@@ -395,22 +437,23 @@ class ContractionRunner:
         policy_kwargs.pop("class", None)
         policy_kwargs.pop("network", None)
         policy_kwargs.pop("backbone", None)
+        policy_kwargs.pop("angle_idx", None)  # angle_idx below is the single source of truth
 
         constrain_eigenvalues = models_cfg.get("cmg", {}).get("network", [{}])[0].get("constrain_eigenvalues", False)
         w_lb = agent_cfg.get("w_lb", 0.1)
         w_ub = agent_cfg.get("w_ub", 10.0)
 
         models = {
-            "policy": policy_cls(obs_space, act_space, device, hidden_dim=hd_policy, activation=act_policy, x_dim=x_dim, **policy_kwargs),
-            "cmg": CMGModel(obs_space, act_space, device, hidden_dim=hd_cmg, activation=act_cmg, x_dim=x_dim, constrain_eigenvalues=constrain_eigenvalues, w_lb=w_lb, w_ub=w_ub),
+            "policy": policy_cls(obs_space, act_space, device, hidden_dim=hd_policy, activation=act_policy, x_dim=x_dim, angle_idx=angle_idx, **policy_kwargs),
+            "cmg": CMGModel(obs_space, act_space, device, hidden_dim=hd_cmg, activation=act_cmg, x_dim=x_dim, angle_idx=angle_idx, constrain_eigenvalues=constrain_eigenvalues, w_lb=w_lb, w_ub=w_ub),
         }
-        
+
         if "dynamics" in models_cfg:
             from contractionRL.agents.skrl.nn_modules import NeuralDynamics
             dyn_net = models_cfg["dynamics"].get("network", [{}])[0]
             dyn_hd = dyn_net.get("layers", [256, 256])
             dyn_act = dyn_net.get("activations", "relu")
-            models["dynamics"] = NeuralDynamics(x_dim, u_dim, hidden_dim=dyn_hd, activation=dyn_act, device=device)
+            models["dynamics"] = NeuralDynamics(x_dim, u_dim, hidden_dim=dyn_hd, activation=dyn_act, device=device, angle_idx=angle_idx)
 
         agent = C3MAgent(
             cfg=C3MCfg(**_filter_cfg_fields(agent_cfg, C3MCfg, context="agent")),
@@ -483,7 +526,8 @@ class ContractionRunner:
 
     def _setup_c2rl(self, env, device, obs_space, state_space, act_space,
                     agent_cfg, trainer_cfg, models_cfg, memory_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None,
-                    base_algorithm: str = "PPO"):
+                    base_algorithm: str = "PPO", angle_idx=None):
+        angle_idx = list(angle_idx or [])
         from contractionRL.agents.skrl.models import CMGModel
         from contractionRL.agents.skrl.c2rl import C2RLAgent, C2RLSkrlTrainer, C2RLTrainerCfg
         from contractionRL.agents.skrl.runner import _gaussian_factory
@@ -514,6 +558,7 @@ class ContractionRunner:
             spec.setdefault("clip_log_std", True)
             spec.setdefault("min_log_std", -4.605)
             spec.setdefault("max_log_std", 2.0)
+            spec.setdefault("angle_idx", angle_idx)
             # agent_class lets _gaussian_factory reject unbounded backbones for
             # C2RL-SAC (divergence) and squashed backbones for C2RL-PPO.
             return _gaussian_factory(obs_space, state_space, act_space, device,
@@ -531,7 +576,7 @@ class ContractionRunner:
         w_ub = agent_cfg.get("w_ub", 10.0)
         cmg_model = CMGModel(
             obs_space, act_space, device, hidden_dim=cmg_hd, activation=cmg_act,
-            x_dim=x_dim, constrain_eigenvalues=constrain_eigenvalues, w_lb=w_lb, w_ub=w_ub,
+            x_dim=x_dim, angle_idx=angle_idx, constrain_eigenvalues=constrain_eigenvalues, w_lb=w_lb, w_ub=w_ub,
         )
 
         # con_critic/opt_critic: algorithm-agnostic network spec — used as a
@@ -543,60 +588,40 @@ class ContractionRunner:
             act = net[0].get("activations", "tanh") if net else "tanh"
             return hd, act
 
-        def _act_module(activation: str):
-            import torch.nn as nn
-            return {"tanh": nn.Tanh, "relu": nn.ReLU}[activation.lower()]
+        # con_value/opt_value (PPO) and con_critic_*/opt_critic_* (SAC) all see
+        # obs with the SAME angle-bearing x/xref blocks as the policy — embed
+        # their input identically (EmbeddedDeterministicModel; see models.py).
+        # Q-models additionally concatenate the RAW action (never angle-valued).
+        from contractionRL.agents.skrl.models import EmbeddedDeterministicModel
 
         def _make_value_model(hidden_dim, activation):
-            """MLP value function V(obs) -> scalar (PPO critic)."""
-            import torch.nn as nn
-            from skrl.models.torch import DeterministicMixin, Model
-            act_cls = _act_module(activation)
-
-            class _ValueModel(DeterministicMixin, Model):
-                def __init__(self, obs_space, act_space, dev):
-                    Model.__init__(self, observation_space=obs_space, action_space=act_space, device=dev)
-                    DeterministicMixin.__init__(self, clip_actions=False)
-                    dims = [int(obs_space.shape[0])] + list(hidden_dim)
-                    layers = []
-                    for a, b in zip(dims[:-1], dims[1:]):
-                        layers += [nn.Linear(a, b), act_cls()]
-                    layers.append(nn.Linear(dims[-1], 1))
-                    self._net = nn.Sequential(*layers)
-
-                def compute(self, inputs, role="value"):
-                    return self._net(inputs["observations"]), {}
-
-            return _ValueModel(obs_space, act_space, device)
+            """V(obs) -> scalar (PPO critic)."""
+            return EmbeddedDeterministicModel(
+                obs_space, act_space, device, hidden_dim=hidden_dim, activation=activation,
+                angle_idx=angle_idx, use_actions=False,
+            )
 
         def _make_q_model(hidden_dim, activation):
-            """MLP Q(obs, action) -> scalar (SAC critic_1/critic_2/targets)."""
-            import torch
-            import torch.nn as nn
-            from skrl.models.torch import DeterministicMixin, Model
-            act_cls = _act_module(activation)
-            n_act = int(act_space.shape[0])
-
-            class _QModel(DeterministicMixin, Model):
-                def __init__(self, obs_space, act_space, dev):
-                    Model.__init__(self, observation_space=obs_space, action_space=act_space, device=dev)
-                    DeterministicMixin.__init__(self, clip_actions=False)
-                    dims = [int(obs_space.shape[0]) + n_act] + list(hidden_dim)
-                    layers = []
-                    for a, b in zip(dims[:-1], dims[1:]):
-                        layers += [nn.Linear(a, b), act_cls()]
-                    layers.append(nn.Linear(dims[-1], 1))
-                    self._net = nn.Sequential(*layers)
-
-                def compute(self, inputs, role="critic"):
-                    x = torch.cat([inputs["observations"], inputs["taken_actions"]], dim=-1)
-                    return self._net(x), {}
-
-            return _QModel(obs_space, act_space, device)
+            """Q(obs, action) -> scalar (SAC critic_1/critic_2/targets)."""
+            return EmbeddedDeterministicModel(
+                obs_space, act_space, device, hidden_dim=hidden_dim, activation=activation,
+                angle_idx=angle_idx, use_actions=True,
+            )
 
         models = {"con_policy": con_policy, "cmg": cmg_model}
         if opt_policy is not None:
             models["opt_policy"] = opt_policy
+
+        # NeuralDynamics (learned ẋ = f(x) + B(x)·u) — same mechanism as C3M.
+        # Built unless analytical dynamics is requested (classic-only). For Isaac
+        # envs it is the ONLY source of f/B; C2RLAgent uses it whenever
+        # use_analytical_dynamics is false.
+        if "dynamics" in models_cfg and not agent_cfg.get("use_analytical_dynamics"):
+            from contractionRL.agents.skrl.nn_modules import NeuralDynamics
+            dyn_net = models_cfg["dynamics"].get("network", [{}])[0]
+            dyn_hd = dyn_net.get("layers", [256, 256])
+            dyn_act = dyn_net.get("activations", "relu")
+            models["dynamics"] = NeuralDynamics(x_dim, u_dim, hidden_dim=dyn_hd, activation=dyn_act, device=device, angle_idx=angle_idx)
 
         if base_algorithm == "PPO":
             con_hd, con_act = _critic_spec("con_critic")
@@ -636,6 +661,7 @@ class ContractionRunner:
             x_dim=x_dim,
             u_dim=u_dim,
             num_envs=env.num_envs,
+            angle_idx=angle_idx,
         )
         trainer_cfg.setdefault("timesteps", 300000)
         trainer_cfg.setdefault("rollouts", agent_cfg.get("rollouts", 300))

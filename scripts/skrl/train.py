@@ -37,6 +37,11 @@ parser.add_argument("--num_timesteps", "--num-timesteps", type=int, default=None
                     help="Total training timesteps.")
 parser.add_argument("--analytical", type=str, default="",
                     help="Pass 'dynamics' to use analytical dynamics (C3M/LQR).")
+parser.add_argument("--use_analytical_dynamics", "--use-analytical-dynamics",
+                    action="store_true", default=False,
+                    help="Use the env's exact analytical get_f_and_B instead of a learned "
+                         "NeuralDynamics (classic envs only). When NOT passed, C3M/C2RL "
+                         "pretrain + refine a NeuralDynamics model (the default for all envs).")
 
 # W&B
 parser.add_argument("--no_wandb", "--no-wandb", action="store_true", default=False,
@@ -145,6 +150,24 @@ logger = logging.getLogger(__name__)
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 _VEL_TASK_TO_ROBOT = {"Quadruped": "quadruped", "Humanoid": "humanoid", "Manipulator": "manipulator"}
+
+
+def _inject_angle_idx(agent_cfg: dict, angle_idx: list) -> None:
+    """Inject ``angle_idx`` into every model sub-block of agent_cfg["models"].
+
+    Only the STANDALONE PPO/SAC path needs this: those models are built by
+    _gaussian_factory/_deterministic_factory (runner.py) purely from each
+    yaml/cfg block's own keys, with no access to the env object. The
+    ContractionRunner path (C3M/LQR/SDLQR/C2RL) is self-sufficient — it reads
+    angle_idx directly off the env in _setup_contraction — so this is a no-op
+    for that path. A no-op (angle_idx=[]) here is also harmless: every
+    consumer treats an empty angle_idx as "nothing to embed".
+    """
+    if not angle_idx:
+        return
+    for block in agent_cfg.get("models", {}).values():
+        if isinstance(block, dict):
+            block.setdefault("angle_idx", angle_idx)
 
 
 def _max_step_reward(robot: str, env_cfg) -> float:
@@ -410,14 +433,29 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg):
     # Generate dynamics data via finite differences
     dt = env_cfg.sim.dt * env_cfg.decimation
     print(f"[RefTraj] Computing dynamics (x_dot) via 4th-order central difference (dt={dt:.3f})...")
+
+    # angle_idx columns (e.g. yaw) wrap at +-pi in the SAVED states_arr — a raw
+    # finite difference across that wrap would spike x_dot by ~2*pi/dt for one
+    # sample. Difference an UNWRAPPED copy instead (np.unwrap makes each angle
+    # column continuous by adding +-2*pi at jumps); states_arr itself (saved as
+    # `x` below) is left untouched — NeuralDynamics only ever consumes x through
+    # its (cos, sin) embedding, which is identical for theta and theta + 2*pi*k,
+    # so this is purely a finite-difference cleanup, not a semantic change to x.
+    angle_idx = list(getattr(isaac_env.unwrapped, "angle_idx", []) or [])
+    diff_states = states_arr
+    if angle_idx:
+        diff_states = states_arr.copy()
+        for idx in angle_idx:
+            diff_states[:, :, idx] = np.unwrap(diff_states[:, :, idx], axis=1)
+
     x_dot_arr = np.zeros_like(states_arr)
-    for i in range(2, states_arr.shape[1] - 2):
-        x_dot_arr[:, i] = (-states_arr[:, i + 2] + 8 * states_arr[:, i + 1] - 8 * states_arr[:, i - 1] + states_arr[:, i - 2]) / (12 * dt)
+    for i in range(2, diff_states.shape[1] - 2):
+        x_dot_arr[:, i] = (-diff_states[:, i + 2] + 8 * diff_states[:, i + 1] - 8 * diff_states[:, i - 1] + diff_states[:, i - 2]) / (12 * dt)
     # Forward/backward differences for boundaries
-    x_dot_arr[:, 0] = (-3 * states_arr[:, 0] + 4 * states_arr[:, 1] - states_arr[:, 2]) / (2 * dt)
-    x_dot_arr[:, 1] = (-3 * states_arr[:, 1] + 4 * states_arr[:, 2] - states_arr[:, 3]) / (2 * dt)
-    x_dot_arr[:, -2] = (3 * states_arr[:, -2] - 4 * states_arr[:, -3] + states_arr[:, -4]) / (2 * dt)
-    x_dot_arr[:, -1] = (3 * states_arr[:, -1] - 4 * states_arr[:, -2] + states_arr[:, -3]) / (2 * dt)
+    x_dot_arr[:, 0] = (-3 * diff_states[:, 0] + 4 * diff_states[:, 1] - diff_states[:, 2]) / (2 * dt)
+    x_dot_arr[:, 1] = (-3 * diff_states[:, 1] + 4 * diff_states[:, 2] - diff_states[:, 3]) / (2 * dt)
+    x_dot_arr[:, -2] = (3 * diff_states[:, -2] - 4 * diff_states[:, -3] + diff_states[:, -4]) / (2 * dt)
+    x_dot_arr[:, -1] = (3 * diff_states[:, -1] - 4 * diff_states[:, -2] + diff_states[:, -3]) / (2 * dt)
     
     # Filter out any episodes that contain NaNs
     nan_mask = np.isnan(states_arr).any(axis=(1, 2)) | np.isnan(actions_arr).any(axis=(1, 2)) | np.isnan(x_dot_arr).any(axis=(1, 2))
@@ -532,9 +570,10 @@ def _evaluate_classic_path_tracking(*, task, runner, num_groups: int = 10, episo
             reward_list.append(ep_reward)
             auc_list.append(float(np.trapezoid(norm_traj, dx=dt)) if hasattr(np, "trapezoid")
                              else float(np.trapz(norm_traj, dx=dt)))
-        C, lbd = fit_exponential_envelope(error_trajs, dt)
+        # paper fit: one overshoot C* per group, one convergence rate per curve
+        C, lbds = fit_exponential_envelope(error_trajs, dt)
         C_list.append(C)
-        lbd_list.append(lbd)
+        lbd_list.extend(float(x) for x in lbds)
     env.close()
 
     rew_mean, rew_ci = mean_confidence_interval(reward_list)
@@ -669,10 +708,11 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, num_grou
     if len(fit_ids) >= num_groups:
         groups = np.array_split(fit_ids, num_groups)
         for g in groups:
-            norm_trajs = [err_np[i, 1:] / e0[i] for i in g]
-            C, lbd = fit_exponential_envelope(norm_trajs, dt)
+            # raw error curves; fit_exponential_envelope normalizes by e(0) itself
+            raw_trajs = [err_np[i] for i in g]
+            C, lbds = fit_exponential_envelope(raw_trajs, dt)
             C_list.append(C)
-            lbd_list.append(lbd)
+            lbd_list.extend(float(x) for x in lbds)
     else:
         print(f"[Eval] WARNING: only {len(fit_ids)} envs with e(0) > 0.05; skipping contraction fit.")
 
@@ -762,7 +802,10 @@ if _is_classic:
         agent_cfg["trainer"]["timesteps"] = args_cli.num_timesteps
     if args_cli.lr is not None:
         agent_cfg["agent"]["learning_rate"] = args_cli.lr
-    if args_cli.analytical == "dynamics":
+    # Analytical dynamics is OFF by default (every contraction config learns a
+    # NeuralDynamics); --use_analytical_dynamics (or legacy --analytical dynamics)
+    # switches to the env's exact get_f_and_B. Classic envs only.
+    if args_cli.analytical == "dynamics" or args_cli.use_analytical_dynamics:
         agent_cfg["agent"]["use_analytical_dynamics"] = True
 
     _run_ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -862,9 +905,38 @@ if _is_classic:
         _a = agent_cfg["agent"]
         _use_state = _a.pop("use_state_norm", False)  # OFF by default (see agent configs / c2rl.py docstring)
         _use_value = _a.pop("use_value_norm", True)
+
+        num_envs = args_cli.num_envs or 4
+        vec_env = SyncVectorEnv([lambda: gym.make(args_cli.task)] * num_envs)
+        env = wrap_env(vec_env, wrapper="gymnasium")
+
+        # Standalone PPO/SAC build models purely from agent_cfg (no env access) —
+        # inject angle_idx (e.g. yaw at [2]) from the underlying classic env so
+        # every network embeds it continuously (see runner.py's _gaussian_factory
+        # / _deterministic_factory). No-op for envs with no wrapping angle.
+        _first_env = vec_env.envs[0]
+        _angle_idx = list(getattr(getattr(_first_env, "unwrapped", _first_env), "angle_idx", []) or [])
+        _inject_angle_idx(agent_cfg, _angle_idx)
+
         if _use_state:
-            _a["state_preprocessor"] = "RunningStandardScaler"
-            _a["state_preprocessor_kwargs"] = None
+            # [x, xref, uref] path-tracking layout (obs_dim = 2*x_dim + u_dim,
+            # same detection as runner.py's "mlp"/"mlp-squashed" backbones) needs
+            # the masked scaler — see c2rl.py's module docstring / preprocessors.py
+            # for why normalizing uref or angle_idx columns there is a
+            # correctness bug, not just a style choice. Flat (e.g. vel-tracking)
+            # layouts have no residual/angle-embedding structure, so the stock
+            # full-vector scaler is fine there.
+            _u_dim = int(env.action_space.shape[0])
+            _remainder = int(env.observation_space.shape[0]) - _u_dim
+            if _remainder > 0 and _remainder % 2 == 0:
+                from contractionRL.agents.skrl.preprocessors import PathTrackingObservationScaler
+                _a["state_preprocessor"] = PathTrackingObservationScaler
+                _a["state_preprocessor_kwargs"] = {
+                    "x_dim": _remainder // 2, "u_dim": _u_dim, "angle_idx": _angle_idx,
+                }
+            else:
+                _a["state_preprocessor"] = "RunningStandardScaler"
+                _a["state_preprocessor_kwargs"] = None
         if _use_value and algorithm == "ppo":
             _a["value_preprocessor"] = "RunningStandardScaler"
             _a["value_preprocessor_kwargs"] = None
@@ -872,10 +944,6 @@ if _is_classic:
         _a.pop("anneal_log_std", None)  # legacy alias, superseded by std_dev_annealing
         _std_dev_annealing = _a.pop("std_dev_annealing", False)
         _std_dev_annealing_kwargs = _a.pop("std_dev_annealing_kwargs", None)
-
-        num_envs = args_cli.num_envs or 4
-        vec_env = SyncVectorEnv([lambda: gym.make(args_cli.task)] * num_envs)
-        env = wrap_env(vec_env, wrapper="gymnasium")
 
         runner = Runner(env, agent_cfg)
         from contractionRL.agents.skrl.agent_patches import (
@@ -1152,16 +1220,45 @@ else:
         _isaac_env = env  # save reference for get_physical_state() during ref-traj generation
         env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)
 
+        # angle_idx (e.g. yaw at [2] on quadruped/humanoid path-tracking) is an
+        # ENV attribute, not a cfg field — inject it into agent_cfg["models"] so
+        # standalone PPO/SAC's _gaussian_factory/_deterministic_factory (which
+        # only see per-block yaml kwargs) embed it too. ContractionRunner
+        # (C3M/LQR/SDLQR/C2RL) reads it directly off the env and needs no
+        # injection. _isaac_env is the pre-SkrlVecEnvWrapper raw env saved above.
+        _angle_idx = list(getattr(_isaac_env.unwrapped, "angle_idx", []) or [])
+        _inject_angle_idx(agent_cfg, _angle_idx)
+
         _a = agent_cfg["agent"]
         _alg = _a.get("class", "").lower()
         _use_state = _a.pop("use_state_norm", False)  # OFF by default (see agent configs / c2rl.py docstring)
         _use_value = _a.pop("use_value_norm", True)
         if _use_state:
-            _a["observation_preprocessor"] = "RunningStandardScaler"
-            _a["observation_preprocessor_kwargs"] = None
+            # [x, xref, uref] path-tracking layout needs the masked scaler (see
+            # c2rl.py's module docstring / preprocessors.py) — normalizing uref
+            # or angle_idx columns there is a correctness bug, not just a style
+            # choice. Flat (e.g. vel-tracking) layouts have no residual/angle-
+            # embedding structure, so the stock full-vector scaler is fine there.
+            _u_dim = int(env.action_space.shape[0])
+            _remainder = int(env.observation_space.shape[0]) - _u_dim
+            if _remainder > 0 and _remainder % 2 == 0:
+                from contractionRL.agents.skrl.preprocessors import PathTrackingObservationScaler
+                _obs_preproc_cls = PathTrackingObservationScaler
+                _obs_preproc_kwargs = {
+                    "x_dim": _remainder // 2, "u_dim": _u_dim, "angle_idx": _angle_idx,
+                }
+            else:
+                _obs_preproc_cls = "RunningStandardScaler"
+                _obs_preproc_kwargs = None
+            _a["observation_preprocessor"] = _obs_preproc_cls
+            _a["observation_preprocessor_kwargs"] = (
+                dict(_obs_preproc_kwargs) if _obs_preproc_kwargs is not None else None
+            )
             if _alg == "ppo":
-                _a["state_preprocessor"] = "RunningStandardScaler"
-                _a["state_preprocessor_kwargs"] = None
+                _a["state_preprocessor"] = _obs_preproc_cls
+                _a["state_preprocessor_kwargs"] = (
+                    dict(_obs_preproc_kwargs) if _obs_preproc_kwargs is not None else None
+                )
         else:
             for _k in ("state_preprocessor", "state_preprocessor_kwargs",
                        "observation_preprocessor", "observation_preprocessor_kwargs"):
@@ -1186,6 +1283,11 @@ else:
 
         if _alg in _CONTRACTION_ALGOS:
             from contractionRL.runners import ContractionRunner
+            # Default: learn a NeuralDynamics (pretrain + online). Passing
+            # --use_analytical_dynamics for an Isaac task deliberately trips the
+            # runner's guard below (no analytical dynamics exist for Isaac envs).
+            if args_cli.use_analytical_dynamics:
+                agent_cfg["agent"]["use_analytical_dynamics"] = True
             runner = ContractionRunner(env, agent_cfg, is_classic=False)
         else:
             runner = Runner(env, agent_cfg)

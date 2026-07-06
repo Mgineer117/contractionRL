@@ -12,7 +12,7 @@ models:
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [256, 256]
+        layers: [128, 128]
         activations: tanh
     output: ACTIONS
   opt_policy:  # optimal policy (gamma_optimal) — the one actually deployed unless con_only
@@ -25,7 +25,7 @@ models:
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [256, 256]
+        layers: [128, 128]
         activations: tanh
     output: ACTIONS
   con_critic:  # architecture shared by SAC's critic_1/critic_2 + their target networks
@@ -43,7 +43,7 @@ models:
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [256, 256]
+        layers: [128, 128]
         activations: tanh
         constrain_eigenvalues: True
 
@@ -52,30 +52,28 @@ models:
     network:
       - name: net
         input: STATE_ACTION
-        layers: [256, 256]
+        layers: [128, 128]
         activations: relu
 
 memory:
   class: RandomMemory
-  memory_size: 244  # con/opt SAC replay buffer size (rows); total capacity = memory_size * num_envs.
+  memory_size: 250000  # con/opt SAC replay buffer size (rows); total capacity = memory_size * num_envs.
                     # PERSISTENT across epochs (only the PPO variant resets its memory each epoch) —
                     # this is what keeps C2RL-SAC off-policy, like standalone SAC.
 
 agent:
   class: C2RL-SAC
-  rollouts: 512  # steps collected per con/opt rollout phase each epoch; MUST match trainer.rollouts
-                         # below. NOT a real SAC_CFG field — for SAC the con/opt replay buffer is sized
-                         # by memory_size above (persistent), not by rollouts.
+  rollouts: 400  # steps collected per con/opt rollout phase each epoch; MUST match trainer.rollouts
+                 # below. NOT a real SAC_CFG field — for SAC the con/opt replay buffer is sized
+                 # by memory_size above (persistent), not by rollouts.
   use_state_norm: false  # OFF by default: keeping observations raw makes the CMG contraction loss
                          # (which evaluates con_policy on RAW obs to get K = du/dx — see _compute_cmg_loss)
                          # consistent with how con_policy is actually trained/deployed. If set true, C2RL
                          # now routes con_agent's SAME RunningStandardScaler through the CMG loss so the
                          # certified Jacobian still matches the deployed (normalized-input) controller.
   # SAC shared config (con_policy/opt_policy each get their own SAC sub-agent).
-  # Standard robotics SAC defaults (see skrl_sac_cfg.yaml across this repo):
-  # batch_size 256, [256,256] ReLU critics, ~1M-transition replay target.
-  gradient_steps: 32
-  batch_size: 8192
+  gradient_steps: 1
+  batch_size: 256
   polyak: 0.005
   learning_rate: 3.0e-4  # shared by policy, critic, and entropy coefficient
   learn_entropy: True
@@ -96,8 +94,8 @@ agent:
   eps: 0.01
   W_entropy_scaler: 1.0e-3
   cmg_updates_per_iter: 3
-  cmg_minibatch_size: 256
-  buffer_size: 4096
+  cmg_minibatch_size: 1024
+  buffer_size: 2048
   # reward = -tracking_scaler*||e||_M^2/std - control_scaler*||u-uref||^2/std,
   # i.e. Q/R exactly like SD-LQR/LQR's Q_scaler/R_scaler (sdlqr.py) — tracking_scaler
   # weights state error under the CURRENT learned metric M(x), control_scaler
@@ -115,9 +113,9 @@ agent:
     step_size: 1  # anneal every epoch
     gamma: 0.99
   dynamics_batch_size: 4096
-  dynamics_pretrain_epochs: 100  # offline-data epochs, or online rollouts when no data path
+  dynamics_pretrain_epochs: 200  # offline-data epochs, or online rollouts when no data path
   experiment:
-    directory: "manipulator_c2rl_sac"
+    directory: "quadrotor_c2rl_sac"
     experiment_name: ""
     write_interval: "auto"  # Logging frequency for tensorboard/W&B (in epochs/steps)
     checkpoint_interval: "auto"  # Frequency of saving model weights (in epochs/steps)
@@ -128,5 +126,5 @@ agent:
 
 trainer:
   class: C2RLSkrlTrainer
-  timesteps: 2000000  # Total number of environment steps to train for
-  rollouts: 512  # MUST match trainer.rollouts below (con/opt RandomMemory is sized from this)
+  timesteps: 600000  # Total number of environment steps to train for
+  rollouts: 400  # MUST match trainer.rollouts below (con/opt RandomMemory is sized from this)

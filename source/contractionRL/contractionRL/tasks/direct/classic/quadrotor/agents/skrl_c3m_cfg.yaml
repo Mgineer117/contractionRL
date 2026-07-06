@@ -1,23 +1,23 @@
 seed: 42  # Random seed for reproducibility
+
 models:
   # separate flag is not functionally used for C3M but is present for code compatibility with SKRL internals
   separate: True
   policy:
     class: DeterministicMixin  # Outputs deterministic continuous values
     backbone: contraction
-    clip_actions: True  # Clip actions to the environment action space limits — matches
-                        # every other env's C3M cfg (this one was the sole outlier)
+    clip_actions: True  # Clip actions to the environment action space limits
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [256, 256]
+        layers: [128, 128]
         activations: tanh
   cmg:
     class: CMG
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [256, 256]
+        layers: [128, 128]
         activations: tanh
         constrain_eigenvalues: True
   dynamics:
@@ -25,11 +25,12 @@ models:
     network:
       - name: net
         input: STATE_ACTION
-        layers: [512, 512, 512, 512]
-        activations: leakyrelu
+        layers: [128, 128]
+        activations: relu
+
 memory:
   class: RandomMemory
-  memory_size: 131072  # Capacity of the experience replay buffer (-1 means dynamic/infinite)
+  memory_size: 131072
 
 agent:
   class: C3M
@@ -42,19 +43,11 @@ agent:
   eps: 0.01  # Margin parameter (epsilon) ensuring strict definiteness of the metric
   w_ub: 10.0  # Upper bound clipping value for the generated metric M(x)
   w_lb: 0.1  # Lower bound clipping value for the generated metric M(x)
-  # Isaac env: train NeuralDynamics online from trajectory buffer data.
-  # Saved to <experiment_dir>/checkpoints/dynamics.pt after training.
-  use_analytical_dynamics: false  # Whether to use exact analytical dynamics (true) or learn NeuralDynamics (false)
-  dynamics_lr: 1.0e-3  # Learning rate for the NeuralDynamics network
-  dynamics_lr_scheduler: "StepLR"  # Learning rate scheduler for NeuralDynamics
-  dynamics_lr_scheduler_kwargs:  # Arguments for the NeuralDynamics scheduler
-    step_size: 1  # anneal every epoch (1M samples / 256 mb size)
-    gamma: 0.99
-  dynamics_pretrain_epochs: 500  # Number of epochs for offline data, or number of rollouts for online fallback
-  dynamics_pretrain_data_path: "logs/quadruped/dynamics_data.npz"  # Path to offline dynamics data
-  dynamics_batch_size: 4096
+  # Classic env: use analytical dynamics (no NeuralDynamics training needed).
+  # Override with --use_analytical_dynamics=false to train NeuralDynamics anyway.
+  use_analytical_dynamics: true  # Whether to use exact analytical dynamics (true) or learn NeuralDynamics (false)
   experiment:
-    directory: "quadruped_c3m"
+    directory: "quadrotor_c3m"
     experiment_name: ""
     write_interval: "auto"  # Logging frequency for tensorboard/W&B (in epochs/steps)
     checkpoint_interval: "auto"  # Frequency of saving model weights (in epochs/steps)
@@ -65,6 +58,6 @@ agent:
 
 trainer:
   class: C3MTrainer
-  timesteps: 100  # Total number of environment steps to train for
-  eval_interval: 2  # Frequency of running evaluation rollouts
+  timesteps: 300  # Total number of environment steps to train for
+  eval_interval: 10  # Frequency of running evaluation rollouts
   environment_info: log  # Type of environment information to record (e.g., log)

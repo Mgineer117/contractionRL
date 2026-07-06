@@ -15,6 +15,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 
+from .angle_utils import embed_angles, embedded_dim, wrap_diff
+
 _MIN_LOG_STD = math.log(0.01)  # ≈ -4.605; annealing floor
 
 
@@ -76,15 +78,19 @@ class CCM_Generator(nn.Module):
         activation: str | nn.Module = "tanh",
         mode: str = "stochastic",
         device: str = "cpu",
+        angle_idx: "Sequence[int]" = (),
     ):
         super().__init__()
         self.x_dim = x_dim
         self.mode = mode
+        self.angle_idx = list(angle_idx)
 
         if isinstance(activation, str):
             activation = {"tanh": nn.Tanh(), "relu": nn.ReLU()}[activation.lower()]
 
-        self.backbone = MLP(x_dim, list(hidden_dim), activation=activation)
+        # Network sees the CONTINUOUS (cos, sin) embedding of any angle dims;
+        # W(x) itself is still indexed/shaped by the RAW x_dim (see forward).
+        self.backbone = MLP(embedded_dim(x_dim, self.angle_idx), list(hidden_dim), activation=activation)
         h = self.backbone.output_dim
         self.mu_head = nn.Linear(h, x_dim * x_dim)
         self.logstd_head = nn.Linear(h, x_dim * x_dim)
@@ -92,7 +98,7 @@ class CCM_Generator(nn.Module):
 
     def forward(self, x: torch.Tensor, deterministic: bool = True):
         n = x.shape[0]
-        h = self.backbone(x)
+        h = self.backbone(embed_angles(x, self.angle_idx))
         mu = self.mu_head(h)
 
         if self.mode == "deterministic" or deterministic:
@@ -134,11 +140,13 @@ class CLActor(nn.Module):
         anneal_stddev: bool = False,
         hidden_dim: list[int] | None = None,
         activation: nn.Module | str = nn.Tanh(),
+        angle_idx: "Sequence[int]" = (),
     ):
         super().__init__()
         self.x_dim = x_dim
         self.u_dim = u_dim
         self.mode = mode
+        self.angle_idx = list(angle_idx)
         assert mode in ("deterministic", "stochastic")
 
         if isinstance(activation, str):
@@ -146,7 +154,11 @@ class CLActor(nn.Module):
 
         hidden = list(hidden_dim) if hidden_dim else [128, 128]
         self.c = 3 * x_dim           # latent multiplier (matches CAC-dev)
-        input_dim = 2 * x_dim        # [x, xref]
+        # w1/w2 see the CONTINUOUS embedding of [x, xref] (each block embedded
+        # independently); the bilinear feedback error e = x - xref stays RAW
+        # (only its angle dims get shortest-angle WRAPPED, not embedded) — see
+        # mean_control/forward below.
+        input_dim = 2 * embedded_dim(x_dim, self.angle_idx)
 
         self.w1 = MLP(input_dim, hidden, self.c * x_dim, activation=activation)
         self.w2 = MLP(input_dim, hidden, self.c * u_dim, activation=activation)
@@ -173,9 +185,9 @@ class CLActor(nn.Module):
 
     def mean_control(self, state: torch.Tensor) -> torch.Tensor:
         x, xref, uref = self.trim_state(state)
-        x_xref = torch.cat((x, xref), dim=-1)
+        x_xref = torch.cat((embed_angles(x, self.angle_idx), embed_angles(xref, self.angle_idx)), dim=-1)
         n = x.shape[0]
-        e = (x - xref).unsqueeze(-1)
+        e = wrap_diff(x - xref, self.angle_idx).unsqueeze(-1)
         w1 = self.w1(x_xref).reshape(n, self.c, self.x_dim)
         w2 = self.w2(x_xref).reshape(n, self.u_dim, self.c)
         l1 = F.tanh(torch.matmul(w1, e))
@@ -183,9 +195,9 @@ class CLActor(nn.Module):
 
     def forward(self, state: torch.Tensor):
         x, xref, uref = self.trim_state(state)
-        x_xref = torch.cat((x, xref), dim=-1)
+        x_xref = torch.cat((embed_angles(x, self.angle_idx), embed_angles(xref, self.angle_idx)), dim=-1)
         n = x.shape[0]
-        e = (x - xref).unsqueeze(-1)
+        e = wrap_diff(x - xref, self.angle_idx).unsqueeze(-1)
         w1 = self.w1(x_xref).reshape(n, self.c, self.x_dim)
         w2 = self.w2(x_xref).reshape(n, self.u_dim, self.c)
         l1 = F.tanh(torch.matmul(w1, e))
@@ -239,6 +251,7 @@ class NeuralDynamics(nn.Module):
         hidden_dim: Sequence[int] = (256, 256),
         activation: str = "relu",
         device: str | None = None,
+        angle_idx: Sequence[int] = (),
     ):
         super().__init__()
         self.x_dim = x_dim
@@ -247,10 +260,14 @@ class NeuralDynamics(nn.Module):
         self._hidden_dim = list(hidden_dim)
         self._activation_str = activation
         self.device = torch.device(device or "cpu")
+        self.angle_idx = list(angle_idx)
 
         act = _ACT_MAP.get(activation, nn.ReLU)()
-        self.f_net = MLP(x_dim, list(hidden_dim), x_dim, activation=act)
-        self.B_net = MLP(x_dim, list(hidden_dim), x_dim * u_dim, activation=act)
+        # Nets see the CONTINUOUS embedding of x's angle dims; f/B are still
+        # shaped/indexed by the RAW x_dim (outputs are raw-coordinate ẋ / rows).
+        emb_dim = embedded_dim(x_dim, self.angle_idx)
+        self.f_net = MLP(emb_dim, list(hidden_dim), x_dim, activation=act)
+        self.B_net = MLP(emb_dim, list(hidden_dim), x_dim * u_dim, activation=act)
         self.to(self.device)
 
     def get_f_and_B(self, x: torch.Tensor):
@@ -260,8 +277,9 @@ class NeuralDynamics(nn.Module):
         if x.dim() == 1:
             x = x.unsqueeze(0)
         x = x.to(self._dtype).to(self.device)
-        f = self.f_net(x)
-        B = self.B_net(x).reshape(-1, self.x_dim, self.u_dim)
+        x_emb = embed_angles(x, self.angle_idx)
+        f = self.f_net(x_emb)
+        B = self.B_net(x_emb).reshape(-1, self.x_dim, self.u_dim)
         B_null = self._compute_B_null(B)
         return f, B, B_null
 
@@ -292,6 +310,7 @@ class NeuralDynamics(nn.Module):
                 "u_dim": self.u_dim,
                 "hidden_dim": self._hidden_dim,
                 "activation": self._activation_str,
+                "angle_idx": self.angle_idx,
                 "state_dict": self.state_dict(),
             },
             path,
@@ -307,6 +326,7 @@ class NeuralDynamics(nn.Module):
             hidden_dim=ckpt["hidden_dim"],
             activation=ckpt["activation"],
             device=device,
+            angle_idx=ckpt.get("angle_idx", []),
         )
         model.load_state_dict(ckpt["state_dict"])
         model.eval()
@@ -332,6 +352,7 @@ class BoundedCCM_Generator(nn.Module):
         w_lb: float = 0.1,
         w_ub: float = 10.0,
         device: str = "cpu",
+        angle_idx: Sequence[int] = (),
     ):
         super().__init__()
 
@@ -340,16 +361,18 @@ class BoundedCCM_Generator(nn.Module):
         self.device = device
         self.w_lb = w_lb
         self.w_ub = w_ub
+        self.angle_idx = list(angle_idx)
 
         if isinstance(activation, str):
             activation = {"tanh": nn.Tanh(), "relu": nn.ReLU()}.get(
                 activation.lower(), nn.Tanh()
             )
+        # Network sees the CONTINUOUS embedding; W(x) itself stays x_dim x x_dim.
         self.model = MLP(
-            input_dim=x_dim, hidden_dims=hidden_dim,
+            input_dim=embedded_dim(x_dim, self.angle_idx), hidden_dims=hidden_dim,
             activation=activation,
         )
-        
+
         self.model.to(device)
 
         out_dim = x_dim * x_dim
@@ -370,7 +393,7 @@ class BoundedCCM_Generator(nn.Module):
         return V @ torch.diag_embed(lam) @ V.mT  # SPD, λ ∈ (w_lb, w_ub)
 
     def forward(self, x: torch.Tensor, deterministic: bool = True):
-        logits = self.model(x)
+        logits = self.model(embed_angles(x, self.angle_idx))
         mu = self.mu(logits)
 
         # Return-dict keys mirror CCM_Generator so the two are drop-in compatible.

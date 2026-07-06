@@ -66,7 +66,8 @@ class ManipulatorPathTrackingEnv(PathTrackingBase):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # reset diverged/non-finite states (a NaN/exploded arm never self-heals)
+        terminated = self._state_diverged(self._get_physical_state())
         return terminated, time_out
 
     def _set_robot_state_from_ref(self, env_ids: torch.Tensor, x_ref_init: torch.Tensor) -> None:

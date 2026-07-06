@@ -5,6 +5,7 @@ import torch
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, quat_from_euler_xyz
 
 from ..common.path_tracking_base import PathTrackingBase
 from .env_cfg import HumanoidPathTrackingEnvCfg
@@ -13,13 +14,20 @@ from .env_cfg import HumanoidPathTrackingEnvCfg
 class HumanoidPathTrackingEnv(PathTrackingBase):
     """Unitree H1 path-tracking environment.
 
-    obs  = [x(41), x_ref(41), u_ref(19)] = 101
-    reward = -||x - x_ref||^2
+    obs  = [x(50), x_ref(50), u_ref(19)] = 119
+    reward = -||x - x_ref||^2  (yaw dim shortest-angle wrapped, see
+             PathTrackingBase._get_rewards)
 
-    x layout: proj_gravity_b(3) + joint_pos_rel(19) + joint_vel(19)
+    x layout: xy_rel_to_origin(2) + yaw(1) + proj_gravity_b(3)
+              + joint_pos_rel(19) + base_lin_vel_b(3) + base_ang_vel_b(3)
+              + joint_vel(19)
+
+    "Option A" — see quadruped_path_tracking/env.py's docstring for the
+    rationale. yaw is the only raw (wrapping) angle — angle_idx=[2].
     """
 
     cfg: HumanoidPathTrackingEnvCfg
+    angle_idx = [2]
 
     def __init__(self, cfg: HumanoidPathTrackingEnvCfg, render_mode=None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
@@ -49,10 +57,16 @@ class HumanoidPathTrackingEnv(PathTrackingBase):
         self._robot.set_joint_position_target(self._joint_targets, joint_ids=self._joint_ids)
 
     def _get_physical_state(self) -> torch.Tensor:
+        xy_rel = self._robot.data.root_pos_w[:, :2] - self.scene.env_origins[:, :2]
+        _, _, yaw = euler_xyz_from_quat(self._robot.data.root_quat_w)
         return torch.cat(
             [
+                xy_rel,
+                yaw.unsqueeze(-1),
                 self._robot.data.projected_gravity_b,
                 self._robot.data.joint_pos[:, self._joint_ids] - self._robot.data.default_joint_pos[:, self._joint_ids],
+                self._robot.data.root_lin_vel_b,
+                self._robot.data.root_ang_vel_b,
                 self._robot.data.joint_vel[:, self._joint_ids],
             ],
             dim=-1,
@@ -63,28 +77,50 @@ class HumanoidPathTrackingEnv(PathTrackingBase):
         fell = self._robot.data.root_pos_w[:, 2] < self.cfg.base_height_min
         if not getattr(self.cfg, "terminate_on_fall", True):
             fell = torch.zeros_like(time_out)
-        return fell, time_out
+        # always reset diverged/non-finite states (independent of fall handling)
+        terminated = fell | self._state_diverged(self._get_physical_state())
+        return terminated, time_out
 
     def _set_robot_state_from_ref(self, env_ids: torch.Tensor, x_ref_init: torch.Tensor) -> None:
-        # x layout: [gravity(3), joint_pos_rel(3:22), joint_vel(22:41)]
-        joint_pos_rel = x_ref_init[:, 3:22]   # (n, 19)
-        joint_vel_ref = x_ref_init[:, 22:41]  # (n, 19)
+        # x layout: [xy_rel(0:2), yaw(2), gravity(3:6), joint_pos_rel(6:25),
+        #            base_lin_vel_b(25:28), base_ang_vel_b(28:31), joint_vel(31:50)]
+        xy_ref = x_ref_init[:, 0:2]
+        yaw_ref = x_ref_init[:, 2]
+        joint_pos_rel = x_ref_init[:, 6:25]
+        base_lin_vel_ref = x_ref_init[:, 25:28]
+        base_ang_vel_ref = x_ref_init[:, 28:31]
+        joint_vel_ref = x_ref_init[:, 31:50]
 
         n = len(env_ids)
         full_pos = self._robot.data.default_joint_pos[env_ids].clone()
         full_vel = self._robot.data.default_joint_vel[env_ids].clone()
 
         # Reference joint state + small random offset so the controller has something to correct
-        noise = torch.empty(n, len(self._joint_ids), device=self.device).uniform_(
+        joint_noise = torch.empty(n, len(self._joint_ids), device=self.device).uniform_(
             -self.cfg.init_noise_scale, self.cfg.init_noise_scale
         )
-        full_pos[:, self._joint_ids] = full_pos[:, self._joint_ids] + joint_pos_rel + noise
+        full_pos[:, self._joint_ids] = full_pos[:, self._joint_ids] + joint_pos_rel + joint_noise
         full_vel[:, self._joint_ids] = joint_vel_ref
 
-        # Root: default pose (upright) + env origin — velocity zeroed (not in state)
+        # Root: reference xy/yaw (+ small noise, same role as joint_noise above)
+        # + env origin; height stays at the default upright pose (z not tracked).
+        xy_noise = torch.empty(n, 2, device=self.device).uniform_(
+            -self.cfg.init_xy_noise_scale, self.cfg.init_xy_noise_scale
+        )
+        yaw_noise = torch.empty(n, device=self.device).uniform_(
+            -self.cfg.init_yaw_noise_scale, self.cfg.init_yaw_noise_scale
+        )
         root = self._robot.data.default_root_state[env_ids].clone()
-        root[:, :3] += self.scene.env_origins[env_ids]
-        root_vel = torch.zeros(n, 6, device=self.device)
+        root[:, :2] = self.scene.env_origins[env_ids, :2] + xy_ref + xy_noise
+        zeros = torch.zeros(n, device=self.device)
+        quat = quat_from_euler_xyz(zeros, zeros, yaw_ref + yaw_noise)
+        root[:, 3:7] = quat
+
+        # base twist is stored BODY-frame in x, but write_root_velocity_to_sim
+        # expects WORLD frame — rotate by the (yaw-only) orientation we just set.
+        root_vel = torch.cat(
+            [quat_apply(quat, base_lin_vel_ref), quat_apply(quat, base_ang_vel_ref)], dim=-1
+        )
 
         self._robot.write_root_pose_to_sim(root[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(root_vel, env_ids)

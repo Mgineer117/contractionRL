@@ -14,7 +14,7 @@ from isaaclab.utils import configclass
 
 @configclass
 class ManipulatorPathTrackingEnvCfg(DirectRLEnvCfg):
-    num_envs = 4096
+    num_envs = 1024
     decimation = 2
     episode_length_s = 15.0
 

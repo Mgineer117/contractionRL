@@ -21,6 +21,8 @@ import torch
 
 from isaaclab.envs import DirectRLEnv
 
+from contractionRL.agents.skrl.angle_utils import wrap_diff
+
 from .eval_metrics import fit_exponential_envelope, mean_confidence_interval
 from .traj_buffer import TrajectoryBuffer
 
@@ -48,7 +50,64 @@ class PathTrackingBase(DirectRLEnv):
     Subclass must define:
         cfg.traj_path   : str — path to .npz reference trajectory file
         cfg.action_space, observation_space
+
+    Subclass may override:
+        angle_idx : list[int] — indices within the (raw, per-block) physical
+            state that hold a wrapping angle (e.g. yaw). Default () — most
+            path-tracking states (proj_gravity + joint pos/vel) have no raw
+            angle. Networks embed these continuously ((cos, sin), see
+            agents/skrl/angle_utils.py); the tracking ERROR computed here stays
+            in raw coordinates but has these dims shortest-angle WRAPPED before
+            any norm/reward/metric — otherwise a wraparound (e.g. a yaw U-turn)
+            would spike the error by ~2*pi.
     """
+    angle_idx: "Sequence[int]" = ()
+
+    # ── Divergence guard ────────────────────────────────────────────────── #
+    # An initially unstable policy (random init, or C2RL's con_policy early on)
+    # can drive the sim to a non-finite / exploded physical state. In Isaac most
+    # state elements are physically bounded, but pathological contacts can still
+    # emit NaN/Inf or huge values. These are sanitized before they reach the
+    # policy input / reward / replay buffer / Stability metrics, and any env past
+    # the divergence bound is force-reset (see _state_diverged) regardless of
+    # terminate_on_fall — a NaN/exploded articulation never self-heals.
+    _STATE_DIVERGENCE_BOUND = 1.0e4   # |state element| beyond this ⇒ reset env
+    _ERROR_CLAMP = 1.0e3              # cap on ||error|| feeding reward/AUC/metrics
+
+    def _sanitize_state(self, x: torch.Tensor) -> torch.Tensor:
+        """Replace NaN/±Inf with finite values so a diverging rollout can't
+        propagate NaNs downstream. Diverged envs are separately reset via
+        _state_diverged() in the subclass _get_dones().
+
+        Emits a throttled warning (once per physics step, regardless of how many
+        call sites sanitize) whenever it actually has to scrub a non-finite
+        state — this should be rare, so a silent guard would hide a real problem.
+        """
+        nonfinite = ~torch.isfinite(x)
+        if nonfinite.any():
+            step = int(getattr(self, "common_step_counter", 0))
+            if step != getattr(self, "_last_nonfinite_warn_step", -1):
+                self._last_nonfinite_warn_step = step
+                n_bad = int(nonfinite.any(dim=-1).sum())
+                print(
+                    f"[PathTracking] WARNING: {n_bad}/{x.shape[0]} env(s) produced a "
+                    f"non-finite (NaN/Inf) physical state at step {step} — sanitizing "
+                    f"it and resetting those envs (divergence guard).",
+                    flush=True,
+                )
+        return torch.nan_to_num(
+            x, nan=0.0,
+            posinf=self._STATE_DIVERGENCE_BOUND, neginf=-self._STATE_DIVERGENCE_BOUND,
+        )
+
+    def _state_diverged(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-env bool mask: physical state non-finite or past the divergence
+        bound. Such envs MUST be reset (independent of terminate_on_fall), else
+        they stay stuck emitting NaN/huge states that poison every downstream
+        buffer for the rest of the episode."""
+        finite = torch.isfinite(x).all(dim=-1)
+        bounded = (x.abs() < self._STATE_DIVERGENCE_BOUND).all(dim=-1)
+        return ~(finite & bounded)
 
     def __init__(self, cfg, render_mode=None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
@@ -65,9 +124,6 @@ class PathTrackingBase(DirectRLEnv):
         # --- episode-level eval metric accumulators ---
         self._episode_auc = torch.zeros(n, device=self.device)
         self._episode_contraction_steps = torch.zeros(n, dtype=torch.long, device=self.device)
-        self._episode_first_error = torch.zeros(n, device=self.device)
-        self._episode_last_error = torch.zeros(n, device=self.device)
-        self._episode_max_error = torch.zeros(n, device=self.device)
         self._prev_error_norm = torch.full((n,), float("inf"), device=self.device)
         self._episode_steps = torch.zeros(n, dtype=torch.long, device=self.device)
 
@@ -210,12 +266,18 @@ class PathTrackingBase(DirectRLEnv):
             t = np.arange(1, len(e) + 1) * dt
             ax_err.plot(t, e ** 2, linewidth=0.6, alpha=0.5, color="tab:blue")
 
-        # 1. fitted envelope — data only, no CMG/gamma involved.
-        C_fit, lambda_fit = fit_exponential_envelope(error_traces, dt)
+        # 1. fitted envelope — data only, no CMG/gamma involved. fit returns the
+        #    fixed overshoot C* (>=1, normalized) and a per-curve convergence
+        #    rate; display uses the mean positive rate and rescales C* by mean
+        #    e(0) so the envelope is in raw error units (paper: e0*C*exp(-λt)).
+        C_fit, lbds_fit = fit_exponential_envelope(error_traces, dt)
+        pos_lbds = lbds_fit[lbds_fit > 0]
+        lambda_fit = float(pos_lbds.mean()) if pos_lbds.size else 0.0
         if lambda_fit > 0:
+            e0_mean = float(np.mean([e[0] for e in error_traces if len(e) and e[0] > 0]))
             ax_err.plot(
-                t_axis, (C_fit * np.exp(-lambda_fit * t_axis)) ** 2, "r--", linewidth=2,
-                label=f"fitted envelope (C={C_fit:.2g}, λ={lambda_fit:.2g})",
+                t_axis, (e0_mean * C_fit * np.exp(-lambda_fit * t_axis)) ** 2, "r--", linewidth=2,
+                label=f"fitted envelope (C={C_fit:.2g}·e₀, λ̄={lambda_fit:.2g})",
             )
 
         if self.target_lambda is not None:
@@ -327,9 +389,11 @@ class PathTrackingBase(DirectRLEnv):
 
         Shared across all path-tracking envs (quadruped/humanoid/manipulator) —
         used by the post-training evaluator to fit the exponential contraction
-        envelope C * exp(-lambda * k * dt) bounding the error curve.
+        envelope C * exp(-lambda * k * dt) bounding the error curve. angle_idx
+        dims (e.g. yaw) are shortest-angle wrapped before the norm — see
+        _get_rewards for why an unwrapped difference would be wrong.
         """
-        return torch.norm(self._get_physical_state() - self._x_ref, dim=-1)
+        return torch.norm(wrap_diff(self._get_physical_state() - self._x_ref, self.angle_idx), dim=-1)
 
     @property
     def x_dim(self) -> int:
@@ -360,25 +424,29 @@ class PathTrackingBase(DirectRLEnv):
     def _get_observations(self) -> dict:
         step = self.episode_length_buf.long()
         self._x_ref, self._u_ref = self._traj_buf.get(self._traj_ids, step)
-        x = self._get_physical_state()
+        # sanitize so the policy never receives NaN/Inf from a diverging env
+        x = self._sanitize_state(self._get_physical_state())
         obs = torch.cat([x, self._x_ref, self._u_ref], dim=-1)
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
-        x = self._get_physical_state()
-        error = x - self._x_ref
-        error_norm = torch.norm(error, dim=-1)   # (N,)
+        # sanitize + clamp so a diverging env yields a large-but-FINITE penalty
+        # (never NaN/Inf) into the reward, AUC, and Stability curves; the env
+        # itself is reset via _state_diverged() in _get_dones().
+        x = self._sanitize_state(self._get_physical_state())
+        # angle_idx dims (e.g. yaw) are wrapped to the shortest-angle difference
+        # BEFORE any norm/reward/metric — a raw difference would spike by ~2*pi
+        # whenever the physical angle wraps (e.g. a yaw U-turn). Non-angle dims
+        # are unaffected (wrap_diff is a no-op there, and a no-op entirely when
+        # angle_idx is empty).
+        error = wrap_diff(x - self._x_ref, self.angle_idx)
+        error_norm = torch.norm(error, dim=-1).clamp(max=self._ERROR_CLAMP)   # (N,)
 
         # accumulate AUC
         self._episode_auc += error_norm
 
-        # record first / last error per env
-        is_first = (self._episode_steps == 0)
-        self._episode_first_error = torch.where(is_first, error_norm, self._episode_first_error)
-        self._episode_last_error = error_norm
-        self._episode_max_error = torch.maximum(self._episode_max_error, error_norm)
-
         # contraction flag: count steps where error strictly decreased (skip step 0)
+        is_first = (self._episode_steps == 0)
         contracting = (~is_first) & (error_norm < self._prev_error_norm)
         self._episode_contraction_steps += contracting.long()
 
@@ -397,7 +465,9 @@ class PathTrackingBase(DirectRLEnv):
             self._viz_pos_live[rows, idx] = pos[in_range].detach().cpu().numpy()
             self._viz_state_live[rows, idx] = x[:viz_n][in_range].detach().cpu().numpy()
 
-        return -torch.sum(error * error, dim=-1)   # -||error||_I^2
+        # -||error||_I^2, using the sanitized+clamped norm so a diverged step
+        # can't emit a huge/NaN reward that wrecks the value fn / normalizers.
+        return -(error_norm * error_norm)
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
@@ -413,51 +483,46 @@ class PathTrackingBase(DirectRLEnv):
         if len(finished) > 0:
             self.extras.setdefault("log", {})
 
-            auc = self._episode_auc[finished].float()
-            steps = self._episode_steps[finished].float().clamp(min=1)
-            e0 = self._episode_first_error[finished].float().clamp(min=1e-8)
-            eT = self._episode_last_error[finished].float().clamp(min=1e-8)
-            e_max = self._episode_max_error[finished].float().clamp(min=1e-8)
-            T = steps
             dt = self.step_dt
 
-            # empirical contraction rate: e(T) = e(0) * exp(-lambda * T*dt).
-            # Clamped to >= 0: a negative raw value just means the error grew
-            # instead of decaying (no contraction observed this episode), which
-            # isn't a valid "rate" — same convention as fit_exponential_envelope's
-            # lambda=0 sentinel for "no decaying envelope fits".
-            lambda_emp = (-(torch.log(eT) - torch.log(e0)) / (T * dt)).clamp(min=0.0)
-
-            # overshoot: peak error relative to the initial error — a contracting
-            # trajectory should never exceed e(0), so overshoot > 1 flags excursions
-            overshoot = e_max / e0
-
-            # contraction flag: fraction of contracting steps (skip step 0)
+            # --- AUC + contraction flag (cheap per-episode accumulators) ---
+            auc = self._episode_auc[finished].float()
+            steps = self._episode_steps[finished].float().clamp(min=1)
             valid_steps = (steps - 1).clamp(min=1)
             contraction_flag = self._episode_contraction_steps[finished].float() / valid_steps
 
-            # convergence score: contraction rate per unit of overshoot — a
-            # single figure-of-merit combining "how fast" (lambda) and "how
-            # clean" (overshoot, penalizing excursions above e(0)). Higher is
-            # better: fast contraction with little to no overshoot. Always
-            # >= 0 since both lambda_emp and overshoot are clamped positive.
-            convergence_score = lambda_emp / overshoot.clamp(min=1e-6)
-
             self.extras["log"]["Stability/contraction_flag"] = contraction_flag.mean()
-
             auc_mean, auc_ci95 = mean_confidence_interval(auc.cpu().numpy())
-            lbd_mean, lbd_ci95 = mean_confidence_interval(lambda_emp.cpu().numpy())
-            os_mean, os_ci95 = mean_confidence_interval(overshoot.cpu().numpy())
-            conv_mean, conv_ci95 = mean_confidence_interval(convergence_score.cpu().numpy())
-
             self.extras["log"]["Stability/auc"] = torch.tensor(auc_mean, device=self.device)
             self.extras["log"]["Stability/auc_ci95"] = torch.tensor(auc_ci95, device=self.device)
-            self.extras["log"]["Stability/contraction_rate"] = torch.tensor(lbd_mean, device=self.device)
-            self.extras["log"]["Stability/contraction_rate_ci95"] = torch.tensor(lbd_ci95, device=self.device)
-            self.extras["log"]["Stability/overshoot"] = torch.tensor(os_mean, device=self.device)
-            self.extras["log"]["Stability/overshoot_ci95"] = torch.tensor(os_ci95, device=self.device)
-            self.extras["log"]["Stability/convergence_score"] = torch.tensor(conv_mean, device=self.device)
-            self.extras["log"]["Stability/convergence_score_ci95"] = torch.tensor(conv_ci95, device=self.device)
+
+            # --- Convergence rate (lambda) + overshoot (C), paper procedure ---
+            # Fit the exponential envelope over the full-length error curves of the
+            # finished viz envs (training is non-terminating, so these are complete
+            # episodes). fit_exponential_envelope fixes ONE overshoot C* from the
+            # highest-overshoot curve, then returns the convergence rate per curve.
+            # contraction_score = lambda / C* — fast contraction per unit overshoot,
+            # higher is better. No deviation from the paper's definition.
+            finished_np = finished.cpu().numpy()
+            steps_np = self._episode_steps[finished].cpu().numpy()
+            curves = [
+                self._viz_error_live[g, :L]
+                for g, L in zip(finished_np, steps_np)
+                if g < self._viz_n and L > 0
+            ]
+            if curves:
+                C_star, lambdas = fit_exponential_envelope(curves, dt)
+                score = lambdas / max(float(C_star), 1e-6)
+                lbd_mean, lbd_ci95 = mean_confidence_interval(lambdas)
+                sc_mean, sc_ci95 = mean_confidence_interval(score)
+
+                self.extras["log"]["Stability/contraction_rate"] = torch.tensor(lbd_mean, device=self.device)
+                self.extras["log"]["Stability/contraction_rate_ci95"] = torch.tensor(lbd_ci95, device=self.device)
+                # C* is a single fixed value for the batch, so it carries no CI.
+                self.extras["log"]["Stability/overshoot"] = torch.tensor(float(C_star), device=self.device)
+                self.extras["log"]["Stability/overshoot_ci95"] = torch.tensor(0.0, device=self.device)
+                self.extras["log"]["Stability/contraction_score"] = torch.tensor(sc_mean, device=self.device)
+                self.extras["log"]["Stability/contraction_score_ci95"] = torch.tensor(sc_ci95, device=self.device)
 
         # --- PathTracking figure: snapshot completed episodes for viz envs ---
         # (env_ids may include indices >= _viz_n, which we simply don't track)
@@ -493,9 +558,6 @@ class PathTrackingBase(DirectRLEnv):
         # --- reset per-env buffers ---
         self._episode_auc[env_ids] = 0.0
         self._episode_contraction_steps[env_ids] = 0
-        self._episode_first_error[env_ids] = 0.0
-        self._episode_last_error[env_ids] = 0.0
-        self._episode_max_error[env_ids] = 0.0
         self._prev_error_norm[env_ids] = float("inf")
         self._episode_steps[env_ids] = 0
 
