@@ -58,6 +58,6 @@ agent:
 
 trainer:
   class: C3MTrainer
-  timesteps: 300  # Total number of environment steps to train for
+  timesteps: 100  # Total number of environment steps to train for
   eval_interval: 10  # Frequency of running evaluation rollouts
   environment_info: log  # Type of environment information to record (e.g., log)
