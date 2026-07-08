@@ -302,7 +302,7 @@ class ContractionRunner:
     # ── contraction agents (C3M/LQR/SDLQR/C2RL) ───────────────────────── #
 
     def _setup_contraction(self, env, cfg, algo, task_id, num_envs, is_classic, dynamics_model=None):
-        from contractionRL.agents.skrl.models import CLActorModel, CMGModel
+        from contractionRL.agents.skrl.models import ControllerNetwork, MetricNetwork
 
         skrl_env = _make_skrl_env(env, task_id, num_envs, is_classic)
         # Use the wrapped env's device for both classic and Isaac envs. The
@@ -403,7 +403,7 @@ class ContractionRunner:
                    agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None,
                    angle_idx=None):
         angle_idx = list(angle_idx or [])
-        from contractionRL.agents.skrl.models import CLActorModel, CMGModel
+        from contractionRL.agents.skrl.models import ControllerNetwork, MetricNetwork
         from contractionRL.agents.skrl.c3m import C3MAgent, C3MCfg, C3MSkrlTrainer, C3MTrainerCfg
         import dataclasses
 
@@ -449,7 +449,7 @@ class ContractionRunner:
 
         models = {
             "policy": policy_cls(obs_space, act_space, device, hidden_dim=hd_policy, activation=act_policy, x_dim=x_dim, angle_idx=angle_idx, **policy_kwargs),
-            "cmg": CMGModel(obs_space, act_space, device, hidden_dim=hd_cmg, activation=act_cmg, x_dim=x_dim, angle_idx=angle_idx, constrain_eigenvalues=constrain_eigenvalues, w_lb=w_lb, w_ub=w_ub),
+            "cmg": MetricNetwork(obs_space, act_space, device, hidden_dim=hd_cmg, activation=act_cmg, x_dim=x_dim, angle_idx=angle_idx, constrain_eigenvalues=constrain_eigenvalues, w_lb=w_lb, w_ub=w_ub),
         }
 
         if "dynamics" in models_cfg:
@@ -533,7 +533,7 @@ class ContractionRunner:
                     agent_cfg, trainer_cfg, models_cfg, memory_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None,
                     base_algorithm: str = "PPO", angle_idx=None):
         angle_idx = list(angle_idx or [])
-        from contractionRL.agents.skrl.models import CMGModel
+        from contractionRL.agents.skrl.models import MetricNetwork
         from contractionRL.agents.skrl.c2rl import C2RLAgent, C2RLSkrlTrainer, C2RLTrainerCfg
         from contractionRL.agents.skrl.runner import _gaussian_factory
 
@@ -584,7 +584,7 @@ class ContractionRunner:
         constrain_eigenvalues = cmg_net[0].get("constrain_eigenvalues", False) if cmg_net else False
         w_lb = agent_cfg.get("w_lb", 0.1)
         w_ub = agent_cfg.get("w_ub", 10.0)
-        cmg_model = CMGModel(
+        cmg_model = MetricNetwork(
             obs_space, act_space, device, hidden_dim=cmg_hd, activation=cmg_act,
             x_dim=x_dim, angle_idx=angle_idx, constrain_eigenvalues=constrain_eigenvalues, w_lb=w_lb, w_ub=w_ub,
         )

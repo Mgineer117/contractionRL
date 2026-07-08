@@ -679,17 +679,20 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, num_grou
     err_np = errors.cpu().numpy()  # (N, T+1)
     rew_np = total_reward.cpu().numpy()
 
-    # AUC over the raw error curve (dt-weighted trapezoid), per episode.
+    # AUC over the normalized error curve (dt-weighted trapezoid), per episode.
     # np.trapezoid is numpy>=2 only; env_isaaclab ships numpy 1.26 (trapz).
     _trapz = getattr(np, "trapezoid", None) or np.trapz
-    auc_np = _trapz(err_np, dx=dt, axis=1)
+    e0_np = err_np[:, 0]
+    e0_np_safe = np.maximum(e0_np, 1e-8)
+    norm_err_np = err_np / e0_np_safe[:, None]
+    auc_np = _trapz(norm_err_np, dx=dt, axis=1)
 
     # Contraction envelope on NORMALIZED error e(t)/e(0) — CAC-dev convention.
     # Envs whose initial error is ~0 (near-zero commanded velocity) carry no
     # contraction information and are excluded from the fit.
     e0 = err_np[:, 0]
     fit_mask = e0 > 0.05
-    C_list, lbd_list = [], []
+    C_list, lbd_list, score_list = [], [], []
     fit_ids = np.nonzero(fit_mask)[0]
     if len(fit_ids) >= num_groups:
         groups = np.array_split(fit_ids, num_groups)
@@ -699,6 +702,7 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, num_grou
             C, lbds = fit_exponential_envelope(raw_trajs, dt)
             C_list.append(C)
             lbd_list.extend(float(x) for x in lbds)
+            score_list.extend(float(x) / max(C, 1e-6) for x in lbds)
     else:
         print(f"[Eval] WARNING: only {len(fit_ids)} envs with e(0) > 0.05; skipping contraction fit.")
 
@@ -714,9 +718,11 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, num_grou
     if C_list:
         C_mean, C_ci = mean_confidence_interval(C_list)
         lbd_mean, lbd_ci = mean_confidence_interval(lbd_list)
+        score_mean, score_ci = mean_confidence_interval(score_list)
         results.update({
             "overshoot_mean": C_mean, "overshoot_ci95": C_ci,
             "contraction_rate_mean": lbd_mean, "contraction_rate_ci95": lbd_ci,
+            "contraction_score_mean": score_mean, "contraction_score_ci95": score_ci,
             "num_fit_groups": len(C_list),
         })
 
@@ -733,8 +739,16 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, num_grou
     print(f"[Eval] Saved → {out_json}")
 
     if not args_cli.no_wandb and "wandb" in sys.modules and sys.modules["wandb"].run is not None:
-        sys.modules["wandb"].log({f"final_eval/{k}": v for k, v in results.items()
-                                  if isinstance(v, (int, float))})
+        wandb_logs = {}
+        for k, v in results.items():
+            if isinstance(v, (int, float)):
+                if "reward" in k:
+                    wandb_logs[f"Reward/{k}"] = v
+                elif any(s in k for s in ["auc", "overshoot", "contraction_rate", "contraction_score"]):
+                    wandb_logs[f"Stability/{k}"] = v
+                else:
+                    wandb_logs[f"final_eval/{k}"] = v
+        sys.modules["wandb"].log(wandb_logs)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -814,7 +828,10 @@ if _is_classic:
         # (search/run_c3m_sweeps.sh: `wandb agent ... > logfile 2>&1 &`), which
         # is exactly the case where wandb's tty auto-detection for the Logs tab
         # can silently fail to capture anything. "wrap" forces it regardless.
-        _wkw["settings"] = _wandb.Settings(console="wrap")
+        try:
+            _wkw["settings"] = _wandb.Settings(console="wrap")
+        except Exception:
+            pass
         # Consistent run name: CLI override > YAML-provided name > deterministic
         # default that matches the local log directory (logs/classic/<algo>/<ts>).
         _wkw["name"] = args_cli.wandb_run_name or _wkw.get("name") or f"classic_{algorithm}_{_run_ts}"
@@ -870,6 +887,11 @@ if _is_classic:
         vec_env = SyncVectorEnv([lambda: gym.make(args_cli.task)] * num_envs)
         # vec_env.device = "cpu"  # REMOVED: This was causing C3M to run its heavy batch gradients on the CPU!
         env = wrap_env(vec_env, wrapper="gymnasium")
+        import sys as _sys
+        import os as _os
+        _sys.path.append(_os.path.dirname(__file__))
+        from wandb_plot_wrapper import WandbPlotWrapper
+        env = WandbPlotWrapper(env)
 
         runner = ContractionRunner(env, agent_cfg, task_id=args_cli.task, num_envs=num_envs, is_classic=True)
         if args_cli.checkpoint:
@@ -895,6 +917,11 @@ if _is_classic:
         num_envs = args_cli.num_envs or 4
         vec_env = SyncVectorEnv([lambda: gym.make(args_cli.task)] * num_envs)
         env = wrap_env(vec_env, wrapper="gymnasium")
+        import sys as _sys
+        import os as _os
+        _sys.path.append(_os.path.dirname(__file__))
+        from wandb_plot_wrapper import WandbPlotWrapper
+        env = WandbPlotWrapper(env)
 
         # Standalone PPO/SAC build models purely from agent_cfg (no env access) —
         # inject angle_idx (e.g. yaw at [2]) from the underlying classic env so
@@ -1204,6 +1231,11 @@ else:
 
         start_time = time.time()
         _isaac_env = env  # save reference for get_physical_state() during ref-traj generation
+        import sys as _sys
+        import os as _os
+        _sys.path.append(_os.path.dirname(__file__))
+        from wandb_plot_wrapper import WandbPlotWrapper
+        env = WandbPlotWrapper(env)
         env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)
 
         # angle_idx (e.g. yaw at [2] on quadruped/humanoid path-tracking) is an

@@ -278,9 +278,13 @@ class BaseEnv(gym.Env):
         if isinstance(x, torch.Tensor):
             lib = torch
             added_batch = x.dim() == 1
+            if added_batch:
+                x = x.unsqueeze(0)
         else:
             lib = np
             added_batch = x.ndim == 1
+            if added_batch:
+                x = x[np.newaxis, :]
         n = 1 if added_batch else x.shape[0]
         result = self._B_null_logic(x, n, lib)
         if added_batch:

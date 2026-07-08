@@ -32,17 +32,28 @@ def b_jacobian(B: torch.Tensor, x: torch.Tensor, u_dim: int, create_graph: bool 
     return J.transpose(2, 3)
 
 
+def Jacobian_Matrix(M: torch.Tensor, x: torch.Tensor, create_graph: bool = True) -> torch.Tensor:
+    bs = x.shape[0]
+    m = M.size(-1)
+    n = x.size(1)
+    J = torch.zeros(bs, m, m, n, device=x.device, dtype=x.dtype)
+    for i in range(m):
+        for j in range(m):
+            g = grad(M[:, i, j].sum(), x, create_graph=create_graph, retain_graph=True, allow_unused=True)[0]
+            if g is not None:
+                J[:, i, j, :] = g
+    return J
+
+
 def weighted_gradients(W: torch.Tensor, v: torch.Tensor, x: torch.Tensor,
                        detach: bool = False, create_graph: bool = True) -> torch.Tensor:
     """Material derivative Ẇ = Σᵢ (∂W/∂xᵢ) vᵢ → (n, d, d)."""
     assert v.size() == x.size()
-    z = torch.ones_like(W, requires_grad=True)
-    g = grad(W, x, grad_outputs=z, create_graph=True, retain_graph=True)[0]
-    S = (g * v).sum()
-    dot_W = grad(S, z, create_graph=create_graph)[0]
+    bs = x.shape[0]
     if detach:
-        dot_W = dot_W.detach()
-    return dot_W
+        return (Jacobian_Matrix(W, x, create_graph).detach() * v.view(bs, 1, 1, -1)).sum(dim=3)
+    else:
+        return (Jacobian_Matrix(W, x, create_graph) * v.view(bs, 1, 1, -1)).sum(dim=3)
 
 
 def loss_pos_matrix_random_sampling(A: torch.Tensor, num_samples: int = 1024) -> torch.Tensor:

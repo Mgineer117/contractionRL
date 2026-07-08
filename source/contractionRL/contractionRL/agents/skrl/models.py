@@ -1,6 +1,6 @@
 """skrl-compatible model wrappers for contractionRL custom actors.
 
-CLActorModel: wraps CLActor (C3M_U contracting controller) in the skrl
+ControllerNetwork: wraps CLActor (C3M_U contracting controller) in the skrl
 GaussianMixin interface so it can be passed to skrl PPO / C2RL runners.
 
 Observation layout assumed: [x (x_dim), xref (x_dim), uref (u_dim)]
@@ -73,7 +73,7 @@ class CLDeterministicActorModel(DeterministicMixin, Model):
         return self.cl_actor.mean_control(state), {}
 
 
-class CMGModel(Model):
+class MetricNetwork(Model):
     """CCM_Generator wrapped as a skrl Model for checkpointing.
 
     The underlying CCM_Generator is accessed via ``self.ccm_gen`` by C3MAgent
@@ -144,7 +144,7 @@ class CMGModel(Model):
         return output
 
 
-class CLActorModel(GaussianMixin, Model):
+class ControllerNetwork(GaussianMixin, Model):
     """Contracting C3M_U actor wrapped as a skrl Gaussian policy model.
 
     Args:
@@ -214,7 +214,7 @@ class CLActorModel(GaussianMixin, Model):
 class MLPResidualActorModel(GaussianMixin, Model):
     """Plain-MLP actor whose output is a residual added to u_ref: mu = uref + MLP(obs).
 
-    Unlike CLActorModel (a specific bilinear w1/w2 architecture that only sees
+    Unlike ControllerNetwork (a specific bilinear w1/w2 architecture that only sees
     (x - xref)), this runs a standard MLP over the FULL observation
     [x, xref, uref] and adds uref to its raw output — same "u = uref +
     feedback" control law as CLActor, just a more generic architecture/inductive
@@ -502,7 +502,7 @@ class SquashedGaussianActorModel(_TanhSquashMixin, GaussianMixin, Model):
 
     log_std is STATE-DEPENDENT (the network outputs both mean and log_std),
     the standard SAC convention — unlike this repo's other actors
-    (CLActorModel/MLPResidualActorModel), which use one global
+    (ControllerNetwork/MLPResidualActorModel), which use one global
     log_std_parameter (fine for PPO's trust-region updates, not for SAC's
     off-policy entropy tuning, which needs the policy to shrink/widen std
     per-state).
@@ -603,7 +603,7 @@ class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
     """Tanh-squashed CLActor (bilinear feedback) actor — ``backbone: control-squashed``.
 
     Same bilinear feedback ``W2(x,xref) @ tanh(W1(x,xref) @ (x - xref))``
-    architecture as ``CLActorModel`` (requires the path-tracking ``[x, xref,
+    architecture as ``ControllerNetwork`` (requires the path-tracking ``[x, xref,
     uref]`` observation layout). The action is
     ``uref + rescale(tanh(feedback + noise))``: the *feedback* is squashed
     (bounded) and uref is added AFTER squashing, so the control law
@@ -613,7 +613,7 @@ class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
     ``_TanhSquashMixin``'s residual handling). Squashed instead of left
     unbounded — same rationale as ``SquashedGaussianActorModel``.
 
-    Unlike ``CLActorModel``, ``anneal_stddev`` is always ``False`` here: this
+    Unlike ``ControllerNetwork``, ``anneal_stddev`` is always ``False`` here: this
     backbone is meant for SAC, which learns log_std by gradient descent
     through the policy loss (automatic entropy tuning) rather than an
     external annealing schedule — CLActor's built-in ``anneal_stddev``
@@ -626,7 +626,7 @@ class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
     ``anneal_stddev=False`` default.
 
     log_std is a single GLOBAL parameter (``cl_actor.logstd``, shape
-    ``(u_dim,)``), not state-dependent — same as ``CLActorModel``. Squashing
+    ``(u_dim,)``), not state-dependent — same as ``ControllerNetwork``. Squashing
     bounds the log_prob either way (that's what fixes SAC's divergence); a
     state-dependent head isn't required for correctness, and reusing
     ``CLActor`` as-is keeps this backbone architecturally identical to plain

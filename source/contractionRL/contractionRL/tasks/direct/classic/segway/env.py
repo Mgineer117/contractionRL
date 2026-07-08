@@ -86,6 +86,15 @@ class SegwayEnv(BaseEnv):
         B[:, 3, 0] = (9.3 * lib.cos(theta) + 38.6) / (lib.cos(theta) ** 2 - 24.7)
         return B
 
+    def _B_null_logic(self, x, n, lib):
+        theta = x[:, 1]
+        Bbot = self._zeros((n, self.num_dim_x, self.num_dim_x - self.num_dim_control), x, lib)
+        Bbot[:, 0, 0] = 1.0
+        Bbot[:, 1, 1] = 1.0
+        Bbot[:, 2, 2] = (9.3 * lib.cos(theta) + 38.6) / (lib.cos(theta) ** 2 - 24.7)
+        Bbot[:, 3, 2] = -(-1.8 * lib.cos(theta) - 10.9) / (lib.cos(theta) - 24.7)
+        return Bbot
+
     def sample_reference_controls(self, freqs, weights, _t, infos, add_noise=False):
         xref_0 = infos["xref_0"]
         uref = np.array([10.2 * xref_0[2] / 47.9])

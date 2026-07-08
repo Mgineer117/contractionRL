@@ -16,7 +16,7 @@ from isaaclab.utils import configclass
 class QuadrupedPathTrackingEnvCfg(DirectRLEnvCfg):
     # env
 
-    num_envs = 1024
+    num_envs = 4096
     decimation = 4
     episode_length_s = 40.0
 

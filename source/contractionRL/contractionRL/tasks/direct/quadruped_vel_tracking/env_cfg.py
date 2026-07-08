@@ -129,6 +129,7 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     rew_z_vel = -0.5
     rew_roll_pitch = -0.05
     rew_action_rate = -0.01
+    rew_hip = -0.3       # penalize adduction/abduction
     rew_base_height = -10.0
 
     # ── trot gait (phase-clock) ──────────────────────────────────────────────
@@ -150,10 +151,10 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     # step_dt = sim.dt * decimation = 0.02 s, so gait_freq=1.0 → one cycle / 50
     # steps (1.0 s), ~1 footfall/sec per foot — a walking (not running) cadence.
     gait_freq = 1.0      # [Hz] gait cycles per second
-    gait_duty = 0.6      # stance fraction per foot (>0.5 → double-support buffer)
-    rew_gait = 2.0       # scale on the centered [-1, 1] schedule-match score
+    gait_duty = 0.8      # stance fraction per foot (>0.5 → double-support buffer)
+    rew_gait = 1.0       # scale on the centered [-1, 1] schedule-match score
     # Half-width [rad] of the smoothstep ramp at each stance↔swing edge. The
     # desired-contact schedule ramps over this band instead of stepping, so the
     # reward has no cliff at the swap — this is the de-jitter knob. ~0.4 rad ≈
     # 0.064 s per side at 1 Hz; larger = smoother/softer gait, smaller = crisper.
-    gait_transition_band = 0.4
+    gait_transition_band = 0.2

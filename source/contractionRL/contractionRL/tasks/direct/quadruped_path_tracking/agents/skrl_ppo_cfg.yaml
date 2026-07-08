@@ -20,7 +20,7 @@ models:
   policy:  # see gaussian_model parameters
     class: GaussianMixin
     backbone: control  # mlp (plain MLP, u = uref + MLP(obs)) | control (CLActor, u = uref + feedback(x-xref))
-    clip_actions: True  # PPO is unbounded; uref+feedback can exceed the declared action space
+    clip_actions: false  # PPO is unbounded; uref+feedback can exceed the declared action space
                         # (both range over it), so this clip is not redundant here
     clip_log_std: True
     min_log_std: -20.0

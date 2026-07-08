@@ -185,7 +185,9 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
                 mask = auc_vals > 0
                 init_costs = self._episode_vel_initial[env_ids]
                 init_cost = torch.clamp(init_costs[mask], min=1e-6)
-                self.extras["log"]["Episode/auc"] = (auc_vals[mask] / init_cost).mean()
+                e_T = self.get_tracking_error()[env_ids][mask]
+                auc_trapz = auc_vals[mask] + 0.5 * init_costs[mask] - 0.5 * e_T
+                self.extras["log"]["Episode/auc"] = (auc_trapz / init_cost * self.step_dt).mean()
                 self.extras["log"]["Reward/discounted_return"] = disc_returns[mask].mean()
                 self.extras["log"]["Reward/avg_reward_per_step"] = (undisc_returns[mask] / lengths[mask]).mean()
                 # undiscounted_return is dropped here — it's the same quantity skrl

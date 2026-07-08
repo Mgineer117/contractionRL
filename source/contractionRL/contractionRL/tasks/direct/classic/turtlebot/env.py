@@ -77,6 +77,14 @@ class TurtlebotEnv(BaseEnv):
         B[:, 2, 1] = k3
         return B
 
+    def _B_null_logic(self, x, n, lib):
+        theta = x[:, 2]
+        Bbot = self._zeros((n, self.num_dim_x, self.num_dim_x - self.num_dim_control), x, lib)
+        Bbot[:, 0, 0] = k2 * lib.sin(theta) * k3
+        Bbot[:, 1, 0] = -k1 * lib.cos(theta) * k3
+        Bbot[:, 2, 0] = 0.0
+        return Bbot
+
     def sample_reference_controls(self, freqs, weights, _t, infos, add_noise=False):
         linear_velocity = UREF_MAX[0] * np.random.uniform(0.2, 0.8)
         uref = np.array([linear_velocity.squeeze(), 0])

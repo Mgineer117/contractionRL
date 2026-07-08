@@ -41,7 +41,7 @@ except ImportError:
     _plt = None
 
 _WANDB_PLOT_INTERVAL = 20   # log trajectory plot every N completed episodes (env 0)
-_VIZ_MAX_ENVS = 100         # cap on how many envs' trajectories go into the plot
+_VIZ_MAX_ENVS = 1         # cap on how many envs' trajectories go into the plot
 
 
 class PathTrackingBase(DirectRLEnv):

@@ -38,7 +38,7 @@ agent:
   cmg_updates_per_policy_update: 3  # Number of CMG metric updates to perform per policy update
   W_lr: 3.0e-4  # Learning rate for the Contraction Metric Generator (CMG) network
   u_lr: 3.0e-4  # Learning rate for the Policy (Actor) network
-  lbd: 0.01  # Contraction rate parameter (lambda) enforcing the exponential stability bound
+  lbd: 0.5  # Contraction rate parameter (lambda) enforcing the exponential stability bound
   eps: 0.01  # Margin parameter (epsilon) ensuring strict definiteness of the metric
   w_ub: 10.0  # Upper bound clipping value for the generated metric M(x)
   w_lb: 0.1  # Lower bound clipping value for the generated metric M(x)

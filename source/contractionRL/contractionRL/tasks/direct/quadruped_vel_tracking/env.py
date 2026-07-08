@@ -37,8 +37,8 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
 
     def __init__(self, cfg: QuadrupedVelTrackingEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
-
         self._joint_ids, _ = self._robot.find_joints([".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"])
+        self._hip_ids, _ = self._robot.find_joints([".*_hip_joint"])
         # Feet ordering/contact come from the ContactSensor (force-based), not the
         # articulation — see _setup_scene. find_bodies indexes into the sensor's
         # tracked bodies, so contact/air-time columns line up with _feet_names.
@@ -228,8 +228,11 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         gait_score = torch.where(moving > 0, match, stand_score)
         rew_gait = (2.0 * gait_score - 1.0) * self.cfg.rew_gait
 
+        hip_pos = self._robot.data.joint_pos[:, self._hip_ids] - self._robot.data.default_joint_pos[:, self._hip_ids]
+        rew_hip = torch.sum(torch.square(hip_pos), dim=1) * self.cfg.rew_hip
+
         total_reward = (self.cfg.rew_alive + rew_lin + rew_yaw + rew_flat + rew_z + rew_rp +
-                        rew_height + rew_gait + rew_act_rate)
+                        rew_height + rew_gait + rew_hip + rew_act_rate)
         
         if not hasattr(self, "_episode_discounted_returns"):
             self._episode_discounted_returns = torch.zeros(self.num_envs, device=self.device)
@@ -283,7 +286,9 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
                 mask = auc_vals > 0
                 init_costs = self._episode_vel_initial[env_ids]
                 init_cost = torch.clamp(init_costs[mask], min=1e-6)
-                self.extras["log"]["Episode/auc"] = (auc_vals[mask] / init_cost).mean()
+                e_T = self.get_tracking_error()[env_ids][mask]
+                auc_trapz = auc_vals[mask] + 0.5 * init_costs[mask] - 0.5 * e_T
+                self.extras["log"]["Episode/auc"] = (auc_trapz / init_cost * self.step_dt).mean()
                 self.extras["log"]["Reward/discounted_return"] = disc_returns[mask].mean()
                 self.extras["log"]["Reward/avg_reward_per_step"] = (undisc_returns[mask] / lengths[mask]).mean()
                 # undiscounted_return is dropped here — it's the same quantity skrl

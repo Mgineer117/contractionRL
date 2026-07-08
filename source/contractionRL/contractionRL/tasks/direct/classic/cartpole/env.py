@@ -91,6 +91,15 @@ class CartPoleEnv(BaseEnv):
         B[:, 3, 0] = lib.cos(theta) / l / (mc + mp * (lib.sin(theta) ** 2))
         return B
 
+    def _B_null_logic(self, x, n, lib):
+        theta = x[:, 1]
+        Bbot = self._zeros((n, self.num_dim_x, self.num_dim_x - self.num_dim_control), x, lib)
+        Bbot[:, 0, 0] = 1.0
+        Bbot[:, 1, 1] = 1.0
+        Bbot[:, 2, 2] = lib.cos(theta) / l / (mc + mp * (lib.sin(theta) ** 2))
+        Bbot[:, 3, 2] = -1.0 / (mc + mp * (lib.sin(theta) ** 2))
+        return Bbot
+
     def sample_reference_controls(self, freqs, weights, _t, infos, add_noise=False):
         xref_0 = infos["xref_0"]
         uref = np.array([10.2 * xref_0[2] / 47.9])

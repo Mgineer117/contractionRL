@@ -289,7 +289,7 @@ class C2RLAgent(Agent):
       ``"opt_critic_1"``/``"opt_critic_2"``/``"opt_target_critic_1"``/``"opt_target_critic_2"``
 
     Both:
-      ``"cmg"``        — CMGModel wrapping CCM_Generator
+      ``"cmg"``        — MetricNetwork wrapping CCM_Generator
 
     Extra constructor kwargs:
       ``get_rollout``:  ``(buffer_size, mode) -> dict(x, xref, uref)``
@@ -1109,23 +1109,151 @@ class C2RLSkrlTrainer(Trainer):
             pd_loss = cmg_dict.get("C2RL/CMG/pd_loss", float("nan"))
             pbar.set_postfix(epoch=epoch, pd=f"{pd_loss:.3g}")
 
+            # Evaluate metrics occasionally
+            eval_interval = getattr(agent._cfg, "eval_interval", 0)
+            if eval_interval > 0 and (epoch + 1) % eval_interval == 0:
+                eval_metrics = self.eval()
+                _stability_keys = {"auc", "contraction_rate", "overshoot", "contraction_score"}
+                for k, v in eval_metrics.items():
+                    tab = "Stability" if any(sk in k for sk in _stability_keys) else "Reward"
+                    agent.track_data(f"{tab}/{k}", v)
+
         # Persist the learned dynamics for reuse/inspection (matches C3M).
         if agent._neural_dynamics is not None:
             dyn_path = os.path.join(agent.experiment_dir, "checkpoints", "dynamics.pt")
             os.makedirs(os.path.dirname(dyn_path), exist_ok=True)
             agent.save_dynamics(dyn_path)
 
-    def eval(self) -> None:
+    def _env_scalar_attr(self, *names):
+        for name in names:
+            val = getattr(self.env, name, None)
+            if val is not None:
+                return val
+        if hasattr(self.env, "get_attr"):
+            for name in names:
+                try:
+                    return self.env.get_attr(name)[0]
+                except Exception:
+                    continue
+        return 0
+
+    def eval(self) -> dict:
+        import numpy as np
         agent: C2RLAgent = self.agents if not isinstance(self.agents, list) else self.agents[0]
         ppo = agent._opt_agent if (agent._opt_agent and not agent._con_only) else agent._con_agent
         ppo.enable_training_mode(False)
         observations, _ = self.env.reset()
         states = self.env.state() if hasattr(self.env, "state") else None
-        done = False
-        while not done:
+
+        x_dim = agent._x_dim
+        num_envs = self.env.num_envs
+        auc_sum = torch.zeros((num_envs, 1), device=self.env.device)
+        total_reward = torch.zeros((num_envs, 1), device=self.env.device)
+        steps_count = torch.zeros((num_envs, 1), device=self.env.device)
+        e0 = torch.zeros((num_envs, 1), device=self.env.device)
+        e_last = torch.zeros((num_envs, 1), device=self.env.device)
+        e_max = torch.zeros((num_envs, 1), device=self.env.device)
+
+        max_steps = int(self._env_scalar_attr("max_episode_length", "max_episode_len")) + 1
+        finished = torch.zeros(num_envs, dtype=torch.bool, device=self.env.device)
+
+        plot_idx = np.random.choice(num_envs, 1, replace=False)
+        traj_x = {i: [] for i in plot_idx}
+        traj_xref = {i: [] for i in plot_idx}
+
+        for _ in range(max_steps):
             with torch.no_grad():
                 actions, _ = ppo.models["policy"].act({"observations": observations}, role="policy")
+
+            active = (~finished).unsqueeze(-1).float()
+            x_curr = observations[:, :x_dim]
+            x_ref = observations[:, x_dim:2*x_dim]
+            error = torch.norm(x_curr - x_ref, dim=-1, keepdim=True)
+
+            for i in plot_idx:
+                if not finished[i]:
+                    traj_x[i].append(x_curr[i].cpu().clone().numpy())
+                    traj_xref[i].append(x_ref[i].cpu().clone().numpy())
+            auc_sum += error * active
+            is_first = (steps_count == 0) & (active > 0)
+            e0 = torch.where(is_first, error, e0)
+            e_last = torch.where(active > 0, error, e_last)
+            e_max = torch.where(active > 0, torch.maximum(e_max, error), e_max)
+
             observations, rewards, terminated, truncated, _ = self.env.step(actions)
-            states = self.env.state() if hasattr(self.env, "state") else None
-            done = bool((terminated | truncated).all())
+            total_reward += rewards.view(num_envs, 1) * active
+            steps_count += active
+
+            finished |= (terminated | truncated).view(num_envs)
+            if finished.all():
+                break
+
         ppo.enable_training_mode(True)
+
+        dt = float(self._env_scalar_attr("step_dt", "dt"))
+        e0c = e0.clamp(min=1e-8)
+        eTc = e_last.clamp(min=1e-8)
+        T = steps_count.clamp(min=1)
+        lambda_emp = (-(torch.log(eTc) - torch.log(e0c)) / (T * dt)).clamp(min=0.0)
+        overshoot = (e_max.clamp(min=1e-8) / e0c).clamp(min=1e-6)
+        contraction_score = lambda_emp / overshoot
+
+        import sys
+        if "wandb" in sys.modules and sys.modules["wandb"].run is not None:
+            import wandb
+            import matplotlib.pyplot as plt
+            import io
+            from PIL import Image
+
+            fig = plt.figure(figsize=(6, 5))
+            plotted = False
+
+            for i in plot_idx:
+                if len(traj_x[i]) == 0:
+                    continue
+                plotted = True
+                tx = np.stack(traj_x[i])
+                txref = np.stack(traj_xref[i])
+
+                if x_dim == 1:
+                    ax = fig.add_subplot(111) if not plotted or 'ax' not in locals() else ax
+                    ax.plot(tx[:, 0], label=f'x (env {i})')
+                    ax.plot(txref[:, 0], '--', label=f'x_ref (env {i})')
+                elif x_dim == 2:
+                    ax = fig.add_subplot(111) if not plotted or 'ax' not in locals() else ax
+                    ax.plot(tx[:, 0], tx[:, 1], label=f'x (env {i})')
+                    ax.plot(txref[:, 0], txref[:, 1], '--', label=f'x_ref (env {i})')
+                else:
+                    ax = fig.add_subplot(111, projection='3d') if not plotted or 'ax' not in locals() else ax
+                    ax.plot(tx[:, 0], tx[:, 1], tx[:, 2], label=f'x (env {i})')
+                    ax.plot(txref[:, 0], txref[:, 1], txref[:, 2], '--', label=f'x_ref (env {i})')
+
+            if plotted:
+                ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')
+                ax.set_title("C2RL Tracking")
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', bbox_inches='tight')
+            plt.close(fig)
+            buf.seek(0)
+            try:
+                img = Image.open(buf)
+                wandb.log({"train/tracking_trajectory": wandb.Image(img)}, step=agent.track_dict.get("timestep", 0) if hasattr(agent, "track_dict") else None)
+            except Exception:
+                pass
+
+        from .eval_metrics import mean_confidence_interval
+        f_mask = finished if finished.any() else torch.ones_like(finished)
+        
+        rew_m, rew_ci = mean_confidence_interval(total_reward[f_mask].cpu().numpy())
+        auc_m, auc_ci = mean_confidence_interval(auc_sum[f_mask].cpu().numpy())
+        cr_m, cr_ci = mean_confidence_interval(lambda_emp[f_mask].cpu().numpy())
+        over_m, over_ci = mean_confidence_interval(overshoot[f_mask].cpu().numpy())
+        score_m, score_ci = mean_confidence_interval(contraction_score[f_mask].cpu().numpy())
+
+        return {
+            "reward_mean": rew_m, "reward_ci95": rew_ci,
+            "auc_mean": auc_m, "auc_ci95": auc_ci,
+            "contraction_rate_mean": cr_m, "contraction_rate_ci95": cr_ci,
+            "overshoot_mean": over_m, "overshoot_ci95": over_ci,
+            "contraction_score_mean": score_m, "contraction_score_ci95": score_ci,
+        }
