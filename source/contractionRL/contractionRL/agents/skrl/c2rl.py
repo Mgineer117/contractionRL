@@ -192,16 +192,16 @@ class C2RLPPOCfg(AgentCfg):
     lbd: float = 1e-2
     eps: float = 1e-2
     W_entropy_scaler: float = 1e-3
-    cmg_updates_per_policy_update: int = 1
+    policy_update_per_cmg_update: int = 1
     batch_size: int = 1024
     # reward normalisation
     reward_norm_beta: float = 0.99
     tracking_scaler: float = 1.0
     control_scaler: float = 0.0
     # Dynamics — learned NeuralDynamics (ẋ = f(x) + B(x)·u) unless
-    # use_analytical_dynamics=True (classic envs only). Same mechanism as C3M:
+    # use_empirical_dynamics=True (classic envs only). Same mechanism as C3M:
     # pretrained offline/online before training, then refined online each epoch.
-    use_analytical_dynamics: bool = False
+    use_empirical_dynamics: bool = False
     dynamics_lr: float = 1e-3
     dynamics_lr_scheduler: str = ""
     dynamics_lr_scheduler_kwargs: dict = field(default_factory=dict)
@@ -240,15 +240,15 @@ class C2RLSACCfg(AgentCfg):
     lbd: float = 1e-2
     eps: float = 1e-2
     W_entropy_scaler: float = 1e-3
-    cmg_updates_per_policy_update: int = 1
+    policy_update_per_cmg_update: int = 1
     # reward normalisation
     reward_norm_beta: float = 0.99
     tracking_scaler: float = 1.0
     control_scaler: float = 0.0
     # Dynamics — learned NeuralDynamics (ẋ = f(x) + B(x)·u) unless
-    # use_analytical_dynamics=True (classic envs only). Same mechanism as C3M:
+    # use_empirical_dynamics=True (classic envs only). Same mechanism as C3M:
     # pretrained offline/online before training, then refined online each epoch.
-    use_analytical_dynamics: bool = False
+    use_empirical_dynamics: bool = False
     dynamics_lr: float = 1e-3
     dynamics_lr_scheduler: str = ""
     dynamics_lr_scheduler_kwargs: dict = field(default_factory=dict)
@@ -369,8 +369,14 @@ class C2RLAgent(Agent):
             if mem_size == -1:
                 mem_size = 10000
                 
-        con_memory = RandomMemory(memory_size=mem_size, num_envs=num_envs, device=device)
-        opt_memory = RandomMemory(memory_size=mem_size, num_envs=num_envs, device=device)
+        if self._base_algorithm == "PPO":
+            con_memory = RandomMemory(memory_size=mem_size, num_envs=num_envs, device=device)
+            opt_memory = RandomMemory(memory_size=mem_size, num_envs=num_envs, device=device)
+        else:
+            shared_memory = RandomMemory(memory_size=mem_size, num_envs=num_envs, device=device)
+            con_memory = shared_memory
+            opt_memory = shared_memory
+            
         self._cmg_buffer_size = self._raw_cfg.get("cmg_memory_size", 131072)
 
         # For SAC, monkey-patch the sample() method on the persistent replay buffers
@@ -406,8 +412,13 @@ class C2RLAgent(Agent):
                     return batches
                 mem.sample = _dynamic_maha_sample
                 
-            _patch_sample(con_memory)
-            _patch_sample(opt_memory)
+            if self._base_algorithm == "SAC":
+                _patch_sample(con_memory)
+                # Since opt_memory is the exact same instance as con_memory for SAC,
+                # we don't need to patch it twice!
+            else:
+                _patch_sample(con_memory)
+                _patch_sample(opt_memory)
 
         rl_kwargs = dict(
             observation_space=observation_space,
@@ -602,14 +613,14 @@ class C2RLAgent(Agent):
         self._con_obs_preprocessor = getattr(self._con_agent, "_observation_preprocessor", None)
 
         # ── Dynamics: analytical or learned online (same mechanism as C3M) ── #
-        # use_analytical_dynamics=True uses the env's exact get_f_and_B (classic
+        # use_empirical_dynamics=True uses the env's exact get_f_and_B (classic
         # only). Otherwise a NeuralDynamics model is pretrained/refined online and
         # its get_f_and_B feeds the CMG contraction loss — Isaac envs always take
         # this path (no closed-form dynamics available).
-        if parsed_cfg.use_analytical_dynamics:
+        if not parsed_cfg.use_empirical_dynamics:
             if get_f_and_B is None:
                 raise ValueError(
-                    "C2RL: use_analytical_dynamics=True requires a get_f_and_B callable "
+                    "C2RL: use_empirical_dynamics=True requires a get_f_and_B callable "
                     "(classic envs only). Isaac Sim envs have no analytical dynamics."
                 )
             self._get_f_and_B = get_f_and_B
@@ -621,7 +632,7 @@ class C2RLAgent(Agent):
             if self._neural_dynamics is None:
                 raise ValueError(
                     "C2RL requires a 'dynamics' model in the models dict when "
-                    "use_analytical_dynamics=False (add a models.dynamics block to the config)."
+                    "use_empirical_dynamics=False (add a models.dynamics block to the config)."
                 )
             self._get_f_and_B = self._neural_dynamics.get_f_and_B
             self._dynamics_optimizer = torch.optim.Adam(
@@ -920,20 +931,14 @@ class C2RLAgent(Agent):
         self._data = self._get_rollout(self._cmg_buffer_size, "c3m")
         self._progress = float(timestep) / max(1, timesteps)
         self._ccm_gen.train()
-        for _ in range(self._cfg.cmg_updates_per_policy_update):
-            loss, info = self._compute_cmg_loss()
-            self._W_optimizer.zero_grad()
-            loss.backward()
-            # Guard against NaN/Inf grads (occasionally caused by eigvalsh or
-            # numerical edge cases in the contraction metric) reaching the CMG
-            # weights — same protection C3M's _optimize_params and this
-            # class's own _train_dynamics already apply. Without it, a single
-            # bad step can NaN the CMG, and every later spd_inverse(W) call
-            # (Mahalanobis reward, next CMG loss) crashes on a non-finite
-            # Cholesky decomposition instead of just skipping this step.
-            if all(torch.isfinite(p.grad).all() for p in self._ccm_gen.parameters() if p.grad is not None):
-                torch.nn.utils.clip_grad_norm_(self._ccm_gen.parameters(), 10.0)
-                self._W_optimizer.step()
+        
+        loss, info = self._compute_cmg_loss()
+        self._W_optimizer.zero_grad()
+        loss.backward()
+        if all(torch.isfinite(p.grad).all() for p in self._ccm_gen.parameters() if p.grad is not None):
+            torch.nn.utils.clip_grad_norm_(self._ccm_gen.parameters(), 10.0)
+            self._W_optimizer.step()
+            
         self._W_lr_scheduler.step()
         self._ccm_gen.eval()
 
@@ -1027,10 +1032,9 @@ class C2RLSkrlTrainer(Trainer):
         states = env.state() if hasattr(env, "state") else None
         global_step = 0
 
-        total_iters = timesteps // (rollout_steps * (1 if con_only else 2))
-        pbar = _tqdm.tqdm(range(max(1, total_iters)), desc="C2RL training", file=sys.stdout)
+        pbar = _tqdm.tqdm(total=timesteps, desc="C2RL training", file=sys.stdout)
 
-        for epoch in pbar:
+        while global_step < timesteps:
 
             # ── Phase 1: contracting rollout ──────────────────────────── #
             agent._con_agent.enable_training_mode(True)
@@ -1038,7 +1042,8 @@ class C2RLSkrlTrainer(Trainer):
                 agent._con_agent.memory.reset()
             con_obs_list, con_act_list = [], []
 
-            for step in range(rollout_steps):
+            steps_to_take = min(rollout_steps, timesteps - global_step)
+            for step in range(steps_to_take):
                 agent._con_agent.pre_interaction(timestep=global_step, timesteps=timesteps)
                 with torch.no_grad():
                     actions, _ = agent._con_agent.act(
@@ -1056,23 +1061,44 @@ class C2RLSkrlTrainer(Trainer):
                 )
                 observations = next_obs
                 states = next_states
+                
+                # Step-based update for SAC
+                if agent._base_algorithm == "SAC":
+                    agent.update_cmg(timestep=global_step, timesteps=timesteps)
+                    for _ in range(agent._cfg.policy_update_per_cmg_update):
+                        agent.update_con(None, None, timestep=global_step, timesteps=timesteps)
+                        agent._con_agent.post_interaction(timestep=global_step, timesteps=timesteps)
+                        if not con_only and agent._opt_agent is not None:
+                            agent.update_opt(None, None, timestep=global_step, timesteps=timesteps)
+                            agent._opt_agent.post_interaction(timestep=global_step, timesteps=timesteps)
+                    
+                    if getattr(agent._con_agent, "writer", None) is not None:
+                        agent._con_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
+                    if not con_only and getattr(agent._opt_agent, "writer", None) is not None:
+                        agent._opt_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
+                        
                 global_step += 1
+                pbar.update(1)
 
-            con_obs_tensor = torch.cat(con_obs_list, dim=0)
-            con_act_tensor = torch.cat(con_act_list, dim=0)
-            agent.update_con(con_obs_tensor, con_act_tensor, timestep=global_step, timesteps=timesteps)
-            agent._con_agent.post_interaction(timestep=global_step, timesteps=timesteps)
-            if getattr(agent._con_agent, "writer", None) is not None:
-                agent._con_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
+            # Chunk-based update for PPO
+            if agent._base_algorithm == "PPO":
+                con_obs_tensor = torch.cat(con_obs_list, dim=0)
+                con_act_tensor = torch.cat(con_act_list, dim=0)
+                agent.update_con(con_obs_tensor, con_act_tensor, timestep=global_step, timesteps=timesteps)
+                agent._con_agent.post_interaction(timestep=global_step, timesteps=timesteps)
+                agent.update_cmg(timestep=global_step, timesteps=timesteps)
+                if getattr(agent._con_agent, "writer", None) is not None:
+                    agent._con_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
 
             # ── Phase 2: optimal rollout ──────────────────────────────── #
-            if not con_only and agent._opt_agent is not None:
+            if not con_only and agent._opt_agent is not None and global_step < timesteps:
                 agent._opt_agent.enable_training_mode(True)
                 if agent._base_algorithm == "PPO":
                     agent._opt_agent.memory.reset()
                 opt_obs_list, opt_act_list = [], []
 
-                for step in range(rollout_steps):
+                steps_to_take = min(rollout_steps, timesteps - global_step)
+                for step in range(steps_to_take):
                     agent._opt_agent.pre_interaction(timestep=global_step, timesteps=timesteps)
                     with torch.no_grad():
                         actions, _ = agent._opt_agent.act(
@@ -1090,30 +1116,49 @@ class C2RLSkrlTrainer(Trainer):
                     )
                     observations = next_obs
                     states = next_states
+                    
+                    # Step-based update for SAC
+                    if agent._base_algorithm == "SAC":
+                        agent.update_cmg(timestep=global_step, timesteps=timesteps)
+                        for _ in range(agent._cfg.policy_update_per_cmg_update):
+                            agent.update_con(None, None, timestep=global_step, timesteps=timesteps)
+                            agent._con_agent.post_interaction(timestep=global_step, timesteps=timesteps)
+                            if not con_only and agent._opt_agent is not None:
+                                agent.update_opt(None, None, timestep=global_step, timesteps=timesteps)
+                                agent._opt_agent.post_interaction(timestep=global_step, timesteps=timesteps)
+                        
+                        if getattr(agent._con_agent, "writer", None) is not None:
+                            agent._con_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
+                        if not con_only and getattr(agent._opt_agent, "writer", None) is not None:
+                            agent._opt_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
+
                     global_step += 1
+                    pbar.update(1)
 
-                opt_obs_tensor = torch.cat(opt_obs_list, dim=0)
-                opt_act_tensor = torch.cat(opt_act_list, dim=0)
-                agent.update_opt(opt_obs_tensor, opt_act_tensor, timestep=global_step, timesteps=timesteps)
-                agent._opt_agent.post_interaction(timestep=global_step, timesteps=timesteps)
-                if getattr(agent._opt_agent, "writer", None) is not None:
-                    agent._opt_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
+                # Chunk-based update for PPO
+                if agent._base_algorithm == "PPO":
+                    opt_obs_tensor = torch.cat(opt_obs_list, dim=0)
+                    opt_act_tensor = torch.cat(opt_act_list, dim=0)
+                    agent.update_opt(opt_obs_tensor, opt_act_tensor, timestep=global_step, timesteps=timesteps)
+                    agent._opt_agent.post_interaction(timestep=global_step, timesteps=timesteps)
+                    agent.update_cmg(timestep=global_step, timesteps=timesteps)
+                    if getattr(agent._opt_agent, "writer", None) is not None:
+                        agent._opt_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
 
-            # ── CMG update ────────────────────────────────────────────── #
-            cmg_dict = agent.update_cmg(timestep=global_step, timesteps=timesteps)
+            # SAC already ran post_interaction inside the loop, but PPO hasn't run the outer agent's post_interaction
             agent.post_interaction(timestep=global_step, timesteps=timesteps)
 
-            pd_loss = cmg_dict.get("C2RL/CMG/pd_loss", float("nan"))
-            pbar.set_postfix(epoch=epoch, pd=f"{pd_loss:.3g}")
-
+            # We use global_step conceptually as 'epoch' for evaluation intervals now
             # Evaluate metrics occasionally
             eval_interval = getattr(agent._cfg, "eval_interval", 0)
-            if eval_interval > 0 and (epoch + 1) % eval_interval == 0:
+            if eval_interval > 0 and global_step % eval_interval == 0:
                 eval_metrics = self.eval()
                 _stability_keys = {"auc", "contraction_rate", "overshoot", "contraction_score"}
                 for k, v in eval_metrics.items():
                     tab = "Stability" if any(sk in k for sk in _stability_keys) else "Reward"
                     agent.track_data(f"{tab}/{k}", v)
+                    if k.endswith("_mean"):
+                        agent.track_data(f"{tab}/{k[:-5]}", v)
 
         # Persist the learned dynamics for reuse/inspection (matches C3M).
         if agent._neural_dynamics is not None:
@@ -1157,6 +1202,7 @@ class C2RLSkrlTrainer(Trainer):
         plot_idx = np.random.choice(num_envs, 1, replace=False)
         traj_x = {i: [] for i in plot_idx}
         traj_xref = {i: [] for i in plot_idx}
+        traj_error = {i: [] for i in plot_idx}
 
         for _ in range(max_steps):
             with torch.no_grad():
@@ -1171,6 +1217,7 @@ class C2RLSkrlTrainer(Trainer):
                 if not finished[i]:
                     traj_x[i].append(x_curr[i].cpu().clone().numpy())
                     traj_xref[i].append(x_ref[i].cpu().clone().numpy())
+                    traj_error[i].append(error[i].item())
             auc_sum += error * active
             is_first = (steps_count == 0) & (active > 0)
             e0 = torch.where(is_first, error, e0)
@@ -1237,6 +1284,37 @@ class C2RLSkrlTrainer(Trainer):
                 wandb.log({"train/tracking_trajectory": wandb.Image(img)}, step=agent.track_dict.get("timestep", 0) if hasattr(agent, "track_dict") else None)
             except Exception:
                 pass
+
+            # Plot Normalized Error
+            fig_err, ax_err = plt.subplots(figsize=(6, 4))
+            err_plotted = False
+            for i in plot_idx:
+                if len(traj_error[i]) > 0:
+                    err_arr = np.array(traj_error[i])
+                    e0_val = max(err_arr[0], 1e-8)
+                    norm_err = err_arr / e0_val
+                    
+                    _trapz = getattr(np, "trapezoid", None) or np.trapz
+                    auc_val = float(_trapz(norm_err, dx=dt))
+                    
+                    ax_err.plot(norm_err, label=f'Env {i} (AUC: {auc_val:.2f})')
+                    err_plotted = True
+            
+            if err_plotted:
+                ax_err.set_title("C2RL Normalized Error")
+                ax_err.set_xlabel("Step")
+                ax_err.set_ylabel("Normalized Error")
+                buf_err = io.BytesIO()
+                fig_err.savefig(buf_err, format='png', bbox_inches='tight')
+                plt.close(fig_err)
+                buf_err.seek(0)
+                try:
+                    img_err = Image.open(buf_err)
+                    wandb.log({"train/normalized_error": wandb.Image(img_err)}, step=agent.track_dict.get("timestep", 0) if hasattr(agent, "track_dict") else None)
+                except Exception:
+                    pass
+            else:
+                plt.close(fig_err)
 
         from .eval_metrics import mean_confidence_interval
         f_mask = finished if finished.any() else torch.ones_like(finished)

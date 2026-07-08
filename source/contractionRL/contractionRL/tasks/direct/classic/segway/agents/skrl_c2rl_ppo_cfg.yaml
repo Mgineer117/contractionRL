@@ -144,7 +144,7 @@ agent:
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.008
   rewards_shaper_scale: 1.0
-  cmg_updates_per_policy_update: 3
+  policy_update_per_cmg_update: 3
   batch_size: 1024
 trainer:
   class: C2RLSkrlTrainer

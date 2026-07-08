@@ -251,25 +251,27 @@ class PathTrackingBase(DirectRLEnv):
         error_traces = [self._viz_error_hist[i, : self._viz_len_hist[i]] for i in valid]
         pos_traces = [self._viz_pos_hist[i, : self._viz_len_hist[i]] for i in valid]
 
-        fig, (ax_pos, ax_err) = _plt.subplots(1, 2, figsize=(12, 5))
-
+        # Plot 1: Attempted trajectories
+        fig_pos, ax_pos = _plt.subplots(figsize=(6, 5))
         for p in pos_traces:
             ax_pos.plot(p[:, 0], p[:, 1], linewidth=0.8, alpha=0.6)
         ax_pos.set_xlabel("x [m]")
         ax_pos.set_ylabel("y [m]")
         ax_pos.set_title(f"Attempted trajectories (n={len(valid)})")
         ax_pos.set_aspect("equal", adjustable="datalim")
+        fig_pos.tight_layout()
+        _wandb.log({"train/tracking_trajectory": _wandb.Image(fig_pos), "global_step": int(getattr(self, "common_step_counter", 0))})  # type: ignore[attr-defined]
+        _plt.close(fig_pos)
 
+        # Plot 2: Tracking error with contraction bounds
+        fig_err, ax_err = _plt.subplots(figsize=(6, 5))
         max_len = max(len(e) for e in error_traces)
         t_axis = np.arange(1, max_len + 1) * dt
         for e in error_traces:
             t = np.arange(1, len(e) + 1) * dt
             ax_err.plot(t, e ** 2, linewidth=0.6, alpha=0.5, color="tab:blue")
 
-        # 1. fitted envelope — data only, no CMG/gamma involved. fit returns the
-        #    fixed overshoot C* (>=1, normalized) and a per-curve convergence
-        #    rate; display uses the mean positive rate and rescales C* by mean
-        #    e(0) so the envelope is in raw error units (paper: e0*C*exp(-λt)).
+        # 1. fitted envelope — data only, no CMG/gamma involved.
         C_fit, lbds_fit = fit_exponential_envelope(error_traces, dt)
         pos_lbds = lbds_fit[lbds_fit > 0]
         lambda_fit = float(pos_lbds.mean()) if pos_lbds.size else 0.0
@@ -299,8 +301,6 @@ class PathTrackingBase(DirectRLEnv):
             # 3. empirical — CURRENT CMG's eigenvalues, measured on visited states.
             if self._cmg_bounds_fn is not None:
                 state_traces = [self._viz_state_hist[i, : self._viz_len_hist[i]] for i in valid]
-                # Cap the sample count fed to the CMG — we need the eigenvalue
-                # *extremes* over the visited states, not every single point.
                 states = np.concatenate(state_traces, axis=0)
                 if len(states) > 2000:
                     states = states[np.random.choice(len(states), 2000, replace=False)]
@@ -318,10 +318,9 @@ class PathTrackingBase(DirectRLEnv):
         ax_err.set_title("Tracking error² with contraction bounds")
         ax_err.set_yscale("log")
         ax_err.legend(fontsize=8)
-
-        fig.tight_layout()
-        _wandb.log({"PathTracking/trajectory_diagnostics": _wandb.Image(fig)})  # type: ignore[attr-defined]
-        _plt.close(fig)
+        fig_err.tight_layout()
+        _wandb.log({"train/normalized_error": _wandb.Image(fig_err), "global_step": int(getattr(self, "common_step_counter", 0))})  # type: ignore[attr-defined]
+        _plt.close(fig_err)
 
     def get_f_and_B(self, x):
         """Return (f, B, B_null) for contraction agents.
@@ -493,7 +492,7 @@ class PathTrackingBase(DirectRLEnv):
 
             self.extras["log"]["Stability/contraction_flag"] = contraction_flag.mean()
             auc_mean, auc_ci95 = mean_confidence_interval(auc.cpu().numpy())
-            self.extras["log"]["Stability/auc"] = torch.tensor(auc_mean, device=self.device)
+            self.extras["log"]["Stability/auc_mean"] = torch.tensor(auc_mean, device=self.device)
             self.extras["log"]["Stability/auc_ci95"] = torch.tensor(auc_ci95, device=self.device)
 
             # --- Convergence rate (lambda) + overshoot (C), paper procedure ---
@@ -516,12 +515,12 @@ class PathTrackingBase(DirectRLEnv):
                 lbd_mean, lbd_ci95 = mean_confidence_interval(lambdas)
                 sc_mean, sc_ci95 = mean_confidence_interval(score)
 
-                self.extras["log"]["Stability/contraction_rate"] = torch.tensor(lbd_mean, device=self.device)
+                self.extras["log"]["Stability/contraction_rate_mean"] = torch.tensor(lbd_mean, device=self.device)
                 self.extras["log"]["Stability/contraction_rate_ci95"] = torch.tensor(lbd_ci95, device=self.device)
                 # C* is a single fixed value for the batch, so it carries no CI.
-                self.extras["log"]["Stability/overshoot"] = torch.tensor(float(C_star), device=self.device)
+                self.extras["log"]["Stability/overshoot_mean"] = torch.tensor(float(C_star), device=self.device)
                 self.extras["log"]["Stability/overshoot_ci95"] = torch.tensor(0.0, device=self.device)
-                self.extras["log"]["Stability/contraction_score"] = torch.tensor(sc_mean, device=self.device)
+                self.extras["log"]["Stability/contraction_score_mean"] = torch.tensor(sc_mean, device=self.device)
                 self.extras["log"]["Stability/contraction_score_ci95"] = torch.tensor(sc_ci95, device=self.device)
 
         # --- PathTracking figure: snapshot completed episodes for viz envs ---

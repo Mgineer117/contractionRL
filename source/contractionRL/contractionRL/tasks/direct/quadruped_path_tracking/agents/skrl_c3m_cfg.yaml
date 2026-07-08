@@ -35,7 +35,7 @@ agent:
   class: C3M
   batch_size: 1024
   learning_rate_scheduler:       # Optional PyTorch learning rate scheduler (e.g., "StepLR")
-  cmg_updates_per_policy_update: 1  # Number of CMG metric updates to perform per policy update
+  policy_update_per_cmg_update: 1  # Number of CMG metric updates to perform per policy update
   W_lr: 3.0e-4  # Learning rate for the Contraction Metric Generator (CMG) network
   u_lr: 3.0e-4  # Learning rate for the Policy (Actor) network
   lbd: 0.5  # Contraction rate parameter (lambda) enforcing the exponential stability bound

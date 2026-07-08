@@ -115,6 +115,11 @@ class BaseEnv(gym.Env):
         # the contraction certificate.
         self.current_u = u.copy()
         reward, infos = self.get_rewards(u)
+        
+        # Track raw distance error for AUC/Contraction envelope
+        err_dist = np.sqrt(max(infos["tracking_error"], 0.0))
+        self.err_history.append(err_dist)
+        
         next_x, next_x_wrapped, termination, truncation, _ = self.get_transition(self.x_t, u)
         next_x_wrapped = np.clip(next_x_wrapped, self.X_MIN.flatten(), self.X_MAX.flatten())
         state = self.construct_state(next_x_wrapped)
@@ -125,17 +130,45 @@ class BaseEnv(gym.Env):
         # dims (e.g. velocity) drift silently outside [X_MIN, X_MAX] — bounded
         # in what the agent observes, unbounded in what actually evolves.
         self.x_t = next_x_wrapped
+        
+        info_dict = {
+            "x": next_x_wrapped,
+            "tracking_error": infos["tracking_error"],
+            "control_effort": infos["control_effort"],
+            "relative_tracking_error": infos["tracking_error"] / self.init_tracking_error,
+        }
+        
+        if termination or truncation:
+            # Compute stability metrics for the completed episode
+            e0 = max(self.err_history[0], 1e-8) if self.err_history else 1.0
+            norm_traj = np.asarray(self.err_history) / e0
+            
+            _trapz = getattr(np, "trapezoid", None) or np.trapz
+            auc = float(_trapz(norm_traj, dx=self.dt))
+            
+            # Populate SKRL's expected info["log"] dictionary
+            info_dict["log"] = {"Stability/auc": auc}
+            
+            try:
+                from contractionRL.agents.skrl.eval_metrics import fit_exponential_envelope
+                # fit_exponential_envelope returns C_star and a list of lambdas (one per curve)
+                C_star, lambdas = fit_exponential_envelope([norm_traj], self.dt)
+                lbd = float(lambdas[0])
+                C_star = float(C_star)
+                score = lbd / max(C_star, 1e-6)
+                
+                info_dict["log"]["Stability/overshoot"] = C_star
+                info_dict["log"]["Stability/contraction_rate"] = lbd
+                info_dict["log"]["Stability/contraction_score"] = score
+            except Exception:
+                pass  # Fallback to just AUC if fit fails
+                
         return (
             state,
             reward,
             termination,
             truncation,
-            {
-                "x": next_x_wrapped,
-                "tracking_error": infos["tracking_error"],
-                "control_effort": infos["control_effort"],
-                "relative_tracking_error": infos["tracking_error"] / self.init_tracking_error,
-            },
+            info_dict,
         )
 
     def get_transition(self, x: np.ndarray, u: np.ndarray):

@@ -15,18 +15,18 @@ Contraction conditions verified jointly:
 Per-``update()`` workflow (called once per ``timestep`` by C3MSkrlTrainer,
 see ``update()`` and ``_learn()`` below):
 
-  1. **Dynamics** (skipped when ``use_analytical_dynamics``) — draw a fresh
+  1. **Dynamics** (skipped when ``use_empirical_dynamics``) — draw a fresh
      ``(x, u, x_dot)`` batch via ``get_rollout(..., "dynamics")`` and take one
      MSE gradient step on ``NeuralDynamics`` (``ẋ = f_net(x) + B_net(x)·u``).
      Isaac envs always use this path (no closed-form dynamics available);
-     classic envs may instead set ``use_analytical_dynamics: true`` to use the
+     classic envs may instead set ``use_empirical_dynamics: true`` to use the
      env's own exact ``get_f_and_B(x)``, skipping this step entirely.
   2. Anneal ``policy.cl_actor``'s exploration ``log_std`` by training progress.
   3. **``_learn()``** — one full pass over ``self._data`` (a static/periodically
      -refreshed buffer of ``(x, xref, uref)`` triples from
      ``get_rollout(..., "c3m")``) in ``batch_size`` chunks. For each chunk:
-       a. ``cmg_updates_per_policy_update`` gradient steps on the CMG
-          (``_ccm_gen``) ALONE, controller held fixed (``_optimize_params``
+       a. 1 gradient step on the CMG
+       b. ``policy_update_per_cmg_update`` gradient steps on the controller held fixed (``_optimize_params``
           zeroes both optimizers but only steps ``_w_optimizer``).
        b. One gradient step on the controller (``_cl_actor``) ALONE, metric
           held fixed (steps ``_u_optimizer`` only).
@@ -87,7 +87,7 @@ class C3MCfg(AgentCfg):
     # Number of CMG (metric) gradient steps per controller step within each
     # batch — read in _learn(). Must be a declared field or the runner's
     # dataclass-field filter silently drops it (always defaulting to 1).
-    cmg_updates_per_policy_update: int = 1
+    policy_update_per_cmg_update: int = 1
     # Alias for u_lr: some configs/sweeps name the controller LR "actor_lr".
     # When set (non-None), __post_init__ copies it into u_lr so both spellings
     # take effect instead of being silently ignored.
@@ -115,7 +115,7 @@ class C3MCfg(AgentCfg):
     # replaced, for negligible extra coverage. 128 stays comfortably above
     # every x_dim in this repo (~4-33) while costing only ~2x eigvalsh.
     pd_loss_num_samples: int = 128
-    use_analytical_dynamics: bool = False
+    use_empirical_dynamics: bool = False
     learning_rate_scheduler: str = ""
     learning_rate_scheduler_kwargs: dict = field(default_factory=dict)
     dynamics_lr: float = 1e-3
@@ -154,7 +154,7 @@ class C3MAgent(Agent):
         mode="c3m"      → {"x", "xref", "uref"}
         mode="dynamics" → {"x", "u", "x_dot"}
       ``get_f_and_B``:   ``(x) -> (f, B, Bbot)`` — required when
-        ``cfg.use_analytical_dynamics=True``; Isaac envs must leave this None
+        ``cfg.use_empirical_dynamics=True``; Isaac envs must leave this None
         (NeuralDynamics is trained online from trajectory buffer data).
     """
 
@@ -201,10 +201,10 @@ class C3MAgent(Agent):
         dev_str = str(device) if not isinstance(device, str) else device
 
         # ── Dynamics: analytical or learned online ──────────────────────── #
-        if cfg.use_analytical_dynamics:
+        if not cfg.use_empirical_dynamics:
             if get_f_and_B is None:
                 raise ValueError(
-                    "C3M: use_analytical_dynamics=True requires a get_f_and_B callable "
+                    "C3M: use_empirical_dynamics=True requires a get_f_and_B callable "
                     "(classic envs only). Isaac Sim envs have no analytical dynamics."
                 )
             self._get_f_and_B = get_f_and_B
@@ -213,7 +213,7 @@ class C3MAgent(Agent):
         else:
             self._neural_dynamics = models.get("dynamics", None)
             if self._neural_dynamics is None:
-                raise ValueError("C3M requires 'dynamics' model in models dictionary when use_analytical_dynamics=False")
+                raise ValueError("C3M requires 'dynamics' model in models dictionary when use_empirical_dynamics=False")
                 
             self._get_f_and_B = self._neural_dynamics.get_f_and_B
             self._dynamics_optimizer = torch.optim.Adam(
@@ -439,13 +439,13 @@ class C3MAgent(Agent):
             idx = indices[b * batch_size : (b + 1) * batch_size]
             
             # CMG (metric) updates holding controller fixed
-            for _ in range(cfg.cmg_updates_per_policy_update):
-                loss, infos = self._compute_loss(idx)
-                self._optimize_params(loss, self._w_optimizer, self._ccm_gen)
+            loss, infos = self._compute_loss(idx)
+            self._optimize_params(loss, self._w_optimizer, self._ccm_gen)
                 
             # Controller (policy) update holding metric fixed
-            loss, infos = self._compute_loss(idx)
-            self._optimize_params(loss, self._u_optimizer, self._cl_actor)
+            for _ in range(cfg.policy_update_per_cmg_update):
+                loss, infos = self._compute_loss(idx)
+                self._optimize_params(loss, self._u_optimizer, self._cl_actor)
 
             total_loss += loss.item()
             total_pd += infos["pd_loss"]
@@ -543,6 +543,9 @@ class C3MSkrlTrainer(Trainer):
                 _stability_keys = {"auc", "contraction_rate", "overshoot", "contraction_score"}
                 for k, v in eval_metrics.items():
                     tab = "Stability" if any(sk in k for sk in _stability_keys) else "Reward"
+                    agent.track_data(f"{tab}/{k}", v)
+                    if k.endswith("_mean"):
+                        agent.track_data(f"{tab}/{k[:-5]}", v)
                     # No space around "/" — must match path_tracking_base.py's
                     # own "Stability/..."/"Reward/..." keys exactly, or PPO/SAC
                     # (whose Stability metrics come from the env) and C3M
