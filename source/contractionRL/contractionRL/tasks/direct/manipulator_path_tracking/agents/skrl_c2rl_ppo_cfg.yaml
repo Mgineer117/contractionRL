@@ -1,67 +1,78 @@
 seed: 42  # Random seed for reproducibility
 
 models:
-  separate: True
+  separate: true
   con_policy:  # contracting policy (gamma_contracting, near-zero) — trains the CMG's certificate
     class: GaussianMixin
     backbone: control  # mlp (plain MLP, u = uref + MLP(obs)) | control (CLActor, u = uref + feedback(x-xref))
-    clip_actions: True  # PPO is unbounded; uref+feedback can exceed the declared action space
+    clip_actions: false # PPO is unbounded; uref+feedback can exceed the declared action space
                         # (both range over it), so this clip is not redundant here
-    clip_log_std: True
-    min_log_std: -4.605
+    clip_log_std: true
+    min_log_std: -20.0
     max_log_std: 2.0
     network:
-      - name: net
-        input: OBSERVATIONS
-        layers: [256, 256]
-        activations: tanh
+    - name: net
+      input: OBSERVATIONS
+      layers:
+      - 128
+      - 128
+      activations: tanh
     output: ACTIONS
+    initial_log_std: 0.0
   opt_policy:  # optimal policy (gamma_optimal) — the one actually deployed unless con_only
     class: GaussianMixin
     backbone: control
-    clip_actions: True  # PPO is unbounded; uref+feedback can exceed the declared action space
+    clip_actions: false # PPO is unbounded; uref+feedback can exceed the declared action space
                         # (both range over it), so this clip is not redundant here
-    clip_log_std: True
-    min_log_std: -4.605
+    clip_log_std: true
+    min_log_std: -20.0
     max_log_std: 2.0
     network:
-      - name: net
-        input: OBSERVATIONS
-        layers: [256, 256]
-        activations: tanh
+    - name: net
+      input: OBSERVATIONS
+      layers:
+      - 128
+      - 128
+      activations: tanh
     output: ACTIONS
+    initial_log_std: 0.0
   con_critic:  # PPO value function V(obs)
     network:
-      - name: net
-        layers: [256, 256]
-        activations: tanh
+    - name: net
+      layers:
+      - 128
+      - 128
+      activations: tanh
   opt_critic:
     network:
-      - name: net
-        layers: [256, 256]
-        activations: tanh
+    - name: net
+      layers:
+      - 128
+      - 128
+      activations: tanh
   cmg:
     class: CMG
     network:
-      - name: net
-        input: OBSERVATIONS
-        layers: [256, 256]
-        activations: tanh
-        constrain_eigenvalues: True
+    - name: net
+      input: OBSERVATIONS
+      layers: [256, 256]
+      activations: tanh
+      constrain_eigenvalues: true
 
   dynamics:
     class: NeuralDynamics
     network:
-      - name: net
-        input: STATE_ACTION
-        layers: [256, 256]
-        activations: relu
+    - name: net
+      input: STATE_ACTION
+      layers: [256, 256]
+      activations: relu
 
 memory:
   class: RandomMemory
   memory_size: -1  # automatically determined (same as agent:rollouts) — con/opt memory
                     # holds exactly one rollout epoch, reset every epoch
 
+  cmg_memory_size: 131072
 agent:
   class: C2RL-PPO
   # PPO shared config (con_policy/opt_policy each get their own PPO sub-agent)
@@ -69,7 +80,7 @@ agent:
   learning_epochs: 5  # Number of gradient descent passes over the collected batch
   mini_batches: 4  # Number of subsets to divide the batch into for stochastic optimization
   gae_lambda: 0.95  # Lambda parameter for Generalized Advantage Estimation (GAE)
-  learning_rate: 1.0e-03  # Global step size for neural network optimization
+  learning_rate: 0.001    # Global step size for neural network optimization
   learning_rate_scheduler: KLAdaptiveLR  # matches the standalone PPO baseline for this env
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.008
@@ -91,12 +102,11 @@ agent:
   time_limit_bootstrap: true  # Bootstrap value at episode truncation instead of treating it as terminal
                                # (path-tracking episodes truncate at a fixed length; without this the
                                # value function is biased into treating "ran out of time" as "episode over")
-  std_dev_annealing: true  # matches the standalone PPO baseline for this env
+  std_dev_annealing: false # matches the standalone PPO baseline for this env
   std_dev_annealing_kwargs:
     schedule: exponential
     final_log_std: -4.6
     power: 5.0
-  # C2RL-specific
   gamma_contracting: 0.0  # con_policy's discount factor (near-zero: approximates a hard per-step constraint)
   gamma_optimal: 0.99  # opt_policy's discount factor — also what the PathTracking figure's theoretical/
                         # empirical bounds inflate by 1/(1-gamma) with, since opt_policy is deployed unless con_only
@@ -105,16 +115,9 @@ agent:
   W_lr: 3.0e-4
   w_ub: 10.0
   w_lb: 0.1
-  lbd: 0.01
+  lbd: 0.5
   eps: 0.01
-  W_entropy_scaler: 1.0e-3
-  cmg_updates_per_iter: 3
-  cmg_minibatch_size: 256
-  buffer_size: 4096
-  # reward = -tracking_scaler*||e||_M^2/std - control_scaler*||u-uref||^2/std,
-  # i.e. Q/R exactly like SD-LQR/LQR's Q_scaler/R_scaler (sdlqr.py) — tracking_scaler
-  # weights state error under the CURRENT learned metric M(x), control_scaler
-  # weights the feedback (action - uref) control effort.
+  W_entropy_scaler: 0.0
   reward_norm_beta: 0.99  # Moving average momentum for both terms' running-variance normalisation
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0  # R: control-effort weight (0 = disabled, matches previous default)
@@ -137,9 +140,12 @@ agent:
     wandb: true  # Enable Weights & Biases logging
     wandb_kwargs:
       project: contractionRL
-      name: ~  # auto-generated by train.py (deterministic, matches local log dir)
+      name:    # auto-generated by train.py (deterministic, matches local log dir)
 
+  discount_factor: 0.99
+  cmg_updates_per_policy_update: 3
+  batch_size: 1024
 trainer:
   class: C2RLSkrlTrainer
-  timesteps: 2000000  # Total number of environment steps to train for
+  timesteps: 50000    # Total number of environment steps to train for
   rollouts: 24  # Number of environment steps per parallel environment per update

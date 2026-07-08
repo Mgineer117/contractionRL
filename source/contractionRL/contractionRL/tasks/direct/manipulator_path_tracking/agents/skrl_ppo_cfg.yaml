@@ -16,29 +16,33 @@ seed: 42
 # Models are instantiated using skrl's model instantiator utility
 # https://skrl.readthedocs.io/en/latest/api/utils/model_instantiators.html
 models:
-  separate: True
+  separate: true
   policy:  # see gaussian_model parameters
     class: GaussianMixin
     backbone: control  # mlp (plain MLP, u = uref + MLP(obs)) | control (CLActor, u = uref + feedback(x-xref))
     clip_actions: false  # PPO is unbounded; uref+feedback can exceed the declared action space
                         # (both range over it), so this clip is not redundant here
-    clip_log_std: True
+    clip_log_std: true
     min_log_std: -20.0
     max_log_std: 2.0
     initial_log_std: 0.0
     network:
-      - name: net
-        input: OBSERVATIONS
-        layers: [128, 128, 128]
-        activations: tanh
+    - name: net
+      input: OBSERVATIONS
+      layers:
+      - 128
+      - 128
+      activations: tanh
     output: ACTIONS
   value:  # see deterministic_model parameters
     class: DeterministicMixin
     network:
-      - name: net
-        input: OBSERVATIONS
-        layers: [128, 128, 128]
-        activations: tanh
+    - name: net
+      input: OBSERVATIONS
+      layers:
+      - 128
+      - 128
+      activations: tanh
     output: ONE
 
 
@@ -58,7 +62,7 @@ agent:
   mini_batches: 4
   discount_factor: 0.99
   gae_lambda: 0.95
-  learning_rate: 1.0e-03
+  learning_rate: 0.001
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.008
@@ -73,16 +77,15 @@ agent:
   value_loss_scale: 0.5
   kl_threshold: 0.016
   rewards_shaper_scale: 1.0
-  time_limit_bootstrap: True
+  time_limit_bootstrap: true
   # Manual log_std annealing (off by default — entropy_loss_scale above is the
   # active exploration control). If enabled, entropy_loss_scale is force-set
   # to 0 (annealing and the entropy bonus would otherwise fight each other).
-  std_dev_annealing: True
+  std_dev_annealing: false
   std_dev_annealing_kwargs:
-    schedule: exponential        # linear | exponential | cosine
-    final_log_std: -4.6     # target log_std at the end of training (ln(0.01) = -4.6)
-    power: 5.0              # exponential schedule only: progress**power
-  # logging and checkpoint
+    schedule: exponential
+    final_log_std: -4.6
+    power: 5.0
   experiment:
     directory: "manipulator_path_tracking"
     experiment_name: ""
@@ -94,5 +97,5 @@ agent:
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 7200
+  timesteps: 50000
   environment_info: log

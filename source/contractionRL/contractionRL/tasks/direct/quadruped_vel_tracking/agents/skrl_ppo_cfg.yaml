@@ -10,18 +10,22 @@ models:
     max_log_std: 2.0
     initial_log_std: 0.0
     network:
-      - name: net
-        input: OBSERVATIONS
-        layers: [128, 128, 128]
-        activations: tanh
+    - name: net
+      input: OBSERVATIONS
+      layers:
+      - 128
+      - 128
+      activations: tanh
     output: ACTIONS
   value:
     class: DeterministicMixin
     network:
-      - name: net
-        input: OBSERVATIONS
-        layers: [128, 128, 128]
-        activations: tanh
+    - name: net
+      input: OBSERVATIONS
+      layers:
+      - 128
+      - 128
+      activations: tanh
     output: ONE
 memory:
   class: RandomMemory
@@ -31,7 +35,7 @@ agent:
   rollouts: 24
   learning_epochs: 5
   mini_batches: 4
-  discount_factor: 0.999
+  discount_factor: 0.99
   learning_rate: 0.001
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
@@ -61,5 +65,5 @@ agent:
   use_value_norm: true
 trainer:
   class: SequentialTrainer
-  timesteps: 100000
+  timesteps: 50000
   environment_info: log

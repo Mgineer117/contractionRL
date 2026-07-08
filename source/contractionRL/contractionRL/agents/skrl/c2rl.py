@@ -38,7 +38,7 @@ left the env). Every epoch (``C2RLSkrlTrainer.train``):
      ``con_only``).
   4. **update_opt** — same as step 2, for opt_policy.
   5. **update_cmg** — refresh the CMG training buffer via ``get_rollout`` and
-     run ``cmg_updates_per_iter`` contraction pd-loss gradient steps, evaluated
+     run ``cmg_updates_per_policy_update`` contraction pd-loss gradient steps, evaluated
      using con_policy's mean control/Jacobian (NOT opt_policy's).
 
 Normalization (see ``_make_base_cfg``, ``_compute_mahalanobis_reward``,
@@ -192,9 +192,8 @@ class C2RLPPOCfg(AgentCfg):
     lbd: float = 1e-2
     eps: float = 1e-2
     W_entropy_scaler: float = 1e-3
-    cmg_updates_per_iter: int = 1
-    cmg_minibatch_size: int = 1024
-    buffer_size: int = 2048
+    cmg_updates_per_policy_update: int = 1
+    batch_size: int = 1024
     # reward normalisation
     reward_norm_beta: float = 0.99
     tracking_scaler: float = 1.0
@@ -241,9 +240,7 @@ class C2RLSACCfg(AgentCfg):
     lbd: float = 1e-2
     eps: float = 1e-2
     W_entropy_scaler: float = 1e-3
-    cmg_updates_per_iter: int = 1
-    cmg_minibatch_size: int = 1024
-    buffer_size: int = 2048
+    cmg_updates_per_policy_update: int = 1
     # reward normalisation
     reward_norm_beta: float = 0.99
     tracking_scaler: float = 1.0
@@ -374,6 +371,7 @@ class C2RLAgent(Agent):
                 
         con_memory = RandomMemory(memory_size=mem_size, num_envs=num_envs, device=device)
         opt_memory = RandomMemory(memory_size=mem_size, num_envs=num_envs, device=device)
+        self._cmg_buffer_size = self._raw_cfg.get("cmg_memory_size", 131072)
 
         # For SAC, monkey-patch the sample() method on the persistent replay buffers
         # so that it intercepts the mini-batch and recomputes the Mahalanobis rewards
@@ -637,9 +635,8 @@ class C2RLAgent(Agent):
             else:
                 self._dynamics_lr_scheduler = None
 
-        self._data = get_rollout(parsed_cfg.buffer_size, "c3m")
+        self._data = get_rollout(self._cmg_buffer_size, "c3m")
         self._get_rollout = get_rollout
-        self._buffer_size = parsed_cfg.buffer_size
 
         self._W_optimizer = torch.optim.Adam(self._ccm_gen.parameters(), lr=parsed_cfg.W_lr)
         self._progress = 0.0
@@ -771,7 +768,7 @@ class C2RLAgent(Agent):
 
         buf = self._data
         n = buf["x"].shape[0]
-        batch_size = min(cfg.cmg_minibatch_size, n)
+        batch_size = min(cfg.batch_size, n)
         idx = np.random.choice(n, size=batch_size, replace=False)
 
         x    = torch.from_numpy(buf["x"][idx]).float().to(device).requires_grad_()
@@ -920,10 +917,10 @@ class C2RLAgent(Agent):
             dyn_loss = self._train_dynamics(dyn_data)
             self.track_data("Loss / C2RL/dynamics/mse", dyn_loss)
 
-        self._data = self._get_rollout(self._buffer_size, "c3m")
+        self._data = self._get_rollout(self._cmg_buffer_size, "c3m")
         self._progress = float(timestep) / max(1, timesteps)
         self._ccm_gen.train()
-        for _ in range(self._cfg.cmg_updates_per_iter):
+        for _ in range(self._cfg.cmg_updates_per_policy_update):
             loss, info = self._compute_cmg_loss()
             self._W_optimizer.zero_grad()
             loss.backward()

@@ -658,6 +658,7 @@ class ContractionRunner:
         # base_algorithm before it became an explicit constructor kwarg — see
         # C2RLAgent.__init__).
         agent_cfg["memory_size"] = mem_size
+        agent_cfg["cmg_memory_size"] = memory_cfg.get("cmg_memory_size", 131072)
         agent = C2RLAgent(
             cfg=agent_cfg,
             models=models,
