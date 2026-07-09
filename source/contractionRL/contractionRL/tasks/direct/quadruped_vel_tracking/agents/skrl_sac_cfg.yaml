@@ -65,7 +65,6 @@ agent:
   random_timesteps: 10000
   learning_starts: 10000
   grad_norm_clip: 1.0
-  std_dev_annealing: false
   std_dev_annealing_kwargs:
     schedule: linear
     final_log_std: -2.0

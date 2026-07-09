@@ -619,11 +619,11 @@ class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
     external annealing schedule — CLActor's built-in ``anneal_stddev``
     freezes ``logstd`` (``requires_grad=False``) and expects something else
     to call ``.anneal_stddev()`` on it, which would fight SAC's own entropy
-    optimizer. If you do want annealed exploration on top of PPO with this
-    backbone, use the repo's existing ``std_dev_annealing`` yaml flag /
-    ``patch_ppo_std_annealing`` (see agent_patches.py) — it writes directly
-    to ``log_std_parameter.data`` and works regardless of this class's
-    ``anneal_stddev=False`` default.
+    optimizer. This is also why ``"control-squashed"`` is deliberately left
+    out of ``runner.CONTROL_BACKBONES``: unlike plain ``"control"``, it never
+    auto-enables ``patch_ppo_std_annealing`` (see agent_patches.py /
+    train.py / c2rl.py), which only fires for backbones whose log_std is
+    actually frozen.
 
     log_std is a single GLOBAL parameter (``cl_actor.logstd``, shape
     ``(u_dim,)``), not state-dependent — same as ``ControllerNetwork``. Squashing

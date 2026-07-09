@@ -80,7 +80,7 @@ agent:
   learning_epochs: 5  # Number of gradient descent passes over the collected batch
   mini_batches: 4  # Number of subsets to divide the batch into for stochastic optimization
   gae_lambda: 0.95  # Lambda parameter for Generalized Advantage Estimation (GAE)
-  learning_rate: 0.001    # Global step size for neural network optimization
+  learning_rate: 1e-5    # Global step size for neural network optimization
   learning_rate_scheduler: KLAdaptiveLR  # matches the standalone PPO baseline for this env
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.008
@@ -102,7 +102,6 @@ agent:
   time_limit_bootstrap: true  # Bootstrap value at episode truncation instead of treating it as terminal
                                # (path-tracking episodes truncate at a fixed length; without this the
                                # value function is biased into treating "ran out of time" as "episode over")
-  std_dev_annealing: false # matches the standalone PPO baseline for this env
   std_dev_annealing_kwargs:
     schedule: exponential
     final_log_std: -4.6
@@ -148,4 +147,3 @@ agent:
 trainer:
   class: C2RLSkrlTrainer
   timesteps: 50000    # Total number of environment steps to train for
-  rollouts: 24  # Number of environment steps per parallel environment per update

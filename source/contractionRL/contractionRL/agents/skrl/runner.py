@@ -79,6 +79,15 @@ from skrl.utils.runner.torch import Runner
 _UNBOUNDED_BACKBONES = frozenset({"mlp", "control", "contraction"})
 _SQUASHED_BACKBONES = frozenset({"mlp-squashed", "control-squashed"})
 
+# The CLActor backbone ("control", with "contraction" kept as a backward-
+# compatible alias) always freezes its log_std parameter (CLActor's own
+# anneal_stddev=True -> requires_grad=False, see nn_modules.py) since it's
+# meant to be annealed on a fixed schedule rather than learned by PPO's
+# gradient. Exported so callers (train.py, c2rl.py) can auto-enable
+# std-dev annealing purely from the backbone choice instead of a separate
+# yaml on/off flag — see agent_patches.patch_ppo_std_annealing.
+CONTROL_BACKBONES = frozenset({"control", "contraction"})
+
 
 def _assert_backbone_algo_compatible(backbone: str, agent_class: str | None) -> None:
     """Raise on (algorithm, backbone) pairings that would silently mistrain.
@@ -140,7 +149,7 @@ def _gaussian_factory(observation_space, state_space, action_space, device,
         import gymnasium
         obs_dim = observation_space.shape[0]
         act_dim = action_space.shape[0]
-        # CLActorModel requires obs layout [x, x_ref, u_ref]: obs_dim == 2*x_dim + u_dim
+        # ControllerNetwork requires obs layout [x, x_ref, u_ref]: obs_dim == 2*x_dim + u_dim
         # and x_dim must be an integer
         remainder = obs_dim - act_dim
         if remainder <= 0 or remainder % 2 != 0:
@@ -149,13 +158,13 @@ def _gaussian_factory(observation_space, state_space, action_space, device,
                 f"obs_dim={obs_dim}, act_dim={act_dim} (remainder={remainder} is not even). "
                 f"Use backbone: mlp for velocity-tracking environments."
             )
-        from contractionRL.agents.skrl.models import CLActorModel
+        from contractionRL.agents.skrl.models import ControllerNetwork
         network = kwargs.pop("network", [{}])
         hidden_dim = network[0].get("layers", [128, 128]) if network else [128, 128]
         kwargs.pop("output", None)
         kwargs.pop("initial_log_std", None)
 
-        return CLActorModel(
+        return ControllerNetwork(
             observation_space=observation_space,
             action_space=action_space,
             device=device,

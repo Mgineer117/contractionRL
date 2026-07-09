@@ -37,7 +37,7 @@ agent:
   mini_batches: 4
   discount_factor: 0.99
   gae_lambda: 0.95
-  learning_rate: 0.001
+  learning_rate: 1.0e-5
   learning_rate_scheduler: KLAdaptiveLR
   random_timesteps: 0
   learning_starts: 0
@@ -60,7 +60,6 @@ agent:
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.008
   rewards_shaper_scale: 1.0
-  std_dev_annealing: false
   std_dev_annealing_kwargs:
     schedule: exponential
     final_log_std: -4.6

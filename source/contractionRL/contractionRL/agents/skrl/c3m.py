@@ -116,8 +116,12 @@ class C3MCfg(AgentCfg):
     # every x_dim in this repo (~4-33) while costing only ~2x eigvalsh.
     pd_loss_num_samples: int = 128
     use_empirical_dynamics: bool = False
-    learning_rate_scheduler: str = ""
-    learning_rate_scheduler_kwargs: dict = field(default_factory=dict)
+    # Defaults to always-on: an unbounded LR indefinitely re-visiting the same
+    # static offline buffer (see module docstring) is a major driver of the
+    # late-training drift/degradation this schedule is meant to damp. Configs
+    # may still override to "" to opt out.
+    learning_rate_scheduler: str = "ExponentialLR"
+    learning_rate_scheduler_kwargs: dict = field(default_factory=lambda: {"gamma": 0.9999})
     dynamics_lr: float = 1e-3
     dynamics_lr_scheduler: str = ""
     dynamics_lr_scheduler_kwargs: dict = field(default_factory=dict)
@@ -537,22 +541,15 @@ class C3MSkrlTrainer(Trainer):
             agent.pre_interaction(timestep=t, timesteps=timesteps)
             agent.update(timestep=t, timesteps=timesteps)
 
-            # Evaluate metrics occasionally
+            # Evaluate metrics occasionally. track_*_summary writes the SAME
+            # "Stability/..."/"Reward/..." keys (no space around "/") that
+            # path_tracking_base.py emits for PPO/SAC, so every algorithm lands
+            # on the same wandb tabs for the same metric.
             if eval_interval > 0 and (t + 1) % eval_interval == 0:
-                eval_metrics = self.eval(timestep=t)
-                _stability_keys = {"auc", "contraction_rate", "overshoot", "contraction_score"}
-                for k, v in eval_metrics.items():
-                    tab = "Stability" if any(sk in k for sk in _stability_keys) else "Reward"
-                    agent.track_data(f"{tab}/{k}", v)
-                    if k.endswith("_mean"):
-                        agent.track_data(f"{tab}/{k[:-5]}", v)
-                    # No space around "/" — must match path_tracking_base.py's
-                    # own "Stability/..."/"Reward/..." keys exactly, or PPO/SAC
-                    # (whose Stability metrics come from the env) and C3M
-                    # (whose Stability metrics come from here) end up on two
-                    # different wandb tabs ("Stability" vs "Stability ") for
-                    # what should be the same metric.
-                    agent.track_data(f"{tab}/{k}", v)
+                from .contraction_metrics import track_reward_summary, track_stability_summary
+                ev = self.eval(timestep=t)
+                track_stability_summary(agent, ev["stability"])
+                track_reward_summary(agent, ev["reward"])
 
             agent.post_interaction(timestep=t, timesteps=timesteps)
 
@@ -609,14 +606,12 @@ class C3MSkrlTrainer(Trainer):
         observations, infos = self.env.reset()
         states = self.env.state() if hasattr(self.env, "state") else None
 
+        from .contraction_metrics import StreamingErrorStats, log_tracking_plots, reward_summary
+
         x_dim = agent._x_dim
         num_envs = self.env.num_envs
-        auc_sum = torch.zeros((num_envs, 1), device=self.env.device)
+        stats = StreamingErrorStats(num_envs, self.env.device)
         total_reward = torch.zeros((num_envs, 1), device=self.env.device)
-        steps_count = torch.zeros((num_envs, 1), device=self.env.device)
-        e0 = torch.zeros((num_envs, 1), device=self.env.device)
-        e_last = torch.zeros((num_envs, 1), device=self.env.device)
-        e_max = torch.zeros((num_envs, 1), device=self.env.device)
 
         # Envs auto-reset individually on done (DirectRLEnv._reset_idx runs
         # inside step()), and termination is per-env (e.g. a quadruped falling
@@ -653,15 +648,10 @@ class C3MSkrlTrainer(Trainer):
                     traj_x[i].append(x_curr[i].cpu().clone().numpy())
                     traj_xref[i].append(x_ref[i].cpu().clone().numpy())
                     traj_error[i].append(error[i].item())
-            auc_sum += error * active
-            is_first = (steps_count == 0) & (active > 0)
-            e0 = torch.where(is_first, error, e0)
-            e_last = torch.where(active > 0, error, e_last)
-            e_max = torch.where(active > 0, torch.maximum(e_max, error), e_max)
+            stats.update(error, active)
 
             observations, rewards, terminated, truncated, _ = self.env.step(actions)
             total_reward += rewards.view(num_envs, 1) * active
-            steps_count += active
 
             finished |= (terminated | truncated).view(num_envs)
             if finished.all():
@@ -670,126 +660,16 @@ class C3MSkrlTrainer(Trainer):
         agent.enable_training_mode(True)
 
         dt = float(self._env_scalar_attr("step_dt", "dt"))
-        e0c = e0.clamp(min=1e-8)
-        eTc = e_last.clamp(min=1e-8)
-        T = steps_count.clamp(min=1)
-        # Empirical contraction rate: e(T) = e(0) * exp(-lambda * T*dt). Clamped
-        # to >= 0 — a negative raw value just means the error grew instead of
-        # decaying (no contraction observed), not a valid "rate".
-        lambda_emp = (-(torch.log(eTc) - torch.log(e0c)) / (T * dt)).clamp(min=0.0)
-        # Overshoot: peak error relative to the initial error.
-        overshoot = (e_max.clamp(min=1e-8) / e0c).clamp(min=1e-6)
-        # Contraction score: contraction rate per unit of overshoot — higher
-        # is better (fast contraction, little to no overshoot).
-        contraction_score = lambda_emp / overshoot
 
-        # Plot tracking trajectory
-        import sys
-        if "wandb" in sys.modules and sys.modules["wandb"].run is not None:
-            import wandb
-            import matplotlib.pyplot as plt
-            import io
-            from PIL import Image
-            
-            fig = plt.figure(figsize=(6, 5))
-            plotted = False
-            
-            for i in plot_idx:
-                if len(traj_x[i]) == 0:
-                    continue
-                plotted = True
-                tx = np.stack(traj_x[i])
-                txref = np.stack(traj_xref[i])
-                
-                if pos_dim == 1:
-                    ax = fig.add_subplot(111) if not plotted or 'ax' not in locals() else ax
-                    time_steps = np.arange(len(tx))
-                    ax.plot(time_steps, tx[:, 0], label=f'x (env {i})')
-                    ax.plot(time_steps, txref[:, 0], '--', color='red', label=f'x_ref (env {i})')
-                    ax.set_xlabel("Time Step")
-                    ax.set_ylabel("Position")
-                elif pos_dim == 2:
-                    ax = fig.add_subplot(111) if not plotted or 'ax' not in locals() else ax
-                    time_steps = np.arange(len(tx))
-                    ax.scatter(tx[:, 0], tx[:, 1], c=time_steps, cmap='viridis', s=10, label=f'x (env {i})')
-                    ax.plot(txref[:, 0], txref[:, 1], '--', color='red', label=f'x_ref (env {i})')
-                    ax.set_xlabel("X Position")
-                    ax.set_ylabel("Y Position")
-                else:
-                    ax = fig.add_subplot(111, projection='3d') if not plotted or 'ax' not in locals() else ax
-                    time_steps = np.arange(len(tx))
-                    ax.scatter(tx[:, 0], tx[:, 1], tx[:, 2], c=time_steps, cmap='viridis', s=10, label=f'x (env {i})')
-                    ax.plot(txref[:, 0], txref[:, 1], txref[:, 2], '--', color='red', label=f'x_ref (env {i})')
-                    ax.set_xlabel("X Position")
-                    ax.set_ylabel("Y Position")
-                    ax.set_zlabel("Z Position")
-            
-            if plotted:
-                # Legend might be too big if 10 envs, but let's just add it or place it outside
-                ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')
-                ax.set_title("C3M Tracking")
-            buf = io.BytesIO()
-            plt.savefig(buf, format='png', bbox_inches='tight')
-            plt.close(fig)
-            buf.seek(0)
-            try:
-                img = Image.open(buf)
-                wandb.log({"train/tracking_trajectory": wandb.Image(img), "global_step": timestep})
-            except Exception:
-                pass
-                
-            # Plot Normalized Error
-            fig_err, ax_err = plt.subplots(figsize=(6, 4))
-            err_plotted = False
-            for i in plot_idx:
-                if len(traj_error[i]) > 0:
-                    err_arr = np.array(traj_error[i])
-                    e0_val = max(err_arr[0], 1e-8)
-                    norm_err = err_arr / e0_val
-                    
-                    _trapz = getattr(np, "trapezoid", None) or np.trapz
-                    auc_val = float(_trapz(norm_err, dx=dt))
-                    
-                    ax_err.plot(norm_err, label=f'Env {i} (AUC: {auc_val:.2f})')
-                    err_plotted = True
-            
-            if err_plotted:
-                ax_err.set_title("C3M Normalized Error")
-                ax_err.set_xlabel("Step")
-                ax_err.set_ylabel("Normalized Error")
-                buf_err = io.BytesIO()
-                fig_err.savefig(buf_err, format='png', bbox_inches='tight')
-                plt.close(fig_err)
-                buf_err.seek(0)
-                try:
-                    img_err = Image.open(buf_err)
-                    wandb.log({"train/normalized_error": wandb.Image(img_err), "global_step": timestep})
-                except Exception:
-                    pass
-            else:
-                plt.close(fig_err)
-
-        from .eval_metrics import mean_confidence_interval
-        
-        # Use only valid samples if some environments finished
+        # Only envs that finished their (first) episode carry valid information.
         f_mask = finished if finished.any() else torch.ones_like(finished)
-        
-        # True integral of error over time using trapezoidal rule on normalized sequence
-        e0c = e0.clamp(min=1e-8)
-        eTc = e_last.clamp(min=1e-8)
-        auc_trapz = auc_sum - 0.5 * e0 + 0.5 * e_last
-        auc_sum_dt = (auc_trapz / e0c) * dt
-        
-        rew_m, rew_ci = mean_confidence_interval(total_reward[f_mask].cpu().numpy())
-        auc_m, auc_ci = mean_confidence_interval(auc_sum_dt[f_mask].cpu().numpy())
-        cr_m, cr_ci = mean_confidence_interval(lambda_emp[f_mask].cpu().numpy())
-        over_m, over_ci = mean_confidence_interval(overshoot[f_mask].cpu().numpy())
-        score_m, score_ci = mean_confidence_interval(contraction_score[f_mask].cpu().numpy())
 
+        # Unified streaming metrics (auc / contraction_rate / overshoot /
+        # contraction_score, each mean + 95% CI) + the normalized-error and
+        # path-tracking figures — same computation/keys as every other algorithm.
+        log_tracking_plots(traj_x, traj_xref, traj_error, dt=dt, prefix="train",
+                            step=timestep, title="C3M")
         return {
-            "reward_mean": rew_m, "reward_ci95": rew_ci,
-            "auc_mean": auc_m, "auc_ci95": auc_ci,
-            "contraction_rate_mean": cr_m, "contraction_rate_ci95": cr_ci,
-            "overshoot_mean": over_m, "overshoot_ci95": over_ci,
-            "contraction_score_mean": score_m, "contraction_score_ci95": score_ci,
+            "stability": stats.summary(dt, f_mask),
+            "reward": reward_summary(total_reward, f_mask),
         }

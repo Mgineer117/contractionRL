@@ -77,8 +77,9 @@ class QuadrupedPathTrackingEnv(PathTrackingBase):
         fell = self._robot.data.root_pos_w[:, 2] < self.cfg.base_height_min
         if not getattr(self.cfg, "terminate_on_fall", True):
             fell = torch.zeros_like(time_out)
-        # always reset diverged/non-finite states (independent of fall handling)
-        terminated = fell | self._state_diverged(self._get_physical_state())
+        # Non-finite/diverged states are handled by the carry-forward guard in
+        # _sanitize_state, not by termination — see PathTrackingBase.
+        terminated = fell
         return terminated, time_out
 
     def _set_robot_state_from_ref(self, env_ids: torch.Tensor, x_ref_init: torch.Tensor) -> None:

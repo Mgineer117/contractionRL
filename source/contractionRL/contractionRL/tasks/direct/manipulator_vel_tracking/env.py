@@ -11,7 +11,7 @@ from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 
-from ..common.eval_metrics import mean_confidence_interval
+from ..common.state_guard import carry_forward_nonfinite
 from ..common.vel_commands import VelCommands
 from .env_cfg import ManipulatorVelTrackingEnvCfg
 
@@ -53,6 +53,13 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
         self._cmd = VelCommands(self.num_envs, self.device, self.cfg.vel_cmd)
         self._episode_vel_auc = torch.zeros(self.num_envs, device=self.device)
         self._episode_vel_initial = torch.zeros(self.num_envs, device=self.device)
+        self._episode_vel_last = torch.zeros(self.num_envs, device=self.device)
+
+        # divergence guard: carry the last finite physical state/reward
+        # forward instead of letting a NaN/Inf physics state reach the
+        # policy, value fn, or the ref-traj collector (get_physical_state()).
+        self._last_valid_state: torch.Tensor | None = None
+        self._last_valid_reward: torch.Tensor | None = None
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot_cfg)
@@ -83,7 +90,7 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
         ee_pos = self._robot.data.body_pos_w[:, self._ee_id[0], :] - self.scene.env_origins   # (N, 3)
         ee_lin_vel = self._robot.data.body_lin_vel_w[:, self._ee_id[0], :]                     # (N, 3)
         ee_yaw_vel = self._robot.data.body_ang_vel_w[:, self._ee_id[0], 2:3]                   # (N, 1)
-        return torch.cat(
+        state = torch.cat(
             [
                 self._robot.data.joint_pos[:, self._arm_ids],
                 self._robot.data.joint_vel[:, self._arm_ids],
@@ -93,6 +100,11 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
             ],
             dim=-1,
         )
+        if self._last_valid_state is None:
+            self._last_valid_state = torch.nan_to_num(state)
+        state = carry_forward_nonfinite(state, self._last_valid_state)
+        self._last_valid_state = state
+        return state
 
     def _get_observations(self) -> dict:
         t = self.episode_length_buf.float() * self.step_dt
@@ -123,6 +135,7 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
         ], dim=-1)
         err_norm = torch.norm(vel_err_vec, dim=-1)
         self._episode_vel_auc += err_norm
+        self._episode_vel_last = err_norm.detach().clone()
         
         # episode_length_buf is incremented to 1 BEFORE _get_rewards runs (see
         # DirectRLEnv.step), so it is never 0 here — use <= 1 to capture the
@@ -137,7 +150,12 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
         normalised = (self._robot.data.joint_pos[:, self._arm_ids] - mid) / (half_range + 1e-6)
         rew_limits = torch.sum(torch.clamp(normalised.abs() - 0.9, min=0.0) ** 2, dim=1) * self.cfg.rew_joint_limits
 
-        return rew_vel + rew_yaw + rew_ar + rew_limits
+        total_reward = rew_vel + rew_yaw + rew_ar + rew_limits
+        if self._last_valid_reward is None:
+            self._last_valid_reward = torch.nan_to_num(total_reward)
+        total_reward = carry_forward_nonfinite(total_reward, self._last_valid_reward)
+        self._last_valid_reward = total_reward
+        return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
@@ -159,16 +177,21 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
                 mask = auc_vals > 0
                 init_costs = self._episode_vel_initial[env_ids]
                 init_cost = torch.clamp(init_costs[mask], min=1e-6)
-                e_T = self.get_tracking_error()[env_ids][mask]
-                auc_trapz = auc_vals[mask] + 0.5 * init_costs[mask] - 0.5 * e_T
+                e_T = self._episode_vel_last[env_ids][mask]
+                auc_trapz = auc_vals[mask] - 0.5 * init_costs[mask] - 0.5 * e_T
                 self.extras["log"]["Episode/auc"] = (auc_trapz / init_cost * self.step_dt).mean()
                 self.extras["log"]["Reward/discounted_return"] = disc_returns[mask].mean()
                 self.extras["log"]["Reward/avg_reward_per_step"] = (undisc_returns[mask] / lengths[mask]).mean()
-                # undiscounted_return is dropped here — it's the same quantity skrl
-                # already tracks as "Reward / Total reward (mean)"; only its 95% CI
-                # (not available from skrl's tracker) is worth adding.
-                _, reward_ci95 = mean_confidence_interval(undisc_returns[mask].cpu().numpy())
-                self.extras["log"]["Reward/total_reward_ci95"] = torch.tensor(reward_ci95, device=self.device)
+                # Same "Reward/total_reward_*" keys, and same per-episode-reset
+                # cadence as the Stability tab, that C3M's eval loop emits via
+                # track_reward_summary — skrl's own "Reward / Total reward
+                # (mean)" tracker uses a DIFFERENT key name and can't be unified
+                # with it, so it was leaving total_reward_mean written only once
+                # (by the post-training evaluator) instead of throughout training.
+                from contractionRL.agents.skrl.contraction_metrics import reward_log_dict, reward_summary
+                self.extras["log"].update(
+                    reward_log_dict(reward_summary(undisc_returns, mask), self.device)
+                )
             
             self._episode_discounted_returns[env_ids] = 0.0
             self._episode_undiscounted_returns[env_ids] = 0.0
@@ -177,6 +200,7 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
             
         self._episode_vel_auc[env_ids] = 0.0
         self._episode_vel_initial[env_ids] = 0.0
+        self._episode_vel_last[env_ids] = 0.0
 
         self._actions[env_ids] = 0.0
         self._prev_actions[env_ids] = 0.0

@@ -34,7 +34,9 @@ memory:
 agent:
   class: C3M
   batch_size: 1024
-  learning_rate_scheduler:       # Optional PyTorch learning rate scheduler (e.g., "StepLR")
+  learning_rate_scheduler: "ExponentialLR"  # mild per-step decay so a long run doesn't collapse LR to ~0
+  learning_rate_scheduler_kwargs:
+    gamma: 0.9999  # shared by the CMG (W) and policy (u) optimizers; stepped once per training iteration
   policy_update_per_cmg_update: 1  # Number of CMG metric updates to perform per policy update
   W_lr: 3.0e-4  # Learning rate for the Contraction Metric Generator (CMG) network
   u_lr: 3.0e-4  # Learning rate for the Policy (Actor) network

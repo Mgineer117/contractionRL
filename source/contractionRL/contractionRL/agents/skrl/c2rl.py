@@ -17,14 +17,24 @@ algorithm (``base_algorithm="PPO"`` → two skrl ``PPO`` sub-agents,
     instead of a near-zero one. This is the policy actually DEPLOYED at
     inference (``act()``) unless ``con_only=True``.
 
-Both policies share one replay/rollout mechanism per epoch (each gets its OWN
-memory buffer — con_memory/opt_memory — but the alternation is what makes them
-"share" the environment: opt_policy picks up wherever con_policy's rollout
-left the env). Every epoch (``C2RLSkrlTrainer.train``):
+Buffer layout depends on ``base_algorithm``: PPO gives con/opt each its OWN
+per-epoch rollout buffer (con_memory/opt_memory, reset & refilled every epoch);
+SAC uses ONE shared persistent replay buffer for both (con_memory IS opt_memory
+— see ``__init__``), so the two SAC agents learn off the pooled con+opt
+transitions. Either way the alternation is what makes them "share" the
+environment: opt_policy picks up wherever con_policy's rollout left the env.
+
+Cadence differs too: PPO is epoch-based (a full con rollout + update, then a
+full opt rollout + update, then CMG), while SAC is step-based (see
+``C2RLSkrlTrainer.train``: after every env step it runs one CMG update and
+``policy_update_per_cmg_update`` con/opt gradient steps). The per-epoch view
+below describes the PPO path:
 
   1. **Con rollout** — ``rollout_steps`` env steps with *con_policy* acting,
-     recorded into ``con_memory`` with the environment's OWN reward (it gets
-     overwritten in step 2).
+     recorded into ``con_memory``. The logged reward is the Mahalanobis
+     (contraction) reward — the objective con actually optimizes — while the
+     env reward is kept as ``Reward / env_reward``; the memory reward is
+     overwritten in step 2 regardless (see ``_record_with_maha``).
   2. **update_con** — recompute the Mahalanobis reward from the RAW observations
      just collected and inject it in place of the environment reward, then run
      one PPO/SAC gradient update for con_policy (PPO: explicit ``update()``
@@ -38,8 +48,10 @@ left the env). Every epoch (``C2RLSkrlTrainer.train``):
      ``con_only``).
   4. **update_opt** — same as step 2, for opt_policy.
   5. **update_cmg** — refresh the CMG training buffer via ``get_rollout`` and
-     run ``cmg_updates_per_policy_update`` contraction pd-loss gradient steps, evaluated
-     using con_policy's mean control/Jacobian (NOT opt_policy's).
+     run ONE contraction pd-loss gradient step on the CMG, evaluated using
+     con_policy's mean control/Jacobian (NOT opt_policy's). (``update_cmg`` is
+     called once per CMG update; ``policy_update_per_cmg_update`` sets how many
+     con/opt policy gradient steps run per CMG update — see the SAC loop.)
 
 Normalization (see ``_make_base_cfg``, ``_compute_mahalanobis_reward``,
 ``_compute_cmg_loss``):
@@ -260,7 +272,9 @@ class C2RLSACCfg(AgentCfg):
 @dataclass
 class C2RLTrainerCfg(TrainerCfg):
     timesteps: int = 300000
-    rollouts: int = 300
+    # NOTE: no `rollouts` here — the rollout length is read from the agent cfg
+    # (agent.rollouts), mirroring ppo/sac. Keeping a trainer-side copy invited a
+    # mismatch with agent.rollouts (which sizes the con/opt memory buffers).
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -571,20 +585,26 @@ class C2RLAgent(Agent):
         # for a contraction algorithm, runner.agent is this OUTER C2RLAgent,
         # which has no .policy/.scheduler/.entropy_optimizer of its own, so
         # train.py's patching there is a no-op. Apply directly to the real base
-        # agents instead, reading std_dev_annealing straight from raw_cfg since
-        # train.py never gets a chance to pop/forward it for con_agent/opt_agent.
+        # agents instead. std-dev annealing is auto-enabled per sub-agent from
+        # its OWN policy's backbone (con_policy/opt_policy can differ) rather
+        # than a single yaml on/off flag — see runner.CONTROL_BACKBONES and
+        # ControllerNetwork's frozen log_std (nn_modules.py's anneal_stddev=True).
         from contractionRL.agents.skrl.agent_patches import (
             patch_kl_logging,
             patch_ppo_std_annealing,
             patch_sac_entropy_clamp,
         )
-        _std_dev_annealing = self._raw_cfg.get("std_dev_annealing", False)
+        from contractionRL.agents.skrl.models import ControllerNetwork
         _std_dev_annealing_kwargs = self._raw_cfg.get("std_dev_annealing_kwargs")
-        for _agent in (self._con_agent, self._opt_agent):
+        for _agent, _policy_model in (
+            (self._con_agent, models.get("con_policy")),
+            (self._opt_agent, models.get("opt_policy")),
+        ):
             if _agent is None:
                 continue
             patch_kl_logging(_agent)
             patch_sac_entropy_clamp(_agent)
+            _std_dev_annealing = isinstance(_policy_model, ControllerNetwork)
             patch_ppo_std_annealing(_agent, _std_dev_annealing, _std_dev_annealing_kwargs)
 
         self._con_memory = con_memory
@@ -711,9 +731,16 @@ class C2RLAgent(Agent):
 
     def _compute_mahalanobis_reward(
         self, observations: torch.Tensor, actions: torch.Tensor | None = None,
+        *, update_running: bool = True,
     ) -> torch.Tensor:
         """Compute -(tracking_scaler * ||e||²_M + control_scaler * ||u - uref||²),
         each term normalised by its own running variance.
+
+        ``update_running`` (default True) advances the EMA reward/control variance
+        used for that normalisation. Pass ``update_running=False`` for
+        LOGGING-only calls (e.g. recording the contraction reward for wandb) so
+        the extra call doesn't perturb the normaliser the actual training reward
+        (update_con/update_opt, SAC's sample patch) depends on.
 
         tracking_scaler/control_scaler play the role of Q/R exactly like
         SD-LQR/LQR's Q_scaler/R_scaler (sdlqr.py): tracking_scaler weights the
@@ -747,11 +774,14 @@ class C2RLAgent(Agent):
 
             beta = cfg.reward_norm_beta
             batch_var = quad.var(unbiased=False).item()
-            if self._running_reward_var is None:
-                self._running_reward_var = batch_var + 1e-8
-            else:
-                self._running_reward_var = beta * self._running_reward_var + (1 - beta) * batch_var
-            std = self._running_reward_var ** 0.5 + 1e-8
+            # Effective variance for THIS call; only persisted when update_running.
+            reward_var = (
+                (batch_var + 1e-8) if self._running_reward_var is None
+                else beta * self._running_reward_var + (1 - beta) * batch_var
+            )
+            if update_running:
+                self._running_reward_var = reward_var
+            std = reward_var ** 0.5 + 1e-8
             reward = -cfg.tracking_scaler * quad / std
 
             if actions is not None and cfg.control_scaler > 0:
@@ -761,11 +791,13 @@ class C2RLAgent(Agent):
                 control_cost = (feedback ** 2).sum(dim=-1, keepdim=True)
 
                 control_batch_var = control_cost.var(unbiased=False).item()
-                if self._running_control_var is None:
-                    self._running_control_var = control_batch_var + 1e-8
-                else:
-                    self._running_control_var = beta * self._running_control_var + (1 - beta) * control_batch_var
-                control_std = self._running_control_var ** 0.5 + 1e-8
+                control_var = (
+                    (control_batch_var + 1e-8) if self._running_control_var is None
+                    else beta * self._running_control_var + (1 - beta) * control_batch_var
+                )
+                if update_running:
+                    self._running_control_var = control_var
+                control_std = control_var ** 0.5 + 1e-8
                 reward = reward - cfg.control_scaler * control_cost / control_std
         return reward
 
@@ -839,15 +871,15 @@ class C2RLAgent(Agent):
         Cu = dot_M + 2 * sym_MABK + 2 * cfg.lbd * M
         Cu = Cu + cfg.eps * I
 
-        pd_loss, pd_reg = loss_pos_matrix_eigen(-Cu)
+        pd_loss, _ = loss_pos_matrix_eigen(-Cu, reg=False)
         entropy_loss = info_W.get("entropy", torch.tensor(0.0, device=device))
         if isinstance(entropy_loss, torch.Tensor):
             entropy_loss = entropy_loss.mean() * cfg.W_entropy_scaler
         else:
             entropy_loss = torch.zeros(1, device=device)
 
-        loss = pd_loss + pd_reg - entropy_loss
-        return loss, {"pd_loss": pd_loss.item(), "pd_reg": pd_reg.item()}
+        loss = pd_loss - entropy_loss
+        return loss, {"pd_loss": pd_loss.item()}
 
     # ── C2RL update methods (called by C2RLSkrlTrainer) ──────────────────── #
 
@@ -944,7 +976,6 @@ class C2RLAgent(Agent):
 
         loss_dict = {
             "C2RL/CMG/pd_loss": info["pd_loss"],
-            "C2RL/CMG/pd_reg":  info["pd_reg"],
         }
         for k, v in loss_dict.items():
             self.track_data(f"Loss / {k}", v)
@@ -982,11 +1013,66 @@ class C2RLAgent(Agent):
 class C2RLSkrlTrainer(Trainer):
     """skrl Trainer for C2RL — alternates con/opt rollouts and CMG updates."""
 
+    @staticmethod
+    def _record_with_maha(
+        agent, base_agent, *, observations, states, actions, rewards,
+        next_obs, next_states, terminated, truncated, infos, global_step, timesteps,
+    ) -> None:
+        """Record a transition, logging the CONTRACTION (Mahalanobis) reward.
+
+        The Mahalanobis reward is what con/opt actually OPTIMIZE (the env reward
+        is only a placeholder that update_con/opt/SAC-sample overwrite), so it is
+        what skrl's per-episode ``Reward / Total reward (max/min/mean)`` and
+        ``Episode / Total timesteps`` should reflect for these two policies. The
+        raw env reward is kept alongside as ``Reward / env_reward (mean)``.
+        ``update_running=False``: this is a logging call and must not perturb the
+        EMA reward normaliser the training reward path depends on. The stored
+        memory reward is irrelevant (PPO's update_con and SAC's sample patch both
+        recompute it), so only the logged cumulative changes here.
+        """
+        maha = agent._compute_mahalanobis_reward(observations, actions, update_running=False)
+        base_agent.record_transition(
+            observations=observations, states=states, actions=actions,
+            rewards=maha.view_as(rewards), next_observations=next_obs, next_states=next_states,
+            terminated=terminated, truncated=truncated, infos=infos,
+            timestep=global_step, timesteps=timesteps,
+        )
+        base_agent.track_data("Reward / env_reward (mean)", float(rewards.float().mean()))
+
+    @staticmethod
+    def _forward_env_log(agent, infos) -> None:
+        """Forward the env's per-episode ``extras['log']`` (e.g. path_tracking_base's
+        or classic env_base's ``Stability/*``) onto the outer agent's tracking_data —
+        exactly as skrl's SequentialTrainer does for PPO/SAC. C2RL steps the real env
+        during training (it "collects samples like ppo/sac"), so it gets the SAME
+        env-computed metrics/tabs from the live rollout, with NO separate eval
+        rollout. Classic envs under SyncVectorEnv only surface "log" nested inside
+        "final_info" (SAME_STEP autoreset), which WandbPlotWrapper lifts to a flat
+        top-level "log" dict before this runs — see wandb_plot_wrapper.py. No-op if
+        that lifting didn't happen (nothing finished this step).
+        """
+        if not isinstance(infos, dict):
+            return
+        log = infos.get("log")
+        if not isinstance(log, dict):
+            return
+        for k, v in log.items():
+            key = k if "/" in k else f"Info / {k}"
+            if isinstance(v, torch.Tensor):
+                if v.numel() == 1:
+                    agent.track_data(key, v.item())
+            elif isinstance(v, (int, float)):
+                agent.track_data(key, float(v))
+
     def train(self) -> None:
         agent: C2RLAgent = self.agents if not isinstance(self.agents, list) else self.agents[0]
         env = self.env
         num_envs = env.num_envs
-        rollout_steps = self.cfg.rollouts if hasattr(self.cfg, "rollouts") else agent._cfg.rollouts
+        # rollouts lives ONLY under `agent:` in the YAML (mirroring ppo/sac); the
+        # trainer block must not carry its own — a separate trainer.rollouts that
+        # disagreed with agent.rollouts used to trip the con-memory size guard
+        # below (agent-sized buffer vs trainer-sized loop).
+        rollout_steps = agent._cfg.rollouts
         timesteps = self.cfg.timesteps
         con_only = agent._con_only
 
@@ -1009,8 +1095,8 @@ class C2RLSkrlTrainer(Trainer):
         if agent._base_algorithm == "PPO" and agent._con_memory.memory_size != rollout_steps:
             raise ValueError(
                 f"[C2RL] Agent con_memory was sized for rollouts={agent._con_memory.memory_size} "
-                f"but the trainer is configured for rollouts={rollout_steps}. Keep "
-                f"agent.rollouts and trainer.rollouts in sync in the YAML config."
+                f"but the rollout loop uses rollouts={rollout_steps}. Both derive from "
+                f"agent.rollouts, so this should not happen — check the YAML `agent.rollouts`."
             )
 
         agent.init(trainer_cfg=self.cfg)
@@ -1031,6 +1117,15 @@ class C2RLSkrlTrainer(Trainer):
         observations, infos = env.reset()
         states = env.state() if hasattr(env, "state") else None
         global_step = 0
+
+        # SAC flushes the inner con/opt agents' tracking data on this cadence
+        # (NOT every step). skrl's write_tracking_data clears the 100-episode
+        # reward/timestep deques on each call, so flushing every step reduced
+        # "Reward / Total reward" and "Episode / Total timesteps" to only the
+        # envs that happened to finish on that exact step. Flushing every
+        # ~timesteps/100 steps (matching standalone SAC's "auto" write_interval)
+        # lets the deques fill, giving the same smooth running mean as SAC.
+        sac_flush_interval = max(1, timesteps // 100)
 
         pbar = _tqdm.tqdm(total=timesteps, desc="C2RL training", file=sys.stdout)
 
@@ -1053,15 +1148,16 @@ class C2RLSkrlTrainer(Trainer):
                 next_states = env.state() if hasattr(env, "state") else None
                 con_obs_list.append(observations.clone())
                 con_act_list.append(actions.clone())
-                agent._con_agent.record_transition(
-                    observations=observations, states=states, actions=actions,
-                    rewards=rewards, next_observations=next_obs, next_states=next_states,
+                self._record_with_maha(
+                    agent, agent._con_agent, observations=observations, states=states,
+                    actions=actions, rewards=rewards, next_obs=next_obs, next_states=next_states,
                     terminated=terminated, truncated=truncated, infos=infos,
-                    timestep=global_step, timesteps=timesteps,
+                    global_step=global_step, timesteps=timesteps,
                 )
+                self._forward_env_log(agent, infos)
                 observations = next_obs
                 states = next_states
-                
+
                 # Step-based update for SAC
                 if agent._base_algorithm == "SAC":
                     agent.update_cmg(timestep=global_step, timesteps=timesteps)
@@ -1071,12 +1167,13 @@ class C2RLSkrlTrainer(Trainer):
                         if not con_only and agent._opt_agent is not None:
                             agent.update_opt(None, None, timestep=global_step, timesteps=timesteps)
                             agent._opt_agent.post_interaction(timestep=global_step, timesteps=timesteps)
-                    
-                    if getattr(agent._con_agent, "writer", None) is not None:
-                        agent._con_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
-                    if not con_only and getattr(agent._opt_agent, "writer", None) is not None:
-                        agent._opt_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
-                        
+
+                    if global_step % sac_flush_interval == 0:
+                        if getattr(agent._con_agent, "writer", None) is not None:
+                            agent._con_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
+                        if not con_only and getattr(agent._opt_agent, "writer", None) is not None:
+                            agent._opt_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
+
                 global_step += 1
                 pbar.update(1)
 
@@ -1108,15 +1205,16 @@ class C2RLSkrlTrainer(Trainer):
                     next_states = env.state() if hasattr(env, "state") else None
                     opt_obs_list.append(observations.clone())
                     opt_act_list.append(actions.clone())
-                    agent._opt_agent.record_transition(
-                        observations=observations, states=states, actions=actions,
-                        rewards=rewards, next_observations=next_obs, next_states=next_states,
+                    self._record_with_maha(
+                        agent, agent._opt_agent, observations=observations, states=states,
+                        actions=actions, rewards=rewards, next_obs=next_obs, next_states=next_states,
                         terminated=terminated, truncated=truncated, infos=infos,
-                        timestep=global_step, timesteps=timesteps,
+                        global_step=global_step, timesteps=timesteps,
                     )
+                    self._forward_env_log(agent, infos)
                     observations = next_obs
                     states = next_states
-                    
+
                     # Step-based update for SAC
                     if agent._base_algorithm == "SAC":
                         agent.update_cmg(timestep=global_step, timesteps=timesteps)
@@ -1126,11 +1224,12 @@ class C2RLSkrlTrainer(Trainer):
                             if not con_only and agent._opt_agent is not None:
                                 agent.update_opt(None, None, timestep=global_step, timesteps=timesteps)
                                 agent._opt_agent.post_interaction(timestep=global_step, timesteps=timesteps)
-                        
-                        if getattr(agent._con_agent, "writer", None) is not None:
-                            agent._con_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
-                        if not con_only and getattr(agent._opt_agent, "writer", None) is not None:
-                            agent._opt_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
+
+                        if global_step % sac_flush_interval == 0:
+                            if getattr(agent._con_agent, "writer", None) is not None:
+                                agent._con_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
+                            if not con_only and getattr(agent._opt_agent, "writer", None) is not None:
+                                agent._opt_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
 
                     global_step += 1
                     pbar.update(1)
@@ -1148,187 +1247,32 @@ class C2RLSkrlTrainer(Trainer):
             # SAC already ran post_interaction inside the loop, but PPO hasn't run the outer agent's post_interaction
             agent.post_interaction(timestep=global_step, timesteps=timesteps)
 
-            # We use global_step conceptually as 'epoch' for evaluation intervals now
-            # Evaluate metrics occasionally
-            eval_interval = getattr(agent._cfg, "eval_interval", 0)
-            if eval_interval > 0 and global_step % eval_interval == 0:
-                eval_metrics = self.eval()
-                _stability_keys = {"auc", "contraction_rate", "overshoot", "contraction_score"}
-                for k, v in eval_metrics.items():
-                    tab = "Stability" if any(sk in k for sk in _stability_keys) else "Reward"
-                    agent.track_data(f"{tab}/{k}", v)
-                    if k.endswith("_mean"):
-                        agent.track_data(f"{tab}/{k[:-5]}", v)
+            # post_interaction()'s OWN write_interval-modulo check (skrl base
+            # Agent) almost never fires here: it's only reachable from THIS
+            # call site, made once per epoch (every ~2x rollout_steps env
+            # steps), whereas standalone PPO/SAC hit it every single env step
+            # via SequentialTrainer. For most rollout/write_interval
+            # combinations gcd(2*rollout_steps, write_interval) doesn't divide
+            # write_interval - 1, so `not timestep % write_interval` is simply
+            # never true (e.g. epoch size 32 vs write_interval 300 can NEVER
+            # coincide) and the outer agent's tracking_data — Stability/* from
+            # _forward_env_log, plus CMG/dynamics losses tracked directly on
+            # `agent` — silently accumulates forever and never reaches
+            # wandb/tensorboard. Flush it explicitly every epoch instead.
+            if getattr(agent, "writer", None) is not None:
+                agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
+
+            # No separate eval rollout: C2RL steps the real env during training,
+            # so its Stability/* (path-tracking) and Episode/Reward metrics come
+            # from the env's own per-episode extras["log"], forwarded live via
+            # _forward_env_log above — exactly like PPO/SAC. The authoritative
+            # convergence-rate/overshoot numbers are the post-training
+            # _evaluate_best_model / _evaluate_classic_path_tracking (paper
+            # fit_exponential_envelope). Live tracking plots come from the
+            # env-wrapping WandbPlotWrapper, same as PPO/SAC.
 
         # Persist the learned dynamics for reuse/inspection (matches C3M).
         if agent._neural_dynamics is not None:
             dyn_path = os.path.join(agent.experiment_dir, "checkpoints", "dynamics.pt")
             os.makedirs(os.path.dirname(dyn_path), exist_ok=True)
             agent.save_dynamics(dyn_path)
-
-    def _env_scalar_attr(self, *names):
-        for name in names:
-            val = getattr(self.env, name, None)
-            if val is not None:
-                return val
-        if hasattr(self.env, "get_attr"):
-            for name in names:
-                try:
-                    return self.env.get_attr(name)[0]
-                except Exception:
-                    continue
-        return 0
-
-    def eval(self) -> dict:
-        import numpy as np
-        agent: C2RLAgent = self.agents if not isinstance(self.agents, list) else self.agents[0]
-        ppo = agent._opt_agent if (agent._opt_agent and not agent._con_only) else agent._con_agent
-        ppo.enable_training_mode(False)
-        observations, _ = self.env.reset()
-        states = self.env.state() if hasattr(self.env, "state") else None
-
-        x_dim = agent._x_dim
-        num_envs = self.env.num_envs
-        auc_sum = torch.zeros((num_envs, 1), device=self.env.device)
-        total_reward = torch.zeros((num_envs, 1), device=self.env.device)
-        steps_count = torch.zeros((num_envs, 1), device=self.env.device)
-        e0 = torch.zeros((num_envs, 1), device=self.env.device)
-        e_last = torch.zeros((num_envs, 1), device=self.env.device)
-        e_max = torch.zeros((num_envs, 1), device=self.env.device)
-
-        max_steps = int(self._env_scalar_attr("max_episode_length", "max_episode_len")) + 1
-        finished = torch.zeros(num_envs, dtype=torch.bool, device=self.env.device)
-
-        plot_idx = np.random.choice(num_envs, 1, replace=False)
-        traj_x = {i: [] for i in plot_idx}
-        traj_xref = {i: [] for i in plot_idx}
-        traj_error = {i: [] for i in plot_idx}
-
-        for _ in range(max_steps):
-            with torch.no_grad():
-                actions, _ = ppo.models["policy"].act({"observations": observations}, role="policy")
-
-            active = (~finished).unsqueeze(-1).float()
-            x_curr = observations[:, :x_dim]
-            x_ref = observations[:, x_dim:2*x_dim]
-            error = torch.norm(x_curr - x_ref, dim=-1, keepdim=True)
-
-            for i in plot_idx:
-                if not finished[i]:
-                    traj_x[i].append(x_curr[i].cpu().clone().numpy())
-                    traj_xref[i].append(x_ref[i].cpu().clone().numpy())
-                    traj_error[i].append(error[i].item())
-            auc_sum += error * active
-            is_first = (steps_count == 0) & (active > 0)
-            e0 = torch.where(is_first, error, e0)
-            e_last = torch.where(active > 0, error, e_last)
-            e_max = torch.where(active > 0, torch.maximum(e_max, error), e_max)
-
-            observations, rewards, terminated, truncated, _ = self.env.step(actions)
-            total_reward += rewards.view(num_envs, 1) * active
-            steps_count += active
-
-            finished |= (terminated | truncated).view(num_envs)
-            if finished.all():
-                break
-
-        ppo.enable_training_mode(True)
-
-        dt = float(self._env_scalar_attr("step_dt", "dt"))
-        e0c = e0.clamp(min=1e-8)
-        eTc = e_last.clamp(min=1e-8)
-        T = steps_count.clamp(min=1)
-        lambda_emp = (-(torch.log(eTc) - torch.log(e0c)) / (T * dt)).clamp(min=0.0)
-        overshoot = (e_max.clamp(min=1e-8) / e0c).clamp(min=1e-6)
-        contraction_score = lambda_emp / overshoot
-
-        import sys
-        if "wandb" in sys.modules and sys.modules["wandb"].run is not None:
-            import wandb
-            import matplotlib.pyplot as plt
-            import io
-            from PIL import Image
-
-            fig = plt.figure(figsize=(6, 5))
-            plotted = False
-
-            for i in plot_idx:
-                if len(traj_x[i]) == 0:
-                    continue
-                plotted = True
-                tx = np.stack(traj_x[i])
-                txref = np.stack(traj_xref[i])
-
-                if x_dim == 1:
-                    ax = fig.add_subplot(111) if not plotted or 'ax' not in locals() else ax
-                    ax.plot(tx[:, 0], label=f'x (env {i})')
-                    ax.plot(txref[:, 0], '--', label=f'x_ref (env {i})')
-                elif x_dim == 2:
-                    ax = fig.add_subplot(111) if not plotted or 'ax' not in locals() else ax
-                    ax.plot(tx[:, 0], tx[:, 1], label=f'x (env {i})')
-                    ax.plot(txref[:, 0], txref[:, 1], '--', label=f'x_ref (env {i})')
-                else:
-                    ax = fig.add_subplot(111, projection='3d') if not plotted or 'ax' not in locals() else ax
-                    ax.plot(tx[:, 0], tx[:, 1], tx[:, 2], label=f'x (env {i})')
-                    ax.plot(txref[:, 0], txref[:, 1], txref[:, 2], '--', label=f'x_ref (env {i})')
-
-            if plotted:
-                ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')
-                ax.set_title("C2RL Tracking")
-            buf = io.BytesIO()
-            plt.savefig(buf, format='png', bbox_inches='tight')
-            plt.close(fig)
-            buf.seek(0)
-            try:
-                img = Image.open(buf)
-                wandb.log({"train/tracking_trajectory": wandb.Image(img)}, step=agent.track_dict.get("timestep", 0) if hasattr(agent, "track_dict") else None)
-            except Exception:
-                pass
-
-            # Plot Normalized Error
-            fig_err, ax_err = plt.subplots(figsize=(6, 4))
-            err_plotted = False
-            for i in plot_idx:
-                if len(traj_error[i]) > 0:
-                    err_arr = np.array(traj_error[i])
-                    e0_val = max(err_arr[0], 1e-8)
-                    norm_err = err_arr / e0_val
-                    
-                    _trapz = getattr(np, "trapezoid", None) or np.trapz
-                    auc_val = float(_trapz(norm_err, dx=dt))
-                    
-                    ax_err.plot(norm_err, label=f'Env {i} (AUC: {auc_val:.2f})')
-                    err_plotted = True
-            
-            if err_plotted:
-                ax_err.set_title("C2RL Normalized Error")
-                ax_err.set_xlabel("Step")
-                ax_err.set_ylabel("Normalized Error")
-                buf_err = io.BytesIO()
-                fig_err.savefig(buf_err, format='png', bbox_inches='tight')
-                plt.close(fig_err)
-                buf_err.seek(0)
-                try:
-                    img_err = Image.open(buf_err)
-                    wandb.log({"train/normalized_error": wandb.Image(img_err)}, step=agent.track_dict.get("timestep", 0) if hasattr(agent, "track_dict") else None)
-                except Exception:
-                    pass
-            else:
-                plt.close(fig_err)
-
-        from .eval_metrics import mean_confidence_interval
-        f_mask = finished if finished.any() else torch.ones_like(finished)
-        
-        rew_m, rew_ci = mean_confidence_interval(total_reward[f_mask].cpu().numpy())
-        auc_m, auc_ci = mean_confidence_interval(auc_sum[f_mask].cpu().numpy())
-        cr_m, cr_ci = mean_confidence_interval(lambda_emp[f_mask].cpu().numpy())
-        over_m, over_ci = mean_confidence_interval(overshoot[f_mask].cpu().numpy())
-        score_m, score_ci = mean_confidence_interval(contraction_score[f_mask].cpu().numpy())
-
-        return {
-            "reward_mean": rew_m, "reward_ci95": rew_ci,
-            "auc_mean": auc_m, "auc_ci95": auc_ci,
-            "contraction_rate_mean": cr_m, "contraction_rate_ci95": cr_ci,
-            "overshoot_mean": over_m, "overshoot_ci95": over_ci,
-            "contraction_score_mean": score_m, "contraction_score_ci95": score_ci,
-        }

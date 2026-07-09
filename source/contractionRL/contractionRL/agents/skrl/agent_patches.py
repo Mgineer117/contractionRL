@@ -79,10 +79,15 @@ def patch_ppo_std_annealing(agent, std_dev_annealing: bool, kwargs: dict | None 
     log_std_parameter from its initial value down to `final_log_std` over the
     total training timesteps, following the chosen schedule.
 
-    YAML usage::
+    `std_dev_annealing` is not a yaml flag: callers (train.py / c2rl.py)
+    auto-derive it from whether the policy's backbone is one of
+    ``runner.CONTROL_BACKBONES`` (``"control"``/``"contraction"``) — those
+    backbones freeze ``log_std_parameter`` (``requires_grad=False``, see
+    ``CLActor``'s ``anneal_stddev=True``) specifically so it's driven by this
+    schedule instead of PPO's gradient. Only the schedule itself is
+    yaml-configurable::
 
         agent:
-          std_dev_annealing: True
           std_dev_annealing_kwargs:
             schedule: exponential   # linear | exponential | cosine
             final_log_std: -2.3     # target log_std (std ~= 0.1)
@@ -139,22 +144,27 @@ def patch_ppo_std_annealing(agent, std_dev_annealing: bool, kwargs: dict | None 
     agent.post_interaction = _annealed_post
 
 def patch_auc_checkpoint(agent) -> None:
-    """Override agent.post_interaction to save the best checkpoint using AUC.
-    
+    """Override agent.post_interaction to save the best checkpoint using contraction_score.
+
     skrl natively saves best_agent.pt by tracking the highest 'Reward / Total reward (mean)'.
-    This patch replaces that reward score with the negative AUC (so lower AUC is treated as
-    better reward) and logs it so SKRL triggers the best checkpoint saving correctly.
+    contraction_score (= lambda / overshoot, see contraction_metrics.py) is the composite
+    stability metric — higher is better, so it plugs directly into skrl's "maximize reward"
+    checkpoint rule with no sign flip. Falls back to negative AUC (lower AUC = better,
+    hence the flip) for any run/env where contraction_score isn't logged.
     """
     _orig_post = getattr(agent, "post_interaction", None)
     if _orig_post is None:
         return
 
     def _auc_post(*, timestep: int, timesteps: int) -> None:
-        # Prioritize Stability/auc (path tracking) over Episode/auc (velocity tracking)
-        # Note: We negate it because SKRL saves checkpoints for the MAXIMIZED reward, and we want to MINIMIZE AUC.
-        score_list = agent.tracking_data.get("Stability/auc") or agent.tracking_data.get("Episode/auc")
+        score_list = agent.tracking_data.get("Stability/contraction_score")
         if score_list:
-            agent.track_data("Reward / Total reward (mean)", -score_list[-1])
+            agent.track_data("Reward / Total reward (mean)", score_list[-1])
+        else:
+            # Prioritize Stability/auc (path tracking) over Episode/auc (velocity tracking)
+            score_list = agent.tracking_data.get("Stability/auc") or agent.tracking_data.get("Episode/auc")
+            if score_list:
+                agent.track_data("Reward / Total reward (mean)", -score_list[-1])
         _orig_post(timestep=timestep, timesteps=timesteps)
 
     agent.post_interaction = _auc_post

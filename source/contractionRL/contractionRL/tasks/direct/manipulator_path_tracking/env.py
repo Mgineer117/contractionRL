@@ -66,8 +66,10 @@ class ManipulatorPathTrackingEnv(PathTrackingBase):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        # reset diverged/non-finite states (a NaN/exploded arm never self-heals)
-        terminated = self._state_diverged(self._get_physical_state())
+        # Path tracking never terminates early — non-finite/diverged states are
+        # handled by the carry-forward guard in _sanitize_state instead (see
+        # PathTrackingBase). Manipulators have no "fell" concept.
+        terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         return terminated, time_out
 
     def _set_robot_state_from_ref(self, env_ids: torch.Tensor, x_ref_init: torch.Tensor) -> None:

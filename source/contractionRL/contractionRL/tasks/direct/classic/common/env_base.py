@@ -23,6 +23,8 @@ import numpy as np
 import torch
 from gymnasium import spaces
 
+from contractionRL.tasks.direct.common.state_guard import carry_forward_nonfinite
+
 
 class BaseEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"]}
@@ -100,6 +102,7 @@ class BaseEnv(gym.Env):
         state = self.construct_state(self.x_t)
         self.init_tracking_error = np.linalg.norm(self.x_t - self.xref[0], ord=2) ** 2
         self.traj_x, self.traj_y, self.err_history = [], [], []
+        self.episode_reward = 0.0
         return state, {"x": self.x_t, "tracking_error": self.init_tracking_error}
 
     def step(self, u):
@@ -115,7 +118,8 @@ class BaseEnv(gym.Env):
         # the contraction certificate.
         self.current_u = u.copy()
         reward, infos = self.get_rewards(u)
-        
+        self.episode_reward += float(reward)
+
         # Track raw distance error for AUC/Contraction envelope
         err_dist = np.sqrt(max(infos["tracking_error"], 0.0))
         self.err_history.append(err_dist)
@@ -146,8 +150,16 @@ class BaseEnv(gym.Env):
             _trapz = getattr(np, "trapezoid", None) or np.trapz
             auc = float(_trapz(norm_traj, dx=self.dt))
             
-            # Populate SKRL's expected info["log"] dictionary
-            info_dict["log"] = {"Stability/auc": auc}
+            # Populate SKRL's expected info["log"] dictionary. Bare
+            # "Reward/total_reward" (no _mean/_ci95 suffix, same convention as
+            # Stability/auc) — WandbPlotWrapper aggregates it across envs into
+            # "Reward/total_reward_mean"/"_ci95" at the SAME per-episode-reset
+            # cadence as Stability/*, instead of that key only ever being
+            # written once by the post-training evaluator.
+            info_dict["log"] = {
+                "Stability/auc": auc,
+                "Reward/total_reward": self.episode_reward,
+            }
             
             try:
                 from contractionRL.agents.skrl.eval_metrics import fit_exponential_envelope
@@ -174,6 +186,12 @@ class BaseEnv(gym.Env):
     def get_transition(self, x: np.ndarray, u: np.ndarray):
         x_dot = self.get_dynamics(x, u)
         next_x = x + self.dt * x_dot
+        # Divergence guard: a poor policy can drive x_dot to NaN/Inf (e.g. a
+        # control-affine term blowing up). Carry the previous state forward
+        # element-wise rather than terminating — episodes never terminate here
+        # (see `termination = False` below), and np.clip(nan, ...) would leave
+        # NaN untouched, silently poisoning every downstream reward/obs.
+        next_x = carry_forward_nonfinite(next_x, x)
         pos_min = self.X_MIN.flatten()[: self.pos_dimension]
         pos_max = self.X_MAX.flatten()[: self.pos_dimension]
         next_pos = next_x[: self.pos_dimension]
@@ -400,9 +418,24 @@ class BaseEnv(gym.Env):
         }
 
     # ------------------------------------------------------------------ #
+    # SyncVectorEnv broadcasts render() to every parallel sub-env instance
+    # (skrl's GymnasiumWrapper.render() -> VectorEnv.call("render", ...)), but
+    # we only ever want to plot one representative episode. The first instance
+    # to have render() invoked claims ownership (a class attr, so it's shared
+    # across all sub-envs of this task); every other instance no-ops instead
+    # of allocating its own pyplot figure. Without this, num_envs figures pile
+    # up unclosed and trip matplotlib's >20-open-figures warning/leak.
+    _render_owner_id: int | None = None
+
     def render(self, mode="rgb_array"):
-        """Lightweight trajectory + tracking-error render."""
+        """Lightweight trajectory + tracking-error render (first env only)."""
         import matplotlib.pyplot as plt
+
+        cls = type(self)
+        if cls._render_owner_id is None:
+            cls._render_owner_id = id(self)
+        if id(self) != cls._render_owner_id:
+            return None
 
         if not hasattr(self, "fig"):
             if mode == "rgb_array":
@@ -442,3 +475,14 @@ class BaseEnv(gym.Env):
             self.fig.canvas.draw()
             img = np.asarray(self.fig.canvas.buffer_rgba())
             return img[:, :, :3].copy()
+
+    def close(self):
+        # Only the render-owning instance ever allocates self.fig; the other
+        # (num_envs - 1) sub-envs no-op here. Runs for every algorithm since
+        # SyncVectorEnv.close() -> each sub-env's close() at the end of train/play.
+        if hasattr(self, "fig"):
+            import matplotlib.pyplot as plt
+
+            plt.close(self.fig)
+            type(self)._render_owner_id = None
+        super().close()

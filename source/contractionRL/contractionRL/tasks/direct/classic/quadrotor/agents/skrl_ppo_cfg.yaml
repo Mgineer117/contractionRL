@@ -40,9 +40,8 @@ agent:
   mini_batches: 4  # Number of subsets to divide the batch into for stochastic optimization
   discount_factor: 0.99  # Gamma discount factor weighting future rewards
   gae_lambda: 0.95  # Lambda parameter for Generalized Advantage Estimation (GAE)
-  learning_rate: 0.001    # Global step size for neural network optimization
+  learning_rate: 1.0e-5    # Global step size for neural network optimization
   learning_rate_scheduler: KLAdaptiveLR
-  std_dev_annealing: false # exponential log_std schedule 0 → -20
   std_dev_annealing_kwargs:
     schedule: exponential
     final_log_std: -4.6

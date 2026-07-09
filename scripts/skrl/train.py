@@ -15,8 +15,9 @@ import sys
 # ─── Pre-parse: must know --classic BEFORE any Isaac Sim imports ──────────── #
 _pre = argparse.ArgumentParser(add_help=False)
 _pre.add_argument("--classic", action="store_true", default=False)
+_pre.add_argument("--task", type=str, default="")
 _pre_args, _ = _pre.parse_known_args()
-_is_classic = _pre_args.classic
+_is_classic = _pre_args.classic or _pre_args.task.startswith("classic")
 
 if not _is_classic:
     from isaaclab.app import AppLauncher
@@ -37,11 +38,10 @@ parser.add_argument("--num_timesteps", "--num-timesteps", type=int, default=None
                     help="Total training timesteps.")
 parser.add_argument("--analytical", type=str, default="",
                     help="Pass 'dynamics' to use analytical dynamics (C3M/LQR).")
-parser.add_argument("--use_analytical_dynamics", "--use-analytical-dynamics",
+parser.add_argument("--use_empirical_dynamics", "--use-empirical-dynamics",
                     action="store_true", default=False,
-                    help="Use the env's exact analytical get_f_and_B instead of a learned "
-                         "NeuralDynamics (classic envs only). When NOT passed, C3M/C2RL "
-                         "pretrain + refine a NeuralDynamics model (the default for all envs).")
+                    help="Use a learned NeuralDynamics model instead of the env's exact analytical get_f_and_B "
+                         "(classic envs only). When NOT passed, C3M/C2RL use analytical dynamics.")
 
 # W&B
 parser.add_argument("--no_wandb", "--no-wandb", action="store_true", default=False,
@@ -141,7 +141,21 @@ import gymnasium as gym
 import yaml
 
 algorithm = args_cli.algorithm.lower()
-_CONTRACTION_ALGOS = {"c3m", "lqr", "sdlqr", "c2rl-ppo", "c2rl-sac"}
+_CONTRACTION_ALGOS = {"c3m", "lqr", "sdlqr", "c2rl-ppo", "c2rl-sac", "c2rl_ppo", "c2rl_sac"}
+
+# Algorithm-aware num_envs defaults (used when --num_envs is not given).
+# SAC-based algorithms (and c3m/lqr/sdlqr, which sample from a large buffer the
+# same way SAC does) need far fewer parallel envs; PPO-based algorithms are
+# on-policy and benefit from massively parallel envs. Applies to both the
+# classic gymnasium route and the Isaac Sim route.
+_SAC_LIKE_ALGOS = {"sac", "c2rl-sac", "c2rl_sac", "c3m", "lqr", "sdlqr"}
+_DEFAULT_NUM_ENVS_SAC = 64
+_DEFAULT_NUM_ENVS_PPO_CLASSIC = 1024
+
+
+def _default_num_envs_classic(algo: str) -> int:
+    return _DEFAULT_NUM_ENVS_SAC if algo.lower() in _SAC_LIKE_ALGOS else _DEFAULT_NUM_ENVS_PPO_CLASSIC
+
 
 seed = args_cli.seed if args_cli.seed is not None else random.randint(0, 10000)
 
@@ -588,8 +602,16 @@ def _evaluate_classic_path_tracking(*, task, runner, num_groups: int = 10, episo
     print(f"[Eval] Saved → {out_json}")
 
     if not args_cli.no_wandb and "wandb" in sys.modules and sys.modules["wandb"].run is not None:
-        sys.modules["wandb"].log({f"final_eval/{k}": v for k, v in results.items()
-                                  if isinstance(v, (int, float))})
+        wandb_logs = {}
+        for k, v in results.items():
+            if isinstance(v, (int, float)):
+                if "reward" in k:
+                    wandb_logs[f"Reward/{k}"] = v
+                elif any(s in k for s in ["auc", "overshoot", "contraction_rate", "contraction_score"]):
+                    wandb_logs[f"Stability/{k}"] = v
+                else:
+                    wandb_logs[f"final_eval/{k}"] = v
+        sys.modules["wandb"].log(wandb_logs)
 
 
 def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, num_groups: int = 10):
@@ -678,6 +700,18 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, num_grou
 
     err_np = errors.cpu().numpy()  # (N, T+1)
     rew_np = total_reward.cpu().numpy()
+
+    # Cap the Stability-tab sample size to the SAC-family env count, regardless
+    # of how many parallel envs THIS run actually used. PPO-family algorithms
+    # train/roll out with far more parallel envs (e.g. 4096) than SAC-family
+    # ones (64, see _DEFAULT_NUM_ENVS_SAC) — without this cap, PPO's mean/CI
+    # would be computed from a much larger sample than SAC's, so the two
+    # wouldn't be comparable on the Stability tab. Truncating (not resampling)
+    # keeps this deterministic across reruns.
+    if num_envs > _DEFAULT_NUM_ENVS_SAC:
+        num_envs = _DEFAULT_NUM_ENVS_SAC
+        err_np = err_np[:num_envs]
+        rew_np = rew_np[:num_envs]
 
     # AUC over the normalized error curve (dt-weighted trapezoid), per episode.
     # np.trapezoid is numpy>=2 only; env_isaaclab ships numpy 1.26 (trapz).
@@ -805,8 +839,8 @@ if _is_classic:
     # Analytical dynamics is OFF by default (every contraction config learns a
     # NeuralDynamics); --use_analytical_dynamics (or legacy --analytical dynamics)
     # switches to the env's exact get_f_and_B. Classic envs only.
-    if args_cli.analytical == "dynamics" or args_cli.use_analytical_dynamics:
-        agent_cfg["agent"]["use_analytical_dynamics"] = True
+    if algorithm in ["c3m", "c2rl_ppo", "c2rl_sac", "lqr", "sdlqr"]:
+        agent_cfg["agent"]["use_empirical_dynamics"] = args_cli.use_empirical_dynamics
 
     _run_ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_dir = os.path.join("logs", "classic", algorithm, _run_ts)
@@ -883,7 +917,7 @@ if _is_classic:
         from skrl.envs.wrappers.torch import wrap_env
         from contractionRL.runners import ContractionRunner
 
-        num_envs = args_cli.num_envs or 4
+        num_envs = args_cli.num_envs if args_cli.num_envs is not None else _default_num_envs_classic(algorithm)
         vec_env = SyncVectorEnv([lambda: gym.make(args_cli.task)] * num_envs)
         # vec_env.device = "cpu"  # REMOVED: This was causing C3M to run its heavy batch gradients on the CPU!
         env = wrap_env(vec_env, wrapper="gymnasium")
@@ -891,7 +925,7 @@ if _is_classic:
         import os as _os
         _sys.path.append(_os.path.dirname(__file__))
         from wandb_plot_wrapper import WandbPlotWrapper
-        env = WandbPlotWrapper(env)
+        env = WandbPlotWrapper(env, total_timesteps=agent_cfg["trainer"]["timesteps"])
 
         runner = ContractionRunner(env, agent_cfg, task_id=args_cli.task, num_envs=num_envs, is_classic=True)
         if args_cli.checkpoint:
@@ -908,20 +942,20 @@ if _is_classic:
         # PPO / SAC use the built-in skrl Runner
         from gymnasium.vector import SyncVectorEnv
         from skrl.envs.wrappers.torch import wrap_env
-        from contractionRL.agents.skrl.runner import CLActorRunner as Runner
+        from contractionRL.agents.skrl.runner import CLActorRunner as Runner, CONTROL_BACKBONES
 
         _a = agent_cfg["agent"]
         _use_state = _a.pop("use_state_norm", False)  # OFF by default (see agent configs / c2rl.py docstring)
         _use_value = _a.pop("use_value_norm", True)
 
-        num_envs = args_cli.num_envs or 4
+        num_envs = args_cli.num_envs if args_cli.num_envs is not None else _default_num_envs_classic(algorithm)
         vec_env = SyncVectorEnv([lambda: gym.make(args_cli.task)] * num_envs)
         env = wrap_env(vec_env, wrapper="gymnasium")
         import sys as _sys
         import os as _os
         _sys.path.append(_os.path.dirname(__file__))
         from wandb_plot_wrapper import WandbPlotWrapper
-        env = WandbPlotWrapper(env)
+        env = WandbPlotWrapper(env, total_timesteps=agent_cfg["trainer"]["timesteps"])
 
         # Standalone PPO/SAC build models purely from agent_cfg (no env access) —
         # inject angle_idx (e.g. yaw at [2]) from the underlying classic env so
@@ -954,9 +988,12 @@ if _is_classic:
             _a["value_preprocessor"] = "RunningStandardScaler"
             _a["value_preprocessor_kwargs"] = None
         _a.pop("anneal_stddev", None)   # no longer a PPO_CFG field; handled below
-        _a.pop("anneal_log_std", None)  # legacy alias, superseded by std_dev_annealing
-        _std_dev_annealing = _a.pop("std_dev_annealing", False)
+        _a.pop("anneal_log_std", None)  # legacy alias, superseded by backbone-driven annealing
+        _a.pop("std_dev_annealing", None)  # legacy on/off flag; now auto-derived from backbone below
         _std_dev_annealing_kwargs = _a.pop("std_dev_annealing_kwargs", None)
+        _std_dev_annealing = (
+            agent_cfg.get("models", {}).get("policy", {}).get("backbone") in CONTROL_BACKBONES
+        )
 
         runner = Runner(env, agent_cfg)
         from contractionRL.agents.skrl.agent_patches import (
@@ -995,6 +1032,8 @@ else:
         )
         sys.exit(1)
 
+    from contractionRL.agents.skrl.runner import CONTROL_BACKBONES
+
     if args_cli.ml_framework.startswith("torch"):
         from contractionRL.agents.skrl.runner import CLActorRunner as Runner
     elif args_cli.ml_framework.startswith("jax"):
@@ -1030,11 +1069,9 @@ else:
         # need far fewer parallel envs (large replay buffer >> many envs),
         # while on-policy PPO-based algorithms benefit from massively parallel
         # envs.  The user can always override with --num_envs.
-        _SAC_ALGOS = {"sac", "c2rl-sac", "c2rl_sac"}
-        _DEFAULT_NUM_ENVS_SAC = 64
         if args_cli.num_envs is not None:
             env_cfg.scene.num_envs = args_cli.num_envs
-        elif algorithm.lower() in _SAC_ALGOS:
+        elif algorithm.lower() in _SAC_LIKE_ALGOS:
             env_cfg.scene.num_envs = _DEFAULT_NUM_ENVS_SAC
         env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
@@ -1231,12 +1268,22 @@ else:
 
         start_time = time.time()
         _isaac_env = env  # save reference for get_physical_state() during ref-traj generation
+        env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)
+        # Raw (un-plot-wrapped) reference for _evaluate_best_model/_generate_ref_trajs:
+        # both toggle skrl_env._reset_once directly to force a real sim reset, which
+        # is an attribute SET — WandbPlotWrapper.__getattr__ only intercepts GETs, so
+        # setting it through the plot wrapper would shadow it on the wrapper instance
+        # instead of the real IsaacLabWrapper, silently breaking that reset.
+        _skrl_env = env
         import sys as _sys
         import os as _os
         _sys.path.append(_os.path.dirname(__file__))
         from wandb_plot_wrapper import WandbPlotWrapper
-        env = WandbPlotWrapper(env)
-        env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)
+        # WandbPlotWrapper must wrap the SKRL-wrapped env (flat tensor obs +
+        # .state()), not the raw Isaac env — the raw env's step() returns a dict
+        # obs ({"policy": ...}), which crashes WandbPlotWrapper's trajectory
+        # extraction (obs[i, :3] on a dict). Order matches the classic branch above.
+        env = WandbPlotWrapper(env, total_timesteps=agent_cfg["trainer"]["timesteps"])
 
         # angle_idx (e.g. yaw at [2] on quadruped/humanoid path-tracking) is an
         # ENV attribute, not a cfg field — inject it into agent_cfg["models"] so
@@ -1290,13 +1337,13 @@ else:
 
         _a.pop("anneal_stddev", None)   # no longer a PPO_CFG field; handled below
         _a.pop("anneal_log_std", None)
-        _std_dev_annealing = _a.pop("std_dev_annealing", False)
+        _a.pop("std_dev_annealing", None)  # legacy on/off flag; now auto-derived from backbone below
         _std_dev_annealing_kwargs = _a.pop("std_dev_annealing_kwargs", None)
 
         # Auto-enable stddev annealing when policy uses the CLActor backbone
         # ("control", with "contraction" kept as a backward-compatible alias)
-        _is_contraction = (
-            agent_cfg.get("models", {}).get("policy", {}).get("backbone") in ("control", "contraction")
+        _std_dev_annealing = (
+            agent_cfg.get("models", {}).get("policy", {}).get("backbone") in CONTROL_BACKBONES
         )
 
         if _alg in _CONTRACTION_ALGOS:
@@ -1304,8 +1351,8 @@ else:
             # Default: learn a NeuralDynamics (pretrain + online). Passing
             # --use_analytical_dynamics for an Isaac task deliberately trips the
             # runner's guard below (no analytical dynamics exist for Isaac envs).
-            if args_cli.use_analytical_dynamics:
-                agent_cfg["agent"]["use_analytical_dynamics"] = True
+            # Isaac envs always use empirical dynamics
+            agent_cfg["agent"]["use_empirical_dynamics"] = True
             runner = ContractionRunner(env, agent_cfg, is_classic=False)
         else:
             runner = Runner(env, agent_cfg)
@@ -1360,7 +1407,7 @@ else:
             task=args_cli.task,
             runner=runner,
             isaac_env=_isaac_env,
-            skrl_env=env,
+            skrl_env=_skrl_env,
             env_cfg=env_cfg,
         )
 
@@ -1369,7 +1416,7 @@ else:
                 task=args_cli.task,
                 runner=runner,
                 isaac_env=_isaac_env,
-                skrl_env=env,
+                skrl_env=_skrl_env,
                 env_cfg=env_cfg,
             )
 

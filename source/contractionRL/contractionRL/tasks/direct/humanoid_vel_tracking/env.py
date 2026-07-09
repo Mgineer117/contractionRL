@@ -12,7 +12,7 @@ from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import euler_xyz_from_quat, quat_apply
 
-from ..common.eval_metrics import mean_confidence_interval
+from ..common.state_guard import carry_forward_nonfinite
 from ..common.vel_commands import VelCommands
 from .env_cfg import HumanoidVelTrackingEnvCfg
 
@@ -45,6 +45,12 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
         self._cmd = VelCommands(self.num_envs, self.device, self.cfg.vel_cmd)
         self._episode_vel_auc = torch.zeros(self.num_envs, device=self.device)
         self._episode_vel_initial = torch.zeros(self.num_envs, device=self.device)
+        self._episode_vel_last = torch.zeros(self.num_envs, device=self.device)
+
+        # divergence guard: carry the last finite obs/reward forward instead
+        # of letting a NaN/Inf physics state reach the policy or value fn.
+        self._last_valid_obs: torch.Tensor | None = None
+        self._last_valid_reward: torch.Tensor | None = None
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot_cfg)
@@ -104,6 +110,10 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
             dim=-1,
         )
         obs = torch.cat([full_state, cmds, self._prev_actions], dim=-1)
+        if self._last_valid_obs is None:
+            self._last_valid_obs = torch.nan_to_num(obs)
+        obs = carry_forward_nonfinite(obs, self._last_valid_obs)
+        self._last_valid_obs = obs
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
@@ -125,6 +135,7 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
         vel_err_vec = cmds[:, :2] - self._robot.data.root_lin_vel_b[:, :2]
         err_norm = torch.norm(vel_err_vec, dim=-1)
         self._episode_vel_auc += err_norm
+        self._episode_vel_last = err_norm.detach().clone()
         
         # episode_length_buf is incremented to 1 BEFORE _get_rewards runs (see
         # DirectRLEnv.step), so it is never 0 here — use <= 1 to capture the
@@ -145,6 +156,10 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
         self._episode_lengths_custom += 1.0
         self._current_discounts *= 0.99
 
+        if self._last_valid_reward is None:
+            self._last_valid_reward = torch.nan_to_num(total_reward)
+        total_reward = carry_forward_nonfinite(total_reward, self._last_valid_reward)
+        self._last_valid_reward = total_reward
         return total_reward
 
     def get_tracking_error(self) -> torch.Tensor:
@@ -185,16 +200,21 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
                 mask = auc_vals > 0
                 init_costs = self._episode_vel_initial[env_ids]
                 init_cost = torch.clamp(init_costs[mask], min=1e-6)
-                e_T = self.get_tracking_error()[env_ids][mask]
-                auc_trapz = auc_vals[mask] + 0.5 * init_costs[mask] - 0.5 * e_T
+                e_T = self._episode_vel_last[env_ids][mask]
+                auc_trapz = auc_vals[mask] - 0.5 * init_costs[mask] - 0.5 * e_T
                 self.extras["log"]["Episode/auc"] = (auc_trapz / init_cost * self.step_dt).mean()
                 self.extras["log"]["Reward/discounted_return"] = disc_returns[mask].mean()
                 self.extras["log"]["Reward/avg_reward_per_step"] = (undisc_returns[mask] / lengths[mask]).mean()
-                # undiscounted_return is dropped here — it's the same quantity skrl
-                # already tracks as "Reward / Total reward (mean)"; only its 95% CI
-                # (not available from skrl's tracker) is worth adding.
-                _, reward_ci95 = mean_confidence_interval(undisc_returns[mask].cpu().numpy())
-                self.extras["log"]["Reward/total_reward_ci95"] = torch.tensor(reward_ci95, device=self.device)
+                # Same "Reward/total_reward_*" keys, and same per-episode-reset
+                # cadence as the Stability tab, that C3M's eval loop emits via
+                # track_reward_summary — skrl's own "Reward / Total reward
+                # (mean)" tracker uses a DIFFERENT key name and can't be unified
+                # with it, so it was leaving total_reward_mean written only once
+                # (by the post-training evaluator) instead of throughout training.
+                from contractionRL.agents.skrl.contraction_metrics import reward_log_dict, reward_summary
+                self.extras["log"].update(
+                    reward_log_dict(reward_summary(undisc_returns, mask), self.device)
+                )
             
             self._episode_discounted_returns[env_ids] = 0.0
             self._episode_undiscounted_returns[env_ids] = 0.0
@@ -203,6 +223,7 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
             
         self._episode_vel_auc[env_ids] = 0.0
         self._episode_vel_initial[env_ids] = 0.0
+        self._episode_vel_last[env_ids] = 0.0
 
         self._actions[env_ids] = 0.0
         self._prev_actions[env_ids] = 0.0

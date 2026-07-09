@@ -187,6 +187,18 @@ def _patch_ppo_annealing(runner) -> None:
 def _make_skrl_env(env, task_id: str | None, num_envs: int, is_classic: bool):
     """Return a skrl-wrapped env suitable for contraction agents."""
     if is_classic:
+        # Reuse the caller's env if it's already a real, usable one instead of
+        # unconditionally rebuilding a bare duplicate. train.py's classic path
+        # already constructs SyncVectorEnv + wrap_env + WandbPlotWrapper before
+        # calling ContractionRunner — rebuilding from scratch here silently
+        # discarded that wrapping, so C3M/LQR/SDLQR/C2RL's actual training loop
+        # (which steps whatever this function returns, NOT the caller's `env`)
+        # ran against an unwrapped env: no Stability/* forwarding, no
+        # normalized_error/path_tracking plots. Building fresh from `task_id`
+        # remains the fallback for callers that pass a bare/unvectorized env
+        # (see the module docstring's documented usage).
+        if hasattr(env, "step") and hasattr(env, "observation_space") and hasattr(env, "num_envs"):
+            return env
         if task_id is None and hasattr(env, "spec") and env.spec:
             task_id = env.spec.id
         if task_id is None:
@@ -431,8 +443,8 @@ class ContractionRunner:
         # GaussianMixin wrapper explicitly.
         policy_class_str = models_cfg.get("policy", {}).get("class", "DeterministicMixin")
         if policy_class_str == "GaussianMixin":
-            from contractionRL.agents.skrl.models import CLActorModel
-            policy_cls = CLActorModel
+            from contractionRL.agents.skrl.models import ControllerNetwork
+            policy_cls = ControllerNetwork
         else:
             from contractionRL.agents.skrl.models import CLDeterministicActorModel
             policy_cls = CLDeterministicActorModel
