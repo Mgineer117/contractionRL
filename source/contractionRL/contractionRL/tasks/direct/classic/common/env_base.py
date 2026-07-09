@@ -77,7 +77,15 @@ class BaseEnv(gym.Env):
             dtype=np.float32,
         )
 
+        # Guards the one-time episode-phase stagger in reset() below — False
+        # during this constructor's own throwaway reset (its result is never
+        # stepped; every SyncVectorEnv sibling is built the same way, so
+        # staggering here would just get overwritten by the real reset that
+        # follows) and flipped True right after, so the stagger fires on the
+        # first reset that actually matters.
+        self._construction_done = False
         self.reset()
+        self._construction_done = True
 
     # ------------------------------------------------------------------ #
     def get_horizon_matched_gamma(self, scale: float = 1.0):
@@ -90,6 +98,27 @@ class BaseEnv(gym.Env):
         if options is None:
             self.x_t, self.xref, self.uref, self.episode_len = self.system_reset()
             self.xref = np.clip(self.xref, self.X_MIN.flatten(), self.X_MAX.flatten())
+            # Every env instance runs with the SAME deterministic episode_len
+            # and is reset in lock-step by gymnasium's SyncVectorEnv (see
+            # ContractionRunner), so without this every parallel env would
+            # truncate/re-perturb on the exact same global step forever,
+            # producing a perfectly synchronized periodic spike in the
+            # aggregate tracking-error curve instead of a smooth population
+            # average. Truncating ONLY this env's first real episode early, at
+            # a uniformly random point, offsets its reset schedule from its
+            # siblings; since every later episode keeps the full nominal
+            # length, that one-time offset (mod episode_len) persists for the
+            # rest of training.
+            if self._construction_done and not getattr(self, "_phase_staggered", False):
+                self._phase_staggered = True
+                # Lower bound is 2, not 1: step() increments time_steps BEFORE
+                # checking truncation (`time_steps == episode_len - 1`), so
+                # time_steps only ever takes values 1, 2, 3, ... and can never
+                # equal episode_len - 1 == 0. An episode_len of 1 would make
+                # truncation unreachable, so time_steps runs past the end of
+                # the precomputed xref/uref trajectory arrays and crashes with
+                # an IndexError.
+                self.episode_len = int(np.random.randint(2, self.episode_len + 1))
         else:
             assert hasattr(self, "xref") and hasattr(self, "uref")
             if options.get("replace_x_0", True):

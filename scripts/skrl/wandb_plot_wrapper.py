@@ -51,11 +51,18 @@ class WandbPlotWrapper:
         self._total_steps += self.num_envs
         self._step_calls += 1
 
-        # Handle batched (Isaac Lab / VectorEnv) vs unbatched
+        # Handle batched (Isaac Lab / VectorEnv) vs unbatched. Must check the
+        # TRACKED env (plot_idx), not env 0 — self._norm_errs/_traj_x/_traj_xref
+        # below are keyed by plot_idx and flushed on this flag, so checking a
+        # different env's done here left the tracked buffers un-flushed at the
+        # tracked env's own episode boundary. They kept accumulating across
+        # that env's resets instead, so the pushed plot silently spliced the
+        # tail of one episode onto the head of the next.
+        plot_env = int(self.plot_idx[0])
         if isinstance(terminated, torch.Tensor):
-            done_0 = bool((terminated | truncated)[0].item())
+            done_0 = bool((terminated | truncated)[plot_env].item())
         elif isinstance(terminated, np.ndarray):
-            done_0 = bool((terminated | truncated)[0])
+            done_0 = bool((terminated | truncated)[plot_env])
         else:
             done_0 = bool(terminated or truncated)
             
