@@ -51,6 +51,7 @@ from skrl.agents.torch.base import Agent, AgentCfg
 
 from .angle_utils import wrap_diff
 from .math_utils import b_jacobian, jacobian
+from .rl_glue import filter_cfg_fields
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -124,7 +125,7 @@ class SDLQRAgent(Agent):
         angle_idx: list | None = None,
     ) -> None:
         if isinstance(cfg, dict):
-            cfg = SDLQRCfg(**{k: v for k, v in cfg.items() if k in SDLQRCfg.__dataclass_fields__})
+            cfg = SDLQRCfg(**filter_cfg_fields(cfg, SDLQRCfg, context="SDLQRAgent"))
         super().__init__(
             cfg=cfg,
             models=models,
@@ -244,7 +245,7 @@ class LQRAgent(Agent):
         angle_idx: list | None = None,
     ) -> None:
         if isinstance(cfg, dict):
-            cfg = LQRCfg(**{k: v for k, v in cfg.items() if k in LQRCfg.__dataclass_fields__})
+            cfg = LQRCfg(**filter_cfg_fields(cfg, LQRCfg, context="LQRAgent"))
         super().__init__(
             cfg=cfg,
             models=models,

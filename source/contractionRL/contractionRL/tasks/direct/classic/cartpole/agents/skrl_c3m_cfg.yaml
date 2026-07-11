@@ -6,7 +6,11 @@ models:
   policy:
     class: DeterministicMixin  # Outputs deterministic continuous values
     backbone: contraction
-    clip_actions: false  # Clip actions to the environment action space limits
+    clip_actions: false  # MUST stay false: C3M's contraction certificate (pd_loss/c1_loss in
+                        # _compute_loss) proves Cu ≺ 0 for the UNCLAMPED closed-loop u = mean_control(x)
+                        # -- clamping only at real env-step time (here) would deploy a saturated
+                        # system training never certified, which can genuinely diverge once the
+                        # feedback needs more authority than [UREF_MIN, UREF_MAX] to correct error.
     network:
     - name: net
       input: OBSERVATIONS
@@ -38,17 +42,19 @@ agent:
   learning_rate_scheduler: "ExponentialLR"  # mild per-step decay so a long run doesn't collapse LR to ~0
   learning_rate_scheduler_kwargs:
     gamma: 0.9999  # shared by the CMG (W) and policy (u) optimizers; stepped once per training iteration
-  policy_update_per_cmg_update: 1  # Number of CMG metric updates to perform per policy update
   W_lr: 3.0e-4  # Learning rate for the Contraction Metric Generator (CMG) network
   u_lr: 3.0e-4  # Learning rate for the Policy (Actor) network
   lbd: 0.5  # Contraction rate parameter (lambda) enforcing the exponential stability bound
   eps: 0.01  # Margin parameter (epsilon) ensuring strict definiteness of the metric
   w_ub: 10.0  # Upper bound clipping value for the generated metric M(x)
   w_lb: 0.1  # Lower bound clipping value for the generated metric M(x)
-  detach_warmup_frac: 0.0  # Fraction of training epochs to detach M from pd_loss (disabled — see C3MCfg.detach_warmup_frac)
+  detach_warmup_frac: 0.3333333333333333  # Fraction of training freezing M in the contraction term
+  # (matches C3MCfg's own default) — the double-backward Ṁ term is the most numerically
+  # fragile part of the loss (see c3m.py docstring); leaving this at 0.0 makes training
+  # seed-sensitive, with some random seeds diverging outright instead of just training worse.
   # Classic env: use analytical dynamics (no NeuralDynamics training needed).
-  # Override with --use_analytical_dynamics=false to train NeuralDynamics anyway.
-  use_analytical_dynamics: true  # Whether to use exact analytical dynamics (true) or learn NeuralDynamics (false)
+  # Pass --use_empirical_dynamics to train a NeuralDynamics instead.
+  use_empirical_dynamics: false  # false = env's analytical get_f_and_B; true = learn NeuralDynamics
   experiment:
     directory: "cartpole_c3m"
     experiment_name: ""
@@ -62,5 +68,5 @@ agent:
 trainer:
   class: C3MTrainer
   timesteps: 100  # Total number of environment steps to train for
-  eval_interval: 10  # Frequency of running evaluation rollouts
+  eval_interval: 1  # Frequency of running evaluation rollouts
   environment_info: log  # Type of environment information to record (e.g., log)

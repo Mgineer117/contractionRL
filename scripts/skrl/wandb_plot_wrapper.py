@@ -96,12 +96,31 @@ class WandbPlotWrapper:
             try:
                 if hasattr(self.env.unwrapped, "envs"):
                     env_i = self.env.unwrapped.envs[i]
-                    if hasattr(env_i, "x_t"):
-                        pos_dim = getattr(env_i, "pos_dimension", len(env_i.x_t))
-                        x_i = env_i.x_t[:pos_dim]
-                        if hasattr(env_i, "xref"):
-                            t_idx = min(env_i.time_steps, len(env_i.xref) - 1)
-                            xref_i = env_i.xref[t_idx][:pos_dim]
+                    pos_dim = getattr(env_i, "pos_dimension", None)
+                    # BaseEnv (env_base.py) names this attribute "num_dim_x", not
+                    # "x_dim" — looking up the wrong name made x_dim always None,
+                    # which silently skipped x_i/xref_i below for every classic
+                    # env, so train/path_tracking was never plotted for PPO/SAC
+                    # (or any algorithm relying solely on this wrapper).
+                    x_dim = getattr(env_i, "num_dim_x", None)
+                    # gymnasium's SyncVectorEnv does SAME-STEP autoreset: on the
+                    # step that ends env i's episode, env.reset() already ran
+                    # INSIDE self.env.step() above, so env_i.x_t/env_i.xref (and
+                    # `obs[i]`) already hold the NEXT episode's data by the time we
+                    # get here. Reading them directly spliced a jump to a
+                    # brand-new random reference onto the tail of every plotted
+                    # episode. Use the true pre-reset terminal observation
+                    # gymnasium stashes in info["final_observation"] instead.
+                    src = None
+                    if done_0 and "final_observation" in info:
+                        fo = info["final_observation"]
+                        if isinstance(fo, (tuple, list, np.ndarray)) and fo[i] is not None:
+                            src = np.asarray(fo[i])
+                    if src is None:
+                        src = obs[i].detach().cpu().numpy() if isinstance(obs, torch.Tensor) else np.asarray(obs[i])
+                    if pos_dim is not None and x_dim is not None:
+                        x_i = src[:pos_dim]
+                        xref_i = src[x_dim: x_dim + pos_dim]
                 else:
                     # Isaac envs: state()[..., :3] is position — but path/vel-
                     # tracking envs expose no separate "critic" observation, so
@@ -152,7 +171,7 @@ class WandbPlotWrapper:
         if "log" in info and "_log" in info and not lifted:
             mask = info["_log"]  # bool array (num_envs,)
             if isinstance(mask, np.ndarray) and mask.any():
-                from contractionRL.agents.skrl.eval_metrics import mean_confidence_interval
+                from contractionRL.tasks.direct.common.eval_metrics import mean_confidence_interval
                 raw_log = info["log"]
                 # raw_log is a dict whose leaf values are numpy arrays and whose
                 # sub-keys starting with "_" are masks — skip those.
@@ -191,7 +210,7 @@ class WandbPlotWrapper:
                             logs_list.setdefault(k, []).append(float(v))
                 
                 if logs_list:
-                    from contractionRL.agents.skrl.eval_metrics import mean_confidence_interval
+                    from contractionRL.tasks.direct.common.eval_metrics import mean_confidence_interval
                     info["log"] = {}
                     for k, v_list in logs_list.items():
                         v_m, v_ci = mean_confidence_interval(np.array(v_list))

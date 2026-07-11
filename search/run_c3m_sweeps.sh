@@ -41,8 +41,10 @@ metric:
   # Stability / contraction_score = contraction_rate / overshoot — rewards
   # fast contraction with little overshoot, higher is better. Requires
   # eval_interval > 0 in the C3M agent cfg (default 10) so C3MSkrlTrainer.eval()
-  # actually logs it periodically during the sweep.
-  name: "Stability/contraction_score"
+  # actually logs it periodically during the sweep. Logged with a "_mean"
+  # suffix (see contraction_metrics.py's track_stability_summary) — there is
+  # no bare "Stability/contraction_score" key.
+  name: "Stability/contraction_score_mean"
   goal: maximize
 
 parameters:
@@ -64,8 +66,6 @@ parameters:
     max: 1e-3
   agent.actor_architecture:  # policy (CLActor w1/w2) hidden layers
     values: [[64, 64], [128, 128], [256, 256], [128, 128, 128]]
-  agent.cmg_updates_per_policy_update:
-    values: [1, 10]
 
 command:
   - \${env}
@@ -76,10 +76,13 @@ command:
   - "$ENV"
   - "--algorithm"
   - "c3m"
+  # C3M is SAC-like (samples from a large offline buffer) — matches train.py's
+  # own default of 64 for c3m/sac/lqr/sdlqr (_DEFAULT_NUM_ENVS_SAC).
   - "--num_envs"
-  - "4"
-  - "--analytical"
-  - "dynamics"
+  - "64"
+  # Analytical dynamics is the DEFAULT for classic contraction envs (train.py:
+  # use_empirical_dynamics defaults False). Pass --use_empirical_dynamics only
+  # to learn a NeuralDynamics instead; the old --analytical flag is a dead no-op.
   - \${args}
 YML
 

@@ -5,8 +5,11 @@ models:
   policy:
     class: DeterministicMixin  # Outputs deterministic continuous values
     backbone: contraction
-    clip_actions: false  # Clip actions to the environment action space limits — matches
-                        # every other env's C3M cfg (this one was the sole outlier)
+    clip_actions: false  # MUST stay false: C3M's contraction certificate (pd_loss/c1_loss in
+                        # _compute_loss) proves Cu ≺ 0 for the UNCLAMPED closed-loop u = mean_control(x)
+                        # -- clamping only at real env-step time (here) would deploy a saturated
+                        # system training never certified, which can genuinely diverge once the
+                        # feedback needs more authority than [UREF_MIN, UREF_MAX] to correct error.
     network:
     - name: net
       input: OBSERVATIONS
@@ -36,8 +39,7 @@ agent:
   batch_size: 1024
   learning_rate_scheduler: "ExponentialLR"  # mild per-step decay so a long run doesn't collapse LR to ~0
   learning_rate_scheduler_kwargs:
-    gamma: 0.9999  # shared by the CMG (W) and policy (u) optimizers; stepped once per training iteration
-  policy_update_per_cmg_update: 1  # Number of CMG metric updates to perform per policy update
+    gamma: 0.9999  # shared by the CMG (W), policy (u), and NeuralDynamics optimizers; stepped once per training iteration
   W_lr: 3.0e-4  # Learning rate for the Contraction Metric Generator (CMG) network
   u_lr: 3.0e-4  # Learning rate for the Policy (Actor) network
   lbd: 0.5  # Contraction rate parameter (lambda) enforcing the exponential stability bound
@@ -46,12 +48,8 @@ agent:
   w_lb: 0.1  # Lower bound clipping value for the generated metric M(x)
   # Isaac env: train NeuralDynamics online from trajectory buffer data.
   # Saved to <experiment_dir>/checkpoints/dynamics.pt after training.
-  use_analytical_dynamics: false  # Whether to use exact analytical dynamics (true) or learn NeuralDynamics (false)
+  use_empirical_dynamics: true  # false = env's analytical get_f_and_B; true = learn NeuralDynamics
   dynamics_lr: 1.0e-3  # Learning rate for the NeuralDynamics network
-  dynamics_lr_scheduler: "StepLR"  # Learning rate scheduler for NeuralDynamics
-  dynamics_lr_scheduler_kwargs:  # Arguments for the NeuralDynamics scheduler
-    step_size: 1  # anneal every epoch (1M samples / 256 mb size)
-    gamma: 0.99
   dynamics_pretrain_epochs: 500  # Number of epochs for offline data, or number of rollouts for online fallback
   dynamics_pretrain_data_path: "logs/quadruped/dynamics_data.npz"  # Path to offline dynamics data
   dynamics_batch_size: 4096
@@ -68,5 +66,5 @@ agent:
 trainer:
   class: C3MTrainer
   timesteps: 100  # Total number of environment steps to train for
-  eval_interval: 2  # Frequency of running evaluation rollouts
+  eval_interval: 1  # Frequency of running evaluation rollouts
   environment_info: log  # Type of environment information to record (e.g., log)

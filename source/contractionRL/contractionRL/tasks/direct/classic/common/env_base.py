@@ -77,17 +77,59 @@ class BaseEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # Guards the one-time episode-phase stagger in reset() below — False
-        # during this constructor's own throwaway reset (its result is never
-        # stepped; every SyncVectorEnv sibling is built the same way, so
-        # staggering here would just get overwritten by the real reset that
-        # follows) and flipped True right after, so the stagger fires on the
-        # first reset that actually matters.
-        self._construction_done = False
         self.reset()
-        self._construction_done = True
 
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _build_cfg(
+        env_config: dict,
+        *,
+        sample_mode: str = "uniform",
+        reward_mode: str = "default",
+        time_bound: float | None = None,
+        dt: float | None = None,
+    ) -> dict:
+        """Merge each subclass's constructor overrides into its ``ENV_CONFIG``.
+
+        Shared by every classic env's ``__init__`` (car/cartpole/quadrotor/
+        segway/turtlebot) so the sample_mode/reward_mode/time_bound/dt
+        override logic lives in exactly one place.
+        """
+        cfg = dict(env_config)
+        cfg["sample_mode"] = sample_mode
+        cfg["reward_mode"] = reward_mode
+        if time_bound is not None:
+            cfg["time_bound"] = time_bound
+        if dt is not None:
+            cfg["dt"] = dt
+        return cfg
+
+    def _rollout_reference(self, xref_0: np.ndarray, freqs, weights) -> tuple[np.ndarray, np.ndarray, int]:
+        """Drive the reference trajectory forward via ``sample_reference_controls``.
+
+        Shared tail of every classic env's ``system_reset``: step the
+        reference state with ``get_transition``, carry forward the
+        wrapped+clipped state (same fix as ``step``'s ``self.x_t`` — using the
+        raw state would let non-angle/non-position dims drift unbounded
+        across iterations before ``reset()``'s final ``np.clip``), and stop
+        early on termination/truncation.
+
+        Returns ``(xref_wrapped_array, uref_array, num_steps)`` — subclasses
+        combine this with their own ``define_initial_state()``-provided
+        ``x_0`` to build ``system_reset``'s ``(x_0, xref, uref, episode_len)``.
+        """
+        xref_list, xref_wrapped_list, uref_list = [xref_0], [xref_0], []
+        for i, _t in enumerate(self.t):
+            uref_t = self.sample_reference_controls(freqs, weights, _t, {"xref_0": xref_0})
+            xref_t, xref_wrapped_t, term, trunc, _ = self.get_transition(xref_list[-1].copy(), uref_t)
+            xref_wrapped_t = np.clip(xref_wrapped_t, self.X_MIN.flatten(), self.X_MAX.flatten())
+            xref_list.append(xref_wrapped_t)
+            xref_wrapped_list.append(xref_wrapped_t)
+            uref_list.append(uref_t)
+            if term or trunc:
+                break
+        return np.array(xref_wrapped_list), np.array(uref_list), i + 1
+
     def get_horizon_matched_gamma(self, scale: float = 1.0):
         scale = max(1e-3, min(scale, 1.0))
         return round(1 - (1 / (scale * self.max_episode_len)), 3)
@@ -98,27 +140,6 @@ class BaseEnv(gym.Env):
         if options is None:
             self.x_t, self.xref, self.uref, self.episode_len = self.system_reset()
             self.xref = np.clip(self.xref, self.X_MIN.flatten(), self.X_MAX.flatten())
-            # Every env instance runs with the SAME deterministic episode_len
-            # and is reset in lock-step by gymnasium's SyncVectorEnv (see
-            # ContractionRunner), so without this every parallel env would
-            # truncate/re-perturb on the exact same global step forever,
-            # producing a perfectly synchronized periodic spike in the
-            # aggregate tracking-error curve instead of a smooth population
-            # average. Truncating ONLY this env's first real episode early, at
-            # a uniformly random point, offsets its reset schedule from its
-            # siblings; since every later episode keeps the full nominal
-            # length, that one-time offset (mod episode_len) persists for the
-            # rest of training.
-            if self._construction_done and not getattr(self, "_phase_staggered", False):
-                self._phase_staggered = True
-                # Lower bound is 2, not 1: step() increments time_steps BEFORE
-                # checking truncation (`time_steps == episode_len - 1`), so
-                # time_steps only ever takes values 1, 2, 3, ... and can never
-                # equal episode_len - 1 == 0. An episode_len of 1 would make
-                # truncation unreachable, so time_steps runs past the end of
-                # the precomputed xref/uref trajectory arrays and crashes with
-                # an IndexError.
-                self.episode_len = int(np.random.randint(2, self.episode_len + 1))
         else:
             assert hasattr(self, "xref") and hasattr(self, "uref")
             if options.get("replace_x_0", True):
@@ -191,7 +212,7 @@ class BaseEnv(gym.Env):
             }
             
             try:
-                from contractionRL.agents.skrl.eval_metrics import fit_exponential_envelope
+                from contractionRL.tasks.direct.common.eval_metrics import fit_exponential_envelope
                 # fit_exponential_envelope returns C_star and a list of lambdas (one per curve)
                 C_star, lambdas = fit_exponential_envelope([norm_traj], self.dt)
                 lbd = float(lambdas[0])

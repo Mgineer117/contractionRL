@@ -1,4 +1,4 @@
-"""Unified runner for contractionRL: routes PPO/SAC → skrl, contraction → mjrl."""
+"""Unified runner for contractionRL: routes PPO/SAC → skrl Runner, contraction algorithms (C3M/LQR/SDLQR/C2RL/C4M) → native skrl Agent subclasses."""
 
 from contractionRL.runners.contraction_runner import ContractionRunner
 

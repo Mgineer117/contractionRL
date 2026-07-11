@@ -2,7 +2,7 @@ seed: 42  # Random seed for reproducibility
 
 models:
   separate: true
-  con_policy:  # contracting policy (gamma_contracting, near-zero) — trains the CMG's certificate
+  con_policy:  # contracting policy (gamma_con ≈ 0) — trains the CMG's certificate
     class: GaussianMixin
     backbone: control-squashed  # mlp (plain MLP, u = uref + MLP(obs)) | control (CLActor, u = uref + feedback(x-xref))
     clip_actions: false
@@ -15,7 +15,7 @@ models:
       layers: [256, 256]
       activations: tanh
     output: ACTIONS
-  opt_policy:  # optimal policy (gamma_optimal) — the one actually deployed unless con_only
+  opt_policy:  # optimal policy (gamma_opt) — the one actually deployed unless con_only
     class: GaussianMixin
     backbone: control-squashed
     clip_actions: false
@@ -84,8 +84,8 @@ agent:
   learning_starts: 0   # time from the live CMG. Both left at 0 (raise learning_starts for a warm-up).
   grad_norm_clip: 1.0  # Maximum permitted magnitude for gradients (prevents exploding gradients)
   # C2RL-specific
-  gamma_contracting: 0.0  # con_policy's discount factor (near-zero: approximates a hard per-step constraint)
-  gamma_optimal: 0.99  # opt_policy's discount factor — also what the PathTracking figure's theoretical/
+  gamma_con: 0.0  # con_policy's discount factor (near-zero: approximates a hard per-step constraint)
+  gamma_opt: 0.99  # opt_policy's discount factor — also what the PathTracking figure's theoretical/
                         # empirical bounds inflate by 1/(1-gamma) with, since opt_policy is deployed unless con_only
   con_only: false  # If true, only con_policy is trained/deployed — no opt_policy at all
   # CMG
@@ -95,13 +95,12 @@ agent:
   lbd: 0.5
   eps: 0.01
   W_entropy_scaler: 0.0
-  reward_norm_beta: 0.99  # Moving average momentum for both terms' running-variance normalisation
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0  # R: control-effort weight (0 = disabled, matches previous default)
-  # Dynamics — learn NeuralDynamics (ẋ = f(x) + B(x)·u) unless
-  # --use_analytical_dynamics is passed (classic envs only). Same
-  # pretraining + online-refinement mechanism as C3M.
-  use_analytical_dynamics: false
+  # Dynamics — use the env's exact analytical get_f_and_B by default; pass
+  # --use_empirical_dynamics (classic envs only) to learn a NeuralDynamics
+  # (ẋ = f(x) + B(x)·u) instead. Same pretraining + online-refinement as C3M.
+  use_empirical_dynamics: true  # false = env's analytical get_f_and_B; true = learn NeuralDynamics
   dynamics_lr: 1.0e-3
   dynamics_lr_scheduler: "StepLR"
   dynamics_lr_scheduler_kwargs:

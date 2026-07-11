@@ -1,0 +1,119 @@
+seed: 42  # Random seed for reproducibility
+
+models:
+  separate: true
+  c3m_policy:  # throwaway controller used ONLY to help synthesize the CMG offline (Phase A) — discarded once frozen
+    class: DeterministicMixin
+    backbone: contraction
+    clip_actions: false
+    network:
+    - name: net
+      input: OBSERVATIONS
+      layers: [128, 128]
+      activations: tanh
+  cmg:
+    class: CMG
+    network:
+    - name: net
+      input: OBSERVATIONS
+      layers: [128, 128]
+      activations: tanh
+      constrain_eigenvalues: true
+  dynamics:
+    class: NeuralDynamics
+    network:
+    - name: net
+      input: STATE_ACTION
+      layers: [128, 128]
+      activations: relu
+  policy:  # the REAL deployed policy (Phase B) — trains against the frozen CMG's Mahalanobis reward
+    class: GaussianMixin
+    backbone: control  # mlp (plain MLP, u = uref + MLP(obs)) | control (CLActor, u = uref + feedback(x-xref))
+    clip_actions: false # PPO is unbounded; uref+feedback can exceed the declared action space
+                        # (both range over it), so this clip is not redundant here
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    network:
+    - name: net
+      input: OBSERVATIONS
+      layers: [128, 128]
+      activations: tanh
+    output: ACTIONS
+    initial_log_std: 0.0
+  critic:  # PPO value function V(obs) for the deployed policy
+    network:
+    - name: net
+      layers: [128, 128]
+      activations: tanh
+
+memory:
+  class: RandomMemory
+  memory_size: -1  # automatically determined (same as agent:rollouts) — Phase B's memory
+                    # holds exactly one rollout epoch, reset every epoch
+
+agent:
+  class: C4M-PPO
+  # ── Phase A: offline CMG synthesis (exactly like standalone C3M) ──────── #
+  c3m_epochs: 100  # number of C3MAgent.update() epoch-passes over the offline buffer
+  c3m_batch_size: 1024
+  c3m_learning_rate_scheduler: "ExponentialLR"  # mild per-step decay so a long run doesn't collapse LR to ~0
+  c3m_learning_rate_scheduler_kwargs:
+    gamma: 0.9999  # shared by the CMG (W) and c3m_policy optimizers; stepped once per Phase A iteration
+  policy_update_per_cmg_update: 1  # Number of CMG metric updates per c3m_policy update (Phase A only)
+  W_lr: 3.0e-4  # Learning rate for the Contraction Metric Generator (CMG) network
+  u_lr: 3.0e-4  # Learning rate for the throwaway c3m_policy controller
+  lbd: 0.5  # Contraction rate parameter (lambda) enforcing the exponential stability bound
+  eps: 0.01  # Margin parameter (epsilon) ensuring strict definiteness of the metric
+  w_ub: 10.0  # Upper bound clipping value for the generated metric M(x)
+  w_lb: 0.1  # Lower bound clipping value for the generated metric M(x)
+  detach_warmup_frac: 0.0  # Fraction of Phase A epochs to detach M from pd_loss (disabled)
+  # Classic env: use analytical dynamics (no NeuralDynamics training needed) for Phase A.
+  # Pass --use_empirical_dynamics to train a NeuralDynamics instead.
+  use_empirical_dynamics: false  # false = env's analytical get_f_and_B; true = learn NeuralDynamics
+
+  # ── Phase B: deployed PPO policy against the frozen CMG ────────────────── #
+  rollouts: 24   # Number of environment steps per parallel environment per update
+  learning_epochs: 5  # Number of gradient descent passes over the collected batch
+  mini_batches: 4  # Number of subsets to divide the batch into for stochastic optimization
+  gae_lambda: 0.95  # Lambda parameter for Generalized Advantage Estimation (GAE)
+  learning_rate: 1.0e-5   # Global step size for neural network optimization
+  learning_rate_scheduler: KLAdaptiveLR # matches the standalone PPO baseline for this env
+  std_dev_annealing_kwargs:
+    schedule: exponential
+    final_log_std: -4.6
+    power: 5.0
+  random_timesteps: 0  # matches the standalone PPO baseline for this env
+  learning_starts: 0  # matches the standalone PPO baseline for this env
+  grad_norm_clip: 0.5  # Maximum permitted magnitude for gradients (prevents exploding gradients)
+  ratio_clip: 0.2  # PPO trust region clipping bound for the objective ratio
+  value_clip: 0.0  # Clipping bound for the value function update
+  entropy_loss_scale: 0.01 # Coefficient to encourage exploration by maximizing action entropy
+  value_loss_scale: 0.5  # Weight coefficient for the value function loss term
+  kl_threshold: 0.016 # Early stopping threshold based on Kullback-Leibler divergence
+  time_limit_bootstrap: true  # Bootstrap value at episode truncation instead of treating it as terminal
+  use_state_norm: false  # OFF by default — see c2rl.py's module docstring (residual-uref distortion)
+  use_value_norm: true  # Same, but for the value function's output
+  discount_factor: 0.99  # deployed policy's discount factor (no con/opt duality here — the CMG is
+                          # already frozen by the time Phase B starts)
+  learning_rate_scheduler_kwargs:
+    kl_threshold: 0.008
+  rewards_shaper_scale: 1.0
+
+  # ── Mahalanobis reward (Phase B, against the frozen metric) ────────────── #
+  tracking_scaler: 1.0  # Q: tracking-error weight
+  control_scaler: 0.0  # R: control-effort weight (0 = disabled)
+
+  experiment:
+    directory: "turtlebot_c4m_ppo"
+    experiment_name: ""
+    write_interval: "auto"  # Logging frequency for tensorboard/W&B (in epochs/steps)
+    checkpoint_interval: "auto"  # Frequency of saving model weights (in epochs/steps)
+    wandb: true  # Enable Weights & Biases logging
+    wandb_kwargs:
+      project: contractionRL
+      name:    # auto-generated by train.py (deterministic, matches local log dir)
+
+trainer:
+  class: C4MSkrlTrainer
+  timesteps: 500000   # Phase B (deployed-policy) total environment steps to train for

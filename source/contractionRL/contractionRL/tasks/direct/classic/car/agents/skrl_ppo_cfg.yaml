@@ -57,7 +57,10 @@ agent:
   experiment:
     directory: "car_ppo"
     experiment_name: ""
-    write_interval: "auto"  # Logging frequency for tensorboard/W&B (in epochs/steps)
+    write_interval: 2000  # "auto" (timesteps/100=500) aliases with car's episode_len=500,
+                           # making the first logged episode-length point (value=499) land
+                           # at global step 500 — visually indistinguishable from the value
+                           # itself. Fixed at 2000 so log-step and episode-length never coincide.
     checkpoint_interval: "auto"  # Frequency of saving model weights (in epochs/steps)
     wandb: true  # Enable Weights & Biases logging
     wandb_kwargs:

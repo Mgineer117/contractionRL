@@ -1,57 +1,61 @@
-"""C2RL — Two-policy contraction-metric synthesis, native skrl Agent.
+"""C2RL — Two-phase contraction-metric synthesis, native skrl Agent.
 
-C2RLAgent trains TWO independent policies against the SAME environment and the
-SAME shared CMG (contraction-metric generator), on top of a chosen base
-algorithm (``base_algorithm="PPO"`` → two skrl ``PPO`` sub-agents,
-``base_algorithm="SAC"`` → two skrl ``SAC`` sub-agents):
+C2RLAgent trains TWO independent policies against the SAME environment, on
+top of a chosen base algorithm (``base_algorithm="PPO"`` → two skrl ``PPO``
+sub-agents, ``base_algorithm="SAC"`` → two skrl ``SAC`` sub-agents):
 
-  * ``con_policy`` ("contracting") — discount ``gamma_contracting`` (≈0, a
-    near-per-step objective) — optimises the Mahalanobis tracking reward
+  * ``con_policy`` ("contracting", ``gamma_con`` ≈ 0, a near-per-step
+    objective) — optimises the Mahalanobis tracking reward
     ``-tracking_scaler·||e||²_M/std - control_scaler·||u-uref||²/std``,
-    where ``M(x) = W(x)⁻¹`` is the CMG's CURRENT metric. This is what actually
-    shapes the CMG (see ``update_cmg``/``_compute_cmg_loss``): con_policy's
-    mean control and its state-Jacobian ``K = du/dx`` feed the contraction
-    condition ``Cu ≺ 0`` directly.
-  * ``opt_policy`` ("optimal") — discount ``gamma_optimal`` (e.g. 0.99) —
-    optimises the SAME Mahalanobis reward, just under a standard RL discount
-    instead of a near-zero one. This is the policy actually DEPLOYED at
-    inference (``act()``) unless ``con_only=True``.
+    where ``M(x) = W(x)⁻¹`` is the CMG's metric. This is what shapes the CMG
+    (see ``update_cmg``/``_compute_cmg_loss``): con_policy's mean control and
+    its state-Jacobian ``K = du/dx`` feed the contraction condition
+    ``Cu ≺ 0`` directly, and its state ``x`` alone (no policy involvement)
+    feeds C3M-style ``C1``/``C2`` conditions on the CMG.
+  * ``opt_policy`` ("optimal", ``gamma_opt``, e.g. 0.99) — optimises the SAME
+    Mahalanobis reward, just under a standard RL discount instead of a
+    near-zero one, against the metric con_policy already shaped. This is the
+    policy actually DEPLOYED at inference (``act()``) unless ``con_only=True``.
+
+Rather than a three-way (cmg, con_policy, opt_policy) joint optimization,
+training is split into two sequential phases by wall-clock timesteps
+(``con_phase_fraction`` of ``timesteps``, default 0.5 — see
+``C2RLSkrlTrainer.train``):
+
+  1. **Phase 1 (con + CMG, joint)** — for the first ``con_phase_fraction`` of
+     ``timesteps``, con_policy rolls out and trains against the Mahalanobis
+     reward while the CMG trains alongside it (``update_cmg``, evaluated using
+     con_policy's mean control/Jacobian). opt_policy does not exist yet as far
+     as training is concerned — it neither acts nor updates.
+  2. **Evaluate con_policy, then freeze CMG** — at the phase boundary,
+     ``C2RLSkrlTrainer.eval_con_policy`` runs one bounded-episode rollout with
+     con_policy's FINAL Phase 1 weights (before it stops training) and logs
+     the result under the ``Stability|Reward/con_final`` tabs — the only
+     "quality gate" con_policy gets, since it is never the deployed policy
+     post-Phase-1. Then ``agent.freeze_cmg()`` sets ``requires_grad_(False)``
+     on every CMG parameter and puts it in ``eval()`` permanently. The metric
+     ``M(x)`` — and hence the Mahalanobis reward — is fixed for the remainder
+     of training.
+  3. **Phase 2 (opt alone, frozen CMG)** — for the remaining timesteps,
+     opt_policy rolls out and trains against the Mahalanobis reward computed
+     from the now-frozen ``M(x)``. con_policy and the CMG no longer update
+     (``update_cmg``/``update_con`` are not called); the (now-static) dynamics
+     model also stops refining, since it only ever fed ``update_cmg``.
+     ``con_only=True`` skips phase 2 and the freeze entirely — con_policy (and
+     the CMG) simply train for the FULL ``timesteps``, matching the old
+     con_only behavior.
 
 Buffer layout depends on ``base_algorithm``: PPO gives con/opt each its OWN
 per-epoch rollout buffer (con_memory/opt_memory, reset & refilled every epoch);
 SAC uses ONE shared persistent replay buffer for both (con_memory IS opt_memory
-— see ``__init__``), so the two SAC agents learn off the pooled con+opt
-transitions. Either way the alternation is what makes them "share" the
-environment: opt_policy picks up wherever con_policy's rollout left the env.
+— see ``__init__``). Because the phases no longer interleave, each buffer is
+only ever written by its own phase's policy.
 
-Cadence differs too: PPO is epoch-based (a full con rollout + update, then a
-full opt rollout + update, then CMG), while SAC is step-based (see
-``C2RLSkrlTrainer.train``: after every env step it runs one CMG update and
-``policy_update_per_cmg_update`` con/opt gradient steps). The per-epoch view
-below describes the PPO path:
-
-  1. **Con rollout** — ``rollout_steps`` env steps with *con_policy* acting,
-     recorded into ``con_memory``. The logged reward is the Mahalanobis
-     (contraction) reward — the objective con actually optimizes — while the
-     env reward is kept as ``Reward / env_reward``; the memory reward is
-     overwritten in step 2 regardless (see ``_record_with_maha``).
-  2. **update_con** — recompute the Mahalanobis reward from the RAW observations
-     just collected and inject it in place of the environment reward, then run
-     one PPO/SAC gradient update for con_policy (PPO: explicit ``update()``
-     call here, since the base agent's own ``rollouts``-cadence hook never
-     fires — one call site drives it manually. SAC: the reward is
-     recomputed on the fly by a monkey-patched ``memory.sample()`` — see
-     below — and the actual gradient step is deferred to
-     ``con_agent.post_interaction()``, called right after, which is what
-     respects ``learning_starts``).
-  3. **Opt rollout** — same as step 1, with *opt_policy* acting (skipped if
-     ``con_only``).
-  4. **update_opt** — same as step 2, for opt_policy.
-  5. **update_cmg** — refresh the CMG training buffer via ``get_rollout`` and
-     run ONE contraction pd-loss gradient step on the CMG, evaluated using
-     con_policy's mean control/Jacobian (NOT opt_policy's). (``update_cmg`` is
-     called once per CMG update; ``policy_update_per_cmg_update`` sets how many
-     con/opt policy gradient steps run per CMG update — see the SAC loop.)
+Cadence within a phase still differs by base algorithm: PPO is epoch-based (a
+full rollout + one PPO update, then CMG in phase 1), SAC is step-based (see
+``C2RLSkrlTrainer.train``: after every env step it runs one CMG update — phase
+1 only — and ``policy_update_per_cmg_update``/-equivalent con or opt gradient
+steps).
 
 Normalization (see ``_make_base_cfg``, ``_compute_mahalanobis_reward``,
 ``_compute_cmg_loss``):
@@ -88,16 +92,11 @@ Normalization (see ``_make_base_cfg``, ``_compute_mahalanobis_reward``,
     True), a separate ``RunningStandardScaler(size=1)`` normalizes the value
     function's target/output, per sub-agent. SAC has no state-value network,
     so this is a no-op there.
-  * **Reward normalization** — UNRELATED to the two preprocessors above. The
-    Mahalanobis tracking term and the (optional) control-effort term are each
-    divided by the sqrt of their own EMA'd batch variance
-    (``reward_norm_beta``, independent running stats per term, both persisted
-    on the OUTER C2RLAgent — not per sub-agent), so their relative scale
-    stays roughly stationary even as the CMG (and hence ``M(x)``) changes
-    shape during training. This plays the role of skrl's own
-    ``rewards_shaper`` but is C2RL-specific and always active; the yaml
+  * **The Mahalanobis reward is UNNORMALIZED** — ``-tracking_scaler·||e||²_M -
+    control_scaler·||u-uref||²``, scaled only by the yaml-set ``tracking_scaler``/
+    ``control_scaler`` constants, with no running-variance rescaling. The yaml
     ``rewards_shaper_scale`` (skrl's own, a flat multiplicative constant) can
-    still be layered on top.
+    still be layered on top via the base PPO/SAC cfg.
   * **The CMG metric M(x) and the Mahalanobis reward always use RAW
     observations** — ``_compute_mahalanobis_reward`` and the ``M(x)``/``e``
     parts of ``_compute_cmg_loss`` read straight from ``get_rollout``/the
@@ -145,15 +144,16 @@ from skrl.agents.torch.base import Agent, AgentCfg
 from skrl.memories.torch import RandomMemory
 from skrl.trainers.torch.base import Trainer, TrainerCfg
 
-from .angle_utils import wrap_diff
 from .math_utils import (
     b_jacobian,
     bound_W,
     jacobian,
     loss_pos_matrix_eigen,
+    loss_pos_matrix_random_sampling,
     spd_inverse,
     weighted_gradients,
 )
+from .rl_glue import compute_mahalanobis_reward, filter_cfg_fields, make_base_rl_cfg
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -194,8 +194,9 @@ class C2RLPPOCfg(AgentCfg):
                                   # + CMG-certificate consistency); every shipped config sets it too
     use_value_norm: bool = True
     # C2RL-specific
-    gamma_contracting: float = 0.0
-    gamma_optimal: float = 0.99
+    gamma_con: float = 0.0  # con_policy's discount factor (near-zero: approximates a hard per-step constraint)
+    gamma_opt: float = 0.99  # opt_policy's discount factor — also what the PathTracking figure's theoretical/
+                             # empirical bounds inflate by 1/(1-gamma) with, since opt_policy is deployed unless con_only
     con_only: bool = False
     # CMG
     W_lr: float = 3e-4
@@ -204,12 +205,18 @@ class C2RLPPOCfg(AgentCfg):
     lbd: float = 1e-2
     eps: float = 1e-2
     W_entropy_scaler: float = 1e-3
+    # Random directions sampled per loss_pos_matrix_random_sampling() call, used
+    # by the C1/C2 contraction-condition losses below (mirrors C3MCfg.pd_loss_num_samples).
+    pd_loss_num_samples: int = 128
     policy_update_per_cmg_update: int = 1
     batch_size: int = 1024
-    # reward normalisation
-    reward_norm_beta: float = 0.99
     tracking_scaler: float = 1.0
     control_scaler: float = 0.0
+    # Fraction of `timesteps` spent in Phase 1 (con_policy + CMG train jointly)
+    # before the CMG is frozen and Phase 2 (opt_policy alone, on the frozen
+    # metric's Mahalanobis reward) takes over the remainder — see
+    # C2RLSkrlTrainer.train and the module docstring. Ignored when con_only.
+    con_phase_fraction: float = 0.5
     # Dynamics — learned NeuralDynamics (ẋ = f(x) + B(x)·u) unless
     # use_empirical_dynamics=True (classic envs only). Same mechanism as C3M:
     # pretrained offline/online before training, then refined online each epoch.
@@ -242,8 +249,9 @@ class C2RLSACCfg(AgentCfg):
     use_state_norm: bool = False  # off by default — see module docstring (residual-uref distortion
                                   # + CMG-certificate consistency); every shipped config sets it too
     # C2RL-specific
-    gamma_contracting: float = 0.0
-    gamma_optimal: float = 0.99
+    gamma_con: float = 0.0  # con_policy's discount factor (near-zero: approximates a hard per-step constraint)
+    gamma_opt: float = 0.99  # opt_policy's discount factor — also what the PathTracking figure's theoretical/
+                             # empirical bounds inflate by 1/(1-gamma) with, since opt_policy is deployed unless con_only
     con_only: bool = False
     # CMG
     W_lr: float = 3e-4
@@ -252,11 +260,17 @@ class C2RLSACCfg(AgentCfg):
     lbd: float = 1e-2
     eps: float = 1e-2
     W_entropy_scaler: float = 1e-3
+    # Random directions sampled per loss_pos_matrix_random_sampling() call, used
+    # by the C1/C2 contraction-condition losses below (mirrors C3MCfg.pd_loss_num_samples).
+    pd_loss_num_samples: int = 128
     policy_update_per_cmg_update: int = 1
-    # reward normalisation
-    reward_norm_beta: float = 0.99
     tracking_scaler: float = 1.0
     control_scaler: float = 0.0
+    # Fraction of `timesteps` spent in Phase 1 (con_policy + CMG train jointly)
+    # before the CMG is frozen and Phase 2 (opt_policy alone, on the frozen
+    # metric's Mahalanobis reward) takes over the remainder — see
+    # C2RLSkrlTrainer.train and the module docstring. Ignored when con_only.
+    con_phase_fraction: float = 0.5
     # Dynamics — learned NeuralDynamics (ẋ = f(x) + B(x)·u) unless
     # use_empirical_dynamics=True (classic envs only). Same mechanism as C3M:
     # pretrained offline/online before training, then refined online each epoch.
@@ -332,7 +346,7 @@ class C2RLAgent(Agent):
         CfgCls = C2RLSACCfg if base_algorithm.upper() == "SAC" else C2RLPPOCfg
         if isinstance(cfg, dict):
             self._raw_cfg = cfg.copy()
-            parsed_cfg = CfgCls(**{k: v for k, v in cfg.items() if k in CfgCls.__dataclass_fields__})
+            parsed_cfg = CfgCls(**filter_cfg_fields(cfg, CfgCls, context="C2RLAgent"))
         else:
             self._raw_cfg = cfg.__dict__.copy()
             parsed_cfg = cfg
@@ -443,84 +457,21 @@ class C2RLAgent(Agent):
 
         def _make_base_cfg(gamma: float, name: str) -> dict:
             # Project the raw C2RL config down to *only* the base agent's own
-            # fields. Passing C2RL/CMG-specific keys (W_lr, lbd, gamma_*, ...) to
-            # PPO_CFG(**cfg) / SAC_CFG(**cfg) would raise TypeError, since those
-            # are kw_only dataclasses that reject unknown kwargs. Also rebuild
-            # `experiment` as a plain dict (the raw value may be an ExperimentCfg
-            # object, which is not subscriptable).
-            if self._base_algorithm == "SAC":
-                from skrl.agents.torch.sac import SAC_CFG as _BaseCfg
-            else:
-                from skrl.agents.torch.ppo import PPO_CFG as _BaseCfg
-            valid = _BaseCfg.__dataclass_fields__
-            d = {k: v for k, v in self._raw_cfg.items() if k in valid and k != "experiment"}
-            d["discount_factor"] = gamma
-
-            # Resolve a string "learning_rate_scheduler" (e.g. "KLAdaptiveLR",
-            # yaml's usual way of naming it) to the real class — skrl's Runner
-            # does this via _process_cfg's eval(), which doesn't run here since
-            # con_agent/opt_agent bypass Runner entirely.
-            if isinstance(d.get("learning_rate_scheduler"), str):
-                from skrl.resources.schedulers.torch import KLAdaptiveLR  # noqa: F401 (used by eval below)
-                d["learning_rate_scheduler"] = eval(d["learning_rate_scheduler"])
-            if d.get("learning_rate_scheduler_kwargs") is None:
-                d["learning_rate_scheduler_kwargs"] = {}
-
-            # "rewards_shaper_scale" is a yaml convenience (same as skrl's own
-            # Runner._process_cfg) for the real PPO_CFG/SAC_CFG field
-            # "rewards_shaper", a Callable — translate it here since con_agent/
-            # opt_agent bypass Runner entirely. 1.0 (or unset) is a no-op.
-            rewards_shaper_scale = self._raw_cfg.get("rewards_shaper_scale")
-            if rewards_shaper_scale is not None and rewards_shaper_scale != 1.0:
-                d["rewards_shaper"] = lambda rewards, *a, scale=rewards_shaper_scale, **kw: rewards * scale
-
-            # Standalone PPO/SAC get observation (and, for PPO, value)
-            # normalization automatically — train.py's use_state_norm/
-            # use_value_norm, applied via skrl's Runner._process_cfg (which
-            # resolves the "RunningStandardScaler" string to the real class
-            # and, for the legacy "state_preprocessor" yaml key specifically,
-            # remaps it to "observation_preprocessor"). None of that runs here
-            # — con_agent/opt_agent are built directly, bypassing Runner
-            # entirely — so replicate it explicitly: same class, same
-            # opt-out flags, and note the field is "observation_preprocessor"
-            # (NOT "state_preprocessor", which is a different, unused-in-this-
-            # repo field for asymmetric actor-critic "state" input).
-            # Default OFF (see the C2RLPPOCfg/C2RLSACCfg field defaults and the
-            # module docstring): a config that omits the key gets no observation
-            # normalization, matching every shipped config's explicit `false`.
-            if self._raw_cfg.get("use_state_norm", False):
-                from contractionRL.agents.skrl.preprocessors import PathTrackingObservationScaler
-                d["observation_preprocessor"] = PathTrackingObservationScaler
-                d["observation_preprocessor_kwargs"] = {
-                    "size": observation_space,
-                    "x_dim": self._x_dim,
-                    "u_dim": self._u_dim,
-                    "angle_idx": self._angle_idx,
-                    "device": device,
-                }
-            if self._base_algorithm == "PPO" and self._raw_cfg.get("use_value_norm", True):
-                from skrl.resources.preprocessors.torch import RunningStandardScaler
-                d["value_preprocessor"] = RunningStandardScaler
-                d["value_preprocessor_kwargs"] = {"size": 1, "device": device}
-            # write_interval=1 so a SummaryWriter gets created (below) — the
-            # actual flush cadence is driven explicitly by C2RLSkrlTrainer
-            # (once per rollout epoch), not by skrl's own interval logic, since
-            # post_interaction() here is only called once per epoch anyway.
-            # checkpoint_interval stays 0: checkpointing is handled by the
-            # OUTER C2RLAgent (see self.checkpoint_modules below), so these
-            # inner agents don't need their own redundant checkpoint files.
-            # experiment.wandb is deliberately omitted (defaults False) so
-            # these inner agents never call wandb.init() themselves — the
-            # OUTER agent (or train.py, for a sweep) is the sole wandb.init()
-            # caller; their own scalars still reach the SAME active run
-            # because skrl's SummaryWriter.add_scalar is monkey-patched
-            # process-wide by train.py's wandb hookup.
-            d["experiment"] = {
-                "directory": os.path.join(self.experiment_dir, name),
-                "write_interval": 1,
-                "checkpoint_interval": 0,
-            }
-            return d
+            # fields — see rl_glue.make_base_rl_cfg for the full rationale
+            # (shared verbatim with C4M, which needs the identical translation
+            # for its own single deployed policy).
+            return make_base_rl_cfg(
+                self._raw_cfg,
+                base_algorithm=self._base_algorithm,
+                gamma=gamma,
+                name=name,
+                experiment_dir=self.experiment_dir,
+                device=device,
+                observation_space=observation_space,
+                angle_idx=self._angle_idx,
+                x_dim=self._x_dim,
+                u_dim=self._u_dim,
+            )
 
         if self._base_algorithm == "PPO":
             from skrl.agents.torch.ppo import PPO as BaseRLAgent
@@ -542,13 +493,13 @@ class C2RLAgent(Agent):
             raise ValueError(f"[C2RL] Unsupported base_algorithm: {self._base_algorithm}")
 
         self._con_agent = BaseRLAgent(
-            cfg=_make_base_cfg(parsed_cfg.gamma_contracting, "con"),
+            cfg=_make_base_cfg(parsed_cfg.gamma_con, "con"),
             models=con_models,
             memory=con_memory,
             **rl_kwargs,
         )
         self._opt_agent = BaseRLAgent(
-            cfg=_make_base_cfg(parsed_cfg.gamma_optimal, "opt"),
+            cfg=_make_base_cfg(parsed_cfg.gamma_opt, "opt"),
             models=opt_models,
             memory=opt_memory,
             **rl_kwargs,
@@ -640,8 +591,9 @@ class C2RLAgent(Agent):
         if not parsed_cfg.use_empirical_dynamics:
             if get_f_and_B is None:
                 raise ValueError(
-                    "C2RL: use_empirical_dynamics=True requires a get_f_and_B callable "
-                    "(classic envs only). Isaac Sim envs have no analytical dynamics."
+                    "C2RL: analytical dynamics (use_empirical_dynamics=False) requires a "
+                    "get_f_and_B callable (classic envs only). Isaac Sim envs have no "
+                    "analytical dynamics — set use_empirical_dynamics=True."
                 )
             self._get_f_and_B = get_f_and_B
             self._neural_dynamics = None
@@ -652,7 +604,7 @@ class C2RLAgent(Agent):
             if self._neural_dynamics is None:
                 raise ValueError(
                     "C2RL requires a 'dynamics' model in the models dict when "
-                    "use_empirical_dynamics=False (add a models.dynamics block to the config)."
+                    "use_empirical_dynamics=True (add a models.dynamics block to the config)."
                 )
             self._get_f_and_B = self._neural_dynamics.get_f_and_B
             self._dynamics_optimizer = torch.optim.Adam(
@@ -670,13 +622,14 @@ class C2RLAgent(Agent):
         self._get_rollout = get_rollout
 
         self._W_optimizer = torch.optim.Adam(self._ccm_gen.parameters(), lr=parsed_cfg.W_lr)
+        # _progress is set by update_cmg as timestep/timesteps of WHATEVER phase
+        # it's called with (only Phase 1 — see C2RLSkrlTrainer.train). Linearly
+        # anneal W_lr from W_lr to 0 over Phase 1, hitting exactly 0 at the
+        # Phase 1->2 boundary where the CMG gets frozen.
         self._progress = 0.0
         self._W_lr_scheduler = LambdaLR(
             self._W_optimizer, lr_lambda=lambda _: max(0.0, 1.0 - self._progress)
         )
-
-        self._running_reward_var: float | None = None
-        self._running_control_var: float | None = None
 
         checkpoint_extra = (
             {"con_value": models["con_value"], "opt_value": models.get("opt_value")}
@@ -731,16 +684,8 @@ class C2RLAgent(Agent):
 
     def _compute_mahalanobis_reward(
         self, observations: torch.Tensor, actions: torch.Tensor | None = None,
-        *, update_running: bool = True,
     ) -> torch.Tensor:
-        """Compute -(tracking_scaler * ||e||²_M + control_scaler * ||u - uref||²),
-        each term normalised by its own running variance.
-
-        ``update_running`` (default True) advances the EMA reward/control variance
-        used for that normalisation. Pass ``update_running=False`` for
-        LOGGING-only calls (e.g. recording the contraction reward for wandb) so
-        the extra call doesn't perturb the normaliser the actual training reward
-        (update_con/update_opt, SAC's sample patch) depends on.
+        """Compute -(tracking_scaler * ||e||²_M + control_scaler * ||u - uref||²).
 
         tracking_scaler/control_scaler play the role of Q/R exactly like
         SD-LQR/LQR's Q_scaler/R_scaler (sdlqr.py): tracking_scaler weights the
@@ -751,55 +696,16 @@ class C2RLAgent(Agent):
         uref itself — uref alone isn't "effort", it's just following the
         reference). control_scaler defaults to 0.0 (no control penalty) for
         backward compatibility; pass ``actions`` to enable it.
+
+        Thin wrapper around ``rl_glue.compute_mahalanobis_reward`` (shared
+        verbatim with C4M) — see there for the full body.
         """
         cfg = self._cfg
-        x_dim = self._x_dim
-        dtype = torch.float32
-
-        x    = observations[:, :x_dim].to(dtype)
-        xref = observations[:, x_dim : 2 * x_dim].to(dtype)
-        e = wrap_diff(x - xref, self._angle_idx).unsqueeze(-1)
-
-        with torch.no_grad():
-            raw_W, _ = self._ccm_gen(x)
-            # Pass the CMG's `bounded` flag so a BoundedCCM_Generator (whose
-            # eigenvalues are ALREADY in [w_lb, w_ub]) isn't shifted by an extra
-            # +w_lb·I here — that would move the metric off the [w_lb, w_ub]
-            # bounds the contraction certificate (set_contraction_certificate)
-            # advertises. Mirrors c3m.py's bound_W call.
-            bounded = getattr(self._ccm_gen, "bounded", False)
-            W = bound_W(raw_W, cfg.w_lb, x_dim, bounded)
-            M = spd_inverse(W)
-            quad = (e.transpose(1, 2) @ M @ e).squeeze(-1)
-
-            beta = cfg.reward_norm_beta
-            batch_var = quad.var(unbiased=False).item()
-            # Effective variance for THIS call; only persisted when update_running.
-            reward_var = (
-                (batch_var + 1e-8) if self._running_reward_var is None
-                else beta * self._running_reward_var + (1 - beta) * batch_var
-            )
-            if update_running:
-                self._running_reward_var = reward_var
-            std = reward_var ** 0.5 + 1e-8
-            reward = -cfg.tracking_scaler * quad / std
-
-            if actions is not None and cfg.control_scaler > 0:
-                u_dim = self._u_dim
-                uref = observations[:, 2 * x_dim : 2 * x_dim + u_dim].to(dtype)
-                feedback = actions.to(dtype) - uref
-                control_cost = (feedback ** 2).sum(dim=-1, keepdim=True)
-
-                control_batch_var = control_cost.var(unbiased=False).item()
-                control_var = (
-                    (control_batch_var + 1e-8) if self._running_control_var is None
-                    else beta * self._running_control_var + (1 - beta) * control_batch_var
-                )
-                if update_running:
-                    self._running_control_var = control_var
-                control_std = control_var ** 0.5 + 1e-8
-                reward = reward - cfg.control_scaler * control_cost / control_std
-        return reward
+        return compute_mahalanobis_reward(
+            self._ccm_gen, observations, actions,
+            x_dim=self._x_dim, u_dim=self._u_dim, angle_idx=self._angle_idx,
+            w_lb=cfg.w_lb, tracking_scaler=cfg.tracking_scaler, control_scaler=cfg.control_scaler,
+        )
 
     # ── CMG update (inlined from mjrl C2RL.compute_cmg_loss / update_cmg) ─ #
 
@@ -853,13 +759,14 @@ class C2RLAgent(Agent):
         M = spd_inverse(W)
 
         with torch.enable_grad():
-            f, B, _ = self._get_f_and_B(x)
+            f, B, Bbot = self._get_f_and_B(x)
         f = f.float().to(device)
         B = B.float().to(device)
+        Bbot = Bbot.float().to(device)
 
         DfDx = jacobian(f, x, create_graph=False)
         DBDx = b_jacobian(B, x, u_dim, create_graph=False)
-        f = f.detach(); B = B.detach()
+        f = f.detach(); B = B.detach(); Bbot = Bbot.detach()
 
         A = DfDx + torch.einsum('bxyu,bu->bxy', DBDx, u)
         dot_x = f + matmul(B, u.unsqueeze(-1)).squeeze(-1)
@@ -872,14 +779,42 @@ class C2RLAgent(Agent):
         Cu = Cu + cfg.eps * I
 
         pd_loss, _ = loss_pos_matrix_eigen(-Cu, reg=False)
+
+        # C3M-style C1/C2 contraction conditions on the CMG alone (no policy
+        # involvement — mirrors C3MAgent._compute_loss verbatim). pd_loss/Cu
+        # above already certifies the closed-loop system under con_policy; C1/C2
+        # additionally shape W(x) itself to admit SOME contracting controller
+        # (Bbot-projected conditions), same as C3M's offline synthesis.
+        n_samp = cfg.pd_loss_num_samples
+        DfW = weighted_gradients(W, f, x)
+        DfDxW = matmul(DfDx, W)
+        sym_DfDxW = 0.5 * (DfDxW + transpose(DfDxW, 1, 2))
+        C1_inner = -DfW + 2 * sym_DfDxW + 2 * cfg.lbd * W
+        C1 = matmul(matmul(transpose(Bbot, 1, 2), C1_inner), Bbot)
+        C1_reg = C1 + cfg.eps * torch.eye(C1.shape[-1], device=device)
+        c1_loss = loss_pos_matrix_random_sampling(-C1_reg, num_samples=n_samp)
+
+        c2_loss = torch.zeros(1, device=device)
+        for j in range(u_dim):
+            DbW = weighted_gradients(W, B[:, :, j], x)
+            DbDxW = matmul(DBDx[:, :, :, j], W)
+            sym_DbDxW = 0.5 * (DbDxW + transpose(DbDxW, 1, 2))
+            C2_inner = DbW - 2 * sym_DbDxW
+            C2 = matmul(matmul(transpose(Bbot, 1, 2), C2_inner), Bbot)
+            c2_loss = c2_loss + (C2 ** 2).reshape(batch_size, -1).sum(1).mean()
+
         entropy_loss = info_W.get("entropy", torch.tensor(0.0, device=device))
         if isinstance(entropy_loss, torch.Tensor):
             entropy_loss = entropy_loss.mean() * cfg.W_entropy_scaler
         else:
             entropy_loss = torch.zeros(1, device=device)
 
-        loss = pd_loss - entropy_loss
-        return loss, {"pd_loss": pd_loss.item()}
+        loss = pd_loss - entropy_loss + c1_loss + c2_loss
+        return loss, {
+            "pd_loss": pd_loss.item(),
+            "c1_loss": c1_loss.item(),
+            "c2_loss": c2_loss.item(),
+        }
 
     # ── C2RL update methods (called by C2RLSkrlTrainer) ──────────────────── #
 
@@ -976,6 +911,8 @@ class C2RLAgent(Agent):
 
         loss_dict = {
             "C2RL/CMG/pd_loss": info["pd_loss"],
+            "C2RL/CMG/c1_loss": info["c1_loss"],
+            "C2RL/CMG/c2_loss": info["c2_loss"],
         }
         for k, v in loss_dict.items():
             self.track_data(f"Loss / {k}", v)
@@ -1005,6 +942,18 @@ class C2RLAgent(Agent):
             self._neural_dynamics.save(path)
             print(f"[C2RL] Saved NeuralDynamics → {path}")
 
+    def freeze_cmg(self) -> None:
+        """Freeze the CMG at the Phase 1 → Phase 2 boundary (see module docstring).
+
+        Called once by C2RLSkrlTrainer.train right after con_policy's joint
+        training with the CMG ends. From here on M(x) = W(x)⁻¹ is fixed, so
+        opt_policy's Mahalanobis reward (Phase 2) is computed against a static
+        metric instead of one con_policy is still actively shaping.
+        """
+        for p in self._ccm_gen.parameters():
+            p.requires_grad_(False)
+        self._ccm_gen.eval()
+
 
 # ─────────────────────────────────────────────────────────────────────────── #
 # Trainer
@@ -1024,13 +973,11 @@ class C2RLSkrlTrainer(Trainer):
         is only a placeholder that update_con/opt/SAC-sample overwrite), so it is
         what skrl's per-episode ``Reward / Total reward (max/min/mean)`` and
         ``Episode / Total timesteps`` should reflect for these two policies. The
-        raw env reward is kept alongside as ``Reward / env_reward (mean)``.
-        ``update_running=False``: this is a logging call and must not perturb the
-        EMA reward normaliser the training reward path depends on. The stored
-        memory reward is irrelevant (PPO's update_con and SAC's sample patch both
-        recompute it), so only the logged cumulative changes here.
+        raw env reward is kept alongside as ``Reward / env_reward (mean)``. The
+        stored memory reward is irrelevant (PPO's update_con and SAC's sample
+        patch both recompute it), so only the logged cumulative changes here.
         """
-        maha = agent._compute_mahalanobis_reward(observations, actions, update_running=False)
+        maha = agent._compute_mahalanobis_reward(observations, actions)
         base_agent.record_transition(
             observations=observations, states=states, actions=actions,
             rewards=maha.view_as(rewards), next_observations=next_obs, next_states=next_states,
@@ -1064,6 +1011,102 @@ class C2RLSkrlTrainer(Trainer):
             elif isinstance(v, (int, float)):
                 agent.track_data(key, float(v))
 
+    def _env_scalar_attr(self, *names):
+        """Fetch a scalar env attribute across both env backends (Isaac vs. classic
+        SyncVectorEnv) — see the identical helper on C3MSkrlTrainer for why both
+        lookup paths are needed. Duplicated here (not shared) since the two
+        trainers don't share a base class."""
+        for name in names:
+            val = getattr(self.env, name, None)
+            if val is not None:
+                return val
+        if hasattr(self.env, "get_attr"):
+            for name in names:
+                try:
+                    return self.env.get_attr(name)[0]
+                except Exception:
+                    continue
+        raise AttributeError(f"none of {names} found on env {self.env!r}")
+
+    def eval_con_policy(self, agent: C2RLAgent, *, timestep: int = 0) -> dict:
+        """Bounded-rollout evaluation of con_policy's FINAL Phase 1 weights.
+
+        Called once, right at the Phase 1 → Phase 2 boundary in ``train()`` —
+        i.e. right before opt_policy starts training — so con_policy's quality
+        is captured (and logged under the ``.../con_final`` tabs) before it
+        stops training and the CMG it shaped gets frozen for good. Mirrors
+        ``C3MSkrlTrainer.eval()`` (same streaming-metric, bounded-episode
+        approach), but acts with ``agent._con_agent`` directly rather than the
+        outer ``C2RLAgent.act()``, which dispatches to opt_policy — not yet a
+        trained policy at this point.
+
+        Runs its OWN ``env.reset()`` + bounded rollout, independent of the
+        training loop's ``observations``/``states`` — callers must re-``reset()``
+        the env afterward before resuming training (see ``train()``).
+        """
+        con_agent = agent._con_agent
+        con_agent.enable_training_mode(False)
+        observations, infos = self.env.reset()
+        states = self.env.state() if hasattr(self.env, "state") else None
+
+        from .contraction_metrics import StreamingErrorStats, log_tracking_plots, reward_summary
+
+        x_dim = agent._x_dim
+        num_envs = self.env.num_envs
+        stats = StreamingErrorStats(num_envs, self.env.device)
+        total_reward = torch.zeros((num_envs, 1), device=self.env.device)
+
+        # Bounded, non-terminating-episode-count loop (same quality-gate
+        # pattern as C3MSkrlTrainer.eval() / train.py's _evaluate_best_model):
+        # envs desynchronize after their first reset, so track which have
+        # finished their FIRST episode and freeze their accumulators.
+        max_steps = int(self._env_scalar_attr("max_episode_length", "max_episode_len")) + 1
+        finished = torch.zeros(num_envs, dtype=torch.bool, device=self.env.device)
+
+        plot_idx = np.random.choice(num_envs, 1, replace=False)
+        traj_x = {i: [] for i in plot_idx}
+        traj_xref = {i: [] for i in plot_idx}
+        traj_error = {i: [] for i in plot_idx}
+
+        for _ in range(max_steps):
+            with torch.no_grad():
+                actions, _ = con_agent.act(observations, states, timestep=0, timesteps=1)
+
+            active = (~finished).unsqueeze(-1).float()
+            pos_dim_val = self._env_scalar_attr("pos_dimension")
+            pos_dim = int(pos_dim_val) if pos_dim_val is not None else (3 if hasattr(self.env, "state") else x_dim)
+
+            x_curr = observations[:, :pos_dim]
+            x_ref = observations[:, x_dim:x_dim + pos_dim]
+            error = torch.norm(observations[:, :x_dim] - observations[:, x_dim:2 * x_dim], dim=-1, keepdim=True)
+
+            for i in plot_idx:
+                if not finished[i]:
+                    traj_x[i].append(x_curr[i].cpu().clone().numpy())
+                    traj_xref[i].append(x_ref[i].cpu().clone().numpy())
+                    traj_error[i].append(error[i].item())
+            stats.update(error, active)
+
+            observations, rewards, terminated, truncated, _ = self.env.step(actions)
+            states = self.env.state() if hasattr(self.env, "state") else None
+            total_reward += rewards.view(num_envs, 1) * active
+
+            finished |= (terminated | truncated).view(num_envs)
+            if finished.all():
+                break
+
+        con_agent.enable_training_mode(True)
+
+        dt = float(self._env_scalar_attr("step_dt", "dt"))
+        f_mask = finished if finished.any() else torch.ones_like(finished)
+
+        log_tracking_plots(traj_x, traj_xref, traj_error, dt=dt, prefix="train/con",
+                            step=timestep, title="C2RL con_policy (final, Phase 1)")
+        return {
+            "stability": stats.summary(dt, f_mask),
+            "reward": reward_summary(total_reward, f_mask),
+        }
+
     def train(self) -> None:
         agent: C2RLAgent = self.agents if not isinstance(self.agents, list) else self.agents[0]
         env = self.env
@@ -1074,7 +1117,7 @@ class C2RLSkrlTrainer(Trainer):
         # below (agent-sized buffer vs trainer-sized loop).
         rollout_steps = agent._cfg.rollouts
         timesteps = self.cfg.timesteps
-        con_only = agent._con_only
+        con_only = agent._con_only or agent._opt_agent is None
 
         # con/opt RandomMemory buffers are allocated inside C2RLAgent.__init__ (at
         # agent.init() there) using the num_envs passed to its constructor — skrl
@@ -1100,6 +1143,8 @@ class C2RLSkrlTrainer(Trainer):
             )
 
         agent.init(trainer_cfg=self.cfg)
+        from .contraction_metrics import log_raw_config
+        log_raw_config(getattr(self, "_wandb_raw_cfg", None))
 
         # Pretrain the learned NeuralDynamics before RL (same mechanism as C3M);
         # no-op for analytical dynamics or dynamics_pretrain_epochs<=0. The helper
@@ -1118,38 +1163,49 @@ class C2RLSkrlTrainer(Trainer):
         states = env.state() if hasattr(env, "state") else None
         global_step = 0
 
-        # SAC flushes the inner con/opt agents' tracking data on this cadence
-        # (NOT every step). skrl's write_tracking_data clears the 100-episode
-        # reward/timestep deques on each call, so flushing every step reduced
-        # "Reward / Total reward" and "Episode / Total timesteps" to only the
-        # envs that happened to finish on that exact step. Flushing every
-        # ~timesteps/100 steps (matching standalone SAC's "auto" write_interval)
-        # lets the deques fill, giving the same smooth running mean as SAC.
-        sac_flush_interval = max(1, timesteps // 100)
+        # Both SAC and PPO flush the currently-active sub-agent's tracking data on
+        # this coarse cadence — NOT every step (SAC) or every rollout chunk (PPO).
+        # skrl's write_tracking_data clears the 100-episode reward/timestep
+        # deques on every call, so flushing too often collapses "Reward / Total
+        # reward" and "Episode / Total timesteps" to just the 0–few episodes that
+        # happened to finish since the last flush → a spiky, single-episode
+        # curve. Flushing every ~timesteps/100 steps (matching the standalone
+        # baselines' "auto" write_interval) lets the deques fill across many
+        # chunks, giving a smooth running mean. Reset at the Phase 1 → Phase 2
+        # handoff since opt_agent starts its own flush cadence from scratch.
+        flush_interval = max(1, timesteps // 100)
+        next_flush = flush_interval
+
+        # Phase 1 (con_policy + CMG train jointly) runs for con_phase_fraction of
+        # `timesteps`; con_only collapses this to the FULL timesteps and Phase 2
+        # (below) never runs — matching the old con_only behavior. See the
+        # module docstring for the two-phase design this replaced tri-level
+        # (cmg/con/opt) alternation with.
+        phase1_end = timesteps if con_only else int(timesteps * agent._cfg.con_phase_fraction)
 
         pbar = _tqdm.tqdm(total=timesteps, desc="C2RL training", file=sys.stdout)
 
-        while global_step < timesteps:
-
-            # ── Phase 1: contracting rollout ──────────────────────────── #
-            agent._con_agent.enable_training_mode(True)
+        def _run_chunk(active_agent, update_fn, *, train_cmg: bool, phase_end: int) -> None:
+            """Run one rollout chunk (PPO: `rollout_steps` steps + one PPO update;
+            SAC: `rollout_steps` steps, each followed by its own gradient step(s))
+            for whichever policy is active this phase, optionally driving the CMG
+            update alongside it (Phase 1 only — see module docstring)."""
+            nonlocal observations, states, global_step, next_flush
             if agent._base_algorithm == "PPO":
-                agent._con_agent.memory.reset()
-            con_obs_list, con_act_list = [], []
+                active_agent.memory.reset()
+            obs_list, act_list = [], []
 
-            steps_to_take = min(rollout_steps, timesteps - global_step)
-            for step in range(steps_to_take):
-                agent._con_agent.pre_interaction(timestep=global_step, timesteps=timesteps)
+            steps_to_take = min(rollout_steps, phase_end - global_step)
+            for _ in range(steps_to_take):
+                active_agent.pre_interaction(timestep=global_step, timesteps=timesteps)
                 with torch.no_grad():
-                    actions, _ = agent._con_agent.act(
-                        observations, states, timestep=global_step, timesteps=timesteps
-                    )
+                    actions, _ = active_agent.act(observations, states, timestep=global_step, timesteps=timesteps)
                 next_obs, rewards, terminated, truncated, infos = env.step(actions)
                 next_states = env.state() if hasattr(env, "state") else None
-                con_obs_list.append(observations.clone())
-                con_act_list.append(actions.clone())
+                obs_list.append(observations.clone())
+                act_list.append(actions.clone())
                 self._record_with_maha(
-                    agent, agent._con_agent, observations=observations, states=states,
+                    agent, active_agent, observations=observations, states=states,
                     actions=actions, rewards=rewards, next_obs=next_obs, next_states=next_states,
                     terminated=terminated, truncated=truncated, infos=infos,
                     global_step=global_step, timesteps=timesteps,
@@ -1160,116 +1216,104 @@ class C2RLSkrlTrainer(Trainer):
 
                 # Step-based update for SAC
                 if agent._base_algorithm == "SAC":
-                    agent.update_cmg(timestep=global_step, timesteps=timesteps)
+                    if train_cmg:
+                        # `timesteps=phase_end` (not the full run) so the CMG LR
+                        # scheduler's progress (see update_cmg/_W_lr_scheduler)
+                        # anneals to 0 exactly at the end of THIS phase (Phase 1,
+                        # the only phase update_cmg ever runs in) rather than
+                        # stalling partway through a linear decay sized for the
+                        # full run.
+                        agent.update_cmg(timestep=global_step, timesteps=phase_end)
                     for _ in range(agent._cfg.policy_update_per_cmg_update):
-                        agent.update_con(None, None, timestep=global_step, timesteps=timesteps)
-                        agent._con_agent.post_interaction(timestep=global_step, timesteps=timesteps)
-                        if not con_only and agent._opt_agent is not None:
-                            agent.update_opt(None, None, timestep=global_step, timesteps=timesteps)
-                            agent._opt_agent.post_interaction(timestep=global_step, timesteps=timesteps)
-
-                    if global_step % sac_flush_interval == 0:
-                        if getattr(agent._con_agent, "writer", None) is not None:
-                            agent._con_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
-                        if not con_only and getattr(agent._opt_agent, "writer", None) is not None:
-                            agent._opt_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
+                        update_fn(None, None, timestep=global_step, timesteps=timesteps)
+                        active_agent.post_interaction(timestep=global_step, timesteps=timesteps)
+                    if global_step % flush_interval == 0 and getattr(active_agent, "writer", None) is not None:
+                        active_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
 
                 global_step += 1
                 pbar.update(1)
 
             # Chunk-based update for PPO
             if agent._base_algorithm == "PPO":
-                con_obs_tensor = torch.cat(con_obs_list, dim=0)
-                con_act_tensor = torch.cat(con_act_list, dim=0)
-                agent.update_con(con_obs_tensor, con_act_tensor, timestep=global_step, timesteps=timesteps)
-                agent._con_agent.post_interaction(timestep=global_step, timesteps=timesteps)
-                agent.update_cmg(timestep=global_step, timesteps=timesteps)
-                if getattr(agent._con_agent, "writer", None) is not None:
-                    agent._con_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
+                obs_tensor = torch.cat(obs_list, dim=0)
+                act_tensor = torch.cat(act_list, dim=0)
+                update_fn(obs_tensor, act_tensor, timestep=global_step, timesteps=timesteps)
+                active_agent.post_interaction(timestep=global_step, timesteps=timesteps)
+                if train_cmg:
+                    # See the matching SAC comment above: anneal over Phase 1
+                    # (phase_end), not the full run.
+                    agent.update_cmg(timestep=global_step, timesteps=phase_end)
+                # Flush on the coarse interval, NOT every chunk (see flush_interval
+                # note above) — flushing per chunk clears the reward deque ~every
+                # rollout and yields the spiky curve.
+                if global_step >= next_flush and getattr(active_agent, "writer", None) is not None:
+                    active_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
+                    next_flush = global_step + flush_interval
 
-            # ── Phase 2: optimal rollout ──────────────────────────────── #
-            if not con_only and agent._opt_agent is not None and global_step < timesteps:
-                agent._opt_agent.enable_training_mode(True)
-                if agent._base_algorithm == "PPO":
-                    agent._opt_agent.memory.reset()
-                opt_obs_list, opt_act_list = [], []
-
-                steps_to_take = min(rollout_steps, timesteps - global_step)
-                for step in range(steps_to_take):
-                    agent._opt_agent.pre_interaction(timestep=global_step, timesteps=timesteps)
-                    with torch.no_grad():
-                        actions, _ = agent._opt_agent.act(
-                            observations, states, timestep=global_step, timesteps=timesteps
-                        )
-                    next_obs, rewards, terminated, truncated, infos = env.step(actions)
-                    next_states = env.state() if hasattr(env, "state") else None
-                    opt_obs_list.append(observations.clone())
-                    opt_act_list.append(actions.clone())
-                    self._record_with_maha(
-                        agent, agent._opt_agent, observations=observations, states=states,
-                        actions=actions, rewards=rewards, next_obs=next_obs, next_states=next_states,
-                        terminated=terminated, truncated=truncated, infos=infos,
-                        global_step=global_step, timesteps=timesteps,
-                    )
-                    self._forward_env_log(agent, infos)
-                    observations = next_obs
-                    states = next_states
-
-                    # Step-based update for SAC
-                    if agent._base_algorithm == "SAC":
-                        agent.update_cmg(timestep=global_step, timesteps=timesteps)
-                        for _ in range(agent._cfg.policy_update_per_cmg_update):
-                            agent.update_con(None, None, timestep=global_step, timesteps=timesteps)
-                            agent._con_agent.post_interaction(timestep=global_step, timesteps=timesteps)
-                            if not con_only and agent._opt_agent is not None:
-                                agent.update_opt(None, None, timestep=global_step, timesteps=timesteps)
-                                agent._opt_agent.post_interaction(timestep=global_step, timesteps=timesteps)
-
-                        if global_step % sac_flush_interval == 0:
-                            if getattr(agent._con_agent, "writer", None) is not None:
-                                agent._con_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
-                            if not con_only and getattr(agent._opt_agent, "writer", None) is not None:
-                                agent._opt_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
-
-                    global_step += 1
-                    pbar.update(1)
-
-                # Chunk-based update for PPO
-                if agent._base_algorithm == "PPO":
-                    opt_obs_tensor = torch.cat(opt_obs_list, dim=0)
-                    opt_act_tensor = torch.cat(opt_act_list, dim=0)
-                    agent.update_opt(opt_obs_tensor, opt_act_tensor, timestep=global_step, timesteps=timesteps)
-                    agent._opt_agent.post_interaction(timestep=global_step, timesteps=timesteps)
-                    agent.update_cmg(timestep=global_step, timesteps=timesteps)
-                    if getattr(agent._opt_agent, "writer", None) is not None:
-                        agent._opt_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
-
-            # SAC already ran post_interaction inside the loop, but PPO hasn't run the outer agent's post_interaction
+        # ── Phase 1: con_policy + CMG train jointly ─────────────────────── #
+        agent._con_agent.enable_training_mode(True)
+        while global_step < phase1_end:
+            _run_chunk(agent._con_agent, agent.update_con, train_cmg=True, phase_end=phase1_end)
             agent.post_interaction(timestep=global_step, timesteps=timesteps)
-
             # post_interaction()'s OWN write_interval-modulo check (skrl base
-            # Agent) almost never fires here: it's only reachable from THIS
-            # call site, made once per epoch (every ~2x rollout_steps env
-            # steps), whereas standalone PPO/SAC hit it every single env step
-            # via SequentialTrainer. For most rollout/write_interval
-            # combinations gcd(2*rollout_steps, write_interval) doesn't divide
-            # write_interval - 1, so `not timestep % write_interval` is simply
-            # never true (e.g. epoch size 32 vs write_interval 300 can NEVER
-            # coincide) and the outer agent's tracking_data — Stability/* from
-            # _forward_env_log, plus CMG/dynamics losses tracked directly on
-            # `agent` — silently accumulates forever and never reaches
-            # wandb/tensorboard. Flush it explicitly every epoch instead.
+            # Agent) almost never fires here — see the historical note this
+            # replaced: for most rollout/write_interval combinations the two
+            # never coincide, so the outer agent's tracking_data (Stability/*
+            # from _forward_env_log, plus CMG/dynamics losses tracked directly
+            # on `agent`) would silently accumulate forever otherwise. Flush it
+            # explicitly every chunk instead.
             if getattr(agent, "writer", None) is not None:
                 agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
 
-            # No separate eval rollout: C2RL steps the real env during training,
-            # so its Stability/* (path-tracking) and Episode/Reward metrics come
-            # from the env's own per-episode extras["log"], forwarded live via
-            # _forward_env_log above — exactly like PPO/SAC. The authoritative
-            # convergence-rate/overshoot numbers are the post-training
-            # _evaluate_best_model / _evaluate_classic_path_tracking (paper
-            # fit_exponential_envelope). Live tracking plots come from the
-            # env-wrapping WandbPlotWrapper, same as PPO/SAC.
+        # ── Freeze CMG, hand off to opt_policy alone ─────────────────────── #
+        if not con_only and agent._opt_agent is not None:
+            # Evaluate con_policy's FINAL (post-Phase-1) weights before it stops
+            # training and opt_policy takes over — see eval_con_policy's
+            # docstring. Must happen before freeze_cmg()/enable_training_mode so
+            # it still measures the policy exactly as Phase 1 left it.
+            from .contraction_metrics import track_reward_summary, track_stability_summary
+            ev = self.eval_con_policy(agent, timestep=global_step)
+            track_stability_summary(agent, ev["stability"], tab="Stability/con_final")
+            track_reward_summary(agent, ev["reward"], tab="Reward/con_final")
+            if getattr(agent, "writer", None) is not None:
+                agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
+
+            agent.freeze_cmg()
+            agent._con_agent.enable_training_mode(False)
+            agent._opt_agent.enable_training_mode(True)
+            next_flush = global_step + flush_interval
+
+            # eval_con_policy ran its own reset + bounded rollout on `env`,
+            # independent of the training loop's observations/states — those are
+            # now stale (the real env has moved on), so Phase 2 must start from a
+            # fresh reset rather than resuming from wherever Phase 1 left off.
+            observations, infos = env.reset()
+            states = env.state() if hasattr(env, "state") else None
+
+            # ── Phase 2: opt_policy trains alone against the frozen metric ── #
+            while global_step < timesteps:
+                _run_chunk(agent._opt_agent, agent.update_opt, train_cmg=False, phase_end=timesteps)
+                agent.post_interaction(timestep=global_step, timesteps=timesteps)
+                if getattr(agent, "writer", None) is not None:
+                    agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
+
+        # No separate eval rollout DURING each phase: C2RL steps the real env
+        # while training, so its Stability/* (path-tracking) and Episode/Reward
+        # metrics come from the env's own per-episode extras["log"], forwarded
+        # live via _forward_env_log above — exactly like PPO/SAC. (The one
+        # exception is the single con_policy quality-gate eval at the Phase 1 →
+        # Phase 2 boundary above, under the Stability|Reward/con_final tabs.) The
+        # authoritative convergence-rate/overshoot numbers are the post-training
+        # _evaluate_best_model / _evaluate_classic_path_tracking (paper
+        # fit_exponential_envelope). Live tracking plots come from the
+        # env-wrapping WandbPlotWrapper, same as PPO/SAC.
+
+        # Final flush of whatever accumulated since the last coarse-interval
+        # flush (the trailing < flush_interval steps), so the tail of every
+        # curve reaches wandb/tensorboard instead of being dropped on exit.
+        for _sub in (agent._con_agent, agent._opt_agent):
+            if _sub is not None and getattr(_sub, "writer", None) is not None:
+                _sub.write_tracking_data(timestep=global_step, timesteps=timesteps)
 
         # Persist the learned dynamics for reuse/inspection (matches C3M).
         if agent._neural_dynamics is not None:

@@ -143,6 +143,39 @@ def patch_ppo_std_annealing(agent, std_dev_annealing: bool, kwargs: dict | None 
 
     agent.post_interaction = _annealed_post
 
+def patch_algo_namespace(agent, algo_name: str) -> None:
+    """Namespace this agent's own track_data() keys under ``algo_name``.
+
+    C3M/C2RL already log their internals as "{tab} / {ALGO}/{metric}" (e.g.
+    "Loss / C3M/dynamics/mse", see c3m.py/c2rl.py) so runs from different
+    algorithms don't collide on the same wandb Loss/Policy/Learning panels.
+    Standalone PPO/SAC never got the same treatment — skrl's own track_data
+    calls (ppo.py/sac.py: "Loss / Policy loss", "Q-network / Q1 (max)", ...)
+    and ours (patch_kl_logging's "Policy / KL divergence") land un-namespaced.
+    This rewrites "{category} / {name}" -> "{category} / {algo_name}/{name}"
+    for every track_data() call, matching that convention.
+
+    "Reward / Total reward (mean/max/min)" is deliberately left untouched:
+    skrl's base Agent writes that EXACT key straight into tracking_data
+    (base.py, bypassing track_data()) to pick the best_agent.pt checkpoint,
+    and patch_auc_checkpoint below injects into that same key via
+    track_data() to redirect the checkpoint metric to contraction_score/AUC —
+    renaming it here would silently break both. Stability/*, Episode/*,
+    Info/* (also written directly into tracking_data, not through
+    track_data()) are unaffected regardless.
+    """
+    orig_track_data = agent.track_data
+
+    def _wrapped(tag, value):
+        if " / " in tag and not tag.startswith("Reward / "):
+            category, name = tag.split(" / ", 1)
+            if not name.startswith(f"{algo_name}/"):
+                tag = f"{category} / {algo_name}/{name}"
+        orig_track_data(tag, value)
+
+    agent.track_data = _wrapped
+
+
 def patch_auc_checkpoint(agent) -> None:
     """Override agent.post_interaction to save the best checkpoint using contraction_score.
 
@@ -157,12 +190,16 @@ def patch_auc_checkpoint(agent) -> None:
         return
 
     def _auc_post(*, timestep: int, timesteps: int) -> None:
-        score_list = agent.tracking_data.get("Stability/contraction_score")
+        # Stability/contraction_score and Stability/auc are logged with a
+        # "_mean" suffix (see contraction_metrics.py's track_stability_summary);
+        # Episode/auc (velocity-tracking envs) has no such suffix — it's a
+        # single value from a different, unrelated logging path.
+        score_list = agent.tracking_data.get("Stability/contraction_score_mean")
         if score_list:
             agent.track_data("Reward / Total reward (mean)", score_list[-1])
         else:
             # Prioritize Stability/auc (path tracking) over Episode/auc (velocity tracking)
-            score_list = agent.tracking_data.get("Stability/auc") or agent.tracking_data.get("Episode/auc")
+            score_list = agent.tracking_data.get("Stability/auc_mean") or agent.tracking_data.get("Episode/auc")
             if score_list:
                 agent.track_data("Reward / Total reward (mean)", -score_list[-1])
         _orig_post(timestep=timestep, timesteps=timesteps)

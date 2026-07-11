@@ -141,14 +141,18 @@ import gymnasium as gym
 import yaml
 
 algorithm = args_cli.algorithm.lower()
-_CONTRACTION_ALGOS = {"c3m", "lqr", "sdlqr", "c2rl-ppo", "c2rl-sac", "c2rl_ppo", "c2rl_sac"}
+_CONTRACTION_ALGOS = {
+    "c3m", "lqr", "sdlqr",
+    "c2rl-ppo", "c2rl-sac", "c2rl_ppo", "c2rl_sac",
+    "c4m-ppo", "c4m-sac", "c4m_ppo", "c4m_sac",
+}
 
 # Algorithm-aware num_envs defaults (used when --num_envs is not given).
 # SAC-based algorithms (and c3m/lqr/sdlqr, which sample from a large buffer the
 # same way SAC does) need far fewer parallel envs; PPO-based algorithms are
 # on-policy and benefit from massively parallel envs. Applies to both the
 # classic gymnasium route and the Isaac Sim route.
-_SAC_LIKE_ALGOS = {"sac", "c2rl-sac", "c2rl_sac", "c3m", "lqr", "sdlqr"}
+_SAC_LIKE_ALGOS = {"sac", "c2rl-sac", "c2rl_sac", "c4m-sac", "c4m_sac", "c3m", "lqr", "sdlqr"}
 _DEFAULT_NUM_ENVS_SAC = 64
 _DEFAULT_NUM_ENVS_PPO_CLASSIC = 1024
 
@@ -514,7 +518,7 @@ def _evaluate_classic_path_tracking(*, task, runner, num_groups: int = 10, episo
     import numpy as np
     import torch
 
-    from contractionRL.agents.skrl.eval_metrics import (
+    from contractionRL.tasks.direct.common.eval_metrics import (
         fit_exponential_envelope,
         mean_confidence_interval,
     )
@@ -637,7 +641,7 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, num_grou
     import numpy as np
     import torch
 
-    from contractionRL.agents.skrl.eval_metrics import (
+    from contractionRL.tasks.direct.common.eval_metrics import (
         fit_exponential_envelope,
         mean_confidence_interval,
     )
@@ -804,10 +808,6 @@ if _is_classic:
         sys.path.insert(0, _classic_dir)
     import contractionRL.tasks.direct.classic  # noqa: F401 — registers gymnasium envs (e.g. Car-v0)
 
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-
     # ── Config loading ────────────────────────────────────────────────────── #
     def _load_cfg(entry_point_key: str, custom_path: str | None = None) -> dict:
         if custom_path:
@@ -830,16 +830,27 @@ if _is_classic:
 
     entry_key = f"skrl_{algorithm.replace('-', '_')}_cfg_entry_point"
     agent_cfg = _load_cfg(entry_key, args_cli.cfg)
+    # --seed CLI arg wins; otherwise fall back to the yaml's own seed (NOT the
+    # random.randint(...) module-level `seed` computed at line 164 before the
+    # yaml was even loaded — using that unconditionally silently discarded
+    # every config's `seed:` field and made "the same command" produce a
+    # different random init/data-sampling trajectory on every invocation).
+    # Mirrors the Isaac-env branch below (search "env_cfg.seed"), which
+    # already got this right.
+    seed = args_cli.seed if args_cli.seed is not None else agent_cfg.get("seed", seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
     agent_cfg["seed"] = seed
 
     if args_cli.num_timesteps is not None:
         agent_cfg["trainer"]["timesteps"] = args_cli.num_timesteps
     if args_cli.lr is not None:
         agent_cfg["agent"]["learning_rate"] = args_cli.lr
-    # Analytical dynamics is OFF by default (every contraction config learns a
-    # NeuralDynamics); --use_analytical_dynamics (or legacy --analytical dynamics)
-    # switches to the env's exact get_f_and_B. Classic envs only.
-    if algorithm in ["c3m", "c2rl_ppo", "c2rl_sac", "lqr", "sdlqr"]:
+    # Classic contraction envs use the env's exact analytical get_f_and_B by
+    # default (use_empirical_dynamics=False); pass --use_empirical_dynamics to
+    # learn a NeuralDynamics instead. Classic envs only (Isaac forces empirical).
+    if algorithm in ["c3m", "c2rl_ppo", "c2rl_sac", "c4m_ppo", "c4m_sac", "lqr", "sdlqr"]:
         agent_cfg["agent"]["use_empirical_dynamics"] = args_cli.use_empirical_dynamics
 
     _run_ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -997,6 +1008,7 @@ if _is_classic:
 
         runner = Runner(env, agent_cfg)
         from contractionRL.agents.skrl.agent_patches import (
+            patch_algo_namespace as _patch_algo_namespace,
             patch_kl_logging as _patch_kl_logging,
             patch_ppo_std_annealing as _patch_ppo_std_annealing,
             patch_sac_entropy_clamp as _patch_sac_entropy_clamp,
@@ -1004,6 +1016,7 @@ if _is_classic:
         _patch_kl_logging(runner.agent)
         _patch_sac_entropy_clamp(runner.agent)
         _patch_ppo_std_annealing(runner.agent, _std_dev_annealing, _std_dev_annealing_kwargs)
+        _patch_algo_namespace(runner.agent, algorithm.upper())
         if args_cli.checkpoint:
             runner.agent.load(args_cli.checkpoint)
         runner.run()
@@ -1348,16 +1361,17 @@ else:
 
         if _alg in _CONTRACTION_ALGOS:
             from contractionRL.runners import ContractionRunner
-            # Default: learn a NeuralDynamics (pretrain + online). Passing
-            # --use_analytical_dynamics for an Isaac task deliberately trips the
-            # runner's guard below (no analytical dynamics exist for Isaac envs).
-            # Isaac envs always use empirical dynamics
+            # Isaac envs have no closed-form dynamics, so they ALWAYS learn a
+            # NeuralDynamics (pretrain + online). Forcing use_empirical_dynamics=True
+            # here also makes the runner's guard reject any config that tries to
+            # request analytical dynamics (use_empirical_dynamics=False) for Isaac.
             agent_cfg["agent"]["use_empirical_dynamics"] = True
             runner = ContractionRunner(env, agent_cfg, is_classic=False)
         else:
             runner = Runner(env, agent_cfg)
 
         from contractionRL.agents.skrl.agent_patches import (
+            patch_algo_namespace as _patch_algo_namespace,
             patch_kl_logging as _patch_kl_logging,
             patch_ppo_std_annealing as _patch_ppo_std_annealing,
             patch_sac_entropy_clamp as _patch_sac_entropy_clamp,
@@ -1369,7 +1383,12 @@ else:
         _patch_kl_logging(runner.agent)
         _patch_sac_entropy_clamp(runner.agent)
         _patch_ppo_std_annealing(runner.agent, _std_dev_annealing, _std_dev_annealing_kwargs)
-        
+        if _alg not in _CONTRACTION_ALGOS:
+            # C3M/C2RL/LQR/SD-LQR already namespace their own track_data() keys
+            # ("Loss / C3M/...", "Loss / C2RL/...", "Con / "/"Opt / " wrapping);
+            # this is standalone PPO/SAC's equivalent (see patch_algo_namespace).
+            _patch_algo_namespace(runner.agent, _alg.upper())
+
         # All agents should use AUC if available.
         _patch_auc_checkpoint(runner.agent)
 

@@ -21,19 +21,19 @@ see ``update()`` and ``_learn()`` below):
      Isaac envs always use this path (no closed-form dynamics available);
      classic envs may instead set ``use_empirical_dynamics: true`` to use the
      env's own exact ``get_f_and_B(x)``, skipping this step entirely.
-  2. Anneal ``policy.cl_actor``'s exploration ``log_std`` by training progress.
-  3. **``_learn()``** — one full pass over ``self._data`` (a static/periodically
+  2. **``_learn()``** — one full pass over ``self._data`` (a static/periodically
      -refreshed buffer of ``(x, xref, uref)`` triples from
-     ``get_rollout(..., "c3m")``) in ``batch_size`` chunks. For each chunk:
-       a. 1 gradient step on the CMG
-       b. ``policy_update_per_cmg_update`` gradient steps on the controller held fixed (``_optimize_params``
-          zeroes both optimizers but only steps ``_w_optimizer``).
-       b. One gradient step on the controller (``_cl_actor``) ALONE, metric
-          held fixed (steps ``_u_optimizer`` only).
-     Both directions optimise the SAME combined loss (``pd_loss + c1_loss +
-     c2_loss (+ os_loss)``, see ``_compute_loss``) — alternating which
-     parameter group actually receives the gradient step is what keeps the
-     joint (metric, controller) optimization stable (mirrors CAC-dev).
+     ``get_rollout(..., "c3m")``) in ``batch_size`` chunks. For each chunk,
+     ``_compute_loss`` builds the SAME combined loss (``pd_loss + c1_loss +
+     c2_loss (+ os_loss)``) over both networks, and ``_optimize_params`` takes
+     ONE joint gradient step — CMG and controller updated simultaneously from
+     the same backward pass, matching the reference C3M training script. (An
+     earlier version alternated — CMG-only step, then controller-only step,
+     each with a fresh forward/backward — mirroring a different, unrelated
+     codebase's convention; that alternation made training a stale-view
+     chasing dynamic between the two networks, similar to GAN training
+     instability, and was found to be substantially more seed-sensitive than
+     the reference's simultaneous update — see git history for the A/B.)
 
 Normalization: **none**. Unlike C2RL, C3M's policy/CMG are bare
 ``nn.Module``s wrapped directly in skrl ``Model``s — they are never wrapped in
@@ -73,6 +73,7 @@ from .math_utils import (
     weighted_gradients,
 )
 from .nn_modules import NeuralDynamics
+from .rl_glue import filter_cfg_fields
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -84,10 +85,6 @@ class C3MCfg(AgentCfg):
     batch_size: int = 1024
     W_lr: float = 3e-4
     u_lr: float = 3e-4
-    # Number of CMG (metric) gradient steps per controller step within each
-    # batch — read in _learn(). Must be a declared field or the runner's
-    # dataclass-field filter silently drops it (always defaulting to 1).
-    policy_update_per_cmg_update: int = 1
     # Alias for u_lr: some configs/sweeps name the controller LR "actor_lr".
     # When set (non-None), __post_init__ copies it into u_lr so both spellings
     # take effect instead of being silently ignored.
@@ -119,12 +116,12 @@ class C3MCfg(AgentCfg):
     # Defaults to always-on: an unbounded LR indefinitely re-visiting the same
     # static offline buffer (see module docstring) is a major driver of the
     # late-training drift/degradation this schedule is meant to damp. Configs
-    # may still override to "" to opt out.
+    # may still override to "" to opt out. Shared across ALL optimizers (CMG,
+    # controller, and — when use_empirical_dynamics — NeuralDynamics); there is
+    # no separate dynamics-only scheduler knob.
     learning_rate_scheduler: str = "ExponentialLR"
     learning_rate_scheduler_kwargs: dict = field(default_factory=lambda: {"gamma": 0.9999})
     dynamics_lr: float = 1e-3
-    dynamics_lr_scheduler: str = ""
-    dynamics_lr_scheduler_kwargs: dict = field(default_factory=dict)
     dynamics_batch_size: int = 4096
     dynamics_pretrain_epochs: int = 5
     dynamics_pretrain_data_path: str = ""
@@ -178,7 +175,7 @@ class C3MAgent(Agent):
         u_dim: int | None = None,
     ) -> None:
         if isinstance(cfg, dict):
-            cfg = C3MCfg(**{k: v for k, v in cfg.items() if k in C3MCfg.__dataclass_fields__})
+            cfg = C3MCfg(**filter_cfg_fields(cfg, C3MCfg, context="C3MAgent"))
         super().__init__(
             cfg=cfg,
             models=models,
@@ -208,8 +205,9 @@ class C3MAgent(Agent):
         if not cfg.use_empirical_dynamics:
             if get_f_and_B is None:
                 raise ValueError(
-                    "C3M: use_empirical_dynamics=True requires a get_f_and_B callable "
-                    "(classic envs only). Isaac Sim envs have no analytical dynamics."
+                    "C3M: analytical dynamics (use_empirical_dynamics=False) requires a "
+                    "get_f_and_B callable (classic envs only). Isaac Sim envs have no "
+                    "analytical dynamics — set use_empirical_dynamics=True."
                 )
             self._get_f_and_B = get_f_and_B
             self._neural_dynamics = None
@@ -217,17 +215,12 @@ class C3MAgent(Agent):
         else:
             self._neural_dynamics = models.get("dynamics", None)
             if self._neural_dynamics is None:
-                raise ValueError("C3M requires 'dynamics' model in models dictionary when use_empirical_dynamics=False")
+                raise ValueError("C3M requires 'dynamics' model in models dictionary when use_empirical_dynamics=True")
                 
             self._get_f_and_B = self._neural_dynamics.get_f_and_B
             self._dynamics_optimizer = torch.optim.Adam(
                 self._neural_dynamics.parameters(), lr=cfg.dynamics_lr
             )
-            if hasattr(cfg, "dynamics_lr_scheduler") and cfg.dynamics_lr_scheduler:
-                scheduler_cls = getattr(torch.optim.lr_scheduler, cfg.dynamics_lr_scheduler)
-                self._dynamics_lr_scheduler = scheduler_cls(self._dynamics_optimizer, **getattr(cfg, "dynamics_lr_scheduler_kwargs", {}))
-            else:
-                self._dynamics_lr_scheduler = None
 
         # ── Extract underlying nn.Module objects from skrl model wrappers ── #
         self._ccm_gen = models["cmg"].ccm_gen
@@ -235,19 +228,27 @@ class C3MAgent(Agent):
 
         # ── Optimizers + LR schedulers ──────────────────────────────────── #
         # Separated optimizers matching actual CAC-dev behavior to allow alternating updates
-        # and gradient NaN-filtering.
+        # and gradient NaN-filtering. A single scheduler type/kwargs (cfg.learning_rate_scheduler)
+        # is shared across the CMG (W), controller (u), and — when learned — NeuralDynamics
+        # optimizers, all stepped together once per update() (see _learn()); there is no
+        # separate dynamics-only scheduler config.
         self._w_optimizer = torch.optim.Adam(self._ccm_gen.parameters(), lr=cfg.W_lr)
         self._u_optimizer = torch.optim.Adam(self._cl_actor.parameters(), lr=cfg.u_lr)
         self._progress = 0.0
-        
+
         if getattr(cfg, "learning_rate_scheduler", None):
             scheduler_cls = getattr(torch.optim.lr_scheduler, cfg.learning_rate_scheduler)
             kwargs = getattr(cfg, "learning_rate_scheduler_kwargs", {})
             self._w_lr_scheduler = scheduler_cls(self._w_optimizer, **kwargs)
             self._u_lr_scheduler = scheduler_cls(self._u_optimizer, **kwargs)
+            self._dynamics_lr_scheduler = (
+                scheduler_cls(self._dynamics_optimizer, **kwargs)
+                if self._dynamics_optimizer is not None else None
+            )
         else:
             self._w_lr_scheduler = None
             self._u_lr_scheduler = None
+            self._dynamics_lr_scheduler = None
 
         # ── Data buffer (numpy; static for analytical, or pre-generated) ────── #
         self._memory_size = getattr(self.memory, "memory_size", 131072) if self.memory is not None else 131072
@@ -297,13 +298,15 @@ class C3MAgent(Agent):
             dyn_loss = self._train_dynamics(dyn_data)
             self.track_data("Loss / C3M/dynamics/mse", dyn_loss)
 
-        # 2. Anneal CLActor log_std
-        self.models["policy"].cl_actor.anneal_stddev(self._progress)
-
-        # 3. Full epoch update (looping entire buffer in batch_size chunks)
+        # 2. Full epoch update (looping entire buffer in batch_size chunks)
         loss_dict = self._learn()
         for k, v in loss_dict.items():
-            self.track_data(f"Loss / {k}", v)
+            # LR metrics (k starts with "C3M/lr/") get their own "Learning" tab,
+            # matching skrl PPO's own "Learning / Learning rate" convention —
+            # mixing them into "Loss / ..." would group scalar LR values with
+            # actual loss curves in wandb/tensorboard.
+            tab = "Learning" if k.startswith("C3M/lr/") else "Loss"
+            self.track_data(f"{tab} / {k}", v)
         # Keep the latest losses on the agent so the trainer's progress-bar
         # postfix can read them even after post_interaction → write_tracking_data
         # clears tracking_data (otherwise the bar shows a spurious "nan").
@@ -409,20 +412,30 @@ class C3MAgent(Agent):
         loss = os_loss + pd_loss + c1_loss + c2_loss
         return loss, {"pd_loss": pd_loss.item(), "c1_loss": c1_loss.item(), "c2_loss": c2_loss.item(), "os_loss": os_loss.item() if not bounded else 0.0}
 
-    def _optimize_params(self, loss: torch.Tensor, optimizer: torch.optim.Optimizer, module: torch.nn.Module) -> bool:
+    def _optimize_params(self, loss: torch.Tensor) -> bool:
+        """One joint gradient step on CMG + controller together.
+
+        Matches the reference C3M script's single ``optimizer.step()`` over
+        both networks' parameters simultaneously — see module docstring for
+        why this replaced an earlier alternating (CMG-step, controller-step)
+        scheme.
+        """
         self._w_optimizer.zero_grad()
         self._u_optimizer.zero_grad()
         loss.backward()
 
         # CAC-dev protection: filter out NaN/Inf gradients occasionally caused by eigvalsh
         # or numerical edge cases in the contraction metric.
-        if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in module.parameters()):
+        params = list(self._ccm_gen.parameters()) + list(self._cl_actor.parameters())
+        if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in params):
             self._w_optimizer.zero_grad()
             self._u_optimizer.zero_grad()
             return False
 
-        torch.nn.utils.clip_grad_norm_(module.parameters(), 1.0)
-        optimizer.step()
+        torch.nn.utils.clip_grad_norm_(self._ccm_gen.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self._cl_actor.parameters(), 1.0)
+        self._w_optimizer.step()
+        self._u_optimizer.step()
         return True
 
     def _learn(self) -> dict:
@@ -441,15 +454,10 @@ class C3MAgent(Agent):
         pbar = tqdm(range(iters), desc=f"Epoch C3M Update", leave=False)
         for b in pbar:
             idx = indices[b * batch_size : (b + 1) * batch_size]
-            
-            # CMG (metric) updates holding controller fixed
+
+            # Single joint gradient step on CMG + controller together.
             loss, infos = self._compute_loss(idx)
-            self._optimize_params(loss, self._w_optimizer, self._ccm_gen)
-                
-            # Controller (policy) update holding metric fixed
-            for _ in range(cfg.policy_update_per_cmg_update):
-                loss, infos = self._compute_loss(idx)
-                self._optimize_params(loss, self._u_optimizer, self._cl_actor)
+            self._optimize_params(loss)
 
             total_loss += loss.item()
             total_pd += infos["pd_loss"]
@@ -457,22 +465,30 @@ class C3MAgent(Agent):
             total_c2 += infos["c2_loss"]
             total_os += infos["os_loss"]
 
-        # Step LR scheduler once per epoch
+        # Step LR schedulers once per epoch (shared type/kwargs across W, u, dynamics)
         if self._w_lr_scheduler is not None:
             self._w_lr_scheduler.step()
         if self._u_lr_scheduler is not None:
             self._u_lr_scheduler.step()
+        if self._dynamics_lr_scheduler is not None:
+            self._dynamics_lr_scheduler.step()
 
         self._ccm_gen.eval(); self._cl_actor.eval()
 
-        return {
+        metrics = {
             "C3M/loss/loss":    total_loss / iters,
             "C3M/loss/pd_loss": total_pd / iters,
             "C3M/loss/c1_loss": total_c1 / iters,
             "C3M/loss/c2_loss": total_c2 / iters,
             "C3M/loss/os_loss": total_os / iters,
-            "C3M/lr/lr":        self._u_lr_scheduler.get_last_lr()[0] if self._u_lr_scheduler else cfg.u_lr,
+            "C3M/lr/u_lr": self._u_lr_scheduler.get_last_lr()[0] if self._u_lr_scheduler else cfg.u_lr,
+            "C3M/lr/w_lr": self._w_lr_scheduler.get_last_lr()[0] if self._w_lr_scheduler else cfg.W_lr,
         }
+        if self._dynamics_lr_scheduler is not None:
+            metrics["C3M/lr/dynamics_lr"] = self._dynamics_lr_scheduler.get_last_lr()[0]
+        elif self._dynamics_optimizer is not None:
+            metrics["C3M/lr/dynamics_lr"] = cfg.dynamics_lr
+        return metrics
 
     def _train_dynamics(self, data: dict) -> float:
         """MSE training of NeuralDynamics on (x, u, x_dot) data."""
@@ -520,6 +536,8 @@ class C3MSkrlTrainer(Trainer):
         log_interval = int(log_interval)
 
         agent.init(trainer_cfg=self.cfg)
+        from .contraction_metrics import log_raw_config
+        log_raw_config(getattr(self, "_wandb_raw_cfg", None))
         agent.enable_training_mode(True)
 
         # Pretrain the learned NeuralDynamics before RL (same mechanism as
@@ -600,76 +618,90 @@ class C3MSkrlTrainer(Trainer):
                     continue
         raise AttributeError(f"none of {names} found on env {self.env!r}")
 
+    def _force_env_reset(self) -> None:
+        """Force skrl to genuinely re-reset the underlying vector env.
+
+        skrl's ``GymnasiumWrapper.reset()`` resets the vector env only ONCE and
+        thereafter returns a cached ``self._observation`` (it assumes vector envs
+        autoreset inside ``step()``). Under **gymnasium 1.x next-step autoreset**
+        (Isaac Sim 5.1 pins gymnasium 1.2.1), that cache holds the previous
+        episode's PARKED terminal observation — where the controller has already
+        converged, so ``x ≈ xref`` and the initial tracking error ``e0 ≈ 0``.
+        The eval AUC is ``(dt / e0)·Σe``, so a near-zero e0 makes AUC explode to
+        ~1e7 even though the controller is perfectly stable (a metric artifact,
+        not divergence). gymnasium 0.29 (the ``base`` env) autoresets in the same
+        step, so its cache is a fresh reset and e0 is correct — which is why this
+        only bites under env_isaaclab. Flipping ``_reset_once`` back on makes the
+        next ``reset()`` actually re-randomize the sub-envs (``time_steps→0``).
+        Project-side only — does not modify skrl.
+        """
+        w = self.env
+        for _ in range(8):
+            if isinstance(w, object) and "_reset_once" in vars(w):
+                vars(w)["_reset_once"] = True
+                return
+            w = getattr(w, "env", None) or getattr(w, "_env", None)
+            if w is None:
+                return
+
     def eval(self, timestep: int = 0) -> dict:
         agent = self.agents if not isinstance(self.agents, list) else self.agents[0]
         agent.enable_training_mode(False)
+        self._force_env_reset()
         observations, infos = self.env.reset()
         states = self.env.state() if hasattr(self.env, "state") else None
 
-        from .contraction_metrics import StreamingErrorStats, log_tracking_plots, reward_summary
+        from .contraction_metrics import log_tracking_plots, reward_summary
 
-        x_dim = agent._x_dim
         num_envs = self.env.num_envs
-        stats = StreamingErrorStats(num_envs, self.env.device)
-        total_reward = torch.zeros((num_envs, 1), device=self.env.device)
+        device = self.env.device
+        dt = float(self._env_scalar_attr("step_dt", "dt"))
 
-        # Envs auto-reset individually on done (DirectRLEnv._reset_idx runs
-        # inside step()), and termination is per-env (e.g. a quadruped falling
-        # early) — so envs desynchronize and `(terminated | truncated).all()`
-        # on a single step may never be true again once even one env has
-        # reset off-cycle, hanging this loop indefinitely. Instead, run a
-        # bounded number of steps and track which envs have finished their
-        # FIRST episode, masking further accumulation for them once they have
-        # (mirrors train.py's `_evaluate_best_model` quality-gate loop).
+        # Metric collection is now handled by StatManagerEnvWrapper on every
+        # reset()/step() (auto e0-anchoring off the true episode counter, one clean
+        # episode per env, memory-bounded to num_envs_for_eval). The eval loop just
+        # drives the rollout and reads self.env.stability_summary() / trajectories()
+        # at the end. reward masking stays here (agent-side).
         max_steps = int(self._env_scalar_attr("max_episode_length", "max_episode_len")) + 1
-        finished = torch.zeros(num_envs, dtype=torch.bool, device=self.env.device)
-        
-        # For plotting up to 10 envs
-        plot_idx = np.random.choice(num_envs, 1, replace=False)
-        traj_x = {i: [] for i in plot_idx}
-        traj_xref = {i: [] for i in plot_idx}
-        traj_error = {i: [] for i in plot_idx}
+        finished = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        total_reward = torch.zeros((num_envs, 1), device=device)
 
-        for _ in range(max_steps):
+        eval_pbar = tqdm(range(max_steps), desc="C3M eval", leave=False, file=sys.stdout)
+        for step in eval_pbar:
+            eval_pbar.set_postfix(timestep=f"{step + 1}/{max_steps}")
             with torch.no_grad():
                 actions, _ = agent.act(observations, states, timestep=0, timesteps=1)
 
-            active = (~finished).unsqueeze(-1).float()
-            # Attempt to figure out pos_dimension
-            pos_dim_val = self._env_scalar_attr("pos_dimension")
-            pos_dim = int(pos_dim_val) if pos_dim_val is not None else (3 if hasattr(self.env, "state") else x_dim)
-            
-            x_curr = observations[:, :pos_dim]
-            x_ref = observations[:, x_dim:x_dim+pos_dim]
-            error = torch.norm(observations[:, :x_dim] - observations[:, x_dim:2*x_dim], dim=-1, keepdim=True)
-            
-            for i in plot_idx:
-                if not finished[i]:
-                    traj_x[i].append(x_curr[i].cpu().clone().numpy())
-                    traj_xref[i].append(x_ref[i].cpu().clone().numpy())
-                    traj_error[i].append(error[i].item())
-            stats.update(error, active)
-
+            active = ~finished
             observations, rewards, terminated, truncated, _ = self.env.step(actions)
-            total_reward += rewards.view(num_envs, 1) * active
+            states = self.env.state() if hasattr(self.env, "state") else None
+            total_reward += rewards.view(num_envs, 1) * active.unsqueeze(-1).float()
 
             finished |= (terminated | truncated).view(num_envs)
             if finished.all():
                 break
+        eval_pbar.close()
 
         agent.enable_training_mode(True)
 
-        dt = float(self._env_scalar_attr("step_dt", "dt"))
-
-        # Only envs that finished their (first) episode carry valid information.
+        # Only envs that finished their (first) episode carry valid reward info.
         f_mask = finished if finished.any() else torch.ones_like(finished)
 
-        # Unified streaming metrics (auc / contraction_rate / overshoot /
-        # contraction_score, each mean + 95% CI) + the normalized-error and
-        # path-tracking figures — same computation/keys as every other algorithm.
-        log_tracking_plots(traj_x, traj_xref, traj_error, dt=dt, prefix="train",
-                            step=timestep, title="C3M")
+        # Metrics + plots come straight from the wrapper's StatManager. Plot a few.
+        # prefix="eval" (not "train"): WandbPlotWrapper (scripts/skrl/
+        # wandb_plot_wrapper.py) already pushes to "train/normalized_error" /
+        # "train/path_tracking" from a LIVE, stochastic, single-env training
+        # rollout on its own step-based cadence. Reusing "train" here collided
+        # both pushes onto the identical wandb keys, silently interleaving this
+        # deterministic (enable_training_mode(False)), multi-env eval rollout
+        # with that noisy training-time one under one legend/slider.
+        tx, txr, terr = self.env.trajectories()
+        keep = list(terr.keys())[:3]
+        log_tracking_plots({i: tx[i] for i in keep if i in tx},
+                           {i: txr[i] for i in keep if i in txr},
+                           {i: terr[i] for i in keep}, dt=dt, prefix="eval",
+                           step=timestep, title="C3M")
         return {
-            "stability": stats.summary(dt, f_mask),
+            "stability": self.env.stability_summary(),
             "reward": reward_summary(total_reward, f_mask),
         }

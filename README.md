@@ -631,13 +631,16 @@ Applies `u = uref − K(x_ref)·e`.
 Two-policy architecture, built on top of a chosen base algorithm (`c2rl-ppo` uses two official
 skrl `PPO` sub-agents, `c2rl-sac` uses two official skrl `SAC` sub-agents) that share one CMG:
 
-- **con_policy** ("contracting", `gamma_contracting` ≈ 0) and **opt_policy** ("optimal",
-  `gamma_optimal`, e.g. 0.99) optimise the **same** Mahalanobis tracking reward
+- **con_policy** ("contracting", `gamma_con` ≈ 0) and **opt_policy** ("optimal", `gamma_opt`, e.g.
+  0.99) optimise the **same** Mahalanobis tracking reward
   `−tracking_scaler·‖e‖²_M/std − control_scaler·‖u−uref‖²/std` (`M(x)` = the CMG's current metric)
   — they differ ONLY in discount factor, not in reward. opt_policy is what's actually deployed at
   inference unless `con_only: true`.
 - con_policy's mean control and its state-Jacobian `K = du/dx` are what the CMG (CCM generator,
   same architecture as C3M) is trained against — opt_policy plays no role in shaping the metric.
+  The CMG loss is `pd_loss + c1_loss + c2_loss`: `pd_loss` certifies the closed-loop system under
+  con_policy (`Cu ≺ 0`), while `c1_loss`/`c2_loss` are C3M's own `C1`/`C2` conditions on the CMG
+  alone (no policy involvement), shaping `W(x)` to admit some contracting controller.
 
 **Per-epoch workflow** (`C2RLSkrlTrainer.train()`, one iteration of the outer loop):
 
@@ -684,8 +687,9 @@ skrl `PPO` sub-agents, `c2rl-sac` uses two official skrl `SAC` sub-agents) that 
 
 | Param | Default | Notes |
 |-------|---------|-------|
-| `gamma_contracting` | 0.0 | Discount for the contracting policy |
-| `gamma_optimal` | 0.99 | Discount for the optimal policy (the one deployed, unless `con_only`) |
+| `gamma_con` | 0.0 | Discount for the contracting policy |
+| `gamma_opt` | 0.99 | Discount for the optimal policy (the one deployed, unless `con_only`) |
+| `pd_loss_num_samples` | 128 | Random directions for the `c1_loss`/`c2_loss` PD-violation hinge loss (mirrors C3M) |
 | `tracking_scaler` | 1.0 | Mahalanobis reward scale (Q, shared by both policies) |
 | `control_scaler` | 0.0 | Control-effort penalty weight (R, shared by both policies; 0 = disabled) |
 | `reward_norm_beta` | 0.99 | EMA momentum for the reward-variance normalisation |

@@ -1,1 +1,1 @@
-"""mjrl agent configurations for the classic Car tracking environment."""
+"""skrl agent configurations for the classic Cartpole tracking environment."""

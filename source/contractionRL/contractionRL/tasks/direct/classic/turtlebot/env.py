@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import numpy as np
-import torch
 
 from ..common.env_base import BaseEnv
 
@@ -56,12 +55,18 @@ ENV_CONFIG = {
 }
 
 class TurtlebotEnv(BaseEnv):
-    def __init__(self, sample_mode: str = "uniform", reward_mode: str = "default", **kwargs):
+    def __init__(
+        self,
+        sample_mode: str = "uniform",
+        reward_mode: str = "default",
+        time_bound: float | None = None,
+        dt: float | None = None,
+        **kwargs,
+    ):
         self.task = "turtlebot"
-        cfg = dict(ENV_CONFIG)
-        cfg["sample_mode"] = sample_mode
-        cfg["reward_mode"] = reward_mode
-        super().__init__(cfg)
+        super().__init__(self._build_cfg(
+            ENV_CONFIG, sample_mode=sample_mode, reward_mode=reward_mode, time_bound=time_bound, dt=dt,
+        ))
 
     def _f_logic(self, x, lib):
         n = x.shape[0]
@@ -102,18 +107,5 @@ class TurtlebotEnv(BaseEnv):
         freqs = list(range(1, 11))
         weights = np.random.randn(len(freqs), len(UREF_MIN))
         weights = (weights / np.sqrt((weights**2).sum(axis=0, keepdims=True))).tolist()
-
-        xref_list, xref_wrapped_list, uref_list = [xref_0], [xref_0], []
-        for i, _t in enumerate(self.t):
-            uref_t = self.sample_reference_controls(freqs, weights, _t, {"xref_0": xref_0})
-            xref_t, xref_wrapped_t, term, trunc, _ = self.get_transition(xref_list[-1].copy(), uref_t)
-            # Carry forward the wrapped+clipped state (same fix as BaseEnv.step's
-            # self.x_t) — using raw xref_t here let non-angle/non-position dims
-            # drift unbounded across iterations before reset()'s final np.clip.
-            xref_wrapped_t = np.clip(xref_wrapped_t, self.X_MIN.flatten(), self.X_MAX.flatten())
-            xref_list.append(xref_wrapped_t)
-            xref_wrapped_list.append(xref_wrapped_t)
-            uref_list.append(uref_t)
-            if term or trunc:
-                break
-        return x_0, np.array(xref_wrapped_list), np.array(uref_list), i + 1
+        xref_arr, uref_arr, n = self._rollout_reference(xref_0, freqs, weights)
+        return x_0, xref_arr, uref_arr, n

@@ -58,6 +58,11 @@ _build
 **/logs/*
 **/recordings/*
 
+# Training run artifacts (nohup redirects, tensorboard events, stray checkpoints)
+nohup.out
+**/*tfevents*
+/checkpoints/
+
 # Pre-Trained Checkpoints
 /.pretrained_checkpoints/
 

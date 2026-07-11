@@ -204,8 +204,8 @@ class PathTrackingBase(DirectRLEnv):
                 rather than as a hard per-step constraint. None (or 0) for
                 C3M, which has no discounting at all — gamma > 0 only for an
                 RL-trained policy (C2RL's con_policy/opt_policy). For C2RL use
-                gamma_optimal unless running con_only, in which case
-                gamma_contracting — i.e. whichever policy's rollout the figure
+                gamma_opt unless running con_only, in which case
+                gamma_con — i.e. whichever policy's rollout the figure
                 is actually showing.
             static_metric_bounds: (m_bar, m_underbar) from the CMG's configured
                 w_lb/w_ub (m_bar=1/w_lb, m_underbar=1/w_ub) — the THEORETICAL
