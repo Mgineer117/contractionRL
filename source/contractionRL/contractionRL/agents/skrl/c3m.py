@@ -1,8 +1,8 @@
 """C3M — skrl-native Control Contraction Metric agent.
 
 Jointly learns:
-  * W(x)        — contraction-metric generator (CCM_Generator / MetricNetwork)
-  * u(x,xref)   — contracting controller (CLActor / ControllerNetwork)
+  * W(x)        — contraction-metric generator (CCM_Generator / MetricModel)
+  * u(x,xref)   — contracting controller (CLActor / CLActorModel)
 
 Training uses random (x, xref, uref) triples from ``env.get_rollout`` — no
 environment rollouts needed.  Use with C3MSkrlTrainer.
@@ -125,6 +125,26 @@ class C3MCfg(AgentCfg):
     dynamics_batch_size: int = 4096
     dynamics_pretrain_epochs: int = 5
     dynamics_pretrain_data_path: str = ""
+    # Fixed pretraining buffer size — sampled ONCE (offline-data subsample when
+    # dynamics_pretrain_data_path is set, else a fresh get_rollout draw), then
+    # multi-epoch trained over, mirroring cmg_memory_size's role in C2RL's CMG
+    # synthesis (see dynamics_pretrain.pretrain_dynamics). Classic envs can
+    # feasibly use any size (synthetic analytic sampling); Isaac envs with a
+    # data_path are capped (+ warned) to the offline data actually on disk.
+    emp_dynamics_memory_size: int = 8192
+    # Classic envs only: how many distinct control vectors get paired with each
+    # sampled state in a "dynamics" rollout (env_base.get_rollout); replaces the
+    # old hardcoded 3. Used both for pretraining and this agent's per-step
+    # online dynamics refinement (see update()).
+    num_controls_per_state: int = 3
+    # Held out from emp_dynamics_memory_size as a validation split never
+    # trained on; pretrain_dynamics stops once its MSE hasn't improved for
+    # dynamics_early_stop_patience consecutive epochs, restoring the
+    # best-val-epoch NeuralDynamics weights (see
+    # dynamics_pretrain.pretrain_dynamics / math_utils.EarlyStopper). <=0
+    # disables both (always pretrain the full budget).
+    dynamics_val_frac: float = 0.1
+    dynamics_early_stop_patience: int = 10
 
     def __post_init__(self):
         # "actor_lr" is an accepted alias for the controller learning rate u_lr.
@@ -147,8 +167,8 @@ class C3MAgent(Agent):
     """Control Contraction Metric agent — native skrl Agent, zero mjrl dependency.
 
     Models in ``models`` dict:
-      ``"policy"`` — ControllerNetwork (contracting C3M_U controller)
-      ``"cmg"``    — MetricNetwork     (contraction-metric generator)
+      ``"policy"`` — CLActorModel (contracting C3M_U controller)
+      ``"cmg"``    — MetricModel     (contraction-metric generator)
 
     Extra constructor kwargs:
       ``get_rollout``:    ``(batch_size, mode) -> dict``
@@ -294,7 +314,10 @@ class C3MAgent(Agent):
         # 1. Online NeuralDynamics training (skipped when analytical)
         dyn_loss = None
         if self._neural_dynamics is not None:
-            dyn_data = self._get_rollout(self._cfg.dynamics_batch_size, "dynamics")
+            dyn_data = self._get_rollout(
+                self._cfg.dynamics_batch_size, "dynamics",
+                num_control_per_state=getattr(self._cfg, "num_controls_per_state", None),
+            )
             dyn_loss = self._train_dynamics(dyn_data)
             self.track_data("Loss / C3M/dynamics/mse", dyn_loss)
 
@@ -353,6 +376,14 @@ class C3MAgent(Agent):
         # (and hence the contraction condition Cu) — this matches C2RL's CMG loss.
         state = torch.cat([x, xref, uref], dim=1)
         u = self._cl_actor.mean_control(state)
+        policy_model = self.models["policy"]
+        if getattr(policy_model, "_d_clip_actions", False):
+            # Certify the action actually deployed by act() (clamped), not the
+            # raw unclamped mean_control output — matches clip_actions=true at
+            # eval time. K goes to zero wherever u saturates (clamp has no
+            # gradient there), which is intentional: don't credit an infeasible
+            # action for satisfying the contraction condition.
+            u = torch.clamp(u, min=policy_model._d_min_actions, max=policy_model._d_max_actions)
         K = jacobian(u, x)
 
         A = DfDx + torch.einsum('bxyu,bu->bxy', DBDx, u)
@@ -550,8 +581,12 @@ class C3MSkrlTrainer(Trainer):
             epochs=getattr(agent.cfg, "dynamics_pretrain_epochs", 5),
             data_path=getattr(agent.cfg, "dynamics_pretrain_data_path", None),
             timesteps=timesteps,
+            memory_size=getattr(agent.cfg, "emp_dynamics_memory_size", None),
+            num_controls_per_state=getattr(agent.cfg, "num_controls_per_state", None),
             log_interval=log_interval,
             tag="[C3M]",
+            val_frac=getattr(agent.cfg, "dynamics_val_frac", 0.1),
+            early_stop_patience=getattr(agent.cfg, "dynamics_early_stop_patience", 10),
         )
 
         pbar = _tqdm.tqdm(range(timesteps), desc="C3M training", file=sys.stdout)

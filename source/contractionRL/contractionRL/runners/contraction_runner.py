@@ -16,8 +16,9 @@ C3M / LQR / SDLQR / C2RL-PPO / C2RL-SAC:
     with custom skrl Trainers (C3MSkrlTrainer, C2RLSkrlTrainer, or
     SequentialTrainer for eval-only analytical agents). C2RL-PPO/C2RL-SAC are
     the SAME C2RLAgent class — the algo string just selects which
-    base_algorithm (PPO or SAC) its con_policy/opt_policy are built on; see
-    _setup_c2rl.
+    base_algorithm (PPO or SAC) its single deployed policy is built on; the
+    ``use_cmg`` config flag selects the metric source (online CM SDP by
+    default, or an offline-synthesized frozen CMG network). See _setup_c2rl.
 
 Classic env: internally creates SyncVectorEnv + wrap_env.
 Isaac env:   env is already a SkrlVecEnvWrapper — passed through.
@@ -40,7 +41,7 @@ import gymnasium as gym
 from contractionRL.agents.skrl.rl_glue import filter_cfg_fields as _filter_cfg_fields
 
 _SKRL_ALGOS = frozenset({"ppo", "sac", "td3", "ddpg", "amp", "ippo", "mappo"})
-_CONTRACTION_ALGOS = frozenset({"c3m", "lqr", "sdlqr", "c2rl-ppo", "c2rl-sac", "c4m-ppo", "c4m-sac"})
+_CONTRACTION_ALGOS = frozenset({"c3m", "lqr", "sdlqr", "c2rl-ppo", "c2rl-sac"})
 
 
 def _make_cmg_bounds_fn(cmg_model, w_lb: float):
@@ -74,13 +75,10 @@ def _make_cmg_bounds_fn(cmg_model, w_lb: float):
 def _build_c3m_models(models_cfg: dict, agent_cfg: dict, obs_space, act_space, device,
                        x_dim, u_dim, angle_idx: list, policy_key: str = "policy") -> dict:
     """Build the policy/cmg/(optional) dynamics models for a C3M-style offline
-    synthesis phase — shared by ``_setup_c3m`` (pure C3M, ``policy_key="policy"``)
-    and ``_setup_c4m`` (C4M's Phase A, a full internal C3MAgent;
-    ``policy_key="c3m_policy"`` since C4M's yaml also has a separate deployed
-    ``"policy"`` block). Mutates ``agent_cfg`` (pops ``actor_architecture`` so
-    it doesn't trip the C3MCfg/C4MCfg field filter). The returned dict always
-    uses the keys ``"policy"``/``"cmg"``/(optional)``"dynamics"`` — what
-    C3MAgent itself expects — regardless of ``policy_key``.
+    synthesis phase — used by ``_setup_c3m`` (pure C3M, ``policy_key="policy"``).
+    Mutates ``agent_cfg`` (pops ``actor_architecture`` so it doesn't trip the
+    C3MCfg field filter). The returned dict uses the keys ``"policy"``/``"cmg"``/
+    (optional)``"dynamics"`` — what C3MAgent itself expects.
     """
     angle_idx = list(angle_idx or [])
     hd_policy = models_cfg.get(policy_key, {}).get("network", [{}])[0].get("layers", [128, 128])
@@ -106,8 +104,8 @@ def _build_c3m_models(models_cfg: dict, agent_cfg: dict, obs_space, act_space, d
     # GaussianMixin wrapper explicitly.
     policy_class_str = models_cfg.get(policy_key, {}).get("class", "DeterministicMixin")
     if policy_class_str == "GaussianMixin":
-        from contractionRL.agents.skrl.models import ControllerNetwork
-        policy_cls = ControllerNetwork
+        from contractionRL.agents.skrl.models import CLActorModel
+        policy_cls = CLActorModel
     else:
         from contractionRL.agents.skrl.models import CLDeterministicActorModel
         policy_cls = CLDeterministicActorModel
@@ -122,10 +120,10 @@ def _build_c3m_models(models_cfg: dict, agent_cfg: dict, obs_space, act_space, d
     w_lb = agent_cfg.get("w_lb", 0.1)
     w_ub = agent_cfg.get("w_ub", 10.0)
 
-    from contractionRL.agents.skrl.models import MetricNetwork
+    from contractionRL.agents.skrl.models import MetricModel
     models = {
         "policy": policy_cls(obs_space, act_space, device, hidden_dim=hd_policy, activation=act_policy, x_dim=x_dim, angle_idx=angle_idx, **policy_kwargs),
-        "cmg": MetricNetwork(obs_space, act_space, device, hidden_dim=hd_cmg, activation=act_cmg, x_dim=x_dim, angle_idx=angle_idx, constrain_eigenvalues=constrain_eigenvalues, w_lb=w_lb, w_ub=w_ub),
+        "cmg": MetricModel(obs_space, act_space, device, hidden_dim=hd_cmg, activation=act_cmg, x_dim=x_dim, angle_idx=angle_idx, constrain_eigenvalues=constrain_eigenvalues, w_lb=w_lb, w_ub=w_ub),
     }
 
     # Only build a NeuralDynamics when learning dynamics (use_empirical_dynamics
@@ -143,12 +141,11 @@ def _build_c3m_models(models_cfg: dict, agent_cfg: dict, obs_space, act_space, d
 
 def _build_gaussian_policy(models_cfg: dict, block_name: str, obs_space, state_space, act_space,
                            device, x_dim, angle_idx: list, agent_class: str):
-    """Build a con/opt/deployed policy — same backbone dispatch PPO/SAC
-    path-tracking configs use (control -> CLActorModel, mlp ->
-    MLPResidualActorModel, both u = uref + feedback). Shared by ``_setup_c2rl``
-    and ``_setup_c4m``. ``agent_class`` lets ``_gaussian_factory`` reject
-    unbounded backbones for SAC-based agents (divergence) and squashed
-    backbones for PPO-based ones.
+    """Build a deployed policy — same backbone dispatch PPO/SAC path-tracking
+    configs use (control -> CLActorModel, mlp -> MLPResidualActorModel, both
+    u = uref + feedback). Used by ``_setup_c2rl``. ``agent_class`` lets
+    ``_gaussian_factory`` reject unbounded backbones for SAC-based agents
+    (divergence) and squashed backbones for PPO-based ones.
     """
     from contractionRL.agents.skrl.runner import _gaussian_factory
 
@@ -172,8 +169,7 @@ def _build_critics(models_cfg: dict, block_name: str, base_algorithm: str, obs_s
                    device, x_dim, angle_idx: list, key_prefix: str = "") -> dict:
     """Build the value/critic model(s) for one policy — a single V(obs) model
     for PPO, or the twin-Q + target architecture (critic_1/2 + targets) for
-    SAC. Shared by ``_setup_c2rl`` (``key_prefix="con_"``/``"opt_"``) and
-    ``_setup_c4m`` (``key_prefix=""``, a single deployed policy).
+    SAC. Used by ``_setup_c2rl`` (``key_prefix=""``, a single deployed policy).
     """
     from contractionRL.agents.skrl.models import EmbeddedDeterministicModel
 
@@ -388,7 +384,7 @@ class ContractionRunner:
     # ── contraction agents (C3M/LQR/SDLQR/C2RL) ───────────────────────── #
 
     def _setup_contraction(self, env, cfg, algo, task_id, num_envs, is_classic, dynamics_model=None):
-        from contractionRL.agents.skrl.models import ControllerNetwork, MetricNetwork
+        from contractionRL.agents.skrl.models import CLActorModel, MetricModel
 
         skrl_env = _make_skrl_env(env, task_id, num_envs, is_classic)
         # Use the wrapped env's device for both classic and Isaac envs. The
@@ -440,18 +436,31 @@ class ContractionRunner:
         trainer_cfg.pop("class", None)
         trainer_cfg.setdefault("close_environment_at_exit", False)
 
+        # C2RL keeps its contraction-metric (cm), CMG-synthesis (cmg), and
+        # empirical-dynamics knobs in their own top-level yaml categories (not
+        # nested under agent:) — see _setup_c2rl, which merges these into
+        # agent_cfg before building the C2RLAgent. Other contraction algos
+        # (C3M/LQR/SD-LQR) don't have these sections, so this is a no-op {} for
+        # them.
+        cm_cfg = copy.deepcopy(cfg.get("cm", {}))
+        cmg_cfg = copy.deepcopy(cfg.get("cmg", {}))
+        empirical_dynamics_cfg = copy.deepcopy(cfg.get("empirical_dynamics", {}))
+
         # Analytical dynamics (use_empirical_dynamics=False) needs the env's exact
         # get_f_and_B, which only classic envs expose. Isaac envs must learn a
         # NeuralDynamics (use_empirical_dynamics=True) — train.py forces this, so
         # this guard only fires on a hand-rolled/standalone misconfiguration.
-        if not agent_cfg.get("use_empirical_dynamics", False) and not is_classic:
+        use_empirical_dynamics = agent_cfg.get(
+            "use_empirical_dynamics", empirical_dynamics_cfg.get("use_empirical_dynamics", False)
+        )
+        if not use_empirical_dynamics and not is_classic:
             raise ValueError(
                 "Analytical dynamics (use_empirical_dynamics=False) is only valid for "
                 "classic envs that expose an analytical get_f_and_B. Isaac Sim envs have "
                 "no analytical dynamics — set use_empirical_dynamics=True (pass "
                 "--use_empirical_dynamics) and let the agent train NeuralDynamics online."
             )
-            
+
         x_dim = getattr(raw_env, "x_dim", None)
         u_dim = getattr(raw_env, "u_dim", None)
         # angle_idx: indices within an x-block that hold a raw (wrapping) angle.
@@ -476,7 +485,10 @@ class ContractionRunner:
         # any _setup_* mutates agent_cfg/trainer_cfg/models_cfg in place — see
         # contraction_metrics.log_raw_config for why this is logged separately
         # from skrl's own dataclass-based wandb config.
-        raw_cfg_snapshot = copy.deepcopy({"agent": agent_cfg, "trainer": trainer_cfg, "models": models_cfg})
+        raw_cfg_snapshot = copy.deepcopy({
+            "agent": agent_cfg, "trainer": trainer_cfg, "models": models_cfg,
+            "cm": cm_cfg, "cmg": cmg_cfg, "empirical_dynamics": empirical_dynamics_cfg,
+        })
 
         if algo in ("c3m",):
             self._setup_c3m(skrl_env, device, obs_space, state_space, act_space,
@@ -496,13 +508,8 @@ class ContractionRunner:
             self._setup_c2rl(skrl_env, device, obs_space, state_space, act_space,
                              agent_cfg, trainer_cfg, models_cfg, memory_cfg, get_rollout, get_f_and_B, x_dim, u_dim,
                              base_algorithm=("PPO" if algo == "c2rl-ppo" else "SAC"), angle_idx=angle_idx,
-                             raw_cfg_snapshot=raw_cfg_snapshot)
-        elif algo in ("c4m-ppo", "c4m-sac"):
-            # base_algorithm derived from the algo string, same convention as C2RL.
-            self._setup_c4m(skrl_env, device, obs_space, state_space, act_space,
-                            agent_cfg, trainer_cfg, models_cfg, memory_cfg, get_rollout, get_f_and_B, x_dim, u_dim,
-                            base_algorithm=("PPO" if algo == "c4m-ppo" else "SAC"), angle_idx=angle_idx,
-                            raw_cfg_snapshot=raw_cfg_snapshot)
+                             raw_cfg_snapshot=raw_cfg_snapshot,
+                             cm_cfg=cm_cfg, cmg_cfg=cmg_cfg, empirical_dynamics_cfg=empirical_dynamics_cfg)
 
     def _setup_c3m(self, env, device, obs_space, state_space, act_space,
                    agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None,
@@ -590,16 +597,32 @@ class ContractionRunner:
 
     def _setup_c2rl(self, env, device, obs_space, state_space, act_space,
                     agent_cfg, trainer_cfg, models_cfg, memory_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None,
-                    base_algorithm: str = "PPO", angle_idx=None, raw_cfg_snapshot=None):
+                    base_algorithm: str = "PPO", angle_idx=None, raw_cfg_snapshot=None,
+                    cm_cfg=None, cmg_cfg=None, empirical_dynamics_cfg=None):
+        """Build a single-policy C2RLAgent. ``use_cmg`` selects the metric source:
+        False (default) → contraction-metric SDP solved online per rollout state
+        (no CMG network); True → a CMG network fit offline by solving the SDP over
+        sampled states and regressing onto {x -> W*}, then frozen (Tsukamoto NCM).
+
+        ``cm_cfg``/``cmg_cfg``/``empirical_dynamics_cfg`` are the yaml's
+        top-level ``cm:``/``cmg:``/``empirical_dynamics:`` blocks — merged into
+        ``agent_cfg`` here so C2RLAgent (which reads its full raw cfg dict as
+        one flat namespace, see ``C2RLPPOCfg``/``C2RLSACCfg``) doesn't need to
+        know they came from separate yaml sections. Kept out of ``agent:`` in
+        the yaml purely so the contraction-metric / CMG-synthesis /
+        empirical-dynamics knobs each read as their own config unit.
+        """
         angle_idx = list(angle_idx or [])
-        from contractionRL.agents.skrl.models import MetricNetwork
         from contractionRL.agents.skrl.c2rl import C2RLAgent, C2RLSkrlTrainer, C2RLTrainerCfg
 
-        base_algorithm = base_algorithm.upper()
-        con_only = bool(agent_cfg.get("con_only", False))
+        agent_cfg = {**agent_cfg, **(cm_cfg or {}), **(cmg_cfg or {}), **(empirical_dynamics_cfg or {})}
 
-        # For PPO, con_memory/opt_memory hold exactly one rollout epoch's transitions
-        # and are reset every epoch. For SAC, they act as persistent replay buffers.
+        base_algorithm = base_algorithm.upper()
+        use_cmg = bool(agent_cfg.get("use_cmg", False))
+
+        # Phase B's memory: PPO's is exactly one rollout epoch (sized by
+        # agent.rollouts); SAC's is a persistent replay buffer, sized via the
+        # yaml's memory.memory_size (same convention as C3M — see C2RLAgent).
         mem_size = memory_cfg.get("memory_size", -1)
         rollouts = agent_cfg.get("rollouts", 300)
         if base_algorithm == "PPO" and mem_size not in (-1, rollouts):
@@ -608,34 +631,34 @@ class ContractionRunner:
                 f"determined, same as agent:rollouts) or exactly match agent.rollouts "
                 f"({rollouts}) for PPO."
             )
+        agent_cfg["memory_size"] = mem_size
 
-        # We pass mem_size via memory_cfg into C2RLAgent constructor
-
-        con_policy = _build_gaussian_policy(models_cfg, "con_policy", obs_space, state_space, act_space,
-                                            device, x_dim, angle_idx, agent_class=f"C2RL-{base_algorithm}")
-        opt_policy = None if con_only else _build_gaussian_policy(
-            models_cfg, "opt_policy", obs_space, state_space, act_space,
-            device, x_dim, angle_idx, agent_class=f"C2RL-{base_algorithm}")
-
-        cmg_net = models_cfg.get("cmg", {}).get("network", [{}])
-        cmg_hd = cmg_net[0].get("layers", [256, 256]) if cmg_net else [256, 256]
-        cmg_act = cmg_net[0].get("activations", "tanh") if cmg_net else "tanh"
-        constrain_eigenvalues = cmg_net[0].get("constrain_eigenvalues", False) if cmg_net else False
         w_lb = agent_cfg.get("w_lb", 0.1)
         w_ub = agent_cfg.get("w_ub", 10.0)
-        cmg_model = MetricNetwork(
-            obs_space, act_space, device, hidden_dim=cmg_hd, activation=cmg_act,
-            x_dim=x_dim, angle_idx=angle_idx, constrain_eigenvalues=constrain_eigenvalues, w_lb=w_lb, w_ub=w_ub,
-        )
+        models = {}
+        cmg_model = None
 
-        models = {"con_policy": con_policy, "cmg": cmg_model}
-        if opt_policy is not None:
-            models["opt_policy"] = opt_policy
+        # use_cmg=True: build a CMG network (MetricModel) that will be FIT offline
+        # by solving the contraction-metric SDP over sampled states and regressing
+        # onto {x -> W*} (see C2RLAgent.synthesize_cmg). No throwaway C3M
+        # controller is needed — the SDP produces the targets directly. use_cmg=
+        # False: no CMG network; the SDP is solved online per rollout state.
+        if use_cmg:
+            from contractionRL.agents.skrl.models import MetricModel
+            cmg_net = models_cfg.get("cmg", {}).get("network", [{}])
+            cmg_hd = cmg_net[0].get("layers", [256, 256]) if cmg_net else [256, 256]
+            cmg_act = cmg_net[0].get("activations", "tanh") if cmg_net else "tanh"
+            constrain_eigenvalues = cmg_net[0].get("constrain_eigenvalues", False) if cmg_net else False
+            cmg_model = MetricModel(
+                obs_space, act_space, device, hidden_dim=cmg_hd, activation=cmg_act,
+                x_dim=x_dim, angle_idx=angle_idx, constrain_eigenvalues=constrain_eigenvalues, w_lb=w_lb, w_ub=w_ub,
+            )
+            models["cmg"] = cmg_model
 
-        # NeuralDynamics (learned ẋ = f(x) + B(x)·u) — same mechanism as C3M.
-        # Built only when learning dynamics (use_empirical_dynamics=True). For Isaac
-        # envs it is the ONLY source of f/B; classic envs default to analytical
-        # (use_empirical_dynamics=False) and ignore it.
+        # NeuralDynamics (learned ẋ = f(x) + B(x)·u) — feeds the contraction-metric
+        # SDP (online per state when use_cmg=False, over the offline dataset when
+        # use_cmg=True). Built only when learning dynamics (use_empirical_dynamics=
+        # True); Isaac envs' sole f/B source, classic envs default to analytical.
         if "dynamics" in models_cfg and agent_cfg.get("use_empirical_dynamics", False):
             from contractionRL.agents.skrl.nn_modules import NeuralDynamics
             dyn_net = models_cfg["dynamics"].get("network", [{}])[0]
@@ -643,25 +666,20 @@ class ContractionRunner:
             dyn_act = dyn_net.get("activations", "relu")
             models["dynamics"] = NeuralDynamics(x_dim, u_dim, hidden_dim=dyn_hd, activation=dyn_act, device=device, angle_idx=angle_idx)
 
-        # con_value/opt_value (PPO) and con_critic_*/opt_critic_* (SAC) all see
-        # obs with the SAME angle-bearing x/xref blocks as the policy — embed
-        # their input identically (EmbeddedDeterministicModel; see models.py).
-        # Q-models additionally concatenate the RAW action (never angle-valued).
-        models.update(_build_critics(models_cfg, "con_critic", base_algorithm, obs_space, act_space,
-                                     device, x_dim, angle_idx, key_prefix="con_"))
-        if opt_policy is not None:
-            models.update(_build_critics(models_cfg, "opt_critic", base_algorithm, obs_space, act_space,
-                                         device, x_dim, angle_idx, key_prefix="opt_"))
+        # Phase B deployed policy + critic — control/mlp backbone dispatch, same
+        # as C3M's. Value (PPO) / twin-Q + targets (SAC) see the SAME
+        # angle-bearing x/xref blocks as the policy and embed them identically.
+        models["policy"] = _build_gaussian_policy(models_cfg, "policy", obs_space, state_space, act_space,
+                                                  device, x_dim, angle_idx, agent_class=f"C2RL-{base_algorithm}")
+        models.update(_build_critics(models_cfg, "critic", base_algorithm, obs_space, act_space,
+                                     device, x_dim, angle_idx, key_prefix=""))
 
         # Pass the RAW agent_cfg dict (not a pre-parsed C2RLPPOCfg/C2RLSACCfg) —
-        # C2RLAgent keeps the full dict in self._raw_cfg, which is what
-        # _make_base_cfg() later filters against PPO_CFG/SAC_CFG. Pre-parsing
-        # first would silently drop any PPO- or SAC-specific field not ALSO
-        # declared on the matching C2RL cfg dataclass (this bit us for
-        # base_algorithm before it became an explicit constructor kwarg — see
-        # C2RLAgent.__init__).
-        agent_cfg["memory_size"] = mem_size
-        agent_cfg["cmg_memory_size"] = memory_cfg.get("cmg_memory_size", 131072)
+        # C2RLAgent keeps the full dict in self._raw_cfg, which make_base_rl_cfg()
+        # later filters against PPO_CFG/SAC_CFG. Pre-parsing first would silently
+        # drop any PPO/SAC-specific field not ALSO declared on the matching C2RL
+        # cfg dataclass (this bit us for base_algorithm before it became an
+        # explicit constructor kwarg — see C2RLAgent.__init__).
         agent = C2RLAgent(
             cfg=agent_cfg,
             models=models,
@@ -678,7 +696,6 @@ class ContractionRunner:
             angle_idx=angle_idx,
         )
         trainer_cfg.setdefault("timesteps", 300000)
-        trainer_cfg.setdefault("rollouts", agent_cfg.get("rollouts", 300))
         trainer = C2RLSkrlTrainer(
             cfg=C2RLTrainerCfg(**_filter_cfg_fields(trainer_cfg, C2RLTrainerCfg, context="ContractionRunner trainer")),
             env=env,
@@ -690,99 +707,16 @@ class ContractionRunner:
         self._env = env
         self._mode = "c2rl"
 
-        # C2RL's certificate is trained against con_policy (gamma_con);
-        # the PathTracking figure shows whichever policy act() actually deploys
-        # — opt_policy (gamma_opt) unless con_only.
-        deployed_gamma = agent_cfg.get("gamma_con", 0.0) if con_only else agent_cfg.get("gamma_opt", 0.99)
-        if hasattr(env, "set_contraction_certificate"):
-            env.set_contraction_certificate(
-                agent_cfg.get("lbd"),
-                discount_factor=deployed_gamma,
-                static_metric_bounds=(1.0 / w_lb, 1.0 / w_ub),
-                cmg_bounds_fn=_make_cmg_bounds_fn(cmg_model, w_lb),
-            )
-
-    def _setup_c4m(self, env, device, obs_space, state_space, act_space,
-                   agent_cfg, trainer_cfg, models_cfg, memory_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None,
-                   base_algorithm: str = "PPO", angle_idx=None, raw_cfg_snapshot=None):
-        angle_idx = list(angle_idx or [])
-        from contractionRL.agents.skrl.c4m import C4MAgent, C4MSkrlTrainer, C4MTrainerCfg
-
-        base_algorithm = base_algorithm.upper()
-
-        # Phase B's memory: PPO's is exactly one rollout epoch (sized by
-        # agent.rollouts); SAC's is a persistent replay buffer, sized via the
-        # yaml's memory.memory_size (same convention as C2RL — see C4MAgent).
-        mem_size = memory_cfg.get("memory_size", -1)
-        rollouts = agent_cfg.get("rollouts", 300)
-        if base_algorithm == "PPO" and mem_size not in (-1, rollouts):
-            raise ValueError(
-                f"[C4M] memory.memory_size={mem_size} must be -1 (automatically "
-                f"determined, same as agent:rollouts) or exactly match agent.rollouts "
-                f"({rollouts}) for PPO."
-            )
-        agent_cfg["memory_size"] = mem_size
-
-        # Phase A models: same C3M-style policy/cmg/(optional) dynamics build
-        # as pure C3M, but reading the "c3m_policy" yaml block (not "policy" —
-        # that key is the DEPLOYED Phase B policy below).
-        c3m_built = _build_c3m_models(models_cfg, agent_cfg, obs_space, act_space, device,
-                                      x_dim, u_dim, angle_idx, policy_key="c3m_policy")
-        models = {"c3m_policy": c3m_built["policy"], "cmg": c3m_built["cmg"]}
-        if "dynamics" in c3m_built:
-            models["dynamics"] = c3m_built["dynamics"]
-
-        # Phase B deployed policy — same backbone dispatch C2RL's con/opt
-        # policies use.
-        models["policy"] = _build_gaussian_policy(models_cfg, "policy", obs_space, state_space, act_space,
-                                                  device, x_dim, angle_idx, agent_class=f"C4M-{base_algorithm}")
-        models.update(_build_critics(models_cfg, "critic", base_algorithm, obs_space, act_space,
-                                     device, x_dim, angle_idx, key_prefix=""))
-
-        w_lb = agent_cfg.get("w_lb", 0.1)
-        w_ub = agent_cfg.get("w_ub", 10.0)
-
-        # Pass the RAW agent_cfg dict (not a pre-parsed C4MPPOCfg/C4MSACCfg) —
-        # C4MAgent keeps the full dict in self._raw_cfg, which is what
-        # make_base_rl_cfg() later filters against PPO_CFG/SAC_CFG. Pre-parsing
-        # first would silently drop any PPO- or SAC-specific field not ALSO
-        # declared on the matching C4M cfg dataclass — same pitfall as C2RL's
-        # base_algorithm handling (see C2RLAgent.__init__).
-        agent = C4MAgent(
-            cfg=agent_cfg,
-            models=models,
-            observation_space=obs_space,
-            state_space=state_space,
-            action_space=act_space,
-            device=device,
-            get_rollout=get_rollout,
-            get_f_and_B=get_f_and_B,
-            base_algorithm=base_algorithm,
-            x_dim=x_dim,
-            u_dim=u_dim,
-            num_envs=env.num_envs,
-            angle_idx=angle_idx,
-        )
-        trainer_cfg.setdefault("timesteps", 300000)
-        trainer_cfg.setdefault("rollouts", agent_cfg.get("rollouts", 300))
-        trainer = C4MSkrlTrainer(
-            cfg=C4MTrainerCfg(**_filter_cfg_fields(trainer_cfg, C4MTrainerCfg, context="ContractionRunner trainer")),
-            env=env,
-            agents=agent,
-        )
-        self._agent = agent
-        self._trainer = trainer
-        self._trainer._wandb_raw_cfg = raw_cfg_snapshot
-        self._env = env
-        self._mode = "c4m"
-
-        # C4M has a single deployed (Phase B) policy — no con_only branch.
+        # Single deployed (Phase B) policy. The PathTracking figure's theoretical
+        # bound inflates by 1/(1-discount_factor). With use_cmg the plotted
+        # certificate reads the CMG's per-state metric bounds; without it (online
+        # CM, no metric network) it falls back to the static [1/w_lb, 1/w_ub].
         if hasattr(env, "set_contraction_certificate"):
             env.set_contraction_certificate(
                 agent_cfg.get("lbd"),
                 discount_factor=agent_cfg.get("discount_factor", 0.99),
                 static_metric_bounds=(1.0 / w_lb, 1.0 / w_ub),
-                cmg_bounds_fn=_make_cmg_bounds_fn(c3m_built["cmg"], w_lb),
+                cmg_bounds_fn=_make_cmg_bounds_fn(cmg_model, w_lb) if cmg_model is not None else None,
             )
 
     # ── public interface ────────────────────────────────────────────────── #

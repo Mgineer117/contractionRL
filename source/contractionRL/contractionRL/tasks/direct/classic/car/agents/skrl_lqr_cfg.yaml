@@ -2,8 +2,6 @@ seed: 42  # Random seed for reproducibility
 
 agent:
   class: LQR
-  batch_size: 2048
-  minibatch_size: 2048
   Q_scaler: 1.0
   R_scaler: 0.0
   experiment:

@@ -62,10 +62,10 @@ agent:
   mini_batches: 4
   discount_factor: 0.99
   gae_lambda: 0.95
-  learning_rate: 1.0e-5
+  learning_rate: 1.0e-6
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.008
+    kl_threshold: 0.01
   use_state_norm: false
   use_value_norm: true
   random_timesteps: 0
@@ -73,9 +73,9 @@ agent:
   grad_norm_clip: 0.5
   ratio_clip: 0.2
   value_clip: 0.0
-  entropy_loss_scale: 0.01
+  entropy_loss_scale: 0.001
   value_loss_scale: 0.5
-  kl_threshold: 0.016
+  kl_threshold: 0.02
   rewards_shaper_scale: 1.0
   time_limit_bootstrap: true
   # Manual log_std annealing (off by default — entropy_loss_scale above is the
@@ -88,7 +88,7 @@ agent:
   experiment:
     directory: "humanoid_path_tracking"
     experiment_name: ""
-    write_interval: auto
+    write_interval: "auto"  # Logging frequency for tensorboard/W&B (in epochs/steps)
     checkpoint_interval: auto
 
 

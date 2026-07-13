@@ -46,7 +46,7 @@ YAML policy config:
 
     policy:
       class: GaussianMixin
-      backbone: mlp-squashed      # tanh-squashed plain-MLP actor (SquashedGaussianActorModel).
+      backbone: mlp-squashed      # tanh-squashed plain-MLP actor (SquashedMLPActorModel).
                                    # Adds uref like "mlp" does IF the observation layout has one
                                    # ([x, xref, uref]); otherwise (e.g. velocity-tracking) it's a
                                    # plain squashed MLP over the full observation. State-dependent
@@ -149,7 +149,7 @@ def _gaussian_factory(observation_space, state_space, action_space, device,
         import gymnasium
         obs_dim = observation_space.shape[0]
         act_dim = action_space.shape[0]
-        # ControllerNetwork requires obs layout [x, x_ref, u_ref]: obs_dim == 2*x_dim + u_dim
+        # CLActorModel requires obs layout [x, x_ref, u_ref]: obs_dim == 2*x_dim + u_dim
         # and x_dim must be an integer
         remainder = obs_dim - act_dim
         if remainder <= 0 or remainder % 2 != 0:
@@ -158,13 +158,13 @@ def _gaussian_factory(observation_space, state_space, action_space, device,
                 f"obs_dim={obs_dim}, act_dim={act_dim} (remainder={remainder} is not even). "
                 f"Use backbone: mlp for velocity-tracking environments."
             )
-        from contractionRL.agents.skrl.models import ControllerNetwork
+        from contractionRL.agents.skrl.models import CLActorModel
         network = kwargs.pop("network", [{}])
         hidden_dim = network[0].get("layers", [128, 128]) if network else [128, 128]
         kwargs.pop("output", None)
         kwargs.pop("initial_log_std", None)
 
-        return ControllerNetwork(
+        return CLActorModel(
             observation_space=observation_space,
             action_space=action_space,
             device=device,
@@ -197,7 +197,7 @@ def _gaussian_factory(observation_space, state_space, action_space, device,
         )
 
     if backbone == "mlp-squashed":
-        from contractionRL.agents.skrl.models import SquashedGaussianActorModel
+        from contractionRL.agents.skrl.models import SquashedMLPActorModel
         network = kwargs.pop("network", [{}])
         hidden_dim = network[0].get("layers", [256, 256]) if network else [256, 256]
         activation = network[0].get("activations", "relu") if network else "relu"
@@ -207,7 +207,7 @@ def _gaussian_factory(observation_space, state_space, action_space, device,
         # keys (meaningful for the other backbones above) don't apply here.
         kwargs.pop("initial_log_std", None)
         kwargs.pop("clip_actions", None)
-        return SquashedGaussianActorModel(
+        return SquashedMLPActorModel(
             observation_space=observation_space,
             action_space=action_space,
             device=device,

@@ -141,10 +141,13 @@ import gymnasium as gym
 import yaml
 
 algorithm = args_cli.algorithm.lower()
+# Bare "c2rl" (no -ppo/-sac suffix) defaults to the PPO variant, since it has
+# no standalone (non-suffixed) config entry point registered.
+if algorithm in ("c2rl",):
+    algorithm = f"{algorithm}_ppo"
 _CONTRACTION_ALGOS = {
     "c3m", "lqr", "sdlqr",
     "c2rl-ppo", "c2rl-sac", "c2rl_ppo", "c2rl_sac",
-    "c4m-ppo", "c4m-sac", "c4m_ppo", "c4m_sac",
 }
 
 # Algorithm-aware num_envs defaults (used when --num_envs is not given).
@@ -152,7 +155,7 @@ _CONTRACTION_ALGOS = {
 # same way SAC does) need far fewer parallel envs; PPO-based algorithms are
 # on-policy and benefit from massively parallel envs. Applies to both the
 # classic gymnasium route and the Isaac Sim route.
-_SAC_LIKE_ALGOS = {"sac", "c2rl-sac", "c2rl_sac", "c4m-sac", "c4m_sac", "c3m", "lqr", "sdlqr"}
+_SAC_LIKE_ALGOS = {"sac", "c2rl-sac", "c2rl_sac", "c3m", "lqr", "sdlqr"}
 _DEFAULT_NUM_ENVS_SAC = 64
 _DEFAULT_NUM_ENVS_PPO_CLASSIC = 1024
 
@@ -850,7 +853,7 @@ if _is_classic:
     # Classic contraction envs use the env's exact analytical get_f_and_B by
     # default (use_empirical_dynamics=False); pass --use_empirical_dynamics to
     # learn a NeuralDynamics instead. Classic envs only (Isaac forces empirical).
-    if algorithm in ["c3m", "c2rl_ppo", "c2rl_sac", "c4m_ppo", "c4m_sac", "lqr", "sdlqr"]:
+    if algorithm in ["c3m", "c2rl_ppo", "c2rl_sac", "lqr", "sdlqr"]:
         agent_cfg["agent"]["use_empirical_dynamics"] = args_cli.use_empirical_dynamics
 
     _run_ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")

@@ -65,7 +65,7 @@ class PathTrackingBase(DirectRLEnv):
     angle_idx: "Sequence[int]" = ()
 
     # ── Divergence guard ────────────────────────────────────────────────── #
-    # An initially unstable policy (random init, or C2RL's con_policy early on)
+    # An initially unstable policy (random init, or C2RL's policy early on)
     # can drive the sim to a non-finite / exploded physical state. Rather than
     # terminating the episode to recover (which would truncate the very
     # trajectory the contraction metrics are fit over), any non-finite element
@@ -203,10 +203,9 @@ class PathTrackingBase(DirectRLEnv):
                 *discounted* objective enforces the certificate on average
                 rather than as a hard per-step constraint. None (or 0) for
                 C3M, which has no discounting at all — gamma > 0 only for an
-                RL-trained policy (C2RL's con_policy/opt_policy). For C2RL use
-                gamma_opt unless running con_only, in which case
-                gamma_con — i.e. whichever policy's rollout the figure
-                is actually showing.
+                RL-trained policy (C2RL's deployed policy uses its
+                discount_factor — i.e. the policy whose rollout the figure
+                is actually showing).
             static_metric_bounds: (m_bar, m_underbar) from the CMG's configured
                 w_lb/w_ub (m_bar=1/w_lb, m_underbar=1/w_ub) — the THEORETICAL
                 bound's fixed conditioning factor.
@@ -345,12 +344,18 @@ class PathTrackingBase(DirectRLEnv):
             )
         return self._dynamics_model.get_f_and_B(x)
 
-    def get_rollout(self, buffer_size: int, mode: str) -> dict:
+    def get_rollout(self, buffer_size: int, mode: str, num_control_per_state: int | None = None) -> dict:
         """Sample random (x, xref, uref) triples for C3M-style contraction synthesis.
 
         Samples reference states from the trajectory buffer, adding bounded
         Gaussian noise to produce actual states that deviate from the reference.
         Returns numpy float32 arrays (required by mjrl's to_tensor()).
+
+        ``num_control_per_state`` is a classic-env-only knob (see
+        ``env_base.get_rollout``) accepted here purely so callers can pass it
+        uniformly across both env families — Isaac's dynamics rollout draws
+        real consecutive-step transitions from the trajectory buffer, so there
+        is no "controls per state" tiling to configure; the argument is ignored.
         """
         if mode == "dynamics":
             return self._get_dynamics_rollout(buffer_size)

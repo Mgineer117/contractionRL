@@ -62,6 +62,39 @@ python -m pip install -e source/contractionRL
 python -c "import torch, scipy, gymnasium, skrl; print('OK')"
 ```
 
+### 5. (Optional) MOSEK — a higher-accuracy SDP solver for C2RL
+
+C2RL's contraction-metric SDP (`cm_solver` in the yaml's `cm:` block — see
+[cm_synthesis.py](source/contractionRL/contractionRL/agents/skrl/cm_synthesis.py))
+defaults to **SCS**, an open-source solver that needs no license and is already
+installed via the `cvxpy` dependency above. **MOSEK** is a commercial
+interior-point solver — the one Tsukamoto's original Neural Contraction Metric
+code uses — that gives materially tighter/more accurate SDP solutions if you
+have a license. `pip install -e source/contractionRL` already installs the
+`mosek` Python package, but it won't actually solve anything until you add a
+license file:
+
+1. **Get a license** — free for academic email addresses:
+   https://www.mosek.com/products/academic-licenses/ (or a trial/commercial
+   license from the same site). MOSEK emails you a `mosek.lic` file.
+2. **Place the license file**:
+   ```bash
+   mkdir -p ~/mosek
+   mv /path/to/downloaded/mosek.lic ~/mosek/mosek.lic
+   ```
+   (or set `MOSEKLM_LICENSE_FILE=/path/to/mosek.lic` instead of using the
+   default location).
+3. **Verify cvxpy sees it**:
+   ```bash
+   python -c "import cvxpy as cp; print(cp.installed_solvers())"  # should list MOSEK
+   ```
+4. **Use it** — set `cm_solver: MOSEK` in the yaml's `cm:` block for whichever
+   C2RL config you're running (e.g.
+   [skrl_c2rl_ppo_cfg.yaml](source/contractionRL/contractionRL/tasks/direct/classic/car/agents/skrl_c2rl_ppo_cfg.yaml)).
+
+Without a license, leave `cm_solver: SCS` (the shipped default) — it needs no
+extra setup.
+
 ---
 
 ## Listing Environments

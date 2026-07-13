@@ -1,6 +1,6 @@
-"""Shared glue used across contraction agents (C3M/SDLQR/LQR/C2RL/C4M) and the
+"""Shared glue used across contraction agents (C3M/SDLQR/LQR/C2RL) and the
 ContractionRunner: raw-dict -> dataclass config filtering, plus the
-CMG-derived Mahalanobis reward machinery shared by C2RL/C4M specifically.
+CMG-derived Mahalanobis reward machinery used by C2RL's use_cmg path.
 
 Extracted verbatim from C2RLAgent (see c2rl.py's module docstring for the full
 normalization rationale) so algorithms call the SAME code instead of copies
@@ -101,9 +101,9 @@ def make_base_rl_cfg(
     x_dim: int,
     u_dim: int,
 ) -> dict:
-    """Project a raw C2RL/C4M-style config dict down to a real PPO_CFG/SAC_CFG dict.
+    """Project a raw C2RL-style config dict down to a real PPO_CFG/SAC_CFG dict.
 
-    Passing C2RL/C4M/CMG-specific keys (W_lr, lbd, gamma_*, ...) to
+    Passing C2RL/CMG-specific keys (W_lr, lbd, use_cmg, ...) to
     PPO_CFG(**cfg) / SAC_CFG(**cfg) would raise TypeError, since those are
     kw_only dataclasses that reject unknown kwargs. Also rebuilds `experiment`
     as a plain dict (the raw value may be an ExperimentCfg object, which is not
@@ -156,7 +156,7 @@ def make_base_rl_cfg(
     # through skrl's Runner._process_cfg. None of that runs here — these
     # agents are built directly, bypassing Runner entirely — so replicate it
     # explicitly: same class, same opt-out flags. Default OFF (see the
-    # C2RLPPOCfg/C2RLSACCfg/C4MCfg field defaults): a config that omits the
+    # C2RLPPOCfg/C2RLSACCfg field defaults): a config that omits the
     # key gets no observation normalization.
     if raw_cfg.get("use_state_norm", False):
         from contractionRL.agents.skrl.preprocessors import PathTrackingObservationScaler

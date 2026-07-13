@@ -23,8 +23,19 @@ INSTALL_REQUIRES = [
     "wandb",
     "gymnasium",
     "scipy",
+    # convex (SDP) solve for C2RL's online CM metric (use_cmg=False; agents/skrl/cm_synthesis.py).
+    # Pinned <1.7: cvxpy 1.7+ hard-requires numpy>=2.0 and osqp>=1.0, which conflict with the
+    # Isaac Sim/Lab pins (numpy<2, osqp==0.6.7.post3). 1.6.x supports numpy 1.26 + osqp 0.6.x and
+    # still ships the SCS solver C2RL uses.
+    "cvxpy<1.7",
     "matplotlib",
-    "tensorboard"
+    "tensorboard",
+    # Optional interior-point SDP solver for C2RL's contraction-metric SDP
+    # (cm_solver: MOSEK in the yaml's `cm:` block; default is cm_solver: SCS,
+    # which needs no license). The `mosek` package installs fine on its own,
+    # but actually SOLVING with it needs a license file — see README.md's
+    # Installation section for how to get and install one.
+    "mosek",
 ]
 
 # Installation operation

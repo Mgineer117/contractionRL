@@ -136,7 +136,6 @@ class CLActor(nn.Module):
         self,
         x_dim: int,
         u_dim: int,
-        mode: str = "deterministic",
         anneal_stddev: bool = False,
         hidden_dim: list[int] | None = None,
         activation: nn.Module | str = nn.Tanh(),
@@ -145,9 +144,7 @@ class CLActor(nn.Module):
         super().__init__()
         self.x_dim = x_dim
         self.u_dim = u_dim
-        self.mode = mode
         self.angle_idx = list(angle_idx)
-        assert mode in ("deterministic", "stochastic")
 
         if isinstance(activation, str):
             activation = {"tanh": nn.Tanh(), "relu": nn.ReLU()}[activation.lower()]
@@ -157,7 +154,7 @@ class CLActor(nn.Module):
         # w1/w2 see the CONTINUOUS embedding of [x, xref] (each block embedded
         # independently); the bilinear feedback error e = x - xref stays RAW
         # (only its angle dims get shortest-angle WRAPPED, not embedded) — see
-        # mean_control/forward below.
+        # mean_control below.
         input_dim = 2 * embedded_dim(x_dim, self.angle_idx)
 
         self.w1 = MLP(input_dim, hidden, self.c * x_dim, activation=activation)
@@ -192,34 +189,6 @@ class CLActor(nn.Module):
         w2 = self.w2(x_xref).reshape(n, self.u_dim, self.c)
         l1 = F.tanh(torch.matmul(w1, e))
         return uref + torch.matmul(w2, l1).squeeze(-1)
-
-    def forward(self, state: torch.Tensor):
-        x, xref, uref = self.trim_state(state)
-        x_xref = torch.cat((embed_angles(x, self.angle_idx), embed_angles(xref, self.angle_idx)), dim=-1)
-        n = x.shape[0]
-        e = wrap_diff(x - xref, self.angle_idx).unsqueeze(-1)
-        w1 = self.w1(x_xref).reshape(n, self.c, self.x_dim)
-        w2 = self.w2(x_xref).reshape(n, self.u_dim, self.c)
-        l1 = F.tanh(torch.matmul(w1, e))
-        mu = uref + torch.matmul(w2, l1).squeeze(-1)
-
-        if self.mode == "deterministic":
-            zeros = torch.zeros(n, 1, device=state.device)
-            return mu, {"dist": None, "logprobs": zeros, "entropy": zeros}
-
-        logstd = torch.clamp(self.logstd, _MIN_LOG_STD, 2)
-        std = logstd.exp().expand_as(mu)
-        dist = Normal(mu, std)
-        u = dist.rsample()
-        logprobs = dist.log_prob(u).sum(-1, keepdim=True)
-        entropy = dist.entropy().sum(-1, keepdim=True)
-        return u, {"dist": dist, "logprobs": logprobs, "entropy": entropy}
-
-    def log_prob(self, dist, controls):
-        return dist.log_prob(controls).sum(-1, keepdim=True)
-
-    def entropy(self, dist):
-        return dist.entropy().sum(-1, keepdim=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────── #

@@ -13,11 +13,11 @@ models:
   policy:
     class: DeterministicMixin  # Outputs deterministic continuous values
     backbone: contraction
-    clip_actions: false  # MUST stay false: C3M's contraction certificate (pd_loss/c1_loss in
-                        # _compute_loss) proves Cu ≺ 0 for the UNCLAMPED closed-loop u = mean_control(x)
-                        # -- clamping only at real env-step time (here) would deploy a saturated
-                        # system training never certified, which can genuinely diverge once the
-                        # feedback needs more authority than [UREF_MIN, UREF_MAX] to correct error.
+    clip_actions: true  # _compute_loss now clamps u to these same bounds before building Cu/K
+                        # (see policy_model._d_clip_actions in c3m.py), so pd_loss/c1_loss certify
+                        # the actual DEPLOYED (clamped) controller instead of an infeasible one --
+                        # K goes to zero wherever u saturates (clamp has no gradient there), which
+                        # is intentional: an infeasible action is never credited with contracting.
     network:
     - name: net
       input: OBSERVATIONS

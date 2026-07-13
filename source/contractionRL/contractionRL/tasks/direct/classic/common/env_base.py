@@ -426,8 +426,14 @@ class BaseEnv(gym.Env):
         reward = (0.5 * tracking_reward) + (0.5 * control_reward)
         return reward, {"tracking_error": tracking_error, "control_effort": control_effort}
 
-    def get_rollout(self, buffer_size: int, mode: str):
-        """Sample random (x, xref, uref) triples for C3M-style synthesis."""
+    def get_rollout(self, buffer_size: int, mode: str, num_control_per_state: int | None = None):
+        """Sample random (x, xref, uref) triples for C3M-style synthesis.
+
+        ``num_control_per_state`` (``mode="dynamics"`` only) — how many distinct
+        control vectors get paired with each sampled state (C3M/C2RL's
+        ``num_controls_per_state``); defaults to 3 (the old hardcoded value) when
+        not given, e.g. by a caller unaware of the config knob.
+        """
         if mode == "c3m":
             xref = (self.X_MAX - self.X_MIN).flatten() * np.random.rand(
                 buffer_size, self.num_dim_x
@@ -446,7 +452,7 @@ class BaseEnv(gym.Env):
             }
 
         # dynamics-learning rollout (uniform/gaussian random control-affine samples)
-        n_control_per_x = 3
+        n_control_per_x = num_control_per_state if num_control_per_state is not None else 3
         batch_size = ceil(buffer_size / n_control_per_x)
         if self.sample_mode == "Gaussian":
             x_mean = (self.X_MAX.flatten() + self.X_MIN.flatten()) / 2.0

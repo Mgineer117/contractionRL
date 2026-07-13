@@ -17,7 +17,5 @@ gym.register(
         "skrl_sdlqr_cfg_entry_point": f"{agents.__name__}:skrl_sdlqr_cfg.yaml",
         "skrl_c2rl_ppo_cfg_entry_point": f"{agents.__name__}:skrl_c2rl_ppo_cfg.yaml",
         "skrl_c2rl_sac_cfg_entry_point": f"{agents.__name__}:skrl_c2rl_sac_cfg.yaml",
-        "skrl_c4m_ppo_cfg_entry_point": f"{agents.__name__}:skrl_c4m_ppo_cfg.yaml",
-        "skrl_c4m_sac_cfg_entry_point": f"{agents.__name__}:skrl_c4m_sac_cfg.yaml",
     },
 )

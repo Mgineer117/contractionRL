@@ -2,14 +2,8 @@ seed: 42  # Random seed for reproducibility
 models:
   separate: true
 
-memory:
-  class: RandomMemory
-  memory_size: 4096  # Capacity of the experience replay buffer (-1 means dynamic/infinite)
-
 agent:
   class: LQR
-  batch_size: 2048
-  minibatch_size: 2048
   Q_scaler: 1.0
   R_scaler: 0.01
   experiment:

@@ -36,18 +36,18 @@ agent:
   learning_epochs: 5
   mini_batches: 4
   discount_factor: 0.99
-  learning_rate: 1.0e-5
+  learning_rate: 1.0e-6
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.008
+    kl_threshold: 0.01
   random_timesteps: 0
   learning_starts: 0
   grad_norm_clip: 0.5
   ratio_clip: 0.2
   value_clip: 0.0
-  entropy_loss_scale: 0.01
+  entropy_loss_scale: 0.001
   value_loss_scale: 0.5
-  kl_threshold: 0.016
+  kl_threshold: 0.02
   rewards_shaper_scale: 1.0
   time_limit_bootstrap: true
   std_dev_annealing_kwargs:

@@ -89,12 +89,81 @@ def loss_pos_matrix_eigen(A: torch.Tensor, reg: bool = True):
     return loss_eigen, loss_reg
 
 
+def build_lr_scheduler(optimizer: torch.optim.Optimizer, name: str, kwargs: dict | None = None):
+    """Instantiate a ``torch.optim.lr_scheduler`` by class name, or ``None`` if ``name`` is falsy.
+
+    Shared by every pretraining loop that anneals an Adam LR by epoch (C2RL's
+    NeuralDynamics fit in ``dynamics_pretrain.py`` and CMG regression in
+    ``cm_synthesis.regress_cmg``) so they build schedulers the same way — each
+    still configures its OWN ``name``/``kwargs`` independently, this just avoids
+    duplicating the ``getattr(torch.optim.lr_scheduler, ...)`` lookup.
+    """
+    if not name:
+        return None
+    sched_cls = getattr(torch.optim.lr_scheduler, name)
+    return sched_cls(optimizer, **(kwargs or {}))
+
+
 def bound_W(raw_W: torch.Tensor, w_lb: float, x_dim: int, bounded: bool = False) -> torch.Tensor:
     """Add w_lb * I to raw CCM output to ensure strict positive definiteness."""
     if bounded:
         return raw_W
     I = torch.eye(x_dim, device=raw_W.device, dtype=raw_W.dtype)
     return raw_W + w_lb * I
+
+
+def train_val_split(n: int, val_frac: float, device=None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Random ``(train_idx, val_idx)`` index split of ``n`` samples.
+
+    ``val_frac<=0`` returns an empty ``val_idx`` and every index in
+    ``train_idx`` (validation/early-stopping disabled). Shared by
+    ``dynamics_pretrain.pretrain_dynamics`` and ``cm_synthesis.regress_cmg`` so
+    both hold out their fixed pretraining buffer the same way.
+    """
+    perm = torch.randperm(n, device=device)
+    n_val = int(n * val_frac) if val_frac > 0 else 0
+    return perm[n_val:], perm[:n_val]
+
+
+class EarlyStopper:
+    """Tracks a held-out validation loss across epochs and signals when to stop.
+
+    Shared by ``dynamics_pretrain.pretrain_dynamics`` (NeuralDynamics fit) and
+    ``cm_synthesis.regress_cmg`` (CMG regression) — both fit a fixed,
+    once-sampled buffer for a configured epoch budget, but with no held-out
+    signal that budget is just a guess: too many epochs overfits the buffer,
+    too few undershoots it. Holding out a validation split and stopping once
+    its loss stops improving lets the epoch budget be an upper bound instead
+    of the actual stopping point.
+
+    ``patience`` is the number of consecutive non-improving epochs tolerated
+    before stopping (``<=0`` disables early stopping — ``step`` always returns
+    ``False`` and the caller runs the full configured epoch count).
+    """
+
+    def __init__(self, patience: int = 0, min_delta: float = 0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best = float("inf")
+        self.best_epoch = -1
+        self.best_state: dict | None = None
+        self.num_bad_epochs = 0
+
+    def step(self, val_loss: float, model: torch.nn.Module, epoch: int) -> bool:
+        """Record ``val_loss`` for ``epoch``; returns True if training should stop now."""
+        if val_loss < self.best - self.min_delta:
+            self.best = val_loss
+            self.best_epoch = epoch
+            self.best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            self.num_bad_epochs = 0
+        else:
+            self.num_bad_epochs += 1
+        return self.patience > 0 and self.num_bad_epochs >= self.patience
+
+    def restore_best(self, model: torch.nn.Module) -> None:
+        """Load back the state_dict from the best (lowest val_loss) epoch seen."""
+        if self.best_state is not None:
+            model.load_state_dict(self.best_state)
 
 
 def spd_inverse(W: torch.Tensor) -> torch.Tensor:

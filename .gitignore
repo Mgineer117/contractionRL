@@ -78,3 +78,6 @@ tests/
 # TacSL sensor
 **/tactile_record/*
 **/gelsight_r15_data/*
+
+# MOSEK license (personal/academic — see README.md's Installation section)
+mosek.lic
