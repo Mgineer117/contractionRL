@@ -71,6 +71,44 @@ def load_offline_dynamics_data(data_path: str, tag: str = "") -> dict:
     }
 
 
+def load_offline_trajectories(data_path: str, tag: str = "") -> dict:
+    """Load an offline ``dynamics_data.npz`` WITHOUT flattening — returns
+    trajectory-structured ``x`` ``(N, T, x_dim)`` and each trajectory's valid
+    length ``lengths`` ``(N,)``, preserving both the within- and
+    across-trajectory order/boundaries that ``load_offline_dynamics_data``
+    intentionally discards (that loader exists for i.i.d. NeuralDynamics
+    fitting, not for a temporal material-derivative term).
+
+    Used by ``ncm_synthesis.build_cm_dataset``'s ``cm_wdot_trajectory=True``
+    path (see ``C2RLAgent.synthesize_cmg`` / ``c2rl.py``'s ``cm_wdot_trajectory``
+    docstring) to thread a real ``Ẇ ≈ (W̄_t − W̄_{t−1})/dt`` through the CV-STEM
+    SDP using the ACTUAL previous state of the SAME reference trajectory,
+    instead of dropping ``Ẇ`` or using Tsukamoto's static ``(W̄-I)/dt`` proxy.
+
+    Raises if the file has no ``lengths`` array — that means it isn't a
+    trajectory-structured ``dynamics_data.npz`` (see
+    ``scripts/skrl/train.py``'s ``_generate_ref_trajs``), so there is no way
+    to recover per-trajectory boundaries from it. Filters out whole episodes
+    containing any NaN, same as ``load_offline_dynamics_data``.
+    """
+    print(f"{tag} Loading offline reference trajectories from {data_path}")
+    npz = np.load(data_path)
+    if "lengths" not in npz:
+        raise ValueError(
+            f"{tag} {data_path} has no 'lengths' array — it isn't a trajectory-structured "
+            f"dynamics_data.npz (see scripts/skrl/train.py's _generate_ref_trajs), so "
+            f"cm_wdot_trajectory can't recover per-trajectory boundaries from it."
+        )
+    x = npz["x"]
+    lengths = npz["lengths"]
+    nan_mask = np.isnan(x).any(axis=(1, 2))
+    if nan_mask.any():
+        print(f"{tag} WARNING: Found NaNs in {nan_mask.sum()} offline episodes! Filtering them out...")
+        x = x[~nan_mask]
+        lengths = lengths[~nan_mask]
+    return {"x": x.astype(np.float32), "lengths": lengths.astype(np.int64)}
+
+
 def pretrain_dynamics(agent, *, epochs: int, data_path: str | None,
                       timesteps: int, memory_size: int | None = None,
                       num_controls_per_state: int | None = None,
@@ -81,7 +119,7 @@ def pretrain_dynamics(agent, *, epochs: int, data_path: str | None,
     """Pretrain ``agent._neural_dynamics`` for ``epochs`` epochs over a FIXED
     ``memory_size``-sized buffer of ``(x, u, x_dot)`` samples, drawn ONCE before
     the epoch loop — the same "sample a fixed dataset, then multi-epoch it"
-    structure ``cm_synthesis.build_cm_dataset``/``regress_cmg`` use for CMG
+    structure ``ncm_synthesis.build_cm_dataset``/``regress_cmg`` use for CMG
     synthesis (see ``C2RLAgent._sample_cmg_x``/``synthesize_cmg``), so both
     pretraining phases behave the same way.
 

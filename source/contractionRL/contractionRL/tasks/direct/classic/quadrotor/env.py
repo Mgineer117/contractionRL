@@ -71,14 +71,13 @@ class QuadrotorEnv(BaseEnv):
     def __init__(
         self,
         sample_mode: str = "uniform",
-        reward_mode: str = "default",
         time_bound: float | None = None,
         dt: float | None = None,
         **kwargs,
     ):
         self.task = "quadrotor"
         super().__init__(self._build_cfg(
-            ENV_CONFIG, sample_mode=sample_mode, reward_mode=reward_mode, time_bound=time_bound, dt=dt,
+            ENV_CONFIG, sample_mode=sample_mode, time_bound=time_bound, dt=dt,
         ))
 
     def _f_logic(self, x, lib):

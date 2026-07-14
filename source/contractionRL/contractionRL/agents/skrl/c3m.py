@@ -93,6 +93,17 @@ class C3MCfg(AgentCfg):
     eps: float = 1e-2
     w_ub: float = 10.0
     w_lb: float = 0.1
+    # QR-orthonormalize the control annihilator B_null before the C1/C2
+    # projections. The envs supply B_null as a non-orthonormal basis (turtlebot's
+    # columns carry factors like k₂·sinθ·k₃), so the C1_reg = C1 + ε·I margin
+    # means a different thing at every state AND the random-projection PD loss
+    # weights each state by ‖B_null‖² — the same inconsistency
+    # ncm_synthesis.train_cmg_ccm's own orthonormalize_bbot option fixes via QR.
+    # OFF by default here (unlike there, where QR is free): C1/C2 are the
+    # TRAINING SIGNAL, so orthonormalizing
+    # reweights the loss across states and shifts C3M's (seed-sensitive) training
+    # dynamics — enable to A/B, not silently. Feasible set is unchanged either way.
+    orthonormalize_bbot: bool = False
     # Fraction of training (by progress, 0-1) during which the metric M is held
     # fixed (detached) in the contraction term Cu, mirroring the reference C3M
     # script's `detach=True if epoch < lr_step else False` warmup (5 of 15
@@ -370,6 +381,11 @@ class C3MAgent(Agent):
         DfDx = jacobian(f, x, create_graph=False).detach()
         DBDx = b_jacobian(B, x, u_dim, create_graph=False).detach()
         f = f.detach(); B = B.detach(); Bbot = Bbot.detach()
+        if getattr(cfg, "orthonormalize_bbot", False):
+            # Bbot is already detached, so this is a plain constant re-basis (no
+            # second-order-grad concern). Makes the ε margin + PD-loss weighting
+            # uniform across states — see C3MCfg.orthonormalize_bbot.
+            Bbot = torch.linalg.qr(Bbot).Q
 
         # Certify the *deterministic* controller: use the mean control, not a
         # noisy rsample. Exploration noise would otherwise perturb A and dot_x

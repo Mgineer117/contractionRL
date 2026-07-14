@@ -59,7 +59,6 @@ class BaseEnv(gym.Env):
 
         self.use_learned_dynamics = False
         self.sample_mode = env_config.get("sample_mode", "uniform")
-        self.reward_mode = env_config.get("reward_mode", "default")
 
         ref_unit_min = np.concatenate((self.X_MIN.flatten(), self.UREF_MIN.flatten()))
         ref_unit_max = np.concatenate((self.X_MAX.flatten(), self.UREF_MAX.flatten()))
@@ -85,19 +84,17 @@ class BaseEnv(gym.Env):
         env_config: dict,
         *,
         sample_mode: str = "uniform",
-        reward_mode: str = "default",
         time_bound: float | None = None,
         dt: float | None = None,
     ) -> dict:
         """Merge each subclass's constructor overrides into its ``ENV_CONFIG``.
 
         Shared by every classic env's ``__init__`` (car/cartpole/quadrotor/
-        segway/turtlebot) so the sample_mode/reward_mode/time_bound/dt
+        segway/turtlebot) so the sample_mode/time_bound/dt
         override logic lives in exactly one place.
         """
         cfg = dict(env_config)
         cfg["sample_mode"] = sample_mode
-        cfg["reward_mode"] = reward_mode
         if time_bound is not None:
             cfg["time_bound"] = time_bound
         if dt is not None:
@@ -167,15 +164,25 @@ class BaseEnv(gym.Env):
         # feedforward term (u = uref + (uref + fb)) and corrupt both tracking and
         # the contraction certificate.
         self.current_u = u.copy()
-        reward, infos = self.get_rewards(u)
+
+        next_x, next_x_wrapped, termination, truncation, _ = self.get_transition(self.x_t, u)
+        next_x_wrapped = np.clip(next_x_wrapped, self.X_MIN.flatten(), self.X_MAX.flatten())
+
+        # Post-transition reward: pair the state the action actually produced
+        # (next_x_wrapped) with self.xref[self.time_steps] (already the
+        # post-transition reference, since time_steps was incremented above).
+        # Using the PRE-transition self.x_t here (the old behavior) paired a
+        # stale state against the NEW reference — an inconsistent, off-by-one
+        # tracking error that also gave PPO/SAC's native reward the same
+        # broken actor->reward gradient the Mahalanobis reward had at low
+        # gamma (see contractionRL "low-gamma CMG" / next_obs discussion).
+        reward, infos = self.get_rewards(u, next_x_wrapped)
         self.episode_reward += float(reward)
 
         # Track raw distance error for AUC/Contraction envelope
         err_dist = np.sqrt(max(infos["tracking_error"], 0.0))
         self.err_history.append(err_dist)
-        
-        next_x, next_x_wrapped, termination, truncation, _ = self.get_transition(self.x_t, u)
-        next_x_wrapped = np.clip(next_x_wrapped, self.X_MIN.flatten(), self.X_MAX.flatten())
+
         state = self.construct_state(next_x_wrapped)
         # Carry forward the WRAPPED+CLIPPED state, not the raw `next_x` — the
         # observation the agent sees is built from next_x_wrapped, so self.x_t
@@ -413,16 +420,28 @@ class BaseEnv(gym.Env):
         ...
 
     # ------------------------------------------------------------------ #
-    def get_rewards(self, u):
-        error = self.wrap_angles(self.x_t - self.xref[self.time_steps])
+    def get_rewards(self, u, x=None):
+        """Tracking + control-effort reward. ``x`` MUST be the POST-transition
+        state (see ``step()``); defaults to ``self.x_t`` only for callers
+        computing a reward for the CURRENT (already-updated) state, e.g.
+        outside the main step() loop.
+        """
+        if x is None:
+            x = self.x_t
+        error = self.wrap_angles(x - self.xref[self.time_steps])
         tracking_error = np.linalg.norm(error, ord=2) ** 2
         control_effort = np.linalg.norm(u, ord=2) ** 2
 
         tracking_reward = -self.tracking_scaler * tracking_error
         control_reward = -self.control_scaler * control_effort
-        if self.reward_mode == "inverse":
-            tracking_reward = 1 / (1 + abs(tracking_reward))
-            control_reward = 1 / (1 + abs(control_reward))
+            
+        # Apply reward shaping: subtract previous state's tracking reward
+        if x is not None and self.time_steps > 0:
+            prev_error = self.wrap_angles(self.x_t - self.xref[self.time_steps - 1])
+            prev_tracking_error = np.linalg.norm(prev_error, ord=2) ** 2
+            prev_tracking_reward = -self.tracking_scaler * prev_tracking_error
+            tracking_reward = tracking_reward - prev_tracking_reward
+
         reward = (0.5 * tracking_reward) + (0.5 * control_reward)
         return reward, {"tracking_error": tracking_error, "control_effort": control_effort}
 

@@ -16,9 +16,10 @@ C3M / LQR / SDLQR / C2RL-PPO / C2RL-SAC:
     with custom skrl Trainers (C3MSkrlTrainer, C2RLSkrlTrainer, or
     SequentialTrainer for eval-only analytical agents). C2RL-PPO/C2RL-SAC are
     the SAME C2RLAgent class — the algo string just selects which
-    base_algorithm (PPO or SAC) its single deployed policy is built on; the
-    ``use_cmg`` config flag selects the metric source (online CM SDP by
-    default, or an offline-synthesized frozen CMG network). See _setup_c2rl.
+    base_algorithm (PPO or SAC) its single deployed policy is built on. C2RL
+    always synthesizes an offline, frozen CMG network (Neural Contraction
+    Metric); ``cmg_method`` selects how it's trained ("ccm" C1/C2 loss
+    minimization, or "cvstem" SDP regression). See _setup_c2rl.
 
 Classic env: internally creates SyncVectorEnv + wrap_env.
 Isaac env:   env is already a SkrlVecEnvWrapper — passed through.
@@ -599,10 +600,14 @@ class ContractionRunner:
                     agent_cfg, trainer_cfg, models_cfg, memory_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None,
                     base_algorithm: str = "PPO", angle_idx=None, raw_cfg_snapshot=None,
                     cm_cfg=None, cmg_cfg=None, empirical_dynamics_cfg=None):
-        """Build a single-policy C2RLAgent. ``use_cmg`` selects the metric source:
-        False (default) → contraction-metric SDP solved online per rollout state
-        (no CMG network); True → a CMG network fit offline by solving the SDP over
-        sampled states and regressing onto {x -> W*}, then frozen (Tsukamoto NCM).
+        """Build a single-policy C2RLAgent. Always builds a CMG network
+        (MetricModel), synthesized offline before Phase B and then frozen
+        (Tsukamoto NCM) — ``cmg_method`` (yaml `cm:` block) selects how: "ccm"
+        (default) trains it directly via C1/C2 loss minimization; "cvstem" solves
+        a per-state SDP and MSE-regresses the network onto the solutions. The CMG
+        is always built as a ``BoundedCCM_Generator`` (``constrain_eigenvalues``
+        forced ``True`` here, regardless of yaml) — see c2rl.py's module
+        docstring for why.
 
         ``cm_cfg``/``cmg_cfg``/``empirical_dynamics_cfg`` are the yaml's
         top-level ``cm:``/``cmg:``/``empirical_dynamics:`` blocks — merged into
@@ -618,7 +623,6 @@ class ContractionRunner:
         agent_cfg = {**agent_cfg, **(cm_cfg or {}), **(cmg_cfg or {}), **(empirical_dynamics_cfg or {})}
 
         base_algorithm = base_algorithm.upper()
-        use_cmg = bool(agent_cfg.get("use_cmg", False))
 
         # Phase B's memory: PPO's is exactly one rollout epoch (sized by
         # agent.rollouts); SAC's is a persistent replay buffer, sized via the
@@ -636,28 +640,23 @@ class ContractionRunner:
         w_lb = agent_cfg.get("w_lb", 0.1)
         w_ub = agent_cfg.get("w_ub", 10.0)
         models = {}
-        cmg_model = None
 
-        # use_cmg=True: build a CMG network (MetricModel) that will be FIT offline
-        # by solving the contraction-metric SDP over sampled states and regressing
-        # onto {x -> W*} (see C2RLAgent.synthesize_cmg). No throwaway C3M
-        # controller is needed — the SDP produces the targets directly. use_cmg=
-        # False: no CMG network; the SDP is solved online per rollout state.
-        if use_cmg:
-            from contractionRL.agents.skrl.models import MetricModel
-            cmg_net = models_cfg.get("cmg", {}).get("network", [{}])
-            cmg_hd = cmg_net[0].get("layers", [256, 256]) if cmg_net else [256, 256]
-            cmg_act = cmg_net[0].get("activations", "tanh") if cmg_net else "tanh"
-            constrain_eigenvalues = cmg_net[0].get("constrain_eigenvalues", False) if cmg_net else False
-            cmg_model = MetricModel(
-                obs_space, act_space, device, hidden_dim=cmg_hd, activation=cmg_act,
-                x_dim=x_dim, angle_idx=angle_idx, constrain_eigenvalues=constrain_eigenvalues, w_lb=w_lb, w_ub=w_ub,
-            )
-            models["cmg"] = cmg_model
+        # Always build a CMG network (MetricModel), synthesized offline (Phase A
+        # — see C2RLAgent.synthesize_cmg) and frozen before Phase B. Forced
+        # constrain_eigenvalues=True regardless of yaml — see c2rl.py's module
+        # docstring for why (C2RLAgent also guards this at construction time).
+        from contractionRL.agents.skrl.models import MetricModel
+        cmg_net = models_cfg.get("cmg", {}).get("network", [{}])
+        cmg_hd = cmg_net[0].get("layers", [256, 256]) if cmg_net else [256, 256]
+        cmg_act = cmg_net[0].get("activations", "tanh") if cmg_net else "tanh"
+        cmg_model = MetricModel(
+            obs_space, act_space, device, hidden_dim=cmg_hd, activation=cmg_act,
+            x_dim=x_dim, angle_idx=angle_idx, constrain_eigenvalues=True, w_lb=w_lb, w_ub=w_ub,
+        )
+        models["cmg"] = cmg_model
 
-        # NeuralDynamics (learned ẋ = f(x) + B(x)·u) — feeds the contraction-metric
-        # SDP (online per state when use_cmg=False, over the offline dataset when
-        # use_cmg=True). Built only when learning dynamics (use_empirical_dynamics=
+        # NeuralDynamics (learned ẋ = f(x) + B(x)·u) — feeds Phase A's CMG
+        # synthesis. Built only when learning dynamics (use_empirical_dynamics=
         # True); Isaac envs' sole f/B source, classic envs default to analytical.
         if "dynamics" in models_cfg and agent_cfg.get("use_empirical_dynamics", False):
             from contractionRL.agents.skrl.nn_modules import NeuralDynamics
@@ -708,15 +707,15 @@ class ContractionRunner:
         self._mode = "c2rl"
 
         # Single deployed (Phase B) policy. The PathTracking figure's theoretical
-        # bound inflates by 1/(1-discount_factor). With use_cmg the plotted
-        # certificate reads the CMG's per-state metric bounds; without it (online
-        # CM, no metric network) it falls back to the static [1/w_lb, 1/w_ub].
+        # bound inflates by 1/(1-discount_factor); the plotted certificate reads
+        # the CMG's per-state metric bounds (cmg_bounds_fn), falling back to the
+        # static [1/w_lb, 1/w_ub] only if the env doesn't wire cmg_bounds_fn up.
         if hasattr(env, "set_contraction_certificate"):
             env.set_contraction_certificate(
                 agent_cfg.get("lbd"),
                 discount_factor=agent_cfg.get("discount_factor", 0.99),
                 static_metric_bounds=(1.0 / w_lb, 1.0 / w_ub),
-                cmg_bounds_fn=_make_cmg_bounds_fn(cmg_model, w_lb) if cmg_model is not None else None,
+                cmg_bounds_fn=_make_cmg_bounds_fn(cmg_model, w_lb),
             )
 
     # ── public interface ────────────────────────────────────────────────── #

@@ -59,6 +59,11 @@ agent:
   # fragile part of the loss (see c3m.py docstring); leaving this at 0.0 makes training
   # seed-sensitive, with some random seeds diverging outright instead of just training worse.
   use_empirical_dynamics: true  # false = env's analytical get_f_and_B; true = learn NeuralDynamics
+  # States×controls for ONLINE dynamics-data generation (use_empirical_dynamics=true
+  # with no dynamics_pretrain_data_path): samples ceil(memory_size / N) states and
+  # pairs each with N distinct controls → N control-aware samples per state. Only
+  # affects NeuralDynamics pretraining; ignored under analytical dynamics. Default 3.
+  num_controls_per_state: 3
   dynamics_lr: 1.0e-3  # Learning rate for the NeuralDynamics network
   dynamics_batch_size: 4096
   dynamics_pretrain_epochs: 10000  # Number of epochs for offline data, or number of rollouts for online fallback

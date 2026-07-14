@@ -1,4 +1,5 @@
-"""C2RL — single-policy contraction-metric RL with a ``use_cmg`` switch.
+"""C2RL — single-policy contraction-metric RL against a Neural Contraction
+Metric (NCM) reward.
 
 C2RLAgent trains ONE real skrl ``PPO``/``SAC`` policy (``base_algorithm="PPO"``
 → a skrl ``PPO`` sub-agent, ``base_algorithm="SAC"`` → a skrl ``SAC`` sub-agent)
@@ -6,48 +7,47 @@ against a Mahalanobis tracking reward
 
     ``-tracking_scaler·||e||²_M - control_scaler·||u - uref||²``,   e = x - xref
 
-where the metric ``M(x) = W(x)⁻¹`` comes from one of two interchangeable
-sources, selected by the ``use_cmg`` config flag (default ``False``):
+where the metric ``M(x) = W(x)⁻¹`` always comes from a CMG network ``W(x)``
+synthesized OFFLINE, before Phase B, then FROZEN (``freeze_cmg``) for the
+whole RL run — Tsukamoto's Neural Contraction Metric recipe. There is no
+online per-state SDP path and no ``use_cmg`` switch: the CMG network is
+mandatory (``models["cmg"]``).
 
-  * **use_cmg = False (default) — online CM, no metric network.** The metric is
-    solved on-the-fly per state by a convex feasibility SDP (Tsukamoto's Neural
-    Contraction Metric, ``cm_synthesis.solve_cm_metric``): at each state a dual
-    contraction metric ``W`` is found, inverted to ``M`` and turned into the
-    reward. There is no CMG network and no offline synthesis phase — just the
-    policy trained under the online CM metric. (This is what C3RL used to be.)
-  * **use_cmg = True — regressed + frozen CMG network (Tsukamoto's full NCM).** A
-    CMG network ``W(x)`` is fit OFFLINE, before RL: sample ``cmg_memory_size``
-    states, solve one convex SDP per state for the target metric ``W*(x)``
-    (``cm_synthesis.build_cm_dataset``), then MSE-regress the CMG network onto the
-    feasible ``{x -> W*}`` pairs (``regress_cmg``) and FREEZE it (``freeze_cmg``).
-    This is the same SDP as the online path — the network just amortizes it into a
-    single batched forward pass so Phase B's Mahalanobis reward is O(1) per state
-    (``M(x) = W(x)⁻¹``, static). There is NO C3M controller and NO differentiable
-    certificate loss — the network is trained purely by regression onto the SDP
-    solutions (this is Tsukamoto's actual Neural Contraction Metric recipe).
-    The ``cmg_memory_size`` states are drawn uniformly either from the classic
-    env's analytic state space (``get_rollout``, unlimited supply) or, when
-    ``dynamics_pretrain_data_path`` points to an offline ``dynamics_data.npz``,
-    from that same offline data (capped to its size, with a warning if
-    ``cmg_memory_size`` asks for more samples than are on disk).
+``cmg_method`` (formerly ``cm_formulation``) selects HOW that network is
+trained — the two are the only supported pipelines, both in ``ncm_synthesis.py``:
 
-Orthogonal to ``use_cmg``, ``cm_formulation`` selects WHICH pointwise SDP is
-solved (both modes, both online and offline) — ``"ccm"`` (default, Manchester-
-style, eliminates the control matrix via the annihilator, existence-only) or
-``"cvstem"`` (Tsukamoto CV-STEM-style, keeps the control matrix via a Riccati
-term instead of eliminating it). See ``cm_synthesis.py``'s module docstring for
-the LMIs and the tradeoff between them.
+  * **``"cvstem"`` — CV-STEM regression.** Sample ``cmg_memory_size`` states,
+    solve one convex feasibility SDP per state for the target metric ``W*(x)``
+    (``ncm_synthesis.build_cm_dataset``, Tsukamoto CV-STEM-style LMI, keeps the
+    control matrix via a Riccati term), then MSE-regress the CMG network onto
+    the feasible ``{x -> W*}`` pairs (``regress_cmg``). No differentiable
+    certificate loss — trained purely by regression onto the SDP solutions.
+  * **``"ccm"`` — C1/C2 loss minimization.** Train the CMG network directly
+    with Manchester's C1 (contraction) and C2 (killing) differentiable losses
+    (``train_cmg_ccm``) over sampled states — no per-state SDP, no MSE
+    regression, pure gradient descent on the pointwise certificate.
 
-Both modes share the SAME single-policy Phase B rollout loop and the SAME
-reward-injection mechanism (see ``C2RLSkrlTrainer``):
+Both pipelines require the CMG to be a ``BoundedCCM_Generator``
+(``constrain_eigenvalues=True`` — hard eigenvalue bounds baked into the
+forward pass, not a soft penalty): ``C2RLAgent.__init__`` raises if the
+supplied ``models["cmg"].ccm_gen`` isn't ``bounded``. ``ContractionRunner``
+enforces this by always passing ``constrain_eigenvalues=True`` when building
+C2RL's CMG model, regardless of yaml.
+
+The ``cmg_memory_size`` states (both pipelines) are drawn uniformly either
+from the classic env's analytic state space (``get_rollout``, unlimited
+supply) or, when ``dynamics_pretrain_data_path`` points to an offline
+``dynamics_data.npz``, from that same offline data (capped to its size, with a
+warning if ``cmg_memory_size`` asks for more samples than are on disk).
+
+Phase B — the single-policy rollout loop — is the same regardless of
+``cmg_method`` (see ``C2RLSkrlTrainer``), since both hand off an identical
+frozen ``ccm_gen``:
 
   * **SAC** overwrites each replayed transition's reward with the Mahalanobis
-    reward inside a patched ``memory.sample()`` and writes it back into the
-    replay buffer. With ``use_cmg`` the frozen CMG is re-evaluated per sampled
-    mini-batch; without it the per-state CM SDP is solved the FIRST time a
-    transition is replayed and CACHED back into the buffer, so later replays of
-    the same transition reuse it (off-policy replays each transition many times,
-    amortizing the solve — see ``_setup_online_cm_cache``).
+    reward inside a patched ``memory.sample()`` — the frozen CMG is
+    re-evaluated per sampled mini-batch (cheap, static metric, see
+    ``_setup_frozen_cmg_sample``).
   * **PPO** discards its on-policy rollout each update, so there is nothing to
     cache: it computes the Mahalanobis reward over the whole fresh rollout batch
     in ``update_policy`` and overwrites that rollout's rewards right before the
@@ -63,9 +63,10 @@ PPO/SAC policy built here). ``use_state_norm`` defaults to False in every
 shipped config.
 
 Learned dynamics (Isaac / ``use_empirical_dynamics=True``): a ``NeuralDynamics``
-model provides ``f``/``B``/``B_null`` and ``∂f/∂x``. It is pretrained before
-training and (use_cmg=True) refined online during Phase A. use_cmg=False needs
-it for every online CM SDP; use_cmg=True needs it only for Phase A synthesis.
+model provides ``f``/``B``/``B_null`` and ``∂f/∂x``. It is pretrained once
+before Phase A, which is the only consumer — the SDP dataset (``"cvstem"``) or
+the C1/C2 gradient computation (``"ccm"``) both need ``f``/``B``/``∂f/∂x`` at
+synthesis time; Phase B never touches it again (the CMG is already frozen).
 Classic envs use their analytical ``get_f_and_B`` and skip this.
 """
 
@@ -134,32 +135,66 @@ class C2RLPPOCfg(AgentCfg):
     # Deployed policy's discount factor — a single policy trained against the
     # Mahalanobis reward, so there is no con/opt duality here.
     discount_factor: float = 0.99
-    # ── Metric source (use_cmg False → online CM SDP; True → frozen CMG net) ─ #
-    use_cmg: bool = False
-    # Mahalanobis reward (both modes)
+    # ── Metric source: ALWAYS a frozen CMG network (models["cmg"]) — see
+    # module docstring. cmg_method selects how it's trained. ─────────────── #
     w_ub: float = 10.0
     w_lb: float = 0.1
     tracking_scaler: float = 1.0
     control_scaler: float = 0.0
-    lbd: float = 1e-2  # contraction rate λ — shared by BOTH modes' SDP (online per-state / offline dataset)
-    # ── SDP contraction metric (shared by both modes) — see cm_synthesis.py ── #
-    cm_eps: float = 1e-2   # strict-definiteness margin on the contraction LMI
-    cm_solver: str = "SCS"  # cvxpy SDP solver
-    # "ccm" (default) — Manchester-style, eliminates B via the annihilator,
-    # existence-only certificate (unchanged legacy behavior). "cvstem" —
-    # Tsukamoto CV-STEM-style, keeps B via a Riccati BR⁻¹Bᵀ term instead of
-    # eliminating it. See cm_synthesis.py module docstring for the LMIs.
-    cm_formulation: str = "ccm"
-    cvstem_r_scaler: float = 1.0  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors sdlqr.py's R_scaler); "cvstem" only
+    lbd: float = 1e-2  # contraction rate λ — used by both cmg_method's synthesis loss
+    # ── SDP contraction metric ("cvstem" cmg_method only) — see ncm_synthesis.py ── #
+    cm_eps: float = 1e-2   # strict-definiteness margin on the contraction LMI (both methods)
+    cm_solver: str = "SCS"  # cvxpy SDP solver ("cvstem" only)
+    # "ccm" (default) — C1/C2 loss minimization (train_cmg_ccm): Manchester-style,
+    # eliminates B via the annihilator, existence-only certificate, no SDP, pure
+    # gradient descent on the pointwise LMI. "cvstem" — CV-STEM regression
+    # (build_cm_dataset + regress_cmg): solves a per-state SDP that keeps B via a
+    # Riccati BR⁻¹Bᵀ term, then MSE-regresses the CMG onto the solutions. See
+    # ncm_synthesis.py module docstring for the LMIs and module docstring above
+    # for the two pipelines.
+    cmg_method: str = "ccm"
+    # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ Riccati term (mirrors sdlqr.py's
+    # R_scaler); "cvstem" method only. See ncm_synthesis.solve_cm_metric — control
+    # enters the LMI only through this penalty, not a bounded control box.
+    cvstem_r_scaler: float = 1.0
+    # Weights of the CV-STEM objective J = cm_chi_weight·χ + cm_nu_weight·ν, which
+    # solve_cm_metric ALWAYS minimizes (Tsukamoto's classncm.cvstem0). χ and ν are
+    # the metric's condition number and scale, and they are decision variables:
+    # W̄ ⪰ I, W̄ ⪯ χI, deployed W = W̄/ν. "cvstem" method only.
+    cm_chi_weight: float | None = None  # None → 1/lbd, mirroring Tsukamoto's chi/alp
+    cm_nu_weight: float = 1.0           # his d2_over
+    # If > 0, include Tsukamoto's Ẇ ≈ (W̄ - I)/dt proxy for the material derivative
+    # (classncm.cvstem0 puts the integration step here). 0 = omit it, which is what
+    # the pointwise-per-state design otherwise forces (no neighbouring sample to
+    # difference against — see ncm_synthesis.py's module docstring). "cvstem" method
+    # only; superseded by cm_wdot_trajectory when that's on.
+    cm_wdot_dt: float = 0.0
+    # Real Ẇ from OFFLINE REFERENCE TRAJECTORIES ("cvstem" method only): instead of
+    # dropping Ẇ or using the static cm_wdot_dt proxy above, sample states as
+    # trajectory-ordered chunks from dynamics_pretrain_data_path (which must be
+    # set — raises otherwise) and difference each state's solved normalized W̄
+    # against the ACTUAL PREVIOUS state's along that same reference trajectory —
+    # Ẇ ≈ (W̄_t − W̄_{t−1})/cm_temporal_dt, the real material derivative rather
+    # than an approximation (see ncm_synthesis.build_cm_dataset's
+    # traj_x/traj_lengths/temporal_dt and dynamics_pretrain.load_offline_trajectories).
+    # Incompatible with cmg_random_ratio>0 (mixing in i.i.d. random states would
+    # break trajectory continuity — ignored when this is on) and with
+    # cmg_method="ccm" (train_cmg_ccm has no per-state SDP to add Ẇ to; raises).
+    cm_wdot_trajectory: bool = False
+    # Integration step between consecutive states in the offline trajectory data —
+    # NOT auto-derived from the env (dynamics_data.npz doesn't record it); set it
+    # to the same dt used to generate that file (scripts/skrl/train.py's
+    # _generate_ref_trajs: env_cfg.sim.dt * env_cfg.decimation). Only read when
+    # cm_wdot_trajectory=True.
+    cm_temporal_dt: float = 0.05
     # On SDP infeasibility at a state, retry that state ALONE with λ halved,
     # up to this many times, before giving up on it (0 = old behavior, drop
-    # immediately). See cm_synthesis._solve_cm_metric_with_backoff.
+    # immediately). See ncm_synthesis._solve_cm_metric_with_backoff. "cvstem" method only.
     max_lambda_reductions: int = 5
     # Guards build_cm_dataset against silently regressing the CMG onto a small,
     # likely-biased subset of states — raises before regression if the SDP's
     # feasible fraction falls below this (0.0 = old behavior, only guards
-    # against 0% feasible; see cm_synthesis.build_cm_dataset). Shared-SDP
-    # concern, same as cm_eps/cm_solver, hence grouped with them (yaml `cm:`).
+    # against 0% feasible; see ncm_synthesis.build_cm_dataset). "cvstem" method only.
     min_feasibility_rate: float = 0.0
     # Cache path for the synthesized {x, W} CM dataset (build_cm_dataset's
     # expensive per-state SDP solve) — see synthesize_cmg. Loaded instead of
@@ -168,18 +203,20 @@ class C2RLPPOCfg(AgentCfg):
     # to a `cm_data.npz` next to dynamics_pretrain_data_path when unset (Isaac
     # envs); classic envs with no data_path need this set explicitly to get
     # caching at all (there's no offline dynamics file to derive a path from).
+    # "cvstem" method only.
     cm_data_path: str = ""
-    # ── use_cmg=True: offline SDP-dataset + CMG-network regression (Tsukamoto NCM) ─ #
+    # ── Offline CMG synthesis (Phase A, always runs before Phase B) ─────────── #
     # Sample cmg_memory_size states — uniformly from the classic env's analytic
     # state space (get_rollout) or, when dynamics_pretrain_data_path is set,
     # uniformly from that offline dynamics_data.npz (capped + warned if
-    # cmg_memory_size exceeds the data on disk; see synthesize_cmg) — solve one
-    # SDP per state (solve_cm_metric, reusing lbd/w_lb/w_ub/cm_eps/cm_solver
-    # above), then MSE-regress the CMG network onto {x -> W*} for
-    # cmg_regress_epochs and freeze it (see build_cm_dataset / regress_cmg). NO
-    # C3M controller, NO differentiable certificate loss.
+    # cmg_memory_size exceeds the data on disk; see synthesize_cmg). "cvstem":
+    # solve one SDP per state (solve_cm_metric, reusing lbd/w_lb/w_ub/cm_eps/
+    # cm_solver above), then MSE-regress the CMG network onto {x -> W*} for
+    # cmg_regress_epochs (build_cm_dataset / regress_cmg). "ccm": train the CMG
+    # directly with C1/C2 losses for cmg_regress_epochs, no SDP (train_cmg_ccm).
+    # Either way the CMG is frozen (freeze_cmg) before Phase B.
     cmg_memory_size: int = 8192
-    cmg_regress_epochs: int = 200
+    cmg_regress_epochs: int = 1000
     cmg_regress_lr: float = 1e-3
     cmg_regress_lr_scheduler: str = ""
     cmg_regress_lr_scheduler_kwargs: dict = field(default_factory=dict)
@@ -187,13 +224,20 @@ class C2RLPPOCfg(AgentCfg):
     # Held out from cmg_memory_size as a validation split never regressed on;
     # regress_cmg stops once its MSE hasn't improved for cmg_early_stop_patience
     # consecutive epochs, restoring the best-val-epoch CMG weights instead of
-    # whatever cmg_regress_epochs happens to land on (see cm_synthesis.regress_cmg
+    # whatever cmg_regress_epochs happens to land on (see ncm_synthesis.regress_cmg
     # / math_utils.EarlyStopper). <=0 disables both (always regress the full budget).
     cmg_val_frac: float = 0.1
     cmg_early_stop_patience: int = 10
+    # Fraction (0..1) of the CMG-dataset states drawn from the BROAD/off-reference
+    # distribution (states an early chaotic policy actually visits) rather than the
+    # reference-trajectory tube — the rest are reference states. 0 = old behavior
+    # (all reference, or all of the offline pool). Random states come from the
+    # offline dynamics-pretrain pool if configured, else get_rollout("dynamics")
+    # (uniform state-space coverage). See ncm_synthesis._sample_cm_states.
+    cmg_random_ratio: float = 0.0
     # Dynamics — learned NeuralDynamics (ẋ = f(x) + B(x)·u) unless
-    # use_empirical_dynamics=True (classic envs only). Feeds every SDP solve
-    # (online per state when use_cmg=False, offline dataset when use_cmg=True).
+    # use_empirical_dynamics=True (classic envs only). Feeds Phase A's CMG
+    # synthesis (SDP dataset for "cvstem", C1/C2 gradient computation for "ccm").
     use_empirical_dynamics: bool = False
     dynamics_lr: float = 1e-3
     dynamics_lr_scheduler: str = ""
@@ -243,30 +287,42 @@ class C2RLSACCfg(AgentCfg):
     std_dev_annealing_kwargs: dict | None = None  # forwarded to patch_ppo_std_annealing()
     memory_size: int = -1
     discount_factor: float = 0.99
-    # ── Metric source ─────────────────────────────────────────────────────── #
-    use_cmg: bool = False
+    # ── Metric source: ALWAYS a frozen CMG network — cmg_method selects how it's
+    # trained (see C2RLPPOCfg / module docstring). ──────────────────────────── #
     w_ub: float = 10.0
     w_lb: float = 0.1
     tracking_scaler: float = 1.0
     control_scaler: float = 0.0
     lbd: float = 1e-2
-    # ── SDP contraction metric (shared by both modes) — see cm_synthesis.py ── #
+    # ── SDP contraction metric ("cvstem" method only) — see ncm_synthesis.py ── #
     cm_eps: float = 1e-2
     cm_solver: str = "SCS"
-    cm_formulation: str = "ccm"  # "ccm" | "cvstem" — see cm_synthesis.py module docstring
+    cmg_method: str = "ccm"  # "ccm" (C1/C2 minimization) | "cvstem" (SDP regression) — see module docstring
     cvstem_r_scaler: float = 1.0
-    max_lambda_reductions: int = 5  # see cm_synthesis._solve_cm_metric_with_backoff
+    # Weights of the CV-STEM objective J (always minimized) — see
+    # C2RLPPOCfg.cm_chi_weight above and ncm_synthesis.solve_cm_metric.
+    cm_chi_weight: float | None = None
+    cm_nu_weight: float = 1.0
+    cm_wdot_dt: float = 0.0  # superseded by cm_wdot_trajectory when that's on
+    # Real Ẇ from offline reference trajectories — see C2RLPPOCfg.cm_wdot_trajectory
+    # / cm_temporal_dt above.
+    cm_wdot_trajectory: bool = False
+    cm_temporal_dt: float = 0.05
+    max_lambda_reductions: int = 5  # see ncm_synthesis._solve_cm_metric_with_backoff
     min_feasibility_rate: float = 0.0
     cm_data_path: str = ""
-    # ── use_cmg=True: offline SDP-dataset + CMG-network regression (Tsukamoto NCM) ─ #
+    # ── Offline CMG synthesis (Phase A, always runs before Phase B) ─────────── #
     cmg_memory_size: int = 8192
-    cmg_regress_epochs: int = 200
+    cmg_regress_epochs: int = 1000
     cmg_regress_lr: float = 1e-3
     cmg_regress_lr_scheduler: str = ""
     cmg_regress_lr_scheduler_kwargs: dict = field(default_factory=dict)
     cmg_regress_batch_size: int = 1024
     cmg_val_frac: float = 0.1
     cmg_early_stop_patience: int = 10
+    # Random/off-reference state fraction for the CMG dataset — see
+    # C2RLPPOCfg.cmg_random_ratio above / ncm_synthesis._sample_cm_states.
+    cmg_random_ratio: float = 0.0
     # Dynamics
     use_empirical_dynamics: bool = False
     dynamics_lr: float = 1e-3
@@ -283,8 +339,8 @@ class C2RLSACCfg(AgentCfg):
 
 @dataclass
 class C2RLTrainerCfg(TrainerCfg):
-    timesteps: int = 300000  # deployed-policy (RL) env steps; use_cmg=True's offline
-                             # SDP+regression synthesis runs once before this loop
+    timesteps: int = 300000  # deployed-policy (RL) env steps; the offline CMG-synthesis
+                             # phase (Phase A) runs once before this loop
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -299,10 +355,9 @@ class C2RLAgent(Agent):
       ``"value"`` (PPO) or ``"critic_1"``/``"critic_2"``/``"target_critic_1"``/
         ``"target_critic_2"`` (SAC) — the deployed policy's own critic(s).
       ``"dynamics"`` — optional NeuralDynamics (use_empirical_dynamics=True).
-
-      Only when ``use_cmg=True``:
-      ``"cmg"``        — MetricModel whose network is regressed onto the offline
-        SDP solutions and then frozen (see synthesize_cmg); read for the reward.
+      ``"cmg"``      — REQUIRED. MetricModel (``BoundedCCM_Generator``, i.e.
+        ``constrain_eigenvalues=True``) synthesized offline (see synthesize_cmg)
+        and frozen before Phase B; read for the Mahalanobis reward.
 
     Extra constructor kwargs: ``get_rollout``, ``get_f_and_B``, ``x_dim``,
     ``u_dim``, ``num_envs``, ``angle_idx``, ``base_algorithm``.
@@ -358,20 +413,42 @@ class C2RLAgent(Agent):
         self._cfg = parsed_cfg
         self._base_algorithm = base_algorithm.upper()
         self._num_envs = num_envs
-        self._use_cmg = bool(parsed_cfg.use_cmg)
         self._get_rollout = get_rollout
 
         # ── Metric source setup ──────────────────────────────────────────── #
-        # Both modes solve the SAME convex contraction-metric SDP (cm_synthesis.py);
-        # they differ only in WHEN. This agent always owns the (optional) learned
-        # dynamics directly — the SDP needs f/B/∂f/∂x either way (online per state
-        # for use_cmg=False, over the offline dataset for use_cmg=True).
-        #   use_cmg=False: no CMG network — the SDP is solved per rollout state.
-        #   use_cmg=True:  a CMG network (models["cmg"]) is fit OFFLINE by solving
-        #     the SDP over sampled states and regressing onto {x -> W*}, then frozen
-        #     (see C2RLSkrlTrainer.train / build_cm_dataset + regress_cmg).
+        # This agent always owns the (optional) learned dynamics directly — Phase
+        # A's CMG synthesis needs f/B/∂f/∂x (SDP dataset for "cvstem", C1/C2
+        # gradient computation for "ccm"). The CMG network (models["cmg"]) is
+        # fit OFFLINE (see C2RLSkrlTrainer.train / synthesize_cmg) and frozen
+        # before Phase B — see module docstring.
         self._setup_dynamics(parsed_cfg, models, get_f_and_B, x_dim, u_dim, device)
-        self._ccm_gen = models["cmg"].ccm_gen if self._use_cmg else None
+        if "cmg" not in models:
+            raise ValueError(
+                "[C2RL] models['cmg'] is required — C2RL always synthesizes a CMG "
+                "network offline before Phase B (see module docstring)."
+            )
+        self._ccm_gen = models["cmg"].ccm_gen
+        if not getattr(self._ccm_gen, "bounded", False):
+            raise ValueError(
+                "[C2RL] models['cmg'] must be a BoundedCCM_Generator "
+                "(constrain_eigenvalues=True) — C2RL always hard-bounds the CMG's "
+                "eigenvalues, regardless of cmg_method. Set "
+                "models.cmg.network.constrain_eigenvalues: true in the yaml, or "
+                "let ContractionRunner build it (it forces this)."
+            )
+        if bool(getattr(parsed_cfg, "cm_wdot_trajectory", False)):
+            if parsed_cfg.cmg_method != "cvstem":
+                raise ValueError(
+                    "[C2RL] cm_wdot_trajectory=True needs cmg_method='cvstem' — "
+                    "'ccm' (train_cmg_ccm) has no per-state SDP to add a Ẇ term to."
+                )
+            if not getattr(parsed_cfg, "dynamics_pretrain_data_path", ""):
+                raise ValueError(
+                    "[C2RL] cm_wdot_trajectory=True needs dynamics_pretrain_data_path "
+                    "set to a trajectory-structured dynamics_data.npz (see "
+                    "dynamics_pretrain.load_offline_trajectories) — there is no other "
+                    "source of REAL trajectory order to difference Ẇ against."
+                )
 
         # ── Phase B: a real skrl PPO/SAC agent for the deployed policy ───── #
         if self._base_algorithm == "PPO":
@@ -386,14 +463,10 @@ class C2RLAgent(Agent):
         self._memory = memory
 
         # SAC reward injection: overwrite each replayed transition's reward with
-        # the Mahalanobis reward. use_cmg=True re-evaluates the frozen CMG per
-        # sampled mini-batch (cheap, static metric); use_cmg=False solves + caches
-        # the per-state CM SDP once per transition (see _setup_online_cm_cache).
+        # the Mahalanobis reward, re-evaluating the frozen CMG per sampled
+        # mini-batch (cheap, static metric — see _setup_frozen_cmg_sample).
         if self._base_algorithm == "SAC":
-            if self._use_cmg:
-                self._setup_frozen_cmg_sample(memory)
-            else:
-                self._setup_online_cm_cache(memory, num_envs)
+            self._setup_frozen_cmg_sample(memory)
 
         rl_kwargs = dict(
             observation_space=observation_space,
@@ -449,23 +522,21 @@ class C2RLAgent(Agent):
             "policy": models["policy"],
             **checkpoint_extra,
         })
-        if self._use_cmg:
-            self.checkpoint_modules["cmg"] = models["cmg"]
+        self.checkpoint_modules["cmg"] = models["cmg"]
         if self._neural_dynamics is not None:
             self.checkpoint_modules["dynamics"] = self._neural_dynamics
 
     # ── Setup helpers ───────────────────────────────────────────────────── #
 
     def _setup_dynamics(self, cfg, models, get_f_and_B, x_dim, u_dim, device) -> None:
-        """Own the (optional) learned dynamics directly (both use_cmg modes).
+        """Own the (optional) learned dynamics directly (feeds Phase A's CMG synthesis).
 
-        The contraction-metric SDP needs ``f``/``B``/``B_null`` and ``∂f/∂x`` at
-        every state it solves at (online per state when use_cmg=False, over the
-        offline dataset when use_cmg=True). Under analytical dynamics that comes
-        from the env's exact ``get_f_and_B``; otherwise a NeuralDynamics model
-        (pretrained before training by the trainer's ``pretrain_dynamics``)
-        provides it. This mirrors C3M's dynamics interface expected by
-        ``dynamics_pretrain``.
+        The CMG synthesis needs ``f``/``B``/``B_null`` and ``∂f/∂x`` at every
+        state it uses (SDP dataset for "cvstem", C1/C2 gradient computation for
+        "ccm"). Under analytical dynamics that comes from the env's exact
+        ``get_f_and_B``; otherwise a NeuralDynamics model (pretrained before
+        training by the trainer's ``pretrain_dynamics``) provides it. This
+        mirrors C3M's dynamics interface expected by ``dynamics_pretrain``.
         """
         if not cfg.use_empirical_dynamics:
             if get_f_and_B is None:
@@ -525,128 +596,79 @@ class C2RLAgent(Agent):
 
     # ── Mahalanobis reward ──────────────────────────────────────────────── #
 
-    def _compute_reward(self, observations: torch.Tensor, actions: torch.Tensor | None = None) -> torch.Tensor:
-        """Mahalanobis tracking reward from the active metric source.
+    def _compute_reward(
+        self, observations: torch.Tensor, actions: torch.Tensor | None = None,
+        prev_observations: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Mahalanobis tracking reward — a forward pass through the frozen CMG
+        (compute_mahalanobis_reward). Reads RAW observations (see module docstring).
 
-        use_cmg=True: forward pass through the frozen CMG (compute_mahalanobis_reward).
-        use_cmg=False: online per-state CM SDP solve (compute_cm_reward_online).
-        Both read RAW observations (see module docstring).
+        Callers MUST pass the POST-transition observations (``next_obs``), not
+        the pre-action ``observations`` the actor conditioned on — the reward
+        needs to be a function of the state the action actually caused, or a
+        near-zero ``discount_factor`` severs the only channel (the bootstrapped
+        value target) through which the actor's choice could ever affect its
+        own objective, and policy gradient degenerates to noise. See the
+        contractionRL "low-gamma CMG" discussion for the derivation. NOTE: if
+        ``control_scaler>0`` is ever enabled, the ``uref`` this pulls out of
+        ``observations`` will then be next-step's reference too — harmless
+        today since every shipped config leaves ``control_scaler=0.0``, but
+        worth revisiting first if that changes.
         """
         cfg = self._cfg
-        if self._use_cmg:
-            return compute_mahalanobis_reward(
-                self._ccm_gen, observations, actions,
+        reward = compute_mahalanobis_reward(
+            self._ccm_gen, observations, actions,
+            x_dim=self._x_dim, u_dim=self._u_dim, angle_idx=self._angle_idx,
+            w_lb=cfg.w_lb, tracking_scaler=cfg.tracking_scaler, control_scaler=cfg.control_scaler,
+        )
+        if prev_observations is not None:
+            prev_reward = compute_mahalanobis_reward(
+                self._ccm_gen, prev_observations, None,
                 x_dim=self._x_dim, u_dim=self._u_dim, angle_idx=self._angle_idx,
                 w_lb=cfg.w_lb, tracking_scaler=cfg.tracking_scaler, control_scaler=cfg.control_scaler,
             )
-        from .cm_synthesis import compute_cm_reward_online
-        return compute_cm_reward_online(
-            observations, actions, self._get_f_and_B,
-            x_dim=self._x_dim, u_dim=self._u_dim, angle_idx=self._angle_idx,
-            lbd=cfg.lbd, w_lb=cfg.w_lb, w_ub=cfg.w_ub, eps=cfg.cm_eps,
-            tracking_scaler=cfg.tracking_scaler, control_scaler=cfg.control_scaler,
-            solver=cfg.cm_solver, formulation=cfg.cm_formulation, r_scaler=cfg.cvstem_r_scaler,
-            max_lambda_reductions=cfg.max_lambda_reductions,
-        )
+            reward = reward - prev_reward
+        return reward
 
-    # ── SAC reward-injection patches ────────────────────────────────────── #
+    # ── SAC reward-injection patch ──────────────────────────────────────── #
 
     def _setup_frozen_cmg_sample(self, memory) -> None:
-        """use_cmg=True SAC: recompute the Mahalanobis reward per sampled
-        mini-batch from the (frozen, by Phase B) CMG's raw-obs metric.
+        """SAC: recompute the Mahalanobis reward per sampled mini-batch from the
+        (frozen, by Phase B) CMG's raw-obs metric.
 
-        Simpler than the online-CM cache below — the metric is static, so
-        there is nothing to invalidate/cache; every sample just re-evaluates the
-        pure forward pass. Applying an obs preprocessor here would evaluate M and
-        e = x - xref in normalized coordinates and distort the reward, so the raw
-        stored observations are used (see module docstring).
+        The metric is static, so there is nothing to invalidate/cache — every
+        sample just re-evaluates the pure forward pass. Applying an obs
+        preprocessor here would evaluate M and e = x - xref in normalized
+        coordinates and distort the reward, so the raw stored observations are
+        used (see module docstring).
+
+        Uses ``next_observations`` (POST-transition), not ``observations`` —
+        see ``_compute_reward``'s docstring for why the reward must be a
+        function of the state the sampled action actually caused, not the
+        state it merely observed. SAC's own ``_tensors_names`` already
+        includes ``next_observations`` (needed for its own critic target), so
+        this never has to request an extra tensor.
         """
         def _dynamic_maha_sample(names, batch_size, mini_batches=1, sequence_length=1, _orig=memory.sample):
             batches = _orig(names, batch_size=batch_size, mini_batches=mini_batches, sequence_length=sequence_length)
             try:
-                obs_idx = names.index("observations") if "observations" in names else names.index("states")
+                obs_idx = names.index("observations") if "observations" in names else -1
+                next_obs_idx = names.index("next_observations") if "next_observations" in names else names.index("next_states")
                 act_idx = names.index("actions")
                 rew_idx = names.index("rewards")
                 for b in batches:
-                    b[rew_idx] = self._compute_reward(b[obs_idx], b[act_idx])
+                    prev_obs = b[obs_idx] if (obs_idx != -1 and getattr(self, "_is_classic_env", False)) else None
+                    b[rew_idx] = self._compute_reward(b[next_obs_idx], b[act_idx], prev_observations=prev_obs)
             except ValueError:
                 pass  # if rewards isn't requested (e.g. target actions), don't modify
             return batches
         memory.sample = _dynamic_maha_sample
 
-    def _setup_online_cm_cache(self, memory, num_envs: int) -> None:
-        """use_cmg=False SAC: online-CM reward with replay-buffer caching.
-
-        No CMG. The FIRST time a transition is replayed we solve the CM
-        feasibility SDP at its state to get M = W⁻¹, compute the Mahalanobis
-        reward, and write it back into the buffer's ``rewards`` slot — so every
-        later replay of the same transition reuses it (off-policy replays each
-        transition many times, so one SDP per transition is far cheaper than
-        pre-synthesizing a CMG).
-
-        ``_maha_cached`` (one bool per flat buffer slot) tracks which slots hold a
-        solved reward; ``add_samples`` is wrapped to invalidate slots as new
-        transitions overwrite them (circular buffer); ``sample`` is wrapped to
-        lazily fill any uncached sampled slots before returning the minibatches.
-        """
-        self._maha_cached = torch.zeros(
-            memory.memory_size * num_envs, dtype=torch.bool, device=self._device
-        )
-
-        # Invalidate cache for buffer rows overwritten by new transitions.
-        _orig_add = memory.add_samples
-
-        def _add_samples(**tensors):
-            mi0 = memory.memory_index
-            _orig_add(**tensors)
-            mi1 = memory.memory_index
-            ms = memory.memory_size
-            if mi1 > mi0:
-                rows = range(mi0, mi1)
-            elif mi1 < mi0:  # circular wrap
-                rows = list(range(mi0, ms)) + list(range(0, mi1))
-            else:  # partial-row write (env_index branch): invalidate the whole row
-                rows = [mi0]
-            for r in rows:
-                self._maha_cached[r * num_envs:(r + 1) * num_envs] = False
-
-        memory.add_samples = _add_samples
-
-        # Lazily fill uncached sampled rewards, cache them, and refresh the
-        # returned minibatches' rewards from the (now fully cached) buffer.
-        _orig_sample = memory.sample
-
-        def _dynamic_maha_sample(names, batch_size, mini_batches=1, sequence_length=1):
-            batches = _orig_sample(
-                names, batch_size=batch_size, mini_batches=mini_batches, sequence_length=sequence_length
-            )
-            if "rewards" not in names:
-                return batches  # SAC also samples without rewards (e.g. target actions) — leave those
-            rew_view = memory.tensors_view["rewards"]
-            obs_key = "observations" if "observations" in memory.tensors else "states"
-            obs_view = memory.tensors_view[obs_key]
-            act_view = memory.tensors_view["actions"]
-
-            idx = memory.sampling_indexes.to(rew_view.device)
-            uncached = ~self._maha_cached[idx]
-            if uncached.any():
-                u_idx = idx[uncached]
-                r = self._compute_reward(obs_view[u_idx], act_view[u_idx])
-                rew_view[u_idx] = r.view(-1, 1).to(rew_view.dtype)
-                self._maha_cached[u_idx] = True
-
-            rew_idx = names.index("rewards")
-            chunks = np.array_split(memory.sampling_indexes, mini_batches) if mini_batches > 1 else [memory.sampling_indexes]
-            for b, ch in enumerate(chunks):
-                batches[b][rew_idx] = rew_view[ch.to(rew_view.device)]
-            return batches
-
-        memory.sample = _dynamic_maha_sample
-
     # ── Phase B update ──────────────────────────────────────────────────── #
 
     def update_policy(
-        self, observations: torch.Tensor, actions: torch.Tensor | None = None,
+        self, next_observations: torch.Tensor, actions: torch.Tensor | None = None,
+        observations: torch.Tensor | None = None,
         *, timestep: int, timesteps: int,
     ) -> dict:
         """Inject the Mahalanobis reward and drive the base agent's update.
@@ -654,22 +676,35 @@ class C2RLAgent(Agent):
         PPO: compute the Mahalanobis reward over the whole fresh rollout batch,
         overwrite the rollout's rewards, then call update() once (PPO's own
         rollouts-cadence hook never fires here — the trainer drives it
-        explicitly). SAC: the reward is recomputed/solved inside the patched
+        explicitly). SAC: the reward is recomputed inside the patched
         memory.sample() and the gradient step is driven by the trainer calling
         ``post_interaction()`` right after, so this is a no-op for SAC.
+
+        ``next_observations`` (POST-transition, i.e. the caller's ``next_obs``
+        batch) — not the pre-action observations the actor conditioned on —
+        see ``_compute_reward``'s docstring.
         """
         if self._base_algorithm == "PPO":
-            maha_r = self._compute_reward(observations, actions)
+            maha_r = self._compute_reward(next_observations, actions, prev_observations=observations)
             try:
                 memory = self._rl_agent.memory
                 r_tensor = memory.get_tensor_by_name("rewards")
+                term_tensor = memory.get_tensor_by_name("terminated")
+                trunc_tensor = memory.get_tensor_by_name("truncated")
+                
                 # The final rollout chunk of training may be shorter than
                 # `rollouts` (timesteps not a multiple of rollout_steps), so
-                # `observations`/`maha_r` can cover fewer rows than the
+                # `next_observations`/`maha_r` can cover fewer rows than the
                 # memory's fixed [rollout_steps, num_envs, 1] reward tensor —
                 # only overwrite the rows that were actually filled.
-                n_steps = observations.shape[0] // memory.num_envs
-                r_tensor[:n_steps].copy_(maha_r.view(n_steps, memory.num_envs, 1))
+                n_steps = next_observations.shape[0] // memory.num_envs
+                
+                # FIX: mask out boundary steps so PPO doesn't train on huge fake penalties
+                finished = (term_tensor[:n_steps] | trunc_tensor[:n_steps])
+                maha_r_shaped = maha_r.view(n_steps, memory.num_envs, 1)
+                maha_r_shaped[finished] = 0.0
+                
+                r_tensor[:n_steps].copy_(maha_r_shaped)
             except RuntimeError as e:
                 import skrl
                 skrl.logger.warning(f"[C2RL] Failed to inject Mahalanobis reward in update_policy: {e}")
@@ -679,8 +714,8 @@ class C2RLAgent(Agent):
     def _train_dynamics(self, data: dict) -> float:
         """MSE training of NeuralDynamics on (x, u, x_dot) data (same as C3M).
 
-        Called by the trainer's ``pretrain_dynamics`` (both use_cmg modes) when
-        learning dynamics — the SDP needs f/B/∂f/∂x before any solve.
+        Called by the trainer's ``pretrain_dynamics`` when learning dynamics —
+        Phase A's CMG synthesis needs f/B/∂f/∂x before it runs.
         """
         import torch.nn as nn
         dev = self._neural_dynamics.device
@@ -699,9 +734,7 @@ class C2RLAgent(Agent):
         return loss.item()
 
     def freeze_cmg(self) -> None:
-        """Freeze the regressed CMG before Phase B (use_cmg=True only)."""
-        if self._ccm_gen is None:
-            return
+        """Freeze the synthesized CMG before Phase B."""
         for p in self._ccm_gen.parameters():
             p.requires_grad_(False)
         self._ccm_gen.eval()
@@ -731,72 +764,137 @@ class C2RLAgent(Agent):
         return x_all[idx]
 
     def synthesize_cmg(self, *, timesteps: int = 0) -> dict:
-        """use_cmg=True offline synthesis: sample states, solve one contraction-metric
-        SDP per state (build_cm_dataset), MSE-regress the CMG network onto the
-        feasible ``{x -> W*}`` targets (regress_cmg), then freeze it. Called once
-        by the trainer before Phase B — needs the dynamics already pretrained so
-        the SDP has meaningful ``f``/``B``/``∂f/∂x``.
+        """Offline CMG synthesis (Phase A, always runs before Phase B) —
+        dispatches to one of two pipelines depending on ``cmg_method``:
 
-        Logs the SDP-synthesis diagnostics (feasibility rate, contraction-LMI
-        residual — see ``cm_synthesis.build_cm_dataset``) as a single point,
-        then the full per-epoch CMG-regression loss/LR curve, both at negative
-        timesteps so they precede Phase B on the ``global_step`` x-axis — same
-        convention ``dynamics_pretrain.py`` uses for the NeuralDynamics fit.
+        * **``"cvstem"``** (CV-STEM): convex optimization.  Sample states, solve
+          one pointwise SDP per state (``build_cm_dataset``), MSE-regress the CMG
+          network onto the feasible ``{x → W*}`` targets (``regress_cmg``), then
+          freeze.  The SDP results are cached to disk.
 
-        The per-state SDP solve is the expensive part, so the resulting ``{x, W}``
-        dataset is ALWAYS written to disk after a fresh solve — to ``cm_data_path``
-        if set, else next to ``dynamics_pretrain_data_path`` (``cm_data_{formulation}.npz``
-        — see ``cm_synthesis.cm_dataset_cache_path``) if THAT'S set, else to this
-        run's own ``experiment_dir/checkpoints/cm_data_{formulation}.npz`` (same
-        convention as the ``dynamics.pt`` checkpoint) so a synthesis is never
-        silently thrown away even with no path configured. Every one of these
-        paths is suffixed with ``cm_formulation`` (``with_formulation_suffix``)
-        so ``"ccm"`` and ``"cvstem"`` runs never share (and can't clobber) the
-        same cache file even when ``cm_data_path``/``dynamics_pretrain_data_path``
-        is unchanged between them. Loading only happens for the first two
-        (explicitly-configured, therefore stable-across-runs) locations — the
-        per-run experiment_dir fallback is written but never auto-loaded, since
-        its path is unique to this run; set ``cm_data_path`` explicitly to reuse
-        a synthesis across runs. See ``load_cached_cm_dataset``/``save_cm_dataset``.
+        * **``"ccm"``** (default — C1/C2 loss minimization): neural-network
+          training.  Train the CMG network end-to-end with C1 (contraction) and
+          C2 (killing) losses (``train_cmg_ccm``) over uniformly sampled states
+          — no per-state SDP, no MSE regression.  C2 makes the metric
+          ``u``-independent by construction, so no u-box vertex enumeration is
+          needed.
+
+        Called once by the trainer before Phase B — needs the dynamics already
+        pretrained so the SDP / gradient computation has meaningful
+        ``f``/``B``/``∂f/∂x``.
+
+        Logs per-epoch loss/LR curves at negative timesteps so they precede
+        Phase B on the ``global_step`` x-axis — same convention
+        ``dynamics_pretrain.py`` uses for the NeuralDynamics fit.
         """
-        from .cm_synthesis import (
+        cfg = self._cfg
+        if cfg.cmg_method == "ccm":
+            return self._synthesize_cmg_ccm(timesteps=timesteps)
+        else:
+            return self._synthesize_cmg_cvstem(timesteps=timesteps)
+
+    def _synthesize_cmg_ccm(self, *, timesteps: int = 0) -> dict:
+        """CCM path: train the CMG network directly with C1+C2 losses."""
+        from .ncm_synthesis import train_cmg_ccm
+        cfg = self._cfg
+        has_writer = getattr(self, "writer", None) is not None
+        epochs = cfg.cmg_regress_epochs
+
+        # ~100 wandb points regardless of epochs, final epoch always flushed.
+        log_every = max(1, epochs // 100)
+
+        def _on_epoch(epoch: int, train_loss: float, lr: float, val_loss: float) -> None:
+            self.track_data("Loss / C2RL/cmg/c1c2_loss", train_loss)
+            self.track_data("Loss / C2RL/cmg/regress_lr", lr)
+            if not np.isnan(val_loss):
+                self.track_data("Loss / C2RL/cmg/c1c2_val_loss", val_loss)
+            if has_writer and ((epoch + 1) % log_every == 0 or epoch == epochs - 1):
+                self.write_tracking_data(timestep=epoch - epochs, timesteps=timesteps)
+
+        info = train_cmg_ccm(
+            self._ccm_gen, self._get_f_and_B, self._get_rollout,
+            x_dim=self._x_dim, u_dim=self._u_dim,
+            lbd=cfg.lbd, w_lb=cfg.w_lb, w_ub=cfg.w_ub, eps=cfg.cm_eps,
+            epochs=epochs, lr=cfg.cmg_regress_lr, batch_size=cfg.cmg_regress_batch_size,
+            num_samples=cfg.cmg_memory_size,
+            lr_scheduler=cfg.cmg_regress_lr_scheduler,
+            lr_scheduler_kwargs=cfg.cmg_regress_lr_scheduler_kwargs,
+            device=self._device, tag="[C2RL]",
+            on_epoch=_on_epoch,
+            val_frac=cfg.cmg_val_frac, early_stop_patience=cfg.cmg_early_stop_patience,
+            x_samples=self._sample_cmg_x(),
+            random_ratio=getattr(cfg, "cmg_random_ratio", 0.0),
+        )
+        self.freeze_cmg()
+        self.track_data("Loss / C2RL/cmg/c1c2_loss_best", info["final_loss"])
+        if not np.isnan(info["final_val_loss"]):
+            self.track_data("Loss / C2RL/cmg/c1c2_val_loss_best", info["final_val_loss"])
+        if has_writer:
+            self.write_tracking_data(timestep=-1, timesteps=timesteps)
+        return {
+            "feasibility_rate": 1.0,  # no SDP, no infeasibility concept
+            "residual_mean": float("nan"),
+            "residual_max": float("nan"),
+            "lambda_reduced_rate": 0.0,
+            "regress_mse": info["final_loss"],
+        }
+
+    def _synthesize_cmg_cvstem(self, *, timesteps: int = 0) -> dict:
+        """CV-STEM path: convex SDP per state + MSE regression (original pipeline)."""
+        from .ncm_synthesis import (
             build_cm_dataset, cm_dataset_cache_path, load_cached_cm_dataset,
-            regress_cmg, save_cm_dataset, with_formulation_suffix,
+            regress_cmg, save_cm_dataset,
         )
         cfg = self._cfg
         data_path = getattr(cfg, "dynamics_pretrain_data_path", "") or None
         explicit_cache_path = getattr(cfg, "cm_data_path", "") or None
-        # Every cm_data*.npz path (explicit, auto-derived, or the per-run
-        # fallback below) is formulation-suffixed — see with_formulation_suffix
-        # — so switching cm_formulation between runs never overwrites or
-        # silently reuses a differently-solved cache under the same filename.
+        # cm_wdot_trajectory (see C2RLPPOCfg's docstring): real Ẇ from OFFLINE
+        # REFERENCE TRAJECTORIES instead of dropping it or Tsukamoto's static
+        # cm_wdot_dt proxy — validated at __init__ time (requires
+        # dynamics_pretrain_data_path); random_ratio is meaningless here (the
+        # whole point is NOT mixing in i.i.d. states) so it's forced to 0 for
+        # both the cache key and the (unused, in this mode) x_samples pool.
+        wdot_trajectory = bool(getattr(cfg, "cm_wdot_trajectory", False))
+        temporal_dt = cfg.cm_temporal_dt if wdot_trajectory else 0.0
+        random_ratio = 0.0 if wdot_trajectory else getattr(cfg, "cmg_random_ratio", 0.0)
+        traj_x = traj_lengths = None
+        if wdot_trajectory:
+            from .dynamics_pretrain import load_offline_trajectories
+            traj_data = load_offline_trajectories(data_path, tag="[C2RL]")
+            traj_x, traj_lengths = traj_data["x"], traj_data["lengths"]
         if explicit_cache_path:
-            cache_path = with_formulation_suffix(Path(explicit_cache_path), cfg.cm_formulation)
+            cache_path = Path(explicit_cache_path)
         elif data_path:
-            cache_path = cm_dataset_cache_path(data_path, cfg.cm_formulation)
+            cache_path = cm_dataset_cache_path(data_path)
         else:
             cache_path = None
         cache_kwargs = dict(
             lbd=cfg.lbd, w_lb=cfg.w_lb, w_ub=cfg.w_ub, eps=cfg.cm_eps,
             solver=cfg.cm_solver, num_samples=cfg.cmg_memory_size, tag="[C2RL]",
-            formulation=cfg.cm_formulation, r_scaler=cfg.cvstem_r_scaler,
+            r_scaler=cfg.cvstem_r_scaler,
+            chi_weight=cfg.cm_chi_weight,
+            nu_weight=cfg.cm_nu_weight, wdot_dt=cfg.cm_wdot_dt,
+            random_ratio=random_ratio,
+            wdot_trajectory=wdot_trajectory, temporal_dt=temporal_dt,
         )
         dataset = load_cached_cm_dataset(cache_path, **cache_kwargs) if cache_path else None
         if dataset is None:
             dataset = build_cm_dataset(
                 self._get_rollout, self._get_f_and_B,
-                x_dim=self._x_dim, u_dim=self._u_dim,
+                x_dim=self._x_dim,
                 lbd=cfg.lbd, w_lb=cfg.w_lb, w_ub=cfg.w_ub, eps=cfg.cm_eps,
                 num_samples=cfg.cmg_memory_size, solver=cfg.cm_solver,
                 device=self._device, tag="[C2RL]",
-                x_samples=self._sample_cmg_x(),
+                x_samples=self._sample_cmg_x() if not wdot_trajectory else None,
+                random_ratio=random_ratio,
                 min_feasibility_rate=cfg.min_feasibility_rate,
-                formulation=cfg.cm_formulation, r_scaler=cfg.cvstem_r_scaler,
+                r_scaler=cfg.cvstem_r_scaler,
                 max_lambda_reductions=cfg.max_lambda_reductions,
+                chi_weight=cfg.cm_chi_weight,
+                nu_weight=cfg.cm_nu_weight, wdot_dt=cfg.cm_wdot_dt,
+                traj_x=traj_x, traj_lengths=traj_lengths, temporal_dt=temporal_dt,
             )
-            save_path = cache_path or with_formulation_suffix(
-                Path(self.experiment_dir) / "checkpoints" / "cm_data.npz", cfg.cm_formulation
-            )
+            save_path = cache_path or Path(self.experiment_dir) / "checkpoints" / "cm_data.npz"
             save_cm_dataset(save_path, dataset, **cache_kwargs)
         has_writer = getattr(self, "writer", None) is not None
         epochs = cfg.cmg_regress_epochs
@@ -860,8 +958,8 @@ class C2RLAgent(Agent):
 # ─────────────────────────────────────────────────────────────────────────── #
 
 class C2RLSkrlTrainer(Trainer):
-    """skrl Trainer for C2RL — optional offline CMG synthesis (use_cmg), then
-    single-policy RL against the Mahalanobis reward (frozen CMG or online CM)."""
+    """skrl Trainer for C2RL — offline CMG synthesis (Phase A), then
+    single-policy RL against the frozen CMG's Mahalanobis reward (Phase B)."""
 
     def _env_scalar_attr(self, *names):
         """See the identical helper on C3M's trainer — cross-backend env attr lookup."""
@@ -906,11 +1004,9 @@ class C2RLSkrlTrainer(Trainer):
         log_raw_config(getattr(self, "_wandb_raw_cfg", None))
         agent.enable_training_mode(True)
 
-        # Pretrain learned dynamics (if any) BEFORE any SDP solve, so the
-        # contraction-metric SDP has meaningful f/B/∂f/∂x. No-op for analytical
-        # dynamics (classic envs). Needed by BOTH modes — use_cmg=True solves the
-        # SDP over the offline dataset next, use_cmg=False solves it online in
-        # Phase B.
+        # Pretrain learned dynamics (if any) BEFORE Phase A's CMG synthesis, so it
+        # has meaningful f/B/∂f/∂x (SDP dataset for "cvstem", C1/C2 gradient
+        # computation for "ccm"). No-op for analytical dynamics (classic envs).
         from .dynamics_pretrain import pretrain_dynamics
         pretrain_dynamics(
             agent,
@@ -924,21 +1020,18 @@ class C2RLSkrlTrainer(Trainer):
             early_stop_patience=getattr(agent._cfg, "dynamics_early_stop_patience", 10),
         )
 
-        if agent._use_cmg:
-            # ── use_cmg=True: offline synthesis — sample states, solve one SDP per
-            # state (build_cm_dataset), regress the CMG network onto {x -> W*}
-            # (regress_cmg), then freeze. Phase B then reads the static metric.
-            # synthesize_cmg logs feasibility/residual/loss/LR to the writer itself. ──
-            info = agent.synthesize_cmg(timesteps=timesteps)
-            print(f"[C2RL] use_cmg=True — CMG regressed from SDP dataset "
-                  f"(feasible {info['feasibility_rate']:.1%}, λ-reduced {info['lambda_reduced_rate']:.1%}, "
-                  f"MSE {info['regress_mse']:.4g}) and frozen.")
-        else:
-            print("[C2RL] use_cmg=False — CM metric solved online per state "
-                  f"({'per replayed transition, cached' if agent._base_algorithm == 'SAC' else 'per rollout batch'}).")
+        # ── Phase A: offline CMG synthesis — "cvstem" solves one SDP per sampled
+        # state (build_cm_dataset) and MSE-regresses the CMG onto {x -> W*}
+        # (regress_cmg); "ccm" trains the CMG directly with C1/C2 losses
+        # (train_cmg_ccm). Either way the CMG is frozen before Phase B reads its
+        # static metric. synthesize_cmg logs feasibility/residual/loss/LR itself. ──
+        info = agent.synthesize_cmg(timesteps=timesteps)
+        print(f"[C2RL] Phase A ({agent._cfg.cmg_method}) — CMG synthesized "
+              f"(feasible {info['feasibility_rate']:.1%}, λ-reduced {info['lambda_reduced_rate']:.1%}, "
+              f"loss {info['regress_mse']:.4g}) and frozen.")
 
         # ── Phase B: rollout + train the deployed policy against the Mahalanobis
-        # reward (frozen CMG or online CM). ─────────────────────────────────
+        # reward computed from the frozen CMG. ─────────────────────────────
         rl_agent = agent._rl_agent
         rl_agent.enable_training_mode(True)
         rollout_steps = agent._cfg.rollouts
@@ -951,11 +1044,20 @@ class C2RLSkrlTrainer(Trainer):
         flush_interval = max(1, timesteps // 100)
         next_flush = flush_interval
 
+        # Per-env maha reward accumulator — tracks the episodic total of the
+        # Mahalanobis reward the policy actually optimizes (stored_reward), so
+        # episode-completion summaries land under "Maha Reward/total_reward_mean"
+        # (with CI) in wandb, distinct from the env's own "Reward/total_reward".
+        num_envs = agent._num_envs
+        maha_episode_reward = torch.zeros(num_envs, dtype=torch.float32, device=agent._device)
+
+        agent._is_classic_env = "classic" in type(env.unwrapped).__module__
+
         pbar = _tqdm.tqdm(total=timesteps, desc="C2RL training (Phase B)", file=sys.stdout)
         while global_step < timesteps:
             if agent._base_algorithm == "PPO":
                 rl_agent.memory.reset()
-            obs_list, act_list = [], []
+            obs_list, next_obs_list, act_list = [], [], []
 
             steps_to_take = min(rollout_steps, timesteps - global_step)
             for _ in range(steps_to_take):
@@ -965,25 +1067,74 @@ class C2RLSkrlTrainer(Trainer):
                 next_obs, rewards, terminated, truncated, infos = env.step(actions)
                 next_states = env.state() if hasattr(env, "state") else None
                 obs_list.append(observations.clone())
+                next_obs_list.append(next_obs.clone())
                 act_list.append(actions.clone())
 
-                # Stored/logged reward: use_cmg=True re-uses the frozen CMG's
-                # cheap forward pass to log the Mahalanobis reward the policy
-                # actually optimizes; use_cmg=False stores a placeholder (the real
-                # online-CM reward is solved later — PPO: over the rollout batch;
-                # SAC: lazily per replayed transition — so solving it here would be
-                # wasted). Either way the raw env reward is logged alongside.
-                if agent._use_cmg:
-                    stored_reward = agent._compute_reward(observations, actions).view_as(rewards)
-                else:
-                    stored_reward = torch.zeros_like(rewards)
+                # Stored/logged reward: the frozen CMG's cheap forward pass gives
+                # the real Mahalanobis reward the policy optimizes, computed right
+                # here at collection time (no later recompute needed for PPO's
+                # rollout-batch update; SAC still re-evaluates it per replayed
+                # mini-batch via _setup_frozen_cmg_sample, since the metric is
+                # static so re-evaluating is as cheap as caching). The raw env
+                # reward is logged alongside. Computed from next_obs (POST-
+                # transition) — see _compute_reward's docstring: the reward
+                # must reflect the state the action caused, not the state it
+                # merely observed, or a near-zero discount_factor gives the
+                # actor no gradient signal at all.
+                prev_obs = observations if agent._is_classic_env else None
+                stored_reward = agent._compute_reward(next_obs, actions, prev_observations=prev_obs).view_as(rewards)
                 rl_agent.record_transition(
                     observations=observations, states=states, actions=actions,
-                    rewards=stored_reward, next_observations=next_obs, next_states=next_states,
+                    rewards=rewards, next_observations=next_obs, next_states=next_states,
                     terminated=terminated, truncated=truncated, infos=infos,
                     timestep=global_step, timesteps=timesteps,
                 )
                 rl_agent.track_data("Reward / env_reward (mean)", float(rewards.float().mean()))
+
+                # ── Maha reward episode tracking ─────────────────────────── #
+                # Accumulate the per-step maha reward into the per-env episode
+                # total; on episode boundaries emit the summary under the
+                # "Maha Reward" wandb tab (total_reward_mean + ci95).
+                with torch.no_grad():
+                    from .rl_glue import compute_mahalanobis_reward
+                    maha_next = compute_mahalanobis_reward(
+                        agent._ccm_gen, next_obs, None,
+                        x_dim=agent._x_dim, u_dim=agent._u_dim, angle_idx=agent._angle_idx,
+                        w_lb=agent._cfg.w_lb, tracking_scaler=1.0, control_scaler=0.0
+                    )
+                    if prev_obs is not None:
+                        maha_prev = compute_mahalanobis_reward(
+                            agent._ccm_gen, prev_obs, None,
+                            x_dim=agent._x_dim, u_dim=agent._u_dim, angle_idx=agent._angle_idx,
+                            w_lb=agent._cfg.w_lb, tracking_scaler=1.0, control_scaler=0.0
+                        )
+                        delta_maha = maha_next - maha_prev
+                    else:
+                        delta_maha = maha_next
+                
+                finished = (terminated | truncated).reshape(num_envs)
+                # FIX: Auto-reset replaces next_obs with the new episode's initial state.
+                # We mask it out so the sum safely collapses to D(initial) - D(pre_terminal).
+                delta_maha[finished] = 0.0
+                
+                maha_episode_reward += delta_maha.detach().float().reshape(num_envs)
+                
+                if finished.any():
+                    import collections
+                    import numpy as np
+                    
+                    if not hasattr(agent, "_track_maha_rewards"):
+                        agent._track_maha_rewards = collections.deque(maxlen=100)
+                    agent._track_maha_rewards.extend(maha_episode_reward[finished].tolist())
+                    
+                    if len(agent._track_maha_rewards) > 0:
+                        track_maha = np.array(agent._track_maha_rewards)
+                        agent.track_data("Maha Reward / Total reward (max)", float(np.max(track_maha)))
+                        agent.track_data("Maha Reward / Total reward (min)", float(np.min(track_maha)))
+                        agent.track_data("Maha Reward / Total reward (mean)", float(np.mean(track_maha)))
+                        
+                    maha_episode_reward[finished] = 0.0
+
                 self._forward_env_log(agent, infos)
                 observations = next_obs
                 states = next_states
@@ -1000,8 +1151,13 @@ class C2RLSkrlTrainer(Trainer):
             # Chunk-based update for PPO
             if agent._base_algorithm == "PPO":
                 obs_tensor = torch.cat(obs_list, dim=0)
+                next_obs_tensor = torch.cat(next_obs_list, dim=0)
                 act_tensor = torch.cat(act_list, dim=0)
-                agent.update_policy(obs_tensor, act_tensor, timestep=global_step, timesteps=timesteps)
+                agent.update_policy(
+                    next_obs_tensor, act_tensor,
+                    observations=obs_tensor if agent._is_classic_env else None,
+                    timestep=global_step, timesteps=timesteps
+                )
                 rl_agent.post_interaction(timestep=global_step, timesteps=timesteps)
                 if global_step >= next_flush and getattr(rl_agent, "writer", None) is not None:
                     rl_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)

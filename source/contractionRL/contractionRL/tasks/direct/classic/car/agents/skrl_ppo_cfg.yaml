@@ -4,7 +4,7 @@ models:
   separate: true
   policy:
     class: GaussianMixin  # Uses a Gaussian distribution for continuous actions
-    backbone: mlp  # mlp (plain MLP, u = uref + MLP(obs)) | control (CLActor, u = uref + feedback(x-xref))
+    backbone: control  # mlp (plain MLP, u = uref + MLP(obs)) | control (CLActor, u = uref + feedback(x-xref))
     clip_actions: false  # Clip actions to the environment action space limits
     clip_log_std: true  # Clip the log standard deviation of the policy distribution
     min_log_std: -20.0  # Lower bound for log standard deviation
@@ -38,7 +38,7 @@ agent:
   rollouts: 24        # num_envs=4, 300 steps → 1200 samples/update; covers ~9s episode at dt=0.03
   learning_epochs: 5  # Number of gradient descent passes over the collected batch
   mini_batches: 4  # Number of subsets to divide the batch into for stochastic optimization
-  discount_factor: 0.99  # Gamma discount factor weighting future rewards
+  discount_factor: 0.1  # Gamma discount factor weighting future rewards
   gae_lambda: 0.95  # Lambda parameter for Generalized Advantage Estimation (GAE)
   learning_rate: 1.0e-6    # Global step size for neural network optimization
   learning_rate_scheduler: KLAdaptiveLR
@@ -74,5 +74,5 @@ agent:
   use_value_norm: true
 trainer:
   class: SequentialTrainer
-  timesteps: 50000   # Total number of environment steps to train for
+  timesteps: 1000000   # Total number of environment steps to train for
   environment_info: log  # Type of environment information to record (e.g., log)

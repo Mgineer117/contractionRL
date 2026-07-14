@@ -444,6 +444,17 @@ class PathTrackingBase(DirectRLEnv):
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
+        # Refresh _x_ref/_u_ref for THIS step here rather than relying on
+        # _get_observations() to have set them: DirectRLEnv.step() calls
+        # _get_rewards() BEFORE _get_observations() (after incrementing
+        # episode_length_buf), so without this, _x_ref/_u_ref would still hold
+        # the PREVIOUS step's values — pairing the post-transition physical
+        # state x below against a one-step-stale reference. _traj_buf.get is a
+        # pure lookup (no side effects), so recomputing it again in
+        # _get_observations() with the same episode_length_buf is harmless.
+        step = self.episode_length_buf.long()
+        self._x_ref, self._u_ref = self._traj_buf.get(self._traj_ids, step)
+
         # sanitize + clamp so a diverging env yields a large-but-FINITE penalty
         # (never NaN/Inf) into the reward, AUC, and Stability curves — the
         # episode is never reset/terminated because of it (see _sanitize_state).

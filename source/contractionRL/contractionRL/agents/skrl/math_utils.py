@@ -94,7 +94,7 @@ def build_lr_scheduler(optimizer: torch.optim.Optimizer, name: str, kwargs: dict
 
     Shared by every pretraining loop that anneals an Adam LR by epoch (C2RL's
     NeuralDynamics fit in ``dynamics_pretrain.py`` and CMG regression in
-    ``cm_synthesis.regress_cmg``) so they build schedulers the same way — each
+    ``ncm_synthesis.regress_cmg``) so they build schedulers the same way — each
     still configures its OWN ``name``/``kwargs`` independently, this just avoids
     duplicating the ``getattr(torch.optim.lr_scheduler, ...)`` lookup.
     """
@@ -117,7 +117,7 @@ def train_val_split(n: int, val_frac: float, device=None) -> tuple[torch.Tensor,
 
     ``val_frac<=0`` returns an empty ``val_idx`` and every index in
     ``train_idx`` (validation/early-stopping disabled). Shared by
-    ``dynamics_pretrain.pretrain_dynamics`` and ``cm_synthesis.regress_cmg`` so
+    ``dynamics_pretrain.pretrain_dynamics`` and ``ncm_synthesis.regress_cmg`` so
     both hold out their fixed pretraining buffer the same way.
     """
     perm = torch.randperm(n, device=device)
@@ -129,7 +129,7 @@ class EarlyStopper:
     """Tracks a held-out validation loss across epochs and signals when to stop.
 
     Shared by ``dynamics_pretrain.pretrain_dynamics`` (NeuralDynamics fit) and
-    ``cm_synthesis.regress_cmg`` (CMG regression) — both fit a fixed,
+    ``ncm_synthesis.regress_cmg`` (CMG regression) — both fit a fixed,
     once-sampled buffer for a configured epoch budget, but with no held-out
     signal that budget is just a guess: too many epochs overfits the buffer,
     too few undershoots it. Holding out a validation split and stopping once

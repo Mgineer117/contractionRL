@@ -65,7 +65,7 @@ python -c "import torch, scipy, gymnasium, skrl; print('OK')"
 ### 5. (Optional) MOSEK — a higher-accuracy SDP solver for C2RL
 
 C2RL's contraction-metric SDP (`cm_solver` in the yaml's `cm:` block — see
-[cm_synthesis.py](source/contractionRL/contractionRL/agents/skrl/cm_synthesis.py))
+[ncm_synthesis.py](source/contractionRL/contractionRL/agents/skrl/ncm_synthesis.py))
 defaults to **SCS**, an open-source solver that needs no license and is already
 installed via the `cvxpy` dependency above. **MOSEK** is a commercial
 interior-point solver — the one Tsukamoto's original Neural Contraction Metric

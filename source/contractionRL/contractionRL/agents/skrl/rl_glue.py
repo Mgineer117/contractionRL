@@ -1,6 +1,6 @@
 """Shared glue used across contraction agents (C3M/SDLQR/LQR/C2RL) and the
 ContractionRunner: raw-dict -> dataclass config filtering, plus the
-CMG-derived Mahalanobis reward machinery used by C2RL's use_cmg path.
+CMG-derived Mahalanobis reward machinery C2RL always reads its reward from.
 
 Extracted verbatim from C2RLAgent (see c2rl.py's module docstring for the full
 normalization rationale) so algorithms call the SAME code instead of copies
@@ -103,7 +103,7 @@ def make_base_rl_cfg(
 ) -> dict:
     """Project a raw C2RL-style config dict down to a real PPO_CFG/SAC_CFG dict.
 
-    Passing C2RL/CMG-specific keys (W_lr, lbd, use_cmg, ...) to
+    Passing C2RL/CMG-specific keys (W_lr, lbd, cmg_method, ...) to
     PPO_CFG(**cfg) / SAC_CFG(**cfg) would raise TypeError, since those are
     kw_only dataclasses that reject unknown kwargs. Also rebuilds `experiment`
     as a plain dict (the raw value may be an ExperimentCfg object, which is not
