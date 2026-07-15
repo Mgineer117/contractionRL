@@ -8,15 +8,16 @@ from PIL import Image
 
 class WandbPlotWrapper:
     """
-    Gym wrapper that dynamically tracks live stochastic episodes.
-    It automatically pushes train/normalized_error, train/position_tracking,
-    and train/velocity_tracking trajectory curves to wandb.
+    Gym wrapper that dynamically tracks live stochastic episodes across up to
+    3 randomly-chosen envs. It automatically pushes train/normalized_error,
+    train/position_tracking, and train/velocity_tracking trajectory curves to
+    wandb.
     """
     def __init__(self, env, total_timesteps=None, num_plots=10):
         self.env = env
         self._episode_count = 0
         self.num_envs = getattr(env, "num_envs", 1)
-        self.plot_idx = np.random.choice(self.num_envs, 1, replace=False)
+        self.plot_idx = np.random.choice(self.num_envs, min(3, self.num_envs), replace=False)
         self._norm_errs = {i: [] for i in self.plot_idx}
         self._traj_x = {i: [] for i in self.plot_idx}
         self._traj_xref = {i: [] for i in self.plot_idx}
@@ -51,13 +52,16 @@ class WandbPlotWrapper:
         self._total_steps += self.num_envs
         self._step_calls += 1
 
-        # Handle batched (Isaac Lab / VectorEnv) vs unbatched. Must check the
+        # Handle batched (Isaac Lab / VectorEnv) vs unbatched. Must check a
         # TRACKED env (plot_idx), not env 0 — self._norm_errs/_traj_x/_traj_xref
         # below are keyed by plot_idx and flushed on this flag, so checking a
         # different env's done here left the tracked buffers un-flushed at the
         # tracked env's own episode boundary. They kept accumulating across
         # that env's resets instead, so the pushed plot silently spliced the
-        # tail of one episode onto the head of the next.
+        # tail of one episode onto the head of the next. plot_idx[0] is the
+        # PRIMARY tracked env — its episode boundary triggers the push/reset
+        # for all up-to-3 tracked envs (they share fixed episode lengths in
+        # this codebase, so the others complete at ~the same step).
         plot_env = int(self.plot_idx[0])
         if isinstance(terminated, torch.Tensor):
             done_0 = bool((terminated | truncated)[plot_env].item())

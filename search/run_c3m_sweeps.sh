@@ -60,6 +60,12 @@ parameters:
     distribution: log_uniform_values
     min: 1e-5
     max: 1e-3
+  agent.c1_c2_scale:
+    distribution: uniform
+    min: 0.01
+    max: 1.0
+  agent.models.policy.backbone:
+    values: [control, control-squashed]
   agent.actor_lr:
     distribution: log_uniform_values
     min: 1e-5

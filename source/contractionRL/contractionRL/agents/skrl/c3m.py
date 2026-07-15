@@ -709,11 +709,10 @@ class C3MSkrlTrainer(Trainer):
         observations, infos = self.env.reset()
         states = self.env.state() if hasattr(self.env, "state") else None
 
-        from .contraction_metrics import log_tracking_plots, reward_summary
+        from .contraction_metrics import reward_summary
 
         num_envs = self.env.num_envs
         device = self.env.device
-        dt = float(self._env_scalar_attr("step_dt", "dt"))
 
         # Metric collection is now handled by StatManagerEnvWrapper on every
         # reset()/step() (auto e0-anchoring off the true episode counter, one clean
@@ -758,20 +757,14 @@ class C3MSkrlTrainer(Trainer):
         # Only envs that finished their (first) episode carry valid reward info.
         f_mask = finished if finished.any() else torch.ones_like(finished)
 
-        # Metrics + plots come straight from the wrapper's StatManager. Plot a few.
-        # prefix="eval" (not "train"): WandbPlotWrapper (scripts/skrl/
-        # wandb_plot_wrapper.py) already pushes to "train/normalized_error" /
-        # "train/path_tracking" from a LIVE, stochastic, single-env training
-        # rollout on its own step-based cadence. Reusing "train" here collided
-        # both pushes onto the identical wandb keys, silently interleaving this
-        # deterministic (enable_training_mode(False)), multi-env eval rollout
-        # with that noisy training-time one under one legend/slider.
-        tx, txr, terr = self.env.trajectories()
-        keep = list(terr.keys())[:3]
-        log_tracking_plots({i: tx[i] for i in keep if i in tx},
-                           {i: txr[i] for i in keep if i in txr},
-                           {i: terr[i] for i in keep}, dt=dt, prefix="eval",
-                           step=timestep, title="C3M")
+        # Tracking plots are NOT pushed from here: C3M never steps the env
+        # outside this eval() rollout (see C3MSkrlTrainer.train() docstring —
+        # "no env interaction during training"), so WandbPlotWrapper (scripts/
+        # skrl/wandb_plot_wrapper.py), which hooks every env.step() call
+        # regardless of caller, already captures this exact rollout under
+        # "train/normalized_error" / "train/path_tracking" — pushing a second,
+        # "eval"-prefixed copy from here was a redundant duplicate of the same
+        # underlying trajectory data.
         return {
             "stability": self.env.stability_summary(),
             "reward": reward_summary(total_reward, f_mask),

@@ -11,7 +11,12 @@ sweep_config = {
         '--headless',
         '${args}'
     ],
-    'parameters': {'learning_rate': {'min': 1e-06, 'max': 0.001}, 'discount_factor': {'values': [0.9, 0.99, 0.999]}}
+    'parameters': {
+        'learning_rate': {'min': 1e-06, 'max': 0.001},
+        'discount_factor': {'values': [0.9, 0.99, 0.999]},
+        'c1_c2_scale': {'distribution': 'uniform', 'min': 0.01, 'max': 1.0},
+        'agent.models.policy.backbone': {'values': ['control', 'control-squashed']},
+    }
 }
 
 try:
