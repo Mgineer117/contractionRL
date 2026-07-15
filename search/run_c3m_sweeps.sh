@@ -71,7 +71,7 @@ parameters:
     min: 1e-5
     max: 1e-3
   agent.actor_architecture:  # policy (CLActor w1/w2) hidden layers
-    values: [[64, 64], [128, 128], [256, 256], [128, 128, 128]]
+    values: [[64, 64], [128, 128], [512, 512], [128, 128, 128, 128]]
 
 command:
   - \${env}
