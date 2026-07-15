@@ -171,11 +171,11 @@ class StatManagerEnvWrapper:
         self._dt: float | None = None
         self._max_ep_len: int | None = None
 
-        self._recent_auc_mean: float = 1e6
+        self._recent_auc_mean: float = 1e2
         self._recent_auc_ci95: float = 0.0
         self._recent_lambda_mean: float = 0.0
         self._recent_lambda_ci95: float = 0.0
-        self._recent_C: float = 1e6
+        self._recent_C: float = 1e2
         self._recent_score_mean: float = 0.0
         self._recent_score_ci95: float = 0.0
         # Bumped each time a full eval buffer is reduced to metrics — lets
@@ -376,6 +376,19 @@ class StatManagerEnvWrapper:
 
         # Extract values for tracking
         err_vals = error.detach()
+
+        # At an auto-reset step the classic BaseEnv's info["tracking_error"] is
+        # the OLD episode's terminal error (computed before reset_idx), while
+        # obs/counters are already the NEW episode's. A slot opened here would
+        # anchor e0 on a near-zero stale value, inflating every normalized
+        # error in the window. Substitute the env's post-reset initial error
+        # (squared norm, hence sqrt) for the freshly reset envs.
+        if init_flags.any():
+            init_err_sq = self._first_attr("init_tracking_error")
+            if isinstance(init_err_sq, torch.Tensor):
+                fresh = torch.sqrt(torch.clamp(
+                    init_err_sq.reshape(-1).to(err_vals), min=0.0))
+                err_vals = torch.where(init_flags.reshape(-1), fresh, err_vals)
         obs_x = obs[:, :pd].detach().cpu().numpy()
         obs_xref = obs[:, xd:xd + pd].detach().cpu().numpy()
 

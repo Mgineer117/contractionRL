@@ -98,7 +98,19 @@ def make_base_rl_cfg(
     # "rewards_shaper", a Callable — translate it here since con_agent/
     # opt_agent bypass Runner entirely. 1.0 (or unset) is a no-op.
     rewards_shaper_scale = raw_cfg.get("rewards_shaper_scale")
-    if rewards_shaper_scale is not None and rewards_shaper_scale != 1.0:
+    # use_reward_norm: non-biasing running-std reward normalization (r/std, no
+    # mean subtraction — preserves the optimal policy). Installed through the
+    # SAME rewards_shaper hook and, when both are set, absorbs rewards_shaper_scale
+    # as its post-normalization scale (giving reward variance scale²). See
+    # preprocessors.RunningRewardScaler for why value_norm alone leaves the
+    # metric-bound-dependent (w_lb/w_ub) reward-scale instability unaddressed.
+    if raw_cfg.get("use_reward_norm", False):
+        from contractionRL.agents.skrl.preprocessors import RunningRewardScaler
+        d["rewards_shaper"] = RunningRewardScaler(
+            scale=(rewards_shaper_scale if rewards_shaper_scale is not None else 1.0),
+            device=device,
+        )
+    elif rewards_shaper_scale is not None and rewards_shaper_scale != 1.0:
         d["rewards_shaper"] = lambda rewards, *a, scale=rewards_shaper_scale, **kw: rewards * scale
 
     # Standalone PPO/SAC get observation (and, for PPO, value) normalization

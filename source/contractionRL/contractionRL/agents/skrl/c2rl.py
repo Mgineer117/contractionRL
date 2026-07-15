@@ -126,6 +126,7 @@ class C2RLPPOCfg(AgentCfg):
     time_limit_bootstrap: bool = False
     use_state_norm: bool = False  # off by default — see module docstring / rl_glue.make_base_rl_cfg
     use_value_norm: bool = True
+    use_reward_norm: bool = False  # non-biasing running-std reward normalizer (r/std) — see rl_glue.make_base_rl_cfg
     rewards_shaper_scale: float = 1.0  # yaml convenience for PPO_CFG's rewards_shaper — see rl_glue.make_base_rl_cfg
     std_dev_annealing_kwargs: dict | None = None  # forwarded to patch_ppo_std_annealing()
     # Set by ContractionRunner from the yaml `memory:` block's memory_size, NOT
@@ -283,6 +284,7 @@ class C2RLSACCfg(AgentCfg):
     learn_entropy: bool = True
     initial_entropy_value: float = 0.2
     use_state_norm: bool = False  # off by default — see module docstring / rl_glue.make_base_rl_cfg
+    use_reward_norm: bool = False  # non-biasing running-std reward normalizer (r/std) — see rl_glue.make_base_rl_cfg
     rewards_shaper_scale: float = 1.0  # yaml convenience for SAC_CFG's rewards_shaper — see rl_glue.make_base_rl_cfg
     std_dev_annealing_kwargs: dict | None = None  # forwarded to patch_ppo_std_annealing()
     memory_size: int = -1

@@ -16,6 +16,69 @@ from skrl.resources.preprocessors.torch import RunningStandardScaler
 from skrl.utils.spaces.torch import compute_space_size
 
 
+class RunningRewardScaler(nn.Module):
+    """Non-biasing reward normalizer for PPO's ``rewards_shaper`` hook.
+
+    Divides the reward by a running estimate of its standard deviation (never
+    subtracts a mean), so the reward fed to GAE is ~unit-variance regardless of
+    the metric-bound-dependent scale of the Mahalanobis reward
+    ``tracking_scaler·(eᵀM e − next_eᵀM next_e)`` (``M = W⁻¹`` has eigenvalues in
+    ``[1/w_ub, 1/w_lb]``, so its magnitude — and its heavy tail — grows as
+    ``1/w_lb``; see ``env_base.get_rewards`` and c2rl.py). This tames both that
+    scale and the early-training transient BEFORE the cumulative ``value_norm``
+    (``RunningStandardScaler`` on the value) can catch up, which it lags because
+    the frozen-CMG reward is non-stationary as the policy improves.
+
+    Why ``/std`` and no centering (the "does not bias the problem" property):
+    multiplying every reward by a positive scalar ``c`` scales all returns and
+    advantages by ``c``, leaving ``argmax_π`` unchanged. Subtracting a mean
+    shifts returns by a state/time-dependent constant and can change the
+    advantage structure — so only the positive-scalar divide is used.
+
+    Reuses skrl's ``RunningStandardScaler`` purely for its parallel-variance
+    tracking; only ``sqrt(running_variance)`` is consumed (running_mean is
+    ignored). By default tracks the variance of the raw per-step reward
+    (``gamma=0.0``), which needs no episode-reset/``done`` signal — the
+    ``rewards_shaper`` hook does not receive ``done`` (see ppo.py
+    ``record_transition``). Setting ``gamma>0`` switches to the SB3
+    ``VecNormalize`` variant (std of the discounted return ``R = γ·R + r``); with
+    no ``done`` reset this leaks across episode boundaries, so it is only
+    appropriate at small ``gamma`` (this repo's ``discount_factor`` is ~0.01,
+    where return ≈ reward and the two variants coincide anyway).
+    """
+
+    def __init__(
+        self,
+        *,
+        gamma: float = 0.0,
+        scale: float = 1.0,
+        epsilon: float = 1e-8,
+        device: str | torch.device | None = None,
+    ) -> None:
+        super().__init__()
+        self.gamma = float(gamma)
+        self.scale = float(scale)
+        self.epsilon = float(epsilon)
+        self._scaler = RunningStandardScaler(size=1, epsilon=epsilon, device=device)
+        # per-env discounted-return accumulator (lazily sized on first call)
+        self._returns: torch.Tensor | None = None
+
+    def forward(self, rewards: torch.Tensor, timestep=None, timesteps=None) -> torch.Tensor:
+        # rewards: (num_envs, 1). Match skrl's rewards_shaper(rewards, timestep, timesteps).
+        with torch.no_grad():
+            if self.gamma > 0.0:
+                if self._returns is None or self._returns.shape != rewards.shape:
+                    self._returns = torch.zeros_like(rewards)
+                self._returns = self.gamma * self._returns + rewards
+                tracked = self._returns
+            else:
+                tracked = rewards
+            # update running variance, then divide reward by std (no centering).
+            self._scaler(tracked, train=True)
+            std = torch.sqrt(self._scaler.running_variance.float()) + self.epsilon
+        return self.scale * rewards / std
+
+
 class PathTrackingObservationScaler(nn.Module):
     """``RunningStandardScaler`` restricted to the ``[x, xref]`` portion of a
     ``[x, xref, uref]`` observation, and further excluding ``angle_idx``

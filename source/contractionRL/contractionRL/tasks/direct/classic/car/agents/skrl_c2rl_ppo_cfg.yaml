@@ -78,6 +78,9 @@ agent:
   rewards_shaper_scale: 1.0
   use_state_norm: false  # OFF by default — see c2rl.py module docstring / rl_glue.make_base_rl_cfg
   use_value_norm: true   # Same, but for the value function's output (PPO only)
+  use_reward_norm: true  # Non-biasing running-std reward normalizer (r/std, no centering) — tames the
+                         # w_lb/w_ub-dependent Mahalanobis-reward scale/heavy-tail before GAE; see rl_glue
+
   discount_factor: 0.01  # deployed policy's discount factor (single policy — no con/opt duality)
   # NOTE: the contraction-metric / Mahalanobis-reward config (cmg_method, w_ub,
   # w_lb, lbd, tracking_scaler, control_scaler, cm_eps, cm_solver) lives in the
@@ -96,8 +99,8 @@ agent:
 # ── Contraction metric + Mahalanobis reward ────────────────────────────────── #
 cm:
   # Mahalanobis reward
-  w_ub: 1.0  # Upper eigenvalue bound for the metric M(x)
-  w_lb: 0.1   # Lower eigenvalue bound for the metric M(x)
+  w_ub: 1.5  # Upper eigenvalue bound for the metric M(x)
+  w_lb: 0.5   # Lower eigenvalue bound for the metric M(x)
   lbd: 0.5    # Contraction rate λ — used by cmg_method's synthesis loss (CM SDP LMI for
               # "cvstem", CMG Cu/C1 loss for "ccm")
   tracking_scaler: 1.0  # Q: tracking-error weight
@@ -174,4 +177,4 @@ empirical_dynamics:
 
 trainer:
   class: C2RLSkrlTrainer
-  timesteps: 20000   # Total number of environment steps to train for
+  timesteps: 50000   # Total number of environment steps to train for
