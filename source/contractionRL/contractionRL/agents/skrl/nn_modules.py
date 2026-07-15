@@ -17,7 +17,7 @@ from torch.distributions import Normal
 
 from .angle_utils import embed_angles, embedded_dim, wrap_diff
 
-_MIN_LOG_STD = math.log(0.01)  # ≈ -4.605; annealing floor
+_MIN_LOG_STD = math.log(0.001)  # ≈ -6.908; annealing floor
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -165,7 +165,7 @@ class CLActor(nn.Module):
         self._init_logstd = 0.0
 
     def anneal_stddev(self, progress: float, mode: str = "exponential") -> None:
-        """Anneal log_std from 0 to log(0.01) (≈-4.6) — prevents KL collapse."""
+        """Anneal log_std from 0 to log(0.001) (≈-6.9) — prevents KL collapse."""
         if not self.anneal:
             return
         progress = float(max(0.0, min(1.0, progress)))
