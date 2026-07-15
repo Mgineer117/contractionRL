@@ -675,6 +675,7 @@ def log_tracking_plots(
         ax_err.set_xlabel("Step")
         ax_err.set_ylabel("Normalized Error")
         ax_err.legend(fontsize="small")
+        ax_err.grid(True, alpha=0.3)
         _push(fig_err, "normalized_error")
     else:
         plt.close(fig_err)
@@ -712,6 +713,7 @@ def log_tracking_plots(
     if pos_plotted:
         ax.set_title(f"{label} Path Tracking")
         ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize="small")
+        ax.grid(True, alpha=0.3)
         _push(fig, "path_tracking")
     else:
         plt.close(fig)
