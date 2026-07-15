@@ -56,6 +56,36 @@ def weighted_gradients(W: torch.Tensor, v: torch.Tensor, x: torch.Tensor,
         return (Jacobian_Matrix(W, x, create_graph) * v.view(bs, 1, 1, -1)).sum(dim=3)
 
 
+_RESCALE_EPS = 1e-6  # keeps half-scales/atanh args away from 0 / +-1 (log(0)/atanh divergence)
+
+
+def rescale_residual(
+    tanh_u: torch.Tensor, residual: torch.Tensor, low: torch.Tensor, high: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(-1, 1) -> (low, high) via an asymmetric, residual-centered rescale.
+
+    ``tanh_u >= 0`` maps into ``[0, high - residual]``, ``tanh_u < 0`` into
+    ``[-(residual - low), 0]``, using a different per-sample half-width for
+    each side (``residual`` varies per state, so these half-widths do too).
+    Guarantees, for EVERY ``residual`` in ``[low, high]``: ``tanh_u == 0 =>
+    action == residual`` exactly (feedback=0 preserves the reference law),
+    and ``action`` lands in ``(low, high)`` for every ``tanh_u``, with no
+    post-hoc clamping ever required (unlike a fixed-scale rescale-then-add,
+    which can push the sum outside the bounds whenever ``residual`` is
+    off-center). Shared by ``_TanhSquashMixin`` (SAC's stochastic squash +
+    log_prob correction) and ``CLActor.mean_control_squashed`` (C3M's
+    deterministic certified control law) — this formula is easy to get
+    subtly wrong, so it lives in exactly one place.
+
+    Returns ``(action, scale)`` — ``scale`` is the per-sample, per-side
+    half-width used (needed by callers computing a log-det correction).
+    """
+    s_hi = torch.clamp(high - residual, min=_RESCALE_EPS)
+    s_lo = torch.clamp(residual - low, min=_RESCALE_EPS)
+    scale = torch.where(tanh_u >= 0, s_hi, s_lo)
+    return residual + tanh_u * scale, scale
+
+
 def loss_pos_matrix_random_sampling(A: torch.Tensor, num_samples: int = 1024) -> torch.Tensor:
     """PD-violation hinge loss via random directional sampling (no eigendecomposition).
 

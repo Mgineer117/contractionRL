@@ -462,7 +462,7 @@ def _sample_cm_states(
     n_ref = num_samples - n_rand
     parts: list[np.ndarray] = []
     if n_ref > 0:
-        ref = np.asarray(get_rollout(n_ref, "c3m")["x"], dtype=np.float32)[:, :x_dim]
+        ref = np.asarray(get_rollout(n_ref, "c3m")["x"].cpu(), dtype=np.float32)[:, :x_dim]
         parts.append(ref)
     if n_rand > 0:
         if x_samples is not None:
@@ -477,7 +477,7 @@ def _sample_cm_states(
             # "dynamics" mode tiles states by num_control_per_state; ask for 1 so we
             # get n_rand DISTINCT states (we only use x, not the paired controls).
             rand = np.asarray(
-                get_rollout(n_rand, "dynamics", num_control_per_state=1)["x"],
+                get_rollout(n_rand, "dynamics", num_control_per_state=1)["x"].cpu(),
                 dtype=np.float32,
             )[:, :x_dim]
             parts.append(rand)
@@ -610,7 +610,7 @@ def build_cm_dataset(
 
     # Autodiff the drift Jacobian once for the whole batch, then loop states for
     # the (numpy/CPU) cvxpy solves. Mirrors c3m.py's _compute_loss Jacobian setup.
-    x = torch.from_numpy(x_np).to(torch.float32).to(device).requires_grad_()
+    x = torch.as_tensor(x_np).to(torch.float32).to(device).requires_grad_()
     with torch.enable_grad():
         f, B, _Bbot = get_f_and_B(x)
     f = f.to(torch.float32).to(device)
@@ -865,8 +865,8 @@ def regress_cmg(
     held-out split is configured, the best-val-epoch weights are restored
     afterward (the post-loop ``stopper.restore_best`` below).
     """
-    x = torch.from_numpy(dataset["x"]).to(torch.float32).to(device)
-    W_target = torch.from_numpy(dataset["W"]).to(torch.float32).to(device)
+    x = torch.as_tensor(dataset["x"]).to(torch.float32).to(device)
+    W_target = torch.as_tensor(dataset["W"]).to(torch.float32).to(device)
     n = x.shape[0]
 
     train_idx, val_idx = train_val_split(n, val_frac, device=device)
@@ -1000,7 +1000,7 @@ def train_cmg_ccm(
         get_rollout, num_samples=num_samples, x_dim=x_dim,
         x_samples=x_samples, random_ratio=random_ratio, tag=tag,
     )
-    x_all = torch.from_numpy(x_np).to(torch.float32).to(device)
+    x_all = torch.as_tensor(x_np).to(torch.float32).to(device)
     n = x_all.shape[0]
     print(f"{tag} CCM neural synthesis: training CMG on {n} states "
           f"(C1+C2 losses, λ={lbd}, ε={eps}, w_lb={w_lb}, w_ub={w_ub}).")

@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from torch.distributions import Normal
 
 from .angle_utils import embed_angles, embedded_dim, wrap_diff
+from .math_utils import rescale_residual
 
 _MIN_LOG_STD = math.log(0.001)  # ≈ -6.908; annealing floor
 
@@ -180,7 +181,8 @@ class CLActor(nn.Module):
         uref = state[:, 2 * self.x_dim : 2 * self.x_dim + self.u_dim]
         return x, xref, uref
 
-    def mean_control(self, state: torch.Tensor) -> torch.Tensor:
+    def _feedback(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Raw (unbounded) bilinear feedback W2(x,xref) @ tanh(W1(x,xref) @ e) and uref."""
         x, xref, uref = self.trim_state(state)
         x_xref = torch.cat((embed_angles(x, self.angle_idx), embed_angles(xref, self.angle_idx)), dim=-1)
         n = x.shape[0]
@@ -188,7 +190,29 @@ class CLActor(nn.Module):
         w1 = self.w1(x_xref).reshape(n, self.c, self.x_dim)
         w2 = self.w2(x_xref).reshape(n, self.u_dim, self.c)
         l1 = F.tanh(torch.matmul(w1, e))
-        return uref + torch.matmul(w2, l1).squeeze(-1)
+        feedback = torch.matmul(w2, l1).squeeze(-1)
+        return feedback, uref
+
+    def mean_control(self, state: torch.Tensor) -> torch.Tensor:
+        feedback, uref = self._feedback(state)
+        return uref + feedback
+
+    def mean_control_squashed(self, state: torch.Tensor, low: torch.Tensor, high: torch.Tensor) -> torch.Tensor:
+        """Deterministic control law bounded into ``(low, high)`` by construction.
+
+        ``u = uref + rescale_residual(tanh(feedback), uref, low, high)`` — the
+        feedback (not ``uref``) is squashed, and ``uref`` is added AFTER
+        squashing so ``feedback == 0`` still gives exactly ``u == uref`` (see
+        ``math_utils.rescale_residual``). Unlike ``torch.clamp``, ``tanh``'s
+        gradient never hits exact zero, so ``K = jacobian(u, x)`` (used to
+        certify the contraction condition in C3M) stays trainable even where
+        the raw feedback would have saturated — see the "clip_actions kills
+        the C3M contraction certificate" discussion in project memory
+        (project_c3m_clip_actions_divergence.md).
+        """
+        feedback, uref = self._feedback(state)
+        action, _ = rescale_residual(torch.tanh(feedback), uref, low, high)
+        return action
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -242,7 +266,7 @@ class NeuralDynamics(nn.Module):
     def get_f_and_B(self, x: torch.Tensor):
         """Return (f, B, B_null) — autodiff-compatible for C3M Jacobians."""
         if not isinstance(x, torch.Tensor):
-            x = torch.from_numpy(np.asarray(x, dtype=np.float32))
+            x = torch.as_tensor(np.asarray(x, dtype=np.float32))
         if x.dim() == 1:
             x = x.unsqueeze(0)
         x = x.to(self._dtype).to(self.device)
@@ -266,7 +290,7 @@ class NeuralDynamics(nn.Module):
 
     def forward(self, x):
         if isinstance(x, np.ndarray):
-            x = torch.from_numpy(x.astype(np.float32)).to(self.device)
+            x = torch.as_tensor(x.astype(np.float32)).to(self.device)
         if isinstance(x, torch.Tensor) and x.dim() == 1:
             x = x.unsqueeze(0)
         return self.get_f_and_B(x)

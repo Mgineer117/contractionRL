@@ -39,6 +39,7 @@ a trapezoid-rule error that earlier per-algorithm copies of this code had.)
 from __future__ import annotations
 
 import io
+import math
 import sys
 import warnings
 
@@ -154,232 +155,59 @@ class StreamingErrorStats:
         return summarize(self.metrics(dt), mask)
 
 
-class StatManager:
-    """Unified, memory-bounded, trajectory-wise path-tracking metric collector.
-
-    One class for every algorithm (C3M/C2RL/PPO/SAC/LQR/SD-LQR) and both env
-    backends (classic ``SyncVectorEnv`` eval rollouts and batched Isaac envs).
-    Fed one env-step at a time via :meth:`update`, it stores each *tracked* env's
-    per-step error TRAJECTORY for the current episode, then computes the four
-    contraction metrics (``auc``/``contraction_rate``/``overshoot``/
-    ``contraction_score``, mean + 95% CI) via the SAME :func:`per_env_metrics` /
-    :func:`summarize` used everywhere else — so keys, formulas and CI are
-    unchanged.
-
-    Memory: only the first ``num_envs_for_eval`` of ``num_envs`` envs are tracked
-    (PPO uses ~4096 envs; keeping full trajectories for all of them is wasteful).
-    A request larger than ``num_envs`` is clamped to ``num_envs`` with a warning.
-
-    Robustness (the point of this class): a per-env trajectory is only
-    ``available`` once anchored at a **detected initialization** — the caller must
-    pass ``initialized`` sourced from the true per-env episode counter
-    (``time_steps == 0`` for classic envs, ``episode_length_buf == 0`` for Isaac),
-    NOT "the first update". If an env is never seen to initialize (e.g. the vector
-    env is left parked at a converged terminal state — the skrl reset-cache +
-    gymnasium 1.x next-step-autoreset failure where ``x ≈ xref`` so ``e0 ≈ 0`` and
-    ``auc = Σe/e0`` explodes to ~1e7), :meth:`summary` still returns a best-effort
-    value BUT emits a warning and reports ``available=False`` — the failure is
-    loud instead of a silent 1e7. ``episode_length`` (fixed for path-tracking) is
-    stored so an unanchored/partial episode can still be length-normalized.
-    """
-
-    def __init__(
-        self,
-        num_envs: int,
-        dt: float,
-        device,
-        *,
-        episode_length: int | None = None,
-        num_envs_for_eval: int | None = None,
-        keep_trajectories: bool = True,
-    ) -> None:
-        if num_envs_for_eval is None:
-            num_envs_for_eval = num_envs
-        elif num_envs_for_eval > num_envs:
-            warnings.warn(
-                f"StatManager: num_envs_for_eval ({num_envs_for_eval}) > num_envs "
-                f"({num_envs}); clamping to {num_envs}.",
-                stacklevel=2,
-            )
-            num_envs_for_eval = num_envs
-        self.n = int(num_envs_for_eval)
-        self.dt = float(dt)
-        self.device = device
-        self.episode_length = int(episode_length) if episode_length is not None else None
-        self.keep_trajectories = keep_trajectories
-        # Track the first ``n`` envs (deterministic, cheap). For a random subset,
-        # pass a pre-permuted env order upstream.
-        self._idx = torch.arange(self.n, device=device)
-        self.reset()
-
-    def reset(self) -> None:
-        self._buf: list[list[float]] = [[] for _ in range(self.n)]        # current episode
-        self._done: list[list[float] | None] = [None] * self.n           # last completed episode
-        self._started = [False] * self.n                                 # current buf anchored at a real init?
-        self._done_started = [False] * self.n                            # was _done anchored at a real init?
-        self._traj_x: list[list] = [[] for _ in range(self.n)]
-        self._traj_xref: list[list] = [[] for _ in range(self.n)]
-        self._done_x: list[list | None] = [None] * self.n
-        self._done_xref: list[list | None] = [None] * self.n
-
-    def _sel(self, t: torch.Tensor) -> torch.Tensor:
-        """Take the tracked subset from a per-env tensor (accepts (N,) or (N,1))."""
-        return t.reshape(t.shape[0], -1)[self._idx] if t.dim() > 1 else t.reshape(-1)[self._idx]
-
-    def update(
-        self,
-        error: torch.Tensor,
-        initialized: torch.Tensor | None = None,
-        finished: torch.Tensor | None = None,
-        active: torch.Tensor | None = None,
-        *,
-        x: torch.Tensor | None = None,
-        xref: torch.Tensor | None = None,
-    ) -> None:
-        """Record one env-step for the tracked subset.
-
-        error       : (N,) or (N,1) per-env scalar tracking error at the CURRENT state.
-        initialized : (N,) bool — env just started a fresh episode (episode counter == 0).
-                      Anchors ``e0``. Source from real env state, not "first update".
-        finished    : (N,) bool — env's episode ended AFTER this step; its buffer is
-                      snapshotted as the reportable completed episode.
-        active      : (N,) bool — env is still being recorded (skip frozen/finished envs).
-                      Defaults to "all active".
-        x, xref     : optional (N, pos_dim) current/reference positions for plotting.
-        """
-        err = self._sel(error).detach().reshape(-1).float().cpu()
-        init = self._sel(initialized).detach().reshape(-1).bool().cpu() if initialized is not None else None
-        fin = self._sel(finished).detach().reshape(-1).bool().cpu() if finished is not None else None
-        act = self._sel(active).detach().reshape(-1).bool().cpu() if active is not None else None
-        xs = self._sel(x).detach().cpu() if (x is not None and self.keep_trajectories) else None
-        xr = self._sel(xref).detach().cpu() if (xref is not None and self.keep_trajectories) else None
-
-        for i in range(self.n):
-            if act is not None and not bool(act[i]):
-                continue  # env frozen (already finished its first episode) — record nothing
-            if init is not None and bool(init[i]):
-                # Fresh episode start → (re)anchor the buffer on a real init.
-                self._buf[i] = []
-                self._traj_x[i] = []
-                self._traj_xref[i] = []
-                self._started[i] = True
-            self._buf[i].append(float(err[i]))
-            if xs is not None:
-                self._traj_x[i].append(xs[i].numpy())
-                if xr is not None:
-                    self._traj_xref[i].append(xr[i].numpy())
-            if fin is not None and bool(fin[i]) and self._buf[i]:
-                # Episode ended → snapshot as the reportable completed episode.
-                self._done[i] = self._buf[i]
-                self._done_started[i] = self._started[i]
-                self._done_x[i] = self._traj_x[i]
-                self._done_xref[i] = self._traj_xref[i]
-                self._buf[i] = []
-                self._traj_x[i] = []
-                self._traj_xref[i] = []
-                self._started[i] = False
-
-    def _episodes(self) -> tuple[list[list[float]], list[bool]]:
-        """Per-tracked-env reportable trajectory (completed if present, else current)."""
-        trajs, started = [], []
-        for i in range(self.n):
-            if self._done[i] is not None:
-                trajs.append(self._done[i]); started.append(self._done_started[i])
-            else:
-                trajs.append(self._buf[i]); started.append(self._started[i])
-        return trajs, started
-
-    @property
-    def available(self) -> bool:
-        """True iff at least one tracked env has an init-anchored trajectory."""
-        _, started = self._episodes()
-        trajs, _ = self._episodes()
-        return any(s and len(t) > 0 for s, t in zip(started, trajs))
-
-    def metrics(self) -> dict[str, torch.Tensor]:
-        """Per-tracked-env metric tensors (see :func:`per_env_metrics`)."""
-        trajs, _ = self._episodes()
-        dev = self.device
-        z = lambda vals: torch.tensor(vals, device=dev, dtype=torch.float32).reshape(-1, 1)
-        # Fixed-length fallback: an env with no recorded data contributes a
-        # neutral, non-exploding entry (masked out by summary()).
-        e0 = z([t[0] if t else 1.0 for t in trajs])
-        e_last = z([t[-1] if t else 1.0 for t in trajs])
-        e_max = z([max(t) if t else 1.0 for t in trajs])
-        err_sum = z([sum(t) if t else 0.0 for t in trajs])
-        steps = z([len(t) if t else (self.episode_length or 1) for t in trajs])
-        return per_env_metrics(e0=e0, e_last=e_last, e_max=e_max, err_sum=err_sum, steps=steps, dt=self.dt)
-
-    def summary(self) -> dict[str, float]:
-        """Mean/ci95 over tracked envs; warns and reports over ALL non-empty envs
-        (unanchored included) when no env has an init-anchored trajectory."""
-        trajs, started = self._episodes()
-        anchored = torch.tensor([s and len(t) > 0 for s, t in zip(started, trajs)], device=self.device)
-        if bool(anchored.any()):
-            mask = anchored
-        else:
-            nonempty = torch.tensor([len(t) > 0 for t in trajs], device=self.device)
-            warnings.warn(
-                "StatManager.summary(): no env has an init-anchored trajectory — the "
-                "eval env was likely never (re)initialized (parked terminal state / "
-                "reset-cache bug). Reporting best-effort metrics over non-anchored "
-                "episodes; e0 may be unreliable.",
-                stacklevel=2,
-            )
-            mask = nonempty if bool(nonempty.any()) else None
-        return summarize(self.metrics(), mask)
-
-    def trajectories(self) -> tuple[dict, dict, dict]:
-        """``(traj_x, traj_xref, traj_error)`` for :func:`log_tracking_plots`
-        (env-index → per-step list), over the reportable episodes."""
-        trajs, _ = self._episodes()
-        traj_error = {i: list(trajs[i]) for i in range(self.n) if trajs[i]}
-        tx = {i: (self._done_x[i] if self._done[i] is not None else self._traj_x[i])
-              for i in range(self.n)}
-        txr = {i: (self._done_xref[i] if self._done[i] is not None else self._traj_xref[i])
-               for i in range(self.n)}
-        traj_x = {i: v for i, v in tx.items() if v}
-        traj_xref = {i: v for i, v in txr.items() if v}
-        return traj_x, traj_xref, traj_error
-
 
 class StatManagerEnvWrapper:
-    """Env wrapper that auto-collects path-tracking metrics via :class:`StatManager`.
-
-    Drop-in wrapper around a (skrl-wrapped) vector env whose observation is
-    ``[x, xref, uref]``. It removes the need for every algorithm's eval loop to
-    hand-thread ``stats.update(...)``: ``reset()`` starts a fresh metric window,
-    ``step()`` computes each env's tracking error ``‖x−xref‖`` from the returned
-    obs and feeds a :class:`StatManager`, anchoring ``e0`` on the env's REAL
-    episode counter (``time_steps == 0``) and freezing each env after its first
-    episode end — so one ``reset()`` + rollout yields one clean per-env episode.
-    Read results with :meth:`stability_summary` / :meth:`trajectories`. Every
-    other attribute/method forwards to the inner env, so it is transparent to the
-    trainer, skrl, and ``WandbPlotWrapper``.
-
-    Config (``x_dim``/``dt``/``episode_length``/``num_envs``) is derived from the
-    env on the first reset via ``get_attr``; recording silently no-ops if that
-    fails, so non-path-tracking envs keep working. Only ``num_envs_for_eval`` envs
-    are tracked (trajectory memory bound; default 64).
+    """Env wrapper that computes paper-style batched C and lambda globally across a sampled
+    subset of environments by storing the full trajectories (first-come, first-eval).
     """
 
     def __init__(self, env, *, num_envs_for_eval: int = 64):
         self.env = env
         self._num_envs_for_eval = num_envs_for_eval
-        self._stats: StatManager | None = None
-        self._finished: torch.Tensor | None = None
+        
+        self._initialized = False
         self._x_dim: int | None = None
         self._pos_dim: int | None = None
+        self._dt: float | None = None
+        self._max_ep_len: int | None = None
+
+        self._recent_auc_mean: float = 1e6
+        self._recent_auc_ci95: float = 0.0
+        self._recent_lambda_mean: float = 0.0
+        self._recent_lambda_ci95: float = 0.0
+        self._recent_C: float = 1e6
+        self._recent_score_mean: float = 0.0
+        self._recent_score_ci95: float = 0.0
+        # Bumped each time a full eval buffer is reduced to metrics — lets
+        # callers (e.g. C3M's eval loop) detect that a rollout actually
+        # produced FRESH numbers instead of silently re-reading stale ones.
+        self._compute_count: int = 0
+
+        # Buffer states
+        self._eval_buffer = None
+        self._time_buffer = None
+        self._tracking_env_ids = None
+        self._tracking_steps = None
+        self._completed_slots = None
+        self._e0 = None
+
+        self._traj_x_buf = None
+        self._traj_xref_buf = None
+        self._recent_trajs = ({}, {}, {})
 
     def __getattr__(self, name):
-        # Fires only for attributes not found on the wrapper itself. Guard the
-        # inner-env handle to avoid infinite recursion before __init__ sets it.
         if name == "env":
             raise AttributeError(name)
         return getattr(self.env, name)
 
     def _first_attr(self, *names, default=None):
         for n in names:
+            # Direct access first (skrl wrappers forward attributes; also try the
+            # raw unwrapped env for Isaac Lab, whose skrl wrapper may not forward).
+            for target in (self.env, getattr(self.env, "unwrapped", None)):
+                if target is not None and hasattr(target, n):
+                    return getattr(target, n)
+            # Fallback to get_attr for standard Gymnasium VectorEnvs
             try:
                 v = self.env.get_attr(n)
                 return v[0] if isinstance(v, (list, tuple)) else v
@@ -391,68 +219,295 @@ class StatManagerEnvWrapper:
         return getattr(self.env, "device", "cpu")
 
     def _ensure_stats(self) -> bool:
-        if self._stats is not None:
+        if self._initialized:
             return True
-        x_dim = self._first_attr("num_dim_x")
+        # "num_dim_x" is the classic BaseEnv name; "x_dim" is the Isaac
+        # path-tracking property (path_tracking_base.py). Both env families
+        # share the [x, xref, uref] observation layout this wrapper slices.
+        x_dim = self._first_attr("num_dim_x", "x_dim")
         dt = self._first_attr("step_dt", "dt")
         ep = self._first_attr("max_episode_length", "max_episode_len")
         if x_dim is None or dt is None:
             return False
+
         self._x_dim = int(x_dim)
-        pd = self._first_attr("pos_dimension", default=x_dim)
-        self._pos_dim = int(pd) if pd is not None else int(x_dim)
+        pd = self._first_attr("pos_dimension")
+        self._pos_dim = int(pd) if pd is not None else min(3, int(x_dim))
+        self._dt = float(dt)
+        self._max_ep_len = int(ep) if ep is not None else 1000
+        
         num_envs = int(getattr(self.env, "num_envs", 1))
-        self._stats = StatManager(
-            num_envs, float(dt), self._device(),
-            episode_length=(int(ep) + 1 if ep is not None else None),
-            num_envs_for_eval=self._num_envs_for_eval, keep_trajectories=True,
-        )
-        self._finished = torch.zeros(num_envs, dtype=torch.bool, device=self._device())
+        self._num_envs_for_eval = min(num_envs, self._num_envs_for_eval)
+        N = self._num_envs_for_eval
+        T = self._max_ep_len
+        dev = self._device()
+
+        self._eval_buffer = torch.zeros((N, T), dtype=torch.float32, device=dev)
+        self._time_buffer = torch.zeros((N, T), dtype=torch.float32, device=dev)
+        self._tracking_env_ids = torch.full((N,), -1, dtype=torch.long, device=dev)
+        self._tracking_steps = torch.zeros(N, dtype=torch.long, device=dev)
+        self._completed_slots = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._e0 = torch.zeros(N, dtype=torch.float32, device=dev)
+        
+        self._traj_x_buf = [[] for _ in range(N)]
+        self._traj_xref_buf = [[] for _ in range(N)]
+
+        self._initialized = True
         return True
 
     def _init_flags(self):
-        try:
-            ts = self.env.get_attr("time_steps")
-            return torch.tensor([int(t) == 0 for t in ts], device=self._device())
-        except Exception:
-            return None
+        """Per-env bool: episode counter == 0, i.e. the env just (auto-)reset.
 
-    def _record(self, obs: torch.Tensor) -> None:
+        Both env families reset done envs INSIDE step() and return the fresh
+        episode's first observation, so counter == 0 marks exactly the obs a
+        new slot must anchor e0 on. "time_steps" is the classic BaseEnv
+        counter; "episode_length_buf" is Isaac Lab's.
+        """
+        try:
+            ts = self._first_attr("time_steps", "episode_length_buf")
+            if isinstance(ts, torch.Tensor):
+                return (ts == 0).reshape(-1).to(self._device())
+            if ts is not None:
+                return torch.tensor([int(t) == 0 for t in ts], device=self._device())
+        except Exception:
+            pass
+        return None
+
+    def _compute_batched_metrics(self):
+        N = self._num_envs_for_eval
+        # Clamp once: a stored error of exactly 0 would otherwise produce
+        # 0 * inf = NaN in the C search below (exp(lambda*t) overflows to inf
+        # in float32 once lambda*t ≳ 88) and -inf in the log for lambda.
+        errs = torch.clamp(self._eval_buffer, min=1e-8)
+
+        # 1. AUC per env (trapezoid over the true per-slot time base)
+        dt_array = self._time_buffer[:, 1:] - self._time_buffer[:, :-1]
+        auc_vec = torch.sum(dt_array * 0.5 * (errs[:, :-1] + errs[:, 1:]), dim=1)
+
+        # 2. Find curve with highest overshoot
+        max_overshoots = torch.max(errs, dim=1).values
+        worst_idx = torch.argmax(max_overshoots)
+        x_worst = errs[worst_idx]
+        t_worst = self._time_buffer[worst_idx]
+
+        # 3. Find optimal C for worst curve: C(lambda) = max_t x(t)·e^{lambda·t}
+        #    over lambda in (0, 10], keeping the C whose envelope AUC is minimal.
+        lambdas = torch.linspace(0.01, 10.0, steps=1000, device=self._device())
+        exp_term = torch.exp(lambdas.unsqueeze(1) * t_worst.unsqueeze(0))
+        C_lambdas = torch.max(x_worst.unsqueeze(0) * exp_term, dim=1).values
+        C_lambdas = torch.clamp(C_lambdas, min=1.0)
+
+        T_max = t_worst[-1]
+        auc_bounds = (C_lambdas / lambdas) * (1.0 - torch.exp(-lambdas * T_max))
+        best_idx = torch.argmin(auc_bounds)
+        best_C = C_lambdas[best_idx]
+
+        # 4. With C fixed, per-env lambda = min_t (ln C - ln x(t)) / t  (t > 0)
+        t_pos = torch.clamp(self._time_buffer[:, 1:], min=1e-8)  # (N, T-1)
+        x_pos = errs[:, 1:]                                      # (N, T-1)
+
+        lambda_vals = (torch.log(best_C) - torch.log(x_pos)) / t_pos
+        min_lambdas = torch.min(lambda_vals, dim=1).values
+        lambda_vec = torch.clamp(min_lambdas, min=0.0, max=10.0)
+        score_vec = lambda_vec / torch.clamp(best_C, min=1e-6)
+
+        auc_m, auc_ci = mean_confidence_interval(auc_vec.detach().cpu().numpy(), 0.95)
+        self._recent_auc_mean = float(auc_m)
+        self._recent_auc_ci95 = float(auc_ci)
+
+        lambda_m, lambda_ci = mean_confidence_interval(lambda_vec.detach().cpu().numpy(), 0.95)
+        self._recent_lambda_mean = float(lambda_m)
+        self._recent_lambda_ci95 = float(lambda_ci)
+
+        score_m, score_ci = mean_confidence_interval(score_vec.detach().cpu().numpy(), 0.95)
+        self._recent_score_mean = float(score_m)
+        self._recent_score_ci95 = float(score_ci)
+
+        self._recent_C = best_C.item()
+        self._compute_count += 1
+
+        # Save trajectories + per-slot normalized error curves (consumed by
+        # log_tracking_plots via trajectories()). Keyed by SLOT index — an env
+        # can legitimately own two slots in one buffer round (early termination
+        # + re-init), so env-id keys would silently collide.
+        err_rows = self._eval_buffer.detach().cpu()
+        res_x, res_xref, res_err = {}, {}, {}
+        for j in range(N):
+            res_x[j] = self._traj_x_buf[j]
+            res_xref[j] = self._traj_xref_buf[j]
+            res_err[j] = err_rows[j].tolist()
+        self._recent_trajs = (res_x, res_xref, res_err)
+
+    def _record(self, obs: torch.Tensor, info: dict | None = None) -> None:
         if not self._ensure_stats():
             return
+
         xd, pd = self._x_dim, self._pos_dim
-        error = torch.norm(obs[:, :xd] - obs[:, xd:2 * xd], dim=-1, keepdim=True)
-        self._stats.update(
-            error, initialized=self._init_flags(), active=~self._finished,
-            x=obs[:, :pd], xref=obs[:, xd:xd + pd],
-        )
+
+        unwrapped = getattr(self.env, "unwrapped", self.env)
+        if isinstance(info, dict) and "tracking_error" in info:
+            # Classic BaseEnv (env_base.py): "tracking_error" is the TRUE
+            # per-env squared error computed BEFORE reset_idx() overwrites
+            # x_t/xref for any env whose episode just ended — same ordering
+            # fix as the reward computation. Reading it from `obs` instead
+            # would, for an auto-reset env, measure the fresh reset (new
+            # episode) state against the OLD episode's e0/window, spiking the
+            # normalized error at the episode boundary.
+            error = torch.sqrt(torch.clamp(info["tracking_error"].reshape(-1).to(self._device()), min=0.0))
+        elif hasattr(unwrapped, "get_tracking_error"):
+            # Isaac path-tracking envs: angle-wrapped ||x - x_ref|| per env.
+            err = unwrapped.get_tracking_error()
+            if isinstance(err, torch.Tensor):
+                error = err.reshape(-1, 1).to(self._device())
+            else:
+                error = torch.tensor(err, dtype=torch.float32, device=self._device()).reshape(-1, 1)
+            error = error.reshape(-1)
+        else:
+            diff = obs[:, :xd] - obs[:, xd:2 * xd]
+            angle_idx = self._first_attr("angle_idx")
+            if angle_idx:
+                for idx in angle_idx:
+                    diff[:, idx] = (diff[:, idx] + math.pi) % (2 * math.pi) - math.pi
+            error = torch.norm(diff, dim=-1, keepdim=True)
+            error = error.reshape(-1)
+        init_flags = self._init_flags()
+        if init_flags is None:
+            init_flags = torch.zeros(error.shape[0], dtype=torch.bool, device=self._device())
+
+        # Extract values for tracking
+        err_vals = error.detach()
+        obs_x = obs[:, :pd].detach().cpu().numpy()
+        obs_xref = obs[:, xd:xd + pd].detach().cpu().numpy()
+
+        N = self._num_envs_for_eval
+
+        # For each env that is initializing, complete its old slot if any, and start a new one
+        init_indices = torch.nonzero(init_flags, as_tuple=True)[0]
+        for env_idx in init_indices:
+            # If this env was already being tracked, complete its old slot FIRST!
+            old_slots = torch.nonzero(self._tracking_env_ids == env_idx, as_tuple=True)[0]
+            for old_slot in old_slots:
+                if not self._completed_slots[old_slot]:
+                    self._completed_slots[old_slot] = True
+                    # Early termination: extend the final recorded error to the
+                    # end of the horizon so every slot has a full-length curve.
+                    # The slot keeps its env id — a completed episode must stay
+                    # in the buffer until the WHOLE buffer is reduced; freeing
+                    # it here would let the very next init reuse and overwrite
+                    # it, and (ids != -1).all() below could then never fire.
+                    step = self._tracking_steps[old_slot]
+                    if step < self._max_ep_len:
+                        last_val = self._eval_buffer[old_slot, step-1] if step > 0 else 1.0
+                        self._eval_buffer[old_slot, step:] = last_val
+                        time_steps_pad = torch.arange(step, self._max_ep_len, device=self._device(), dtype=torch.float32)
+                        self._time_buffer[old_slot, step:] = time_steps_pad * self._dt
+
+            # Now assign a new slot (first come, first eval — no free slot means
+            # this episode simply isn't tracked this round)
+            empty_slots = torch.nonzero(self._tracking_env_ids == -1, as_tuple=True)[0]
+            if len(empty_slots) > 0:
+                slot = empty_slots[0]
+                self._tracking_env_ids[slot] = env_idx
+                self._tracking_steps[slot] = 0
+                self._completed_slots[slot] = False
+                self._traj_x_buf[slot] = []
+                self._traj_xref_buf[slot] = []
+                    
+        # Update active slots
+        active_slots = torch.nonzero((self._tracking_env_ids != -1) & (~self._completed_slots), as_tuple=True)[0]
+        
+        for slot in active_slots:
+            env_id = self._tracking_env_ids[slot]
+            step = self._tracking_steps[slot]
+            
+            if step == 0:
+                self._e0[slot] = err_vals[env_id].clamp(min=1e-8)
+            
+            if step < self._max_ep_len:
+                val = err_vals[env_id] / self._e0[slot]
+                self._eval_buffer[slot, step] = val
+                self._time_buffer[slot, step] = step * self._dt
+                
+                self._traj_x_buf[slot].append(obs_x[env_id])
+                self._traj_xref_buf[slot].append(obs_xref[env_id])
+            
+            step += 1
+            self._tracking_steps[slot] = step
+            
+            # If reached max length, pad to end
+            if step >= self._max_ep_len:
+                self._completed_slots[slot] = True
+
+        # Check if all slots are completed
+        if (self._tracking_env_ids != -1).all() and self._completed_slots.all():
+            self._compute_batched_metrics()
+            # Clear slots
+            self._tracking_env_ids.fill_(-1)
+            self._completed_slots.fill_(False)
+
+    @staticmethod
+    def _obs_tensor(obs):
+        """Batched obs tensor from a step/reset return (Isaac wrappers may
+        return an observation dict keyed by group, e.g. {"policy": ...})."""
+        if isinstance(obs, dict):
+            obs = obs.get("policy")
+        return obs if torch.is_tensor(obs) else None
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        # Start a fresh metric window and record e0.
-        self._stats = None
-        self._finished = None
-        if torch.is_tensor(obs):
-            self._record(obs)
+        # An EXTERNAL reset (e.g. C3M's per-eval reset) starts a fresh window:
+        # every in-flight episode is invalidated, so drop all slots. Without
+        # this, leftover partial slots would be "completed" by padding at the
+        # next init detection and reduced into garbage metrics.
+        if self._initialized:
+            self._tracking_env_ids.fill_(-1)
+            self._completed_slots.fill_(False)
+        o = self._obs_tensor(obs)
+        if o is not None:
+            self._record(o, info if isinstance(info, dict) else None)
         return obs, info
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-        if torch.is_tensor(obs):
-            self._record(obs)  # active mask uses finished from PRIOR steps
-            if self._finished is not None:
-                done = (terminated | truncated).reshape(-1).to(self._finished.device).bool()
-                self._finished |= done
+        o = self._obs_tensor(obs)
+        if o is not None:
+            self._record(o, info if isinstance(info, dict) else None)
+
+            # Inject metrics into info["log"] so skrl's trainer (cfg
+            # `environment_info: log`, scalar tensors only) tracks them.
+            if self._initialized and isinstance(info, dict):
+                if "log" not in info or not isinstance(info["log"], dict):
+                    info["log"] = {}
+                info["log"].update(stability_log_dict(self.stability_summary(), self._device()))
+
         return obs, reward, terminated, truncated, info
 
     def stability_summary(self) -> dict[str, float]:
-        return self._stats.summary() if self._stats is not None else {}
+        if not self._initialized:
+            return {}
+        # Every metric carries the "{name}_mean"/"{name}_ci95" key shape that
+        # track_stability_summary documents and patch_auc_checkpoint
+        # (agent_patches.py) looks up. C is a single shared scalar, so its
+        # ci95 is 0 by construction.
+        return {
+            "auc_mean": self._recent_auc_mean,
+            "auc_ci95": self._recent_auc_ci95,
+            "contraction_rate_mean": self._recent_lambda_mean,
+            "contraction_rate_ci95": self._recent_lambda_ci95,
+            "overshoot_mean": self._recent_C,
+            "overshoot_ci95": 0.0,
+            "contraction_score_mean": self._recent_score_mean,
+            "contraction_score_ci95": self._recent_score_ci95,
+        }
 
     def trajectories(self):
-        return self._stats.trajectories() if self._stats is not None else ({}, {}, {})
+        return self._recent_trajs
 
     def all_finished(self) -> bool:
-        return bool(self._finished.all()) if self._finished is not None else False
+        # We can just return False or True depending on usage.
+        # This was previously used by ContractionRunner's eval loop.
+        # In this new logic, the buffer fills up and resets automatically.
+        return False
 
 
 def reward_summary(

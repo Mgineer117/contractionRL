@@ -88,28 +88,29 @@ class WandbPlotWrapper:
                     err = err_array[i].item() if err_array.ndim > 0 else err_array.item()
                 
                 if err is not None:
-                    self._norm_errs[i].append(err)
+                    self._norm_errs[i].append(float(np.sqrt(max(err, 0.0))))
                 
         for i in self.plot_idx:
             x_i = None
             xref_i = None
             try:
-                if hasattr(self.env.unwrapped, "envs"):
-                    env_i = self.env.unwrapped.envs[i]
-                    pos_dim = getattr(env_i, "pos_dimension", None)
-                    # BaseEnv (env_base.py) names this attribute "num_dim_x", not
-                    # "x_dim" — looking up the wrong name made x_dim always None,
-                    # which silently skipped x_i/xref_i below for every classic
-                    # env, so train/path_tracking was never plotted for PPO/SAC
-                    # (or any algorithm relying solely on this wrapper).
-                    x_dim = getattr(env_i, "num_dim_x", None)
-                    # gymnasium's SyncVectorEnv does SAME-STEP autoreset: on the
-                    # step that ends env i's episode, env.reset() already ran
-                    # INSIDE self.env.step() above, so env_i.x_t/env_i.xref (and
-                    # `obs[i]`) already hold the NEXT episode's data by the time we
-                    # get here. Reading them directly spliced a jump to a
-                    # brand-new random reference onto the tail of every plotted
-                    # episode. Use the true pre-reset terminal observation
+                unwrapped = self.env.unwrapped
+                # Both env families share the [x, xref, uref] flat observation
+                # layout: classic BaseEnv exposes "num_dim_x"/"pos_dimension",
+                # Isaac path-tracking exposes the "x_dim" property (positions
+                # are its first 3 state dims by convention).
+                x_dim = getattr(unwrapped, "num_dim_x", None)
+                if x_dim is None:
+                    x_dim = getattr(unwrapped, "x_dim", None)
+                if hasattr(unwrapped, "envs"):
+                    # Legacy gymnasium SyncVectorEnv of per-env instances.
+                    env_i = unwrapped.envs[i]
+                    env_i_unwrapped = getattr(env_i, "unwrapped", env_i)
+                    pos_dim = getattr(env_i_unwrapped, "pos_dimension", None)
+                    x_dim = getattr(env_i_unwrapped, "num_dim_x", None)
+                    # SyncVectorEnv does SAME-STEP autoreset: on the step that
+                    # ends env i's episode, `obs[i]` already holds the NEXT
+                    # episode's data. Use the pre-reset terminal observation
                     # gymnasium stashes in info["final_observation"] instead.
                     src = None
                     if done_0 and "final_observation" in info:
@@ -121,20 +122,41 @@ class WandbPlotWrapper:
                     if pos_dim is not None and x_dim is not None:
                         x_i = src[:pos_dim]
                         xref_i = src[x_dim: x_dim + pos_dim]
+                elif x_dim is not None:
+                    # Batched env (classic BaseEnv / Isaac path-tracking): the
+                    # env auto-resets done envs INSIDE step(), so on the done
+                    # step `obs[i]` is the next episode's first observation.
+                    # BaseEnv stashes the pre-reset terminal obs as
+                    # info["final_observation"] (rows = done-env subset,
+                    # aligned via the boolean mask info["_final_observation"]).
+                    pos_dim = getattr(unwrapped, "pos_dimension", None) or min(3, int(x_dim))
+                    src = None
+                    if done_0 and "final_observation" in info and "_final_observation" in info:
+                        mask = info["_final_observation"]
+                        mask = mask.detach().cpu().numpy() if isinstance(mask, torch.Tensor) else np.asarray(mask)
+                        mask = mask.reshape(-1).astype(bool)
+                        if mask[i]:
+                            row = int(mask[:i].sum())
+                            fo = info["final_observation"]
+                            src = fo[row].detach().cpu().numpy() if isinstance(fo, torch.Tensor) else np.asarray(fo[row])
+                    if src is None:
+                        src = obs[i].detach().cpu().numpy() if isinstance(obs, torch.Tensor) else np.asarray(obs[i])
+                    x_i = src[:pos_dim]
+                    xref_i = src[x_dim: x_dim + pos_dim]
                 else:
-                    # Isaac envs: state()[..., :3] is position — but path/vel-
-                    # tracking envs expose no separate "critic" observation, so
-                    # state() returns None. Fall back to the flat policy obs
-                    # ([x, xref, uref]), whose first dims are x itself.
+                    # Isaac vel-tracking envs (no [x, xref, uref] layout):
+                    # state()[..., :3] is position — but these envs expose no
+                    # separate "critic" observation, so state() returns None.
+                    # Fall back to the flat policy obs, whose first dims are x.
                     x_val = self.env.state() if hasattr(self.env, "state") else None
                     if isinstance(x_val, tuple): x_val = x_val[0]
                     if x_val is None:
                         x_val = obs
                     x_i = x_val[i, :3].detach().cpu().numpy() if isinstance(x_val, torch.Tensor) else np.array(x_val)[i, :3]
 
-                    xref_val = getattr(self.env.unwrapped, "_x_ref", None)
-                    if xref_val is None and hasattr(self.env.unwrapped, "get_reference_state"):
-                        xref_val = self.env.unwrapped.get_reference_state()
+                    xref_val = getattr(unwrapped, "_x_ref", None)
+                    if xref_val is None and hasattr(unwrapped, "get_reference_state"):
+                        xref_val = unwrapped.get_reference_state()
                     if xref_val is not None:
                         xref_i = xref_val[i, :3].detach().cpu().numpy() if isinstance(xref_val, torch.Tensor) else np.array(xref_val)[i, :3]
             except Exception:

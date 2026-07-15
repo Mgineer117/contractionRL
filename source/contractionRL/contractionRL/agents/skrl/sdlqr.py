@@ -91,7 +91,7 @@ def _care_gain(A: torch.Tensor, B_mat: torch.Tensor,
         # point → fall back to zero feedback (u = uref) rather than aborting the
         # entire batched rollout for one bad env.
         return torch.zeros(u_dim, x_dim, dtype=dtype, device=A.device)
-    P = torch.from_numpy(P_np).to(A)
+    P = torch.as_tensor(P_np).to(A)
     return solve(R, B_mat.T @ P)  # (u_dim, x_dim)
 
 

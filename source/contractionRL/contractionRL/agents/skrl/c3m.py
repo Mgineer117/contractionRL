@@ -104,6 +104,13 @@ class C3MCfg(AgentCfg):
     # reweights the loss across states and shifts C3M's (seed-sensitive) training
     # dynamics — enable to A/B, not silently. Feasible set is unchanged either way.
     orthonormalize_bbot: bool = False
+    # Multiplies (c1_loss + c2_loss) before summing into the total loss, e.g.
+    # 0.1 → loss = os_loss + pd_loss + 0.1 * (c1_loss + c2_loss). Does NOT touch
+    # pd_loss/os_loss — only C1/C2 (the open-loop metric-feasibility conditions),
+    # letting the closed-loop controller term (pd_loss, Cu) dominate training
+    # when C1/C2 are noisy/dominant early on. Defaults to 1.0 (no-op, matches
+    # the reference C3M script's unweighted sum).
+    c1_c2_scale: float = 1.0
     # Fraction of training (by progress, 0-1) during which the metric M is held
     # fixed (detached) in the contraction term Cu, mirroring the reference C3M
     # script's `detach=True if epoch < lr_step else False` warmup (5 of 15
@@ -350,9 +357,11 @@ class C3MAgent(Agent):
 
     # ── Contraction math (inlined from mjrl C3M) ───────────────────────── #
 
-    def _to_tensor(self, arr) -> torch.Tensor:
-        dev = self._device
-        return torch.from_numpy(arr).to(torch.float32).to(dev)
+    def _to_tensor(self, arr):
+        dev = self.device
+        if isinstance(arr, torch.Tensor):
+            return arr.to(torch.float32).to(dev)
+        return torch.as_tensor(arr).to(torch.float32).to(dev)
 
     def _compute_loss(self, idx):
         cfg = self._cfg
@@ -390,16 +399,24 @@ class C3MAgent(Agent):
         # Certify the *deterministic* controller: use the mean control, not a
         # noisy rsample. Exploration noise would otherwise perturb A and dot_x
         # (and hence the contraction condition Cu) — this matches C2RL's CMG loss.
+        #
+        # Go through the policy model's own compute() rather than calling
+        # self._cl_actor.mean_control() directly: which control law gets
+        # certified (raw/unbounded vs. tanh-squashed/bounded) is then purely a
+        # function of which backbone built the model (CLDeterministicActorModel
+        # vs. SquashedCLDeterministicActorModel — see models.py), the same
+        # "backbone name selects the class, class defines the behavior"
+        # convention SAC's control-squashed backbone already uses, rather than
+        # a boolean flag threaded through here. A hard torch.clamp instead of
+        # the tanh squash would NOT be equivalent: clamp's gradient is exactly
+        # zero at saturation, so K = jacobian(u, x) collapses to zero there
+        # too, and the certificate degrades to checking the OPEN-LOOP drift
+        # alone in every state that needed feedback most — this is what caused
+        # the real AUC divergence documented in project memory
+        # (project_c3m_clip_actions_divergence.md,
+        # project_c3m_env_divergence_2026-07-10.md).
         state = torch.cat([x, xref, uref], dim=1)
-        u = self._cl_actor.mean_control(state)
-        policy_model = self.models["policy"]
-        if getattr(policy_model, "_d_clip_actions", False):
-            # Certify the action actually deployed by act() (clamped), not the
-            # raw unclamped mean_control output — matches clip_actions=true at
-            # eval time. K goes to zero wherever u saturates (clamp has no
-            # gradient there), which is intentional: don't credit an infeasible
-            # action for satisfying the contraction condition.
-            u = torch.clamp(u, min=policy_model._d_min_actions, max=policy_model._d_max_actions)
+        u = self.models["policy"].compute({"observations": state}, role="policy")[0]
         K = jacobian(u, x)
 
         A = DfDx + torch.einsum('bxyu,bu->bxy', DBDx, u)
@@ -456,7 +473,7 @@ class C3MAgent(Agent):
             overshoot = W - cfg.w_ub * I
             os_loss = loss_pos_matrix_random_sampling(-overshoot, num_samples=n_samp)
 
-        loss = os_loss + pd_loss + c1_loss + c2_loss
+        loss = os_loss + pd_loss + cfg.c1_c2_scale * (c1_loss + c2_loss)
         return loss, {"pd_loss": pd_loss.item(), "c1_loss": c1_loss.item(), "c2_loss": c2_loss.item(), "os_loss": os_loss.item() if not bounded else 0.0}
 
     def _optimize_params(self, loss: torch.Tensor) -> bool:
@@ -576,13 +593,11 @@ class C3MSkrlTrainer(Trainer):
     def train(self) -> None:
         agent = self.agents if not isinstance(self.agents, list) else self.agents[0]
         timesteps = self.cfg.timesteps
-        eval_interval = getattr(self.cfg, "eval_interval", 0)
-        log_interval = getattr(agent, "write_interval", "auto")
-        if str(log_interval).lower() == "auto":
-            log_interval = eval_interval if eval_interval > 0 else 200
-        log_interval = int(log_interval)
+        eval_interval = getattr(self.cfg, "eval_interval", 1)
 
         agent.init(trainer_cfg=self.cfg)
+        agent.write_interval = eval_interval
+        
         from .contraction_metrics import log_raw_config
         log_raw_config(getattr(self, "_wandb_raw_cfg", None))
         agent.enable_training_mode(True)
@@ -599,7 +614,7 @@ class C3MSkrlTrainer(Trainer):
             timesteps=timesteps,
             memory_size=getattr(agent.cfg, "emp_dynamics_memory_size", None),
             num_controls_per_state=getattr(agent.cfg, "num_controls_per_state", None),
-            log_interval=log_interval,
+            log_interval=eval_interval,
             tag="[C3M]",
             val_frac=getattr(agent.cfg, "dynamics_val_frac", 0.1),
             early_stop_patience=getattr(agent.cfg, "dynamics_early_stop_patience", 10),
@@ -620,9 +635,6 @@ class C3MSkrlTrainer(Trainer):
                 track_stability_summary(agent, ev["stability"])
                 track_reward_summary(agent, ev["reward"])
 
-            agent.post_interaction(timestep=t, timesteps=timesteps)
-
-            if log_interval and (t + 1) % log_interval == 0:
                 # Read the losses captured on the agent by update(); tracking_data
                 # may already be cleared by post_interaction → write_tracking_data,
                 # which would otherwise make _last() return a spurious nan.
@@ -636,12 +648,7 @@ class C3MSkrlTrainer(Trainer):
                     postfix["dyn"] = f"{metrics.get('C3M/dynamics/mse', float('nan')):.3g}"
                 pbar.set_postfix(**postfix)
 
-                # Write tracking data to wandb/tensorboard. The writer only
-                # exists when skrl resolved write_interval > 0 (auto =
-                # timesteps//100, so 0 for <100-step runs); guard so short runs
-                # and writer-less configs log to the progress bar without crashing.
-                if getattr(agent, "writer", None) is not None:
-                    agent.write_tracking_data(timestep=t, timesteps=timesteps)
+            agent.post_interaction(timestep=t, timesteps=timesteps)
 
         if agent._neural_dynamics is not None:
             dyn_path = os.path.join(agent.experiment_dir, "checkpoints", "dynamics.pt")
@@ -716,6 +723,9 @@ class C3MSkrlTrainer(Trainer):
         max_steps = int(self._env_scalar_attr("max_episode_length", "max_episode_len")) + 1
         finished = torch.zeros(num_envs, dtype=torch.bool, device=device)
         total_reward = torch.zeros((num_envs, 1), device=device)
+        # Snapshot the wrapper's compute counter so we can tell whether THIS
+        # rollout actually produced fresh metrics (see check after the loop).
+        computes_before = getattr(self.env, "_compute_count", None)
 
         eval_pbar = tqdm(range(max_steps), desc="C3M eval", leave=False, file=sys.stdout)
         for step in eval_pbar:
@@ -734,6 +744,16 @@ class C3MSkrlTrainer(Trainer):
         eval_pbar.close()
 
         agent.enable_training_mode(True)
+
+        if computes_before is not None and getattr(self.env, "_compute_count", None) == computes_before:
+            import warnings
+            warnings.warn(
+                "C3M eval: the StatManagerEnvWrapper buffer did not complete during "
+                "this rollout (an env may have terminated early before the eval "
+                "horizon elapsed) — stability_summary() below reports the PREVIOUS "
+                "evaluation's metrics.",
+                stacklevel=2,
+            )
 
         # Only envs that finished their (first) episode carry valid reward info.
         f_mask = finished if finished.any() else torch.ones_like(finished)

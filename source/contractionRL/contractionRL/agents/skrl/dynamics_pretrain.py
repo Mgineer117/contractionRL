@@ -176,9 +176,9 @@ def pretrain_dynamics(agent, *, epochs: int, data_path: str | None,
         data = agent._get_rollout(n_samples, "dynamics", num_control_per_state=num_controls_per_state)
         x_np, u_np, xdot_np = data["x"], data["u"], data["x_dot"]
 
-    x = torch.from_numpy(x_np).to(torch.float32).to(dev)
-    u = torch.from_numpy(u_np).to(torch.float32).to(dev)
-    x_dot = torch.from_numpy(xdot_np).to(torch.float32).to(dev)
+    x = torch.as_tensor(x_np).to(torch.float32).to(dev)
+    u = torch.as_tensor(u_np).to(torch.float32).to(dev)
+    x_dot = torch.as_tensor(xdot_np).to(torch.float32).to(dev)
     n = x.shape[0]
 
     train_idx, val_idx = train_val_split(n, val_frac, device=dev)

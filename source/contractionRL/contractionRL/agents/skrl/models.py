@@ -22,6 +22,7 @@ except ImportError:
     raise ImportError("skrl is required. Install it or use the local developer copy.")
 
 from .angle_utils import embed_angles, embedded_dim
+from .math_utils import rescale_residual
 from .nn_modules import CCM_Generator, BoundedCCM_Generator, CLActor, MLP, NeuralDynamics
 
 _MIN_LOG_STD = math.log(0.001)  # ≈ -6.908; matches CLActor annealing floor
@@ -34,7 +35,15 @@ _X_DIM_UNSET = object()
 
 
 class CLDeterministicActorModel(DeterministicMixin, Model):
-    """Contracting C3M_U actor wrapped as a skrl Deterministic policy model."""
+    """Contracting C3M_U actor wrapped as a skrl Deterministic policy model.
+
+    This is C3M's DEFAULT policy class (``class: DeterministicMixin`` in the
+    per-env ``skrl_c3m_cfg.yaml`` files, built by
+    ``contraction_runner._build_c3m_models``) — not the generic backbone
+    dispatch in ``runner.py``. UNBOUNDED — for the tanh-squashed, bounded
+    counterpart (``backbone: control-squashed``), see
+    ``SquashedCLDeterministicActorModel`` below.
+    """
 
     def __init__(
         self,
@@ -70,6 +79,70 @@ class CLDeterministicActorModel(DeterministicMixin, Model):
     def compute(self, inputs: dict, role: str = "policy"):
         state = inputs["observations"]
         return self.cl_actor.mean_control(state), {}
+
+
+class SquashedCLDeterministicActorModel(DeterministicMixin, Model):
+    """Tanh-squashed CLActor, deterministic — ``backbone: control-squashed`` for C3M.
+
+    Same bilinear feedback architecture as ``CLDeterministicActorModel``, but
+    ``compute()`` returns ``cl_actor.mean_control_squashed`` (feedback
+    tanh-bounded into the action space, ``uref`` added AFTER squashing — see
+    ``CLActor.mean_control_squashed`` / ``math_utils.rescale_residual``)
+    instead of the raw unbounded ``mean_control``.
+
+    Unlike ``SquashedCLActorModel`` (SAC's GaussianMixin counterpart, which
+    needs ``_TanhSquashMixin``'s stochastic-sample + log_prob-correction
+    machinery), this is plain deterministic — C3M certifies ``mean_control``
+    directly, never a noisy sample — so no mixin is needed beyond a bounded
+    ``compute()``.
+
+    C3M needs this instead of a hard ``clip_actions`` clamp on
+    ``CLDeterministicActorModel``: ``torch.clamp``'s gradient is exactly zero
+    at saturation, so ``K = jacobian(u, x)`` collapses to zero there too, and
+    the certified contraction condition silently degrades to checking the
+    OPEN-LOOP drift alone in exactly the states that need feedback most —
+    this caused the real AUC divergence documented in project memory
+    (project_c3m_clip_actions_divergence.md,
+    project_c3m_env_divergence_2026-07-10.md). ``tanh``'s gradient never hits
+    exact zero, so the certificate stays trainable even near saturation.
+    """
+
+    def __init__(
+        self,
+        observation_space,
+        action_space,
+        device,
+        clip_actions: bool = False,
+        hidden_dim: list | None = None,
+        activation: str = "tanh",
+        x_dim: int | None = None,
+        angle_idx: list | None = None,
+        **kwargs,
+    ):
+        Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
+        DeterministicMixin.__init__(self, clip_actions=clip_actions)
+
+        obs_dim = int(self.observation_space.shape[0])
+        u_dim = int(self.action_space.shape[0])
+        if x_dim is None:
+            x_dim = (obs_dim - u_dim) // 2
+
+        self.cl_actor = CLActor(
+            x_dim=x_dim,
+            u_dim=u_dim,
+            anneal_stddev=False,
+            hidden_dim=hidden_dim or [128, 128],
+            activation=activation,
+            angle_idx=angle_idx or [],
+        )
+
+        # DeterministicMixin.__init__ already computed _d_min_actions/_d_max_actions
+        # unconditionally (regardless of clip_actions) — reuse those.
+        self.to(self.device)
+
+    def compute(self, inputs: dict, role: str = "policy"):
+        state = inputs["observations"]
+        return self.cl_actor.mean_control_squashed(state, self._d_min_actions, self._d_max_actions), {}
 
 
 class MetricModel(Model):
@@ -156,6 +229,9 @@ class CLActorModel(GaussianMixin, Model):
         max_log_std:       upper clip bound for log_std.
         initial_log_std:   initial value for the global log_std parameter.
         hidden_dim:        hidden layer sizes for the CLActor weight generators.
+
+    UNBOUNDED — for the tanh-squashed, bounded counterpart (``backbone:
+    control-squashed``), see ``SquashedCLActorModel``.
     """
 
     def __init__(
@@ -397,12 +473,10 @@ class _TanhSquashMixin:
         Returns ``(action, scale)`` where ``scale`` is the per-sample,
         per-side half-width used (needed for the log-det correction in
         ``act()``). See the class docstring for why this is exact and
-        clamp-free, unlike a fixed-scale rescale-then-add.
+        clamp-free, unlike a fixed-scale rescale-then-add. Delegates to
+        ``math_utils.rescale_residual`` — shared with ``CLActor.mean_control_squashed``.
         """
-        s_hi = torch.clamp(self._action_high - residual, min=self._RESCALE_EPS)
-        s_lo = torch.clamp(residual - self._action_low, min=self._RESCALE_EPS)
-        scale = torch.where(tanh_u >= 0, s_hi, s_lo)
-        return residual + tanh_u * scale, scale
+        return rescale_residual(tanh_u, residual, self._action_low, self._action_high)
 
     def _unrescale_residual(self, action: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Inverse of ``_rescale_residual``: action -> (tanh_u in (-1, 1), scale)."""

@@ -103,13 +103,37 @@ def _build_c3m_models(models_cfg: dict, agent_cfg: dict, obs_space, act_space, d
     # RL method), so the CLActor should be deterministic by default — no
     # Gaussian log_std / sampling machinery. A config may still opt into the
     # GaussianMixin wrapper explicitly.
+    #
+    # backbone: control-squashed selects the tanh-squashed (bounded) variant —
+    # same "backbone name picks the class" convention PPO/SAC's
+    # _gaussian_factory uses (see runner.py). C3M certifies whichever control
+    # law the selected class's compute() returns (see _compute_loss below), so
+    # squashed-vs-unbounded is entirely a function of this choice, not a
+    # separate flag.
     policy_class_str = models_cfg.get(policy_key, {}).get("class", "DeterministicMixin")
+    policy_backbone = models_cfg.get(policy_key, {}).get("backbone", "control")
+    squashed = policy_backbone == "control-squashed"
     if policy_class_str == "GaussianMixin":
+        if squashed:
+            # SquashedCLActorModel.compute() deliberately returns the PRE-squash
+            # feedback (mean of the Normal) — squashing happens inside act(),
+            # for SAC's log_prob correction (see _TanhSquashMixin). C3M
+            # certifies compute()'s output directly (no sampling), so this
+            # combination would silently certify an unbounded, uref-less
+            # value instead of the actual bounded control law. Use the
+            # DeterministicMixin default instead (policy.class unset, or
+            # explicitly "DeterministicMixin") — SquashedCLDeterministicActorModel
+            # squashes inside compute() itself.
+            raise ValueError(
+                "C3M backbone: control-squashed requires class: DeterministicMixin "
+                "(the default) — GaussianMixin + control-squashed isn't supported for "
+                "C3M's certification, which calls compute() directly rather than act()."
+            )
         from contractionRL.agents.skrl.models import CLActorModel
         policy_cls = CLActorModel
     else:
-        from contractionRL.agents.skrl.models import CLDeterministicActorModel
-        policy_cls = CLDeterministicActorModel
+        from contractionRL.agents.skrl.models import CLDeterministicActorModel, SquashedCLDeterministicActorModel
+        policy_cls = SquashedCLDeterministicActorModel if squashed else CLDeterministicActorModel
 
     policy_kwargs = models_cfg.get(policy_key, {}).copy()
     policy_kwargs.pop("class", None)
@@ -269,7 +293,7 @@ def _make_skrl_env(env, task_id: str | None, num_envs: int, is_classic: bool):
         if hasattr(env, "step") and hasattr(env, "observation_space") and hasattr(env, "num_envs"):
             # Auto-collect path-tracking metrics on every reset/step so eval loops
             # don't hand-thread stats.update(...) (see StatManagerEnvWrapper).
-            return StatManagerEnvWrapper(env)
+            return StatManagerEnvWrapper(env) if not hasattr(env, "stability_summary") else env
         if task_id is None and hasattr(env, "spec") and env.spec:
             task_id = env.spec.id
         if task_id is None:
@@ -287,7 +311,7 @@ def _make_skrl_env(env, task_id: str | None, num_envs: int, is_classic: bool):
         # letting C3M/C2RL's batched Jacobian/backprop math run on GPU instead
         # of silently pinning the whole classic pipeline (including the neural
         # networks) to CPU.
-        return StatManagerEnvWrapper(wrap_env(vec_env, wrapper="gymnasium"))
+        return StatManagerEnvWrapper(wrap_env(vec_env, wrapper="gymnasium")) if not hasattr(env, "stability_summary") else wrap_env(vec_env, wrapper="gymnasium")
     return env  # Isaac: already wrapped
 
 

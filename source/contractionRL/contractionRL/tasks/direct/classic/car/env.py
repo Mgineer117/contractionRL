@@ -1,7 +1,7 @@
-"""Car (Dubins-like) tracking environment (ported from CAC-dev ``envs/xyD/car.py``).
+"""Car (Dubins-like) tracking environment (ported to batched PyTorch).
 
 State  x = [p_x, p_y, theta, v]
-Control u = [omega, a]   (angular rate, linear accel) added to reference control.
+Control u = [omega, a]
 Control-affine dynamics:
     f(x) = [v cos(theta), v sin(theta), 0, 0]
     B(x) = [[0,0],[0,0],[1,0],[0,1]]
@@ -9,6 +9,8 @@ Control-affine dynamics:
 
 from __future__ import annotations
 
+import math
+import torch
 import numpy as np
 
 from ..common.env_base import BaseEnv
@@ -16,17 +18,25 @@ from ..common.env_base import BaseEnv
 ANGLE_IDX = [2]
 
 v_l, v_h = 1.0, 2.0
-X_MIN = np.array([-15.0, -15.0, -np.pi, v_l]).reshape(-1, 1)
-X_MAX = np.array([15.0, 15.0, np.pi, v_h]).reshape(-1, 1)
-XREF_INIT_MIN = np.array([-2.0, -2.0, -1.0, 1.5])
-XREF_INIT_MAX = np.array([2.0, 2.0, 1.0, 1.5])
-XE_INIT_MIN = np.full((4,), -1.0)
-XE_INIT_MAX = np.full((4,), 1.0)
+# Position bound must comfortably contain the reference rollout: xref's velocity is
+# fixed at 1.5 (see XREF_INIT below — sample_reference_controls never drives the
+# acceleration control) and heading only gets steered by omega, so over the full
+# time_bound the reference can travel up to ~v*time_bound in a single direction if
+# heading holds roughly constant. Without enough margin here, _rollout_reference's
+# torch.clamp(next_x_wrapped, X_MIN, X_MAX) silently clips the reference position mid
+# -trajectory, which corrupts tracking-error/reward at the boundary. 30.0 covers the
+# worst case (1.5 * 15.0 = 22.5) plus the +-2.0 initial spread with margin to spare.
+X_MIN = [-30.0, -30.0, -math.pi, v_l]
+X_MAX = [30.0, 30.0, math.pi, v_h]
+XREF_INIT_MIN = [-2.0, -2.0, -1.0, 1.5]
+XREF_INIT_MAX = [2.0, 2.0, 1.0, 1.5]
+XE_INIT_MIN = [-1.0, -1.0, -1.0, -1.0]
+XE_INIT_MAX = [1.0, 1.0, 1.0, 1.0]
 lim = 1.0
-XE_MIN = np.array([-lim, -lim, -lim, -lim]).reshape(-1, 1)
-XE_MAX = np.array([lim, lim, lim, lim]).reshape(-1, 1)
-UREF_MIN = np.array([-3.0, -3.0]).reshape(-1, 1)
-UREF_MAX = np.array([3.0, 3.0]).reshape(-1, 1)
+XE_MIN = [-lim, -lim, -lim, -lim]
+XE_MAX = [lim, lim, lim, lim]
+UREF_MIN = [-3.0, -3.0]
+UREF_MAX = [3.0, 3.0]
 
 ENV_CONFIG = {
     "x_min": X_MIN, "x_max": X_MAX,
@@ -44,42 +54,50 @@ ENV_CONFIG = {
 class CarEnv(BaseEnv):
     def __init__(
         self,
+        num_envs: int = 1,
+        device: str = "cpu",
         sample_mode: str = "uniform",
         time_bound: float | None = None,
         dt: float | None = None,
         **kwargs,
     ):
         self.task = "car"
-        super().__init__(self._build_cfg(
-            ENV_CONFIG, sample_mode=sample_mode, time_bound=time_bound, dt=dt,
-        ))
+        super().__init__(
+            self._build_cfg(ENV_CONFIG, sample_mode=sample_mode, time_bound=time_bound, dt=dt),
+            num_envs=num_envs,
+            device=device
+        )
 
-    def _f_logic(self, x, lib):
+    def _f_logic(self, x):
         n = x.shape[0]
-        f = self._zeros((n, self.num_dim_x), x, lib)
-        f[:, 0] = x[:, 3] * lib.cos(x[:, 2])
-        f[:, 1] = x[:, 3] * lib.sin(x[:, 2])
+        f = self._zeros((n, self.num_dim_x), x)
+        f[:, 0] = x[:, 3] * torch.cos(x[:, 2])
+        f[:, 1] = x[:, 3] * torch.sin(x[:, 2])
         return f
 
-    def _B_logic(self, x, lib):
+    def _B_logic(self, x):
         n = x.shape[0]
-        B = self._zeros((n, self.num_dim_x, self.num_dim_control), x, lib)
-        B[:, 2, 0] = 1
-        B[:, 3, 1] = 1
+        B = self._zeros((n, self.num_dim_x, self.num_dim_control), x)
+        B[:, 2, 0] = 1.0
+        B[:, 3, 1] = 1.0
         return B
 
     def sample_reference_controls(self, freqs, weights, _t, infos, add_noise=False):
-        uref = np.array([0.0, 0.0])
-        for freq, weight in zip(freqs, weights):
-            uref += np.array([weight[0] * np.sin(freq * _t / self.time_bound * 2 * np.pi), 0])
+        n = weights.shape[0]
+        uref = torch.zeros(n, self.num_dim_control, device=self.device)
+        for i, freq in enumerate(freqs):
+            weight = weights[:, i, :]
+            val = weight[:, 0] * math.sin(freq * _t / self.time_bound * 2 * math.pi)
+            uref[:, 0] += val
         if add_noise:
-            uref += np.random.normal(0, np.abs(0.1 * uref), size=uref.shape)
-        return np.clip(uref, UREF_MIN.flatten(), UREF_MAX.flatten())
+            uref += torch.randn_like(uref) * torch.abs(0.1 * uref)
+        return torch.clamp(uref, self.UREF_MIN, self.UREF_MAX)
 
-    def system_reset(self):
-        xref_0, xe_0, x_0 = self.define_initial_state()
+    def system_reset(self, env_ids: torch.Tensor):
+        xref_0, xe_0, x_0 = self.define_initial_state(env_ids)
         freqs = list(range(1, 11))
-        weights = np.random.randn(len(freqs), len(UREF_MIN))
-        weights = (weights / np.sqrt((weights ** 2).sum(axis=0, keepdims=True))).tolist()
-        xref_arr, uref_arr, n = self._rollout_reference(xref_0, freqs, weights)
-        return x_0, xref_arr, uref_arr, n
+        n = len(env_ids)
+        weights = torch.randn(n, len(freqs), len(UREF_MIN), device=self.device)
+        weights = weights / torch.sqrt((weights ** 2).sum(dim=1, keepdim=True))
+        xref_arr, uref_arr, length = self._rollout_reference(xref_0, freqs, weights)
+        return x_0, xref_arr, uref_arr, length
