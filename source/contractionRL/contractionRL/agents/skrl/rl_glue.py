@@ -14,8 +14,6 @@ from typing import Sequence
 
 import torch
 
-from .angle_utils import wrap_diff
-from .math_utils import bound_W, spd_inverse
 
 
 def filter_cfg_fields(cfg_dict: dict, dataclass_type, *, context: str) -> dict:
@@ -37,55 +35,7 @@ def filter_cfg_fields(cfg_dict: dict, dataclass_type, *, context: str) -> dict:
     return {k: v for k, v in cfg_dict.items() if k in fields}
 
 
-def compute_mahalanobis_reward(
-    ccm_gen,
-    observations: torch.Tensor,
-    actions: torch.Tensor | None = None,
-    *,
-    x_dim: int,
-    u_dim: int,
-    angle_idx: Sequence[int],
-    w_lb: float,
-    tracking_scaler: float,
-    control_scaler: float,
-) -> torch.Tensor:
-    """Compute -(tracking_scaler * ||e||^2_M + control_scaler * ||u - uref||^2).
 
-    tracking_scaler/control_scaler play the role of Q/R exactly like
-    SD-LQR/LQR's Q_scaler/R_scaler (sdlqr.py): tracking_scaler weights the
-    state error under the CURRENT contraction metric M(x), control_scaler
-    weights control effort. The control term penalizes the FEEDBACK
-    component (action - uref), not the total applied control, matching
-    LQR's R term (which weights the closed-loop gain's contribution, not
-    uref itself — uref alone isn't "effort", it's just following the
-    reference). control_scaler defaults to 0.0 (no control penalty) for
-    backward compatibility; pass ``actions`` to enable it.
-    """
-    dtype = torch.float32
-
-    x    = observations[:, :x_dim].to(dtype)
-    xref = observations[:, x_dim : 2 * x_dim].to(dtype)
-    e = wrap_diff(x - xref, angle_idx).unsqueeze(-1)
-
-    with torch.no_grad():
-        raw_W, _ = ccm_gen(x)
-        # Pass the CMG's `bounded` flag so a BoundedCCM_Generator (whose
-        # eigenvalues are ALREADY in [w_lb, w_ub]) isn't shifted by an extra
-        # +w_lb·I here — that would move the metric off the [w_lb, w_ub]
-        # bounds the contraction certificate (set_contraction_certificate)
-        # advertises. Mirrors c3m.py's bound_W call.
-        bounded = getattr(ccm_gen, "bounded", False)
-        W = bound_W(raw_W, w_lb, x_dim, bounded)
-        M = spd_inverse(W)
-        quad = (e.transpose(1, 2) @ M @ e).squeeze(-1)
-        reward = -tracking_scaler * quad
-
-        if actions is not None and control_scaler > 0:
-            uref = observations[:, 2 * x_dim : 2 * x_dim + u_dim].to(dtype)
-            feedback = actions.to(dtype) - uref
-            control_cost = (feedback ** 2).sum(dim=-1, keepdim=True)
-            reward = reward - control_scaler * control_cost
-    return reward
 
 
 def make_base_rl_cfg(
@@ -189,3 +139,4 @@ def make_base_rl_cfg(
         "checkpoint_interval": 0,
     }
     return d
+

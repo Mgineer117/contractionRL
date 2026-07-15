@@ -597,13 +597,10 @@ def log_tracking_plots(
         fig.savefig(buf, format="png", bbox_inches="tight")
         plt.close(fig)
         buf.seek(0)
-        try:
-            payload = {f"{prefix}/{key}": wandb.Image(Image.open(buf))}
-            if step is not None:
-                payload["global_step"] = step
-            wandb.log(payload)
-        except Exception:
-            pass
+        payload = {f"{prefix}/{key}": wandb.Image(Image.open(buf))}
+        if step is not None:
+            payload["global_step"] = step
+        wandb.log(payload)
 
     # ── Normalized error curve(s) ─────────────────────────────────────────── #
     _trapz = getattr(np, "trapezoid", None) or np.trapz

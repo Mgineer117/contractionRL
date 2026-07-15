@@ -87,7 +87,7 @@ from skrl.memories.torch import RandomMemory
 from skrl.trainers.torch.base import Trainer, TrainerCfg
 
 from .math_utils import build_lr_scheduler
-from .rl_glue import compute_mahalanobis_reward, filter_cfg_fields, make_base_rl_cfg
+from .rl_glue import filter_cfg_fields, make_base_rl_cfg
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -462,11 +462,7 @@ class C2RLAgent(Agent):
         memory = RandomMemory(memory_size=mem_size, num_envs=num_envs, device=device)
         self._memory = memory
 
-        # SAC reward injection: overwrite each replayed transition's reward with
-        # the Mahalanobis reward, re-evaluating the frozen CMG per sampled
-        # mini-batch (cheap, static metric — see _setup_frozen_cmg_sample).
-        if self._base_algorithm == "SAC":
-            self._setup_frozen_cmg_sample(memory)
+
 
         rl_kwargs = dict(
             observation_space=observation_space,
@@ -594,120 +590,19 @@ class C2RLAgent(Agent):
         # C2RLSkrlTrainer drives update_policy (Phase B) directly.
         pass
 
-    # ── Mahalanobis reward ──────────────────────────────────────────────── #
-
-    def _compute_reward(
-        self, observations: torch.Tensor, actions: torch.Tensor | None = None,
-        prev_observations: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        """Mahalanobis tracking reward — a forward pass through the frozen CMG
-        (compute_mahalanobis_reward). Reads RAW observations (see module docstring).
-
-        Callers MUST pass the POST-transition observations (``next_obs``), not
-        the pre-action ``observations`` the actor conditioned on — the reward
-        needs to be a function of the state the action actually caused, or a
-        near-zero ``discount_factor`` severs the only channel (the bootstrapped
-        value target) through which the actor's choice could ever affect its
-        own objective, and policy gradient degenerates to noise. See the
-        contractionRL "low-gamma CMG" discussion for the derivation. NOTE: if
-        ``control_scaler>0`` is ever enabled, the ``uref`` this pulls out of
-        ``observations`` will then be next-step's reference too — harmless
-        today since every shipped config leaves ``control_scaler=0.0``, but
-        worth revisiting first if that changes.
-        """
-        cfg = self._cfg
-        reward = compute_mahalanobis_reward(
-            self._ccm_gen, observations, actions,
-            x_dim=self._x_dim, u_dim=self._u_dim, angle_idx=self._angle_idx,
-            w_lb=cfg.w_lb, tracking_scaler=cfg.tracking_scaler, control_scaler=cfg.control_scaler,
-        )
-        if prev_observations is not None:
-            prev_reward = compute_mahalanobis_reward(
-                self._ccm_gen, prev_observations, None,
-                x_dim=self._x_dim, u_dim=self._u_dim, angle_idx=self._angle_idx,
-                w_lb=cfg.w_lb, tracking_scaler=cfg.tracking_scaler, control_scaler=cfg.control_scaler,
-            )
-            reward = reward - prev_reward
-        return reward
-
-    # ── SAC reward-injection patch ──────────────────────────────────────── #
-
-    def _setup_frozen_cmg_sample(self, memory) -> None:
-        """SAC: recompute the Mahalanobis reward per sampled mini-batch from the
-        (frozen, by Phase B) CMG's raw-obs metric.
-
-        The metric is static, so there is nothing to invalidate/cache — every
-        sample just re-evaluates the pure forward pass. Applying an obs
-        preprocessor here would evaluate M and e = x - xref in normalized
-        coordinates and distort the reward, so the raw stored observations are
-        used (see module docstring).
-
-        Uses ``next_observations`` (POST-transition), not ``observations`` —
-        see ``_compute_reward``'s docstring for why the reward must be a
-        function of the state the sampled action actually caused, not the
-        state it merely observed. SAC's own ``_tensors_names`` already
-        includes ``next_observations`` (needed for its own critic target), so
-        this never has to request an extra tensor.
-        """
-        def _dynamic_maha_sample(names, batch_size, mini_batches=1, sequence_length=1, _orig=memory.sample):
-            batches = _orig(names, batch_size=batch_size, mini_batches=mini_batches, sequence_length=sequence_length)
-            try:
-                obs_idx = names.index("observations") if "observations" in names else -1
-                next_obs_idx = names.index("next_observations") if "next_observations" in names else names.index("next_states")
-                act_idx = names.index("actions")
-                rew_idx = names.index("rewards")
-                for b in batches:
-                    prev_obs = b[obs_idx] if (obs_idx != -1 and getattr(self, "_is_classic_env", False)) else None
-                    b[rew_idx] = self._compute_reward(b[next_obs_idx], b[act_idx], prev_observations=prev_obs)
-            except ValueError:
-                pass  # if rewards isn't requested (e.g. target actions), don't modify
-            return batches
-        memory.sample = _dynamic_maha_sample
-
     # ── Phase B update ──────────────────────────────────────────────────── #
 
     def update_policy(
-        self, next_observations: torch.Tensor, actions: torch.Tensor | None = None,
-        observations: torch.Tensor | None = None,
-        *, timestep: int, timesteps: int,
+        self, *, timestep: int, timesteps: int,
     ) -> dict:
-        """Inject the Mahalanobis reward and drive the base agent's update.
+        """Drive the base RL agent's update.
 
-        PPO: compute the Mahalanobis reward over the whole fresh rollout batch,
-        overwrite the rollout's rewards, then call update() once (PPO's own
-        rollouts-cadence hook never fires here — the trainer drives it
-        explicitly). SAC: the reward is recomputed inside the patched
-        memory.sample() and the gradient step is driven by the trainer calling
-        ``post_interaction()`` right after, so this is a no-op for SAC.
-
-        ``next_observations`` (POST-transition, i.e. the caller's ``next_obs``
-        batch) — not the pre-action observations the actor conditioned on —
-        see ``_compute_reward``'s docstring.
+        The Mahalanobis reward is computed directly by the env's get_rewards()
+        (via the injected frozen CCM), so no reward overwrite is needed here.
+        PPO: call update() once per rollout chunk.
+        SAC: no-op (post_interaction drives the gradient step).
         """
         if self._base_algorithm == "PPO":
-            maha_r = self._compute_reward(next_observations, actions, prev_observations=observations)
-            try:
-                memory = self._rl_agent.memory
-                r_tensor = memory.get_tensor_by_name("rewards")
-                term_tensor = memory.get_tensor_by_name("terminated")
-                trunc_tensor = memory.get_tensor_by_name("truncated")
-                
-                # The final rollout chunk of training may be shorter than
-                # `rollouts` (timesteps not a multiple of rollout_steps), so
-                # `next_observations`/`maha_r` can cover fewer rows than the
-                # memory's fixed [rollout_steps, num_envs, 1] reward tensor —
-                # only overwrite the rows that were actually filled.
-                n_steps = next_observations.shape[0] // memory.num_envs
-                
-                # FIX: mask out boundary steps so PPO doesn't train on huge fake penalties
-                finished = (term_tensor[:n_steps] | trunc_tensor[:n_steps])
-                maha_r_shaped = maha_r.view(n_steps, memory.num_envs, 1)
-                maha_r_shaped[finished] = 0.0
-                
-                r_tensor[:n_steps].copy_(maha_r_shaped)
-            except RuntimeError as e:
-                import skrl
-                skrl.logger.warning(f"[C2RL] Failed to inject Mahalanobis reward in update_policy: {e}")
             self._rl_agent.update(timestep=timestep, timesteps=timesteps)
         return {}
 
@@ -1036,6 +931,30 @@ class C2RLSkrlTrainer(Trainer):
         rl_agent.enable_training_mode(True)
         rollout_steps = agent._cfg.rollouts
 
+        # Inject the frozen CMG into each sub-env so get_rewards() uses
+        # the Mahalanobis reward natively.
+        _env = env
+        while hasattr(_env, "_env") and getattr(_env, "_env") is not _env:
+            _env = getattr(_env, "_env")
+        while hasattr(_env, "unwrapped") and getattr(_env, "unwrapped") is not _env:
+            _env = getattr(_env, "unwrapped")
+
+        agent._is_classic_env = False
+        import copy
+        cpu_ccm = copy.deepcopy(agent._ccm_gen).to("cpu")
+        
+        if hasattr(_env, "envs"):
+            for e in _env.envs:
+                inner = e.unwrapped if hasattr(e, "unwrapped") else e
+                if not agent._is_classic_env:
+                    agent._is_classic_env = "classic" in type(inner).__module__
+                if agent._is_classic_env and hasattr(inner, "set_ccm"):
+                    inner.set_ccm(cpu_ccm, agent._cfg.w_lb, "cpu")
+        else:
+            agent._is_classic_env = "classic" in type(_env).__module__
+            if agent._is_classic_env and hasattr(_env, "set_ccm"):
+                _env.set_ccm(cpu_ccm, agent._cfg.w_lb, "cpu")
+
         observations, infos = env.reset()
         states = env.state() if hasattr(env, "state") else None
         global_step = 0
@@ -1044,21 +963,10 @@ class C2RLSkrlTrainer(Trainer):
         flush_interval = max(1, timesteps // 100)
         next_flush = flush_interval
 
-        # Per-env maha reward accumulator — tracks the episodic total of the
-        # Mahalanobis reward the policy actually optimizes (stored_reward), so
-        # episode-completion summaries land under "Maha Reward/total_reward_mean"
-        # (with CI) in wandb, distinct from the env's own "Reward/total_reward".
-        num_envs = agent._num_envs
-        maha_episode_reward = torch.zeros(num_envs, dtype=torch.float32, device=agent._device)
-
-        agent._is_classic_env = "classic" in type(env.unwrapped).__module__
-
         pbar = _tqdm.tqdm(total=timesteps, desc="C2RL training (Phase B)", file=sys.stdout)
         while global_step < timesteps:
             if agent._base_algorithm == "PPO":
                 rl_agent.memory.reset()
-            obs_list, next_obs_list, act_list = [], [], []
-
             steps_to_take = min(rollout_steps, timesteps - global_step)
             for _ in range(steps_to_take):
                 rl_agent.pre_interaction(timestep=global_step, timesteps=timesteps)
@@ -1066,81 +974,22 @@ class C2RLSkrlTrainer(Trainer):
                     actions, _ = rl_agent.act(observations, states, timestep=global_step, timesteps=timesteps)
                 next_obs, rewards, terminated, truncated, infos = env.step(actions)
                 next_states = env.state() if hasattr(env, "state") else None
-                obs_list.append(observations.clone())
-                next_obs_list.append(next_obs.clone())
-                act_list.append(actions.clone())
 
-                # Stored/logged reward: the frozen CMG's cheap forward pass gives
-                # the real Mahalanobis reward the policy optimizes, computed right
-                # here at collection time (no later recompute needed for PPO's
-                # rollout-batch update; SAC still re-evaluates it per replayed
-                # mini-batch via _setup_frozen_cmg_sample, since the metric is
-                # static so re-evaluating is as cheap as caching). The raw env
-                # reward is logged alongside. Computed from next_obs (POST-
-                # transition) — see _compute_reward's docstring: the reward
-                # must reflect the state the action caused, not the state it
-                # merely observed, or a near-zero discount_factor gives the
-                # actor no gradient signal at all.
-                prev_obs = observations if agent._is_classic_env else None
-                stored_reward = agent._compute_reward(next_obs, actions, prev_observations=prev_obs).view_as(rewards)
+                # The env's get_rewards() already computes the Mahalanobis reward
+                # via the injected frozen CCM — use it directly.
                 rl_agent.record_transition(
                     observations=observations, states=states, actions=actions,
                     rewards=rewards, next_observations=next_obs, next_states=next_states,
                     terminated=terminated, truncated=truncated, infos=infos,
                     timestep=global_step, timesteps=timesteps,
                 )
-                rl_agent.track_data("Reward / env_reward (mean)", float(rewards.float().mean()))
-
-                # ── Maha reward episode tracking ─────────────────────────── #
-                # Accumulate the per-step maha reward into the per-env episode
-                # total; on episode boundaries emit the summary under the
-                # "Maha Reward" wandb tab (total_reward_mean + ci95).
-                with torch.no_grad():
-                    from .rl_glue import compute_mahalanobis_reward
-                    maha_next = compute_mahalanobis_reward(
-                        agent._ccm_gen, next_obs, None,
-                        x_dim=agent._x_dim, u_dim=agent._u_dim, angle_idx=agent._angle_idx,
-                        w_lb=agent._cfg.w_lb, tracking_scaler=1.0, control_scaler=0.0
-                    )
-                    if prev_obs is not None:
-                        maha_prev = compute_mahalanobis_reward(
-                            agent._ccm_gen, prev_obs, None,
-                            x_dim=agent._x_dim, u_dim=agent._u_dim, angle_idx=agent._angle_idx,
-                            w_lb=agent._cfg.w_lb, tracking_scaler=1.0, control_scaler=0.0
-                        )
-                        delta_maha = maha_next - maha_prev
-                    else:
-                        delta_maha = maha_next
-                
-                finished = (terminated | truncated).reshape(num_envs)
-                # FIX: Auto-reset replaces next_obs with the new episode's initial state.
-                # We mask it out so the sum safely collapses to D(initial) - D(pre_terminal).
-                delta_maha[finished] = 0.0
-                
-                maha_episode_reward += delta_maha.detach().float().reshape(num_envs)
-                
-                if finished.any():
-                    import collections
-                    import numpy as np
-                    
-                    if not hasattr(agent, "_track_maha_rewards"):
-                        agent._track_maha_rewards = collections.deque(maxlen=100)
-                    agent._track_maha_rewards.extend(maha_episode_reward[finished].tolist())
-                    
-                    if len(agent._track_maha_rewards) > 0:
-                        track_maha = np.array(agent._track_maha_rewards)
-                        agent.track_data("Maha Reward / Total reward (max)", float(np.max(track_maha)))
-                        agent.track_data("Maha Reward / Total reward (min)", float(np.min(track_maha)))
-                        agent.track_data("Maha Reward / Total reward (mean)", float(np.mean(track_maha)))
-                        
-                    maha_episode_reward[finished] = 0.0
 
                 self._forward_env_log(agent, infos)
                 observations = next_obs
                 states = next_states
 
                 if agent._base_algorithm == "SAC":
-                    agent.update_policy(None, None, timestep=global_step, timesteps=timesteps)
+                    agent.update_policy(timestep=global_step, timesteps=timesteps)
                     rl_agent.post_interaction(timestep=global_step, timesteps=timesteps)
                     if global_step % flush_interval == 0 and getattr(rl_agent, "writer", None) is not None:
                         rl_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
@@ -1150,14 +999,7 @@ class C2RLSkrlTrainer(Trainer):
 
             # Chunk-based update for PPO
             if agent._base_algorithm == "PPO":
-                obs_tensor = torch.cat(obs_list, dim=0)
-                next_obs_tensor = torch.cat(next_obs_list, dim=0)
-                act_tensor = torch.cat(act_list, dim=0)
-                agent.update_policy(
-                    next_obs_tensor, act_tensor,
-                    observations=obs_tensor if agent._is_classic_env else None,
-                    timestep=global_step, timesteps=timesteps
-                )
+                agent.update_policy(timestep=global_step, timesteps=timesteps)
                 rl_agent.post_interaction(timestep=global_step, timesteps=timesteps)
                 if global_step >= next_flush and getattr(rl_agent, "writer", None) is not None:
                     rl_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)

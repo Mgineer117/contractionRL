@@ -150,6 +150,17 @@ class BaseEnv(gym.Env):
         self.init_tracking_error = np.linalg.norm(self.x_t - self.xref[0], ord=2) ** 2
         self.traj_x, self.traj_y, self.err_history = [], [], []
         self.episode_reward = 0.0
+        
+        # Initialize M for the starting state (if CMG is injected via set_ccm)
+        if getattr(self, "ccm_gen", None) is not None:
+            import torch
+            from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
+            with torch.no_grad():
+                x_t_tensor = torch.tensor(self.x_0, dtype=torch.float32, device=self.ccm_device).unsqueeze(0)
+                W_raw, _ = self.ccm_gen(x_t_tensor)
+                W = bound_W(W_raw, self.w_lb, self.num_dim_x, getattr(self.ccm_gen, "bounded", False))
+                self.M = spd_inverse(W)
+                
         return state, {"x": self.x_t, "tracking_error": self.init_tracking_error}
 
     def step(self, u):
@@ -176,7 +187,7 @@ class BaseEnv(gym.Env):
         # tracking error that also gave PPO/SAC's native reward the same
         # broken actor->reward gradient the Mahalanobis reward had at low
         # gamma (see contractionRL "low-gamma CMG" / next_obs discussion).
-        reward, infos = self.get_rewards(u, next_x_wrapped)
+        reward, infos = self.get_rewards(self.x_t, u, next_x_wrapped)
         self.episode_reward += float(reward)
 
         # Track raw distance error for AUC/Contraction envelope
@@ -419,30 +430,57 @@ class BaseEnv(gym.Env):
     def system_reset(self):
         ...
 
+    def set_ccm(self, ccm_gen, w_lb, device):
+        """Inject the frozen CCM for Mahalanobis reward computation."""
+        self.ccm_gen = ccm_gen
+        self.w_lb = w_lb
+        self.ccm_device = device
+
     # ------------------------------------------------------------------ #
-    def get_rewards(self, u, x=None):
-        """Tracking + control-effort reward. ``x`` MUST be the POST-transition
-        state (see ``step()``); defaults to ``self.x_t`` only for callers
-        computing a reward for the CURRENT (already-updated) state, e.g.
-        outside the main step() loop.
+    def get_rewards(self, x, u, next_x):
+        """Tracking + control-effort reward.
+        Returns the telescoping difference: V(x) - V(next_x).
         """
-        if x is None:
-            x = self.x_t
-        error = self.wrap_angles(x - self.xref[self.time_steps])
-        tracking_error = np.linalg.norm(error, ord=2) ** 2
+        error = self.wrap_angles(x - self.xref[self.time_steps - 1])
+        next_error = self.wrap_angles(next_x - self.xref[self.time_steps])
+        
+        tracking_error = np.linalg.norm(next_error, ord=2) ** 2
         control_effort = np.linalg.norm(u, ord=2) ** 2
 
-        tracking_reward = -self.tracking_scaler * tracking_error
-        control_reward = -self.control_scaler * control_effort
+        if getattr(self, "ccm_gen", None) is not None:
+            import torch
+            from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
+            with torch.no_grad():
+                to_t = lambda arr: torch.tensor(arr, dtype=torch.float32, device=self.ccm_device).unsqueeze(0)
+                
+                # Simply read the cached M from reset() or the previous step
+                M = self.M
+                
+                # Evaluate metric at next_x
+                next_W_raw, _ = self.ccm_gen(to_t(next_x))
+                next_W = bound_W(next_W_raw, self.w_lb, self.num_dim_x, getattr(self.ccm_gen, "bounded", False))
+                next_M = spd_inverse(next_W)
+                
+                # Cache next_M for the next step unconditionally
+                self.M = next_M
+                
+                # Convert errors to tensor
+                err_t = to_t(error).unsqueeze(-1)
+                next_err_t = to_t(next_error).unsqueeze(-1)
+                
+                # Calculate quad forms: e^T M e
+                quad = (err_t.transpose(1, 2) @ M @ err_t).squeeze()
+                next_quad = (next_err_t.transpose(1, 2) @ next_M @ next_err_t).squeeze()
+                
+                tracking_reward = self.tracking_scaler * (quad - next_quad).item()
+                control_reward = -self.control_scaler * control_effort
+                
+                # Reward is V(x) - V(next_x) (positive if error decreases) + control penalty
+                reward = tracking_reward + control_reward
+        else:
+            # Reward is V(x) - V(next_x)
+            reward = np.dot(error, error) - np.dot(next_error, next_error)
             
-        # Apply reward shaping: subtract previous state's tracking reward
-        if x is not None and self.time_steps > 0:
-            prev_error = self.wrap_angles(self.x_t - self.xref[self.time_steps - 1])
-            prev_tracking_error = np.linalg.norm(prev_error, ord=2) ** 2
-            prev_tracking_reward = -self.tracking_scaler * prev_tracking_error
-            tracking_reward = tracking_reward - prev_tracking_reward
-
-        reward = (0.5 * tracking_reward) + (0.5 * control_reward)
         return reward, {"tracking_error": tracking_error, "control_effort": control_effort}
 
     def get_rollout(self, buffer_size: int, mode: str, num_control_per_state: int | None = None):

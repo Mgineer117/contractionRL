@@ -24,7 +24,7 @@ except ImportError:
 from .angle_utils import embed_angles, embedded_dim
 from .nn_modules import CCM_Generator, BoundedCCM_Generator, CLActor, MLP, NeuralDynamics
 
-_MIN_LOG_STD = math.log(0.01)  # ≈ -4.605; matches CLActor annealing floor
+_MIN_LOG_STD = math.log(0.001)  # ≈ -6.908; matches CLActor annealing floor
 
 # Sentinel distinguishing "caller didn't pass x_dim" (fall back to the
 # dimension-parity guess) from "caller passed x_dim=None" (an env that
