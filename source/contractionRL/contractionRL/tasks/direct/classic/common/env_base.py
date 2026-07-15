@@ -230,18 +230,27 @@ class BaseEnv(gym.Env):
             }
             
             try:
-                from contractionRL.tasks.direct.common.eval_metrics import fit_exponential_envelope
-                # fit_exponential_envelope returns C_star and a list of lambdas (one per curve)
-                C_star, lambdas = fit_exponential_envelope([norm_traj], self.dt)
-                lbd = float(lambdas[0])
-                C_star = float(C_star)
-                score = lbd / max(C_star, 1e-6)
+                import torch
+                from contractionRL.agents.skrl.contraction_metrics import per_env_metrics
                 
-                info_dict["log"]["Stability/overshoot"] = C_star
-                info_dict["log"]["Stability/contraction_rate"] = lbd
-                info_dict["log"]["Stability/contraction_score"] = score
+                err_arr = np.asarray(self.err_history)
+                # Create batched (size 1) tensors for the unified metric function
+                t_e0 = torch.tensor([err_arr[0] if len(err_arr) > 0 else 1.0], dtype=torch.float32)
+                t_e_last = torch.tensor([err_arr[-1] if len(err_arr) > 0 else 1.0], dtype=torch.float32)
+                t_e_max = torch.tensor([np.max(err_arr) if len(err_arr) > 0 else 1.0], dtype=torch.float32)
+                t_err_sum = torch.tensor([np.sum(err_arr)], dtype=torch.float32)
+                t_steps = torch.tensor([len(err_arr)], dtype=torch.float32)
+                
+                metrics = per_env_metrics(
+                    e0=t_e0, e_last=t_e_last, e_max=t_e_max,
+                    err_sum=t_err_sum, steps=t_steps, dt=self.dt
+                )
+                
+                info_dict["log"]["Stability/overshoot"] = metrics["overshoot"][0].item()
+                info_dict["log"]["Stability/contraction_rate"] = metrics["contraction_rate"][0].item()
+                info_dict["log"]["Stability/contraction_score"] = metrics["contraction_score"][0].item()
             except Exception:
-                pass  # Fallback to just AUC if fit fails
+                pass  # Fallback to just AUC if computation fails
                 
         return (
             state,
