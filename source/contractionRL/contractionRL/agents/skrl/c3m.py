@@ -595,8 +595,18 @@ class C3MSkrlTrainer(Trainer):
         timesteps = self.cfg.timesteps
         eval_interval = getattr(self.cfg, "eval_interval", 1)
 
-        agent.init(trainer_cfg=self.cfg)
+        # Must be set on the instance attribute BEFORE init(): base Agent.init()
+        # only creates self.writer when self.write_interval > 0 *at that moment*
+        # (self.write_interval starts out as the literal "auto" string from
+        # __init__, and init()'s "auto" resolution — timesteps // 100, which is
+        # 0 for any timesteps < 100 — reads/writes that same attribute, not
+        # self.cfg.experiment.write_interval). Overriding it only after init()
+        # leaves self.writer unset while write_tracking_data() still gets
+        # called every eval_interval steps → AttributeError: 'C3MAgent' object
+        # has no attribute 'writer', crashing the run before any metric is
+        # ever logged to W&B.
         agent.write_interval = eval_interval
+        agent.init(trainer_cfg=self.cfg)
         
         from .contraction_metrics import log_raw_config
         log_raw_config(getattr(self, "_wandb_raw_cfg", None))
