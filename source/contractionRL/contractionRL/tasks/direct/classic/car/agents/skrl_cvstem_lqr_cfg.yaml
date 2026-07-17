@@ -1,0 +1,65 @@
+seed: 42  # Random seed for reproducibility
+
+# CV-STEM-LQR: Tsukamoto's CV-STEM contraction controller — analytical (no RL),
+# u = uref - K(x)(x-xref) with K(x) = R⁻¹B(x)ᵀM(x), M(x)=W(x)⁻¹ from the CV-STEM
+# metric SDP. See agents/skrl/cvstem_lqr.py.
+
+models:
+  separate: true
+  # Only built (and synthesized+frozen) when metric_source=pretrained; ignored
+  # for metric_source=online (which re-solves the SDP every step).
+  cmg:
+    class: CMG
+    network:
+    - name: net
+      input: OBSERVATIONS
+      layers: [128, 128]
+      activations: tanh
+
+agent:
+  class: CVSTEM-LQR
+  # "online" — solve the CV-STEM SDP fresh at every step (truest to the
+  #            certificate; needs an SDP solver at deploy; one solve per env/step).
+  # "pretrained" — synthesize+freeze a CMG once, then M(x) is a network forward
+  #                pass (fast, vectorized on-device; certificate = regression fit).
+  metric_source: online
+  # R = r_scaler·I, used in BOTH the metric SDP's Riccati term AND the deployed
+  # gain K = R⁻¹BᵀM — a single knob so K stays the CERTIFIED CV-STEM gain.
+  r_scaler: 1.0
+  experiment:
+    directory: "car_cvstem_lqr"
+    experiment_name: ""
+    write_interval: "auto"
+    checkpoint_interval: "auto"
+    wandb: true
+    wandb_kwargs:
+      project: contractionRL
+      name:
+
+# ── Contraction metric SDP (both metric sources) ───────────────────────────── #
+cm:
+  w_ub: 10.0    # Upper eigenvalue bound for W (M ≥ 1/w_ub)
+  w_lb: 0.1     # Lower eigenvalue bound for W (M ≤ 1/w_lb)
+  lbd: 0.5      # Contraction rate λ
+  cm_eps: 0.01  # Strict-definiteness margin on the contraction LMI
+  cm_solver: MOSEK  # SCS (no license) | CLARABEL | MOSEK (tightest/fastest; see README)
+  max_lambda_reductions: 5  # per-state λ-backoff budget on SDP infeasibility
+  # ── metric_source=pretrained only ──
+  min_feasibility_rate: 0.5
+  cm_data_path: "logs/classic/car/cvstem_lqr_cm_data.npz"
+
+# ── Offline CMG synthesis (metric_source=pretrained only) ──────────────────── #
+cmg:
+  cmg_memory_size: 131072
+  cmg_regress_epochs: 10
+  cmg_regress_lr: 1.0e-3
+  cmg_regress_lr_scheduler: "StepLR"
+  cmg_regress_lr_scheduler_kwargs:
+    step_size: 1
+    gamma: 0.99
+  cmg_regress_batch_size: 1024
+
+trainer:
+  class: SequentialTrainer
+  timesteps: 10000  # Total number of environment steps to evaluate for
+  environment_info: log  # Enable logging of stability metrics from info["log"]

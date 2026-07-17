@@ -74,5 +74,5 @@ agent:
   use_value_norm: true
 trainer:
   class: SequentialTrainer
-  timesteps: 20000   # Total number of environment steps to train for
+  timesteps: 50000   # Total number of environment steps to train for
   environment_info: log  # Type of environment information to record (e.g., log)

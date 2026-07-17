@@ -35,9 +35,10 @@ models:
       input: STATE_ACTION
       layers: [128, 128]
       activations: relu
-  # Always built (see c2rl.py module docstring). cmg_method=cvstem (below):
-  # trained via CV-STEM SDP regression. Always a BoundedCCM_Generator
-  # regardless of constrain_eigenvalues here — the runner forces it.
+  # Always built (see c2rl.py module docstring). cmg_method=ccm (below): trained
+  # directly via C1/C2 loss minimization (train_cmg_ccm) — no SDP. Always a
+  # BoundedCCM_Generator regardless of constrain_eigenvalues here — the runner
+  # forces it.
   cmg:
     class: CMG
     network:
@@ -87,7 +88,7 @@ agent:
   # top-level `cm:` block below; the offline CMG synthesis (Phase A, always
   # runs) additionally reads `cmg:`; use_empirical_dynamics reads `empirical_dynamics:`.
   experiment:
-    directory: "quadrotor_c2rl_ppo"
+    directory: "car_c2rl_ppo"
     experiment_name: ""
     write_interval: "auto"  # Logging frequency for tensorboard/W&B (in epochs/steps)
     checkpoint_interval: "auto"  # Frequency of saving model weights (in epochs/steps)
@@ -109,25 +110,25 @@ cm:
   cm_eps: 0.01  # Strict-definiteness margin on the contraction LMI
   cm_solver: MOSEK  # cvxpy SDP solver: SCS (default, no license) | CLARABEL (no license, tighter/slower) | MOSEK (commercial license, tightest/fastest — see README.md Installation)
   # cmg_method selects the training pipeline (see c2rl.py module docstring):
-  #   "ccm"    — trains the CMG directly via C1/C2 loss minimization
-  #             (train_cmg_ccm) — no SDP, so cvstem_r_scaler/
+  #   "ccm"    (default, this config) — trains the CMG directly via C1/C2 loss
+  #             minimization (train_cmg_ccm) — no SDP, so cvstem_r_scaler/
   #             max_lambda_reductions/min_feasibility_rate/cm_data_path below
   #             are unused here.
-  #   "cvstem" (default, this config) — Tsukamoto CV-STEM-style: solves one
-  #              pointwise SDP per state (ncm_synthesis.solve_cm_metric)
-  #              keeping B directly via a Riccati term (R = cvstem_r_scaler·I
-  #              below) — the same congruence trick (W = M⁻¹) that convexifies
-  #              the Riccati inequality — M(x) doubles as a state-dependent-
-  #              Riccati solution, so K(x) = R⁻¹B(x)ᵀM(x) is a ready LQR-style
-  #              gain (not wired up here — C2RL only consumes M for the reward):
+  #   "cvstem" — Tsukamoto CV-STEM-style: solves one pointwise SDP per state
+  #              (ncm_synthesis.solve_cm_metric) keeping B directly via a
+  #              Riccati term (R = cvstem_r_scaler·I below) — the same
+  #              congruence trick (W = M⁻¹) that convexifies the Riccati
+  #              inequality — M(x) doubles as a state-dependent-Riccati
+  #              solution, so K(x) = R⁻¹B(x)ᵀM(x) is a ready LQR-style gain
+  #              (not wired up here — C2RL only consumes M for the reward):
   #               A(x)·W + W·A(x)ᵀ - 2·B·R⁻¹·Bᵀ + 2λ·W ⪯ -ε·I
   #               w_lb·I ⪯ W ⪯ w_ub·I
   #              (the factor 2 is the closed loop A - B R⁻¹BᵀM carried through the
   #              W = M⁻¹ congruence — it is what makes K above the certified gain.)
   #              Control is penalized via this Riccati term, not bounded over an
   #              action range — see ncm_synthesis.py module docstring.
-  cmg_method: cvstem
-  cvstem_r_scaler: 0.1  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only
+  cmg_method: ccm
+  cvstem_r_scaler: 1.0  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only
   # On SDP infeasibility AT A GIVEN STATE, retry that state alone with λ
   # halved, up to this many times, before giving up on it and dropping it from
   # the dataset — 0 disables this and reverts to dropping immediately. Warns
@@ -140,17 +141,17 @@ cm:
   # minutes; unused by "ccm", which has no cache). Reused on a later run as long
   # as lbd/w_lb/w_ub/cm_eps/cm_solver/cvstem_r_scaler/cmg_memory_size below all
   # still match too; re-solved and overwritten otherwise. "cvstem" only.
-  cm_data_path: "logs/classic/quadrotor/cm_data.npz"
+  cm_data_path: "logs/classic/car/cm_data.npz"
 
 # ── Offline CMG synthesis (Phase A, always runs before Phase B) ───────────── #
 # Sample cmg_memory_size states (uniformly from the classic env's analytic
 # state space, or from empirical_dynamics.dynamics_pretrain_data_path when
 # set). "cvstem": solve one SDP per state, then MSE-regress the models.cmg
-# network onto {x -> W*}. "ccm": train models.cmg directly with C1/C2 losses,
-# no SDP. Either way, freeze before Phase B.
+# network onto {x -> W*}. "ccm" (this config): train models.cmg directly with
+# C1/C2 losses, no SDP. Either way, freeze before Phase B.
 cmg:
   cmg_memory_size: 131072
-  cmg_regress_epochs: 50
+  cmg_regress_epochs: 10
   cmg_regress_lr: 1.0e-3
   cmg_regress_lr_scheduler: "StepLR"  # built the same way as empirical_dynamics' scheduler
   cmg_regress_lr_scheduler_kwargs:
@@ -177,4 +178,4 @@ empirical_dynamics:
 
 trainer:
   class: C2RLSkrlTrainer
-  timesteps: 30000   # Total number of environment steps to train for
+  timesteps: 50000   # Total number of environment steps to train for

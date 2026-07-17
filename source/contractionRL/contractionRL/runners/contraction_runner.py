@@ -42,7 +42,7 @@ import gymnasium as gym
 from contractionRL.agents.skrl.rl_glue import filter_cfg_fields as _filter_cfg_fields
 
 _SKRL_ALGOS = frozenset({"ppo", "sac", "td3", "ddpg", "amp", "ippo", "mappo"})
-_CONTRACTION_ALGOS = frozenset({"c3m", "lqr", "sdlqr", "c2rl-ppo", "c2rl-sac"})
+_CONTRACTION_ALGOS = frozenset({"c3m", "lqr", "sdlqr", "cvstem-lqr", "c2rl-ppo", "c2rl-sac"})
 
 
 def _make_cmg_bounds_fn(cmg_model, w_lb: float):
@@ -526,6 +526,16 @@ class ContractionRunner:
             self._setup_sdlqr(skrl_env, device, obs_space, state_space, act_space,
                               agent_cfg, trainer_cfg, models_cfg, get_f_and_B, lqr=(algo == "lqr"), x_dim=x_dim, u_dim=u_dim, angle_idx=angle_idx,
                               raw_cfg_snapshot=raw_cfg_snapshot)
+        elif algo in ("cvstem-lqr",):
+            # CV-STEM-LQR reads the same `cm:`/`cmg:` blocks C2RL does (contraction
+            # metric + offline CMG synthesis knobs), merged into agent_cfg — the
+            # "pretrained" metric_source builds+freezes a CMG here, "online"
+            # solves the SDP per step and needs no network.
+            self._setup_cvstem_lqr(skrl_env, device, obs_space, state_space, act_space,
+                                   agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B,
+                                   x_dim=x_dim, u_dim=u_dim, angle_idx=angle_idx,
+                                   raw_cfg_snapshot=raw_cfg_snapshot,
+                                   cm_cfg=cm_cfg, cmg_cfg=cmg_cfg)
         elif algo in ("c2rl-ppo", "c2rl-sac"):
             # base_algorithm is derived from the algo string itself (i.e. which
             # entry point / yaml you used), not a config toggle — see
@@ -603,8 +613,14 @@ class ContractionRunner:
             u_dim=u_dim,
             angle_idx=angle_idx,
         )
-        # SequentialTrainer for eval — no gradient updates
+        # SequentialTrainer for eval — no gradient updates. Pass trainer_cfg
+        # through IN FULL (like C3M/C2RL below) rather than a hardcoded
+        # {timesteps, close_environment_at_exit} dict — the latter silently
+        # dropped `headless` (set by train.py for every classic run), so
+        # SequentialTrainer.train() called self.env.render() every step and
+        # crashed with NotImplementedError (classic BaseEnv has no render()).
         tcfg = dataclasses.asdict(TrainerCfg(**_filter_cfg_fields({
+            **trainer_cfg,
             "timesteps": trainer_cfg.get("timesteps", 10000),
             "close_environment_at_exit": False,
         }, TrainerCfg, context="ContractionRunner trainer")))
@@ -619,6 +635,83 @@ class ContractionRunner:
         self._trainer = trainer
         self._env = env
         self._mode = "lqr" if lqr else "sdlqr"
+
+    def _setup_cvstem_lqr(self, env, device, obs_space, state_space, act_space,
+                          agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B,
+                          x_dim=None, u_dim=None, angle_idx=None, raw_cfg_snapshot=None,
+                          cm_cfg=None, cmg_cfg=None):
+        """Build a CVSTEMLQRAgent — Tsukamoto's CV-STEM contraction controller.
+
+        Analytical (like SD-LQR), so a SequentialTrainer / no gradient updates.
+        The `cm:`/`cmg:` yaml blocks (contraction-metric + offline CMG-synthesis
+        knobs, kept out of `agent:` exactly as for C2RL) are merged into
+        agent_cfg so CVSTEMLQRCfg sees them as one flat namespace. For
+        metric_source='pretrained' a frozen CMG (MetricModel, BoundedCCM,
+        constrain_eigenvalues=True) is built and synthesized inside the agent;
+        'online' needs no network."""
+        from contractionRL.agents.skrl.cvstem_lqr import CVSTEMLQRAgent, CVSTEMLQRCfg
+        from skrl.trainers.torch import SequentialTrainer
+        from skrl.trainers.torch.base import TrainerCfg
+        import dataclasses
+
+        agent_cfg = {**agent_cfg, **(cm_cfg or {}), **(cmg_cfg or {})}
+        angle_idx = list(angle_idx or [])
+        w_lb = agent_cfg.get("w_lb", 0.1)
+        w_ub = agent_cfg.get("w_ub", 10.0)
+
+        models = {}
+        if str(agent_cfg.get("metric_source", "online")).lower() == "pretrained":
+            from contractionRL.agents.skrl.models import MetricModel
+            cmg_net = models_cfg.get("cmg", {}).get("network", [{}])
+            cmg_hd = cmg_net[0].get("layers", [256, 256]) if cmg_net else [256, 256]
+            cmg_act = cmg_net[0].get("activations", "tanh") if cmg_net else "tanh"
+            models["cmg"] = MetricModel(
+                obs_space, act_space, device, hidden_dim=cmg_hd, activation=cmg_act,
+                x_dim=x_dim, angle_idx=angle_idx, constrain_eigenvalues=True,
+                w_lb=w_lb, w_ub=w_ub,
+            )
+
+        agent = CVSTEMLQRAgent(
+            cfg=CVSTEMLQRCfg(**_filter_cfg_fields(agent_cfg, CVSTEMLQRCfg, context="ContractionRunner agent")),
+            models=models,
+            observation_space=obs_space,
+            state_space=state_space,
+            action_space=act_space,
+            device=device,
+            get_f_and_B=get_f_and_B,
+            get_rollout=get_rollout,
+            x_dim=x_dim,
+            u_dim=u_dim,
+            angle_idx=angle_idx,
+        )
+        # Same fix as _setup_lqr_sdlqr above — pass trainer_cfg through in
+        # full so `headless` (train.py) isn't silently dropped.
+        tcfg = dataclasses.asdict(TrainerCfg(**_filter_cfg_fields({
+            **trainer_cfg,
+            "timesteps": trainer_cfg.get("timesteps", 10000),
+            "close_environment_at_exit": False,
+        }, TrainerCfg, context="ContractionRunner trainer")))
+        trainer = SequentialTrainer(cfg=tcfg, env=env, agents=agent)
+        from contractionRL.agents.skrl.contraction_metrics import log_raw_config
+        log_raw_config(raw_cfg_snapshot)
+        self._agent = agent
+        self._trainer = trainer
+        self._env = env
+        self._mode = "cvstem-lqr"
+
+        # Certificate for the PathTracking plot — like C3M, this is a hard
+        # per-step contraction controller (no discounting). 'pretrained' exposes
+        # per-state CMG bounds; 'online' has no persistent net, so static bounds.
+        if hasattr(env, "set_contraction_certificate"):
+            cmg_bounds_fn = (
+                _make_cmg_bounds_fn(models["cmg"], w_lb) if "cmg" in models else None
+            )
+            env.set_contraction_certificate(
+                agent_cfg.get("lbd"),
+                discount_factor=None,
+                static_metric_bounds=(1.0 / w_lb, 1.0 / w_ub),
+                cmg_bounds_fn=cmg_bounds_fn,
+            )
 
     def _setup_c2rl(self, env, device, obs_space, state_space, act_space,
                     agent_cfg, trainer_cfg, models_cfg, memory_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None,

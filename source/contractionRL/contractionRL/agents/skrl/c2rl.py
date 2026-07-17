@@ -146,14 +146,14 @@ class C2RLPPOCfg(AgentCfg):
     # ── SDP contraction metric ("cvstem" cmg_method only) — see ncm_synthesis.py ── #
     cm_eps: float = 1e-2   # strict-definiteness margin on the contraction LMI (both methods)
     cm_solver: str = "SCS"  # cvxpy SDP solver ("cvstem" only)
-    # "ccm" (default) — C1/C2 loss minimization (train_cmg_ccm): Manchester-style,
+    # "ccm" — C1/C2 loss minimization (train_cmg_ccm): Manchester-style,
     # eliminates B via the annihilator, existence-only certificate, no SDP, pure
-    # gradient descent on the pointwise LMI. "cvstem" — CV-STEM regression
-    # (build_cm_dataset + regress_cmg): solves a per-state SDP that keeps B via a
-    # Riccati BR⁻¹Bᵀ term, then MSE-regresses the CMG onto the solutions. See
-    # ncm_synthesis.py module docstring for the LMIs and module docstring above
-    # for the two pipelines.
-    cmg_method: str = "ccm"
+    # gradient descent on the pointwise LMI. "cvstem" (default) — CV-STEM
+    # regression (build_cm_dataset + regress_cmg): solves a per-state SDP that
+    # keeps B via a Riccati BR⁻¹Bᵀ term, then MSE-regresses the CMG onto the
+    # solutions. See ncm_synthesis.py module docstring for the LMIs and module
+    # docstring above for the two pipelines.
+    cmg_method: str = "cvstem"
     # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ Riccati term (mirrors sdlqr.py's
     # R_scaler); "cvstem" method only. See ncm_synthesis.solve_cm_metric — control
     # enters the LMI only through this penalty, not a bounded control box.
@@ -299,7 +299,7 @@ class C2RLSACCfg(AgentCfg):
     # ── SDP contraction metric ("cvstem" method only) — see ncm_synthesis.py ── #
     cm_eps: float = 1e-2
     cm_solver: str = "SCS"
-    cmg_method: str = "ccm"  # "ccm" (C1/C2 minimization) | "cvstem" (SDP regression) — see module docstring
+    cmg_method: str = "cvstem"  # "ccm" (C1/C2 minimization) | "cvstem" (SDP regression, default) — see module docstring
     cvstem_r_scaler: float = 1.0
     # Weights of the CV-STEM objective J (always minimized) — see
     # C2RLPPOCfg.cm_chi_weight above and ncm_synthesis.solve_cm_metric.
@@ -660,6 +660,33 @@ class C2RLAgent(Agent):
         idx = np.random.choice(n_avail, size=n_samples, replace=False)
         return x_all[idx]
 
+    def _log_cmg_condition_numbers(self, x_np, *, max_states: int = 1000) -> None:
+        """Post-pretraining diagnostic: condition number κ(x) = λmax/λmin of the
+        frozen CMG's bounded ``W(x)`` over (a ≤``max_states`` subsample of) the
+        states it was trained on. κ(W) == κ(M=W⁻¹), so this is also the
+        anisotropy of the Mahalanobis reward the policy trains against; the
+        w_lb/w_ub box bounds it by w_ub/w_lb. Tracks mean and 95% quantile
+        (flushed by the caller's timestep=-1 write)."""
+        from .math_utils import bound_W
+        x_np = np.asarray(x_np, dtype=np.float32)[:, :self._x_dim]
+        if x_np.shape[0] > max_states:
+            idx = np.random.choice(x_np.shape[0], size=max_states, replace=False)
+            x_np = x_np[idx]
+        x = torch.as_tensor(x_np, device=self._device)
+        with torch.no_grad():
+            raw_W, _ = self._ccm_gen(x)
+            W = bound_W(raw_W, self._cfg.w_lb, self._x_dim,
+                        getattr(self._ccm_gen, "bounded", False))
+            eig = torch.linalg.eigvalsh(W)  # ascending, (n, x_dim)
+            cond = eig[:, -1] / eig[:, 0].clamp(min=1e-12)
+        cond_mean = cond.mean().item()
+        cond_q95 = torch.quantile(cond, 0.95).item()
+        print(f"[C2RL] CMG condition number over {x.shape[0]} training states: "
+              f"mean={cond_mean:.4g}, 95%={cond_q95:.4g} "
+              f"(bound w_ub/w_lb={self._cfg.w_ub / self._cfg.w_lb:.4g})")
+        self.track_data("Loss / C2RL/cmg/cond_mean", cond_mean)
+        self.track_data("Loss / C2RL/cmg/cond_q95", cond_q95)
+
     def synthesize_cmg(self, *, timesteps: int = 0) -> dict:
         """Offline CMG synthesis (Phase A, always runs before Phase B) —
         dispatches to one of two pipelines depending on ``cmg_method``:
@@ -726,6 +753,7 @@ class C2RLAgent(Agent):
         self.track_data("Loss / C2RL/cmg/c1c2_loss_best", info["final_loss"])
         if not np.isnan(info["final_val_loss"]):
             self.track_data("Loss / C2RL/cmg/c1c2_val_loss_best", info["final_val_loss"])
+        self._log_cmg_condition_numbers(info["x"])
         if has_writer:
             self.write_tracking_data(timestep=-1, timesteps=timesteps)
         return {
@@ -739,8 +767,8 @@ class C2RLAgent(Agent):
     def _synthesize_cmg_cvstem(self, *, timesteps: int = 0) -> dict:
         """CV-STEM path: convex SDP per state + MSE regression (original pipeline)."""
         from .ncm_synthesis import (
-            build_cm_dataset, cm_dataset_cache_path, load_cached_cm_dataset,
-            regress_cmg, save_cm_dataset,
+            build_cm_dataset, cm_dataset_cache_path, cm_dataset_filename,
+            load_cached_cm_dataset, regress_cmg, save_cm_dataset,
         )
         cfg = self._cfg
         data_path = getattr(cfg, "dynamics_pretrain_data_path", "") or None
@@ -760,9 +788,15 @@ class C2RLAgent(Agent):
             traj_data = load_offline_trajectories(data_path, tag="[C2RL]")
             traj_x, traj_lengths = traj_data["x"], traj_data["lengths"]
         if explicit_cache_path:
-            cache_path = Path(explicit_cache_path)
+            # An explicit cm_data_path is treated as a BASE name: the swept SDP
+            # knobs are appended (cm_dataset_filename) so different lbd/w_lb/w_ub
+            # runs never clobber or wrongly reuse each other's cache.
+            base = Path(explicit_cache_path)
+            cache_path = base.with_name(
+                cm_dataset_filename(cfg.lbd, cfg.w_lb, cfg.w_ub, cfg.cvstem_r_scaler, stem=base.stem))
         elif data_path:
-            cache_path = cm_dataset_cache_path(data_path)
+            cache_path = cm_dataset_cache_path(
+                data_path, lbd=cfg.lbd, w_lb=cfg.w_lb, w_ub=cfg.w_ub, r_scaler=cfg.cvstem_r_scaler)
         else:
             cache_path = None
         cache_kwargs = dict(
@@ -791,7 +825,9 @@ class C2RLAgent(Agent):
                 nu_weight=cfg.cm_nu_weight, wdot_dt=cfg.cm_wdot_dt,
                 traj_x=traj_x, traj_lengths=traj_lengths, temporal_dt=temporal_dt,
             )
-            save_path = cache_path or Path(self.experiment_dir) / "checkpoints" / "cm_data.npz"
+            save_path = cache_path or (
+                Path(self.experiment_dir) / "checkpoints"
+                / cm_dataset_filename(cfg.lbd, cfg.w_lb, cfg.w_ub, cfg.cvstem_r_scaler))
             save_cm_dataset(save_path, dataset, **cache_kwargs)
         has_writer = getattr(self, "writer", None) is not None
         epochs = cfg.cmg_regress_epochs
@@ -834,6 +870,7 @@ class C2RLAgent(Agent):
         self.track_data("Loss / C2RL/cmg/regress_mse_best", info["final_loss"])
         if not np.isnan(info["final_val_loss"]):
             self.track_data("Loss / C2RL/cmg/regress_val_mse_best", info["final_val_loss"])
+        self._log_cmg_condition_numbers(dataset["x"])
         if has_writer:
             self.write_tracking_data(timestep=-1, timesteps=timesteps)
         return {

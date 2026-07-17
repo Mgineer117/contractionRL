@@ -61,7 +61,7 @@ agent:
   eps: 0.01  # Margin parameter (epsilon) ensuring strict definiteness of the metric
   w_ub: 10.0  # Upper bound clipping value for the generated metric M(x)
   w_lb: 0.1  # Lower bound clipping value for the generated metric M(x)
-  c1_c2_scale: 0.5  # Multiplies (c1_loss + c2_loss) in the total loss: loss = os_loss + pd_loss +
+  c1_c2_scale: 0.01  # Multiplies (c1_loss + c2_loss) in the total loss: loss = os_loss + pd_loss +
   # c1_c2_scale * (c1_loss + c2_loss). Set e.g. 0.1 to downweight the open-loop C1/C2
   # feasibility terms relative to pd_loss (the closed-loop Cu certificate).
   detach_warmup_frac: 0.0  # Fraction of training freezing M in the contraction term

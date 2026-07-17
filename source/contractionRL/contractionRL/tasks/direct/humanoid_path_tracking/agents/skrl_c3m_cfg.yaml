@@ -60,7 +60,7 @@ agent:
   eps: 0.01  # Margin parameter (epsilon) ensuring strict definiteness of the metric
   w_ub: 10.0  # Upper bound clipping value for the generated metric M(x)
   w_lb: 0.1  # Lower bound clipping value for the generated metric M(x)
-  c1_c2_scale: 0.1
+  c1_c2_scale: 0.5
   detach_warmup_frac: 0.0  # Fraction of training freezing M in the contraction term
   # (matches C3MCfg's own default) — the double-backward Ṁ term is the most numerically
   # fragile part of the loss (see c3m.py docstring); leaving this at 0.0 makes training

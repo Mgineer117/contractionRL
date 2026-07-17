@@ -26,6 +26,13 @@ class BaseEnv(gym.Env):
         self.XE_MAX = torch.tensor(env_config["xe_max"], device=self.device, dtype=torch.float32).flatten()
         self.UREF_MIN = torch.tensor(env_config["uref_min"], device=self.device, dtype=torch.float32).flatten()
         self.UREF_MAX = torch.tensor(env_config["uref_max"], device=self.device, dtype=torch.float32).flatten()
+        # Physical actuator limits enforced in step(): 2x the uref box, leaving
+        # headroom for the feedback term of uref+feedback controllers (C2RL/C3M
+        # policies legitimately exceed the declared uref action space; clamping
+        # to the uref box itself breaks the contraction certificate — see the
+        # c2rl yaml's clip_actions note).
+        self.U_MIN = 2.0 * self.UREF_MIN
+        self.U_MAX = 2.0 * self.UREF_MAX
 
         self.num_dim_x = env_config["num_dim_x"]
         self.num_dim_control = env_config["num_dim_control"]
@@ -126,6 +133,33 @@ class BaseEnv(gym.Env):
         self.w_lb = w_lb
         self.ccm_device = device
 
+    def set_eig_reshape(self, target_cond: float | None) -> None:
+        """Reward-side ablation: reshape M's eigenvalue SPREAD to ``target_cond``
+        while keeping its eigenvectors and geometric-mean scale fixed.
+
+        Isolates "is it conditioning or is it what the fit converged to" —
+        applying this to a wide-envelope fit's M answers whether clamping cond
+        alone (without refitting) recovers a tight-envelope-like reward, and
+        applying it to a tight-envelope fit's M answers the converse (does
+        widening ONLY the spread, same fit otherwise, reproduce the wide
+        envelope's degradation). See visualization/bound_sweep.py's docstring
+        for why cond(M) — not the fit itself — was the open question.
+        """
+        self.eig_reshape_cond = target_cond
+
+    def _apply_eig_reshape(self, M: torch.Tensor) -> torch.Tensor:
+        target = getattr(self, "eig_reshape_cond", None)
+        if target is None:
+            return M
+        eigvals, eigvecs = torch.linalg.eigh(M)  # ascending
+        log_gm = eigvals.clamp_min(1e-12).log().mean(dim=-1, keepdim=True)
+        n = eigvals.shape[-1]
+        t = torch.linspace(0.0, 1.0, n, device=M.device, dtype=M.dtype)
+        log_span = t * float(np.log(target))
+        new_log = log_gm - 0.5 * float(np.log(target)) + log_span
+        new_eigvals = new_log.exp()
+        return eigvecs @ torch.diag_embed(new_eigvals) @ eigvecs.transpose(-1, -2)
+
     def get_rewards(self, x, u, next_x, env_ids):
         t_idx = self.time_steps[env_ids]
         xref_prev = self.xref[env_ids, torch.clamp(t_idx - 1, min=0)]
@@ -147,10 +181,13 @@ class BaseEnv(gym.Env):
                 next_W = bound_W(next_W_raw, self.w_lb, self.num_dim_x, getattr(self.ccm_gen, "bounded", False))
                 next_M = spd_inverse(next_W)
                 self.M[env_ids] = next_M
-                
+
+                M = self._apply_eig_reshape(M)
+                next_M = self._apply_eig_reshape(next_M)
+
                 err_t = error.unsqueeze(-1)
                 next_err_t = next_error.unsqueeze(-1)
-                
+
                 V = torch.bmm(torch.bmm(err_t.transpose(1, 2), M), err_t).squeeze(-1).squeeze(-1)
                 next_V = torch.bmm(torch.bmm(next_err_t.transpose(1, 2), next_M), next_err_t).squeeze(-1).squeeze(-1)
                 
@@ -196,6 +233,7 @@ class BaseEnv(gym.Env):
         if not isinstance(u, torch.Tensor):
             u = torch.tensor(u, device=self.device, dtype=torch.float32)
         u = torch.nan_to_num(u)
+        u = torch.clamp(u, self.U_MIN, self.U_MAX)
         self.time_steps += 1
         
         f_x, B_x, _ = self.get_f_and_B(self.x_t)

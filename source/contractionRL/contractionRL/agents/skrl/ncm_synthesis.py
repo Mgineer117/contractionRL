@@ -716,12 +716,28 @@ def _same_weight(cached, requested: float | None) -> bool:
     return cached == requested
 
 
-def cm_dataset_cache_path(dynamics_data_path: str) -> Path:
+def cm_dataset_filename(lbd: float, w_lb: float, w_ub: float, r_scaler: float = 1.0,
+                        stem: str = "cm_data") -> str:
+    """Canonical CM-dataset cache filename encoding the SDP knobs that most
+    often get swept (``lbd``/``w_lb``/``w_ub``/``r_scaler``), so runs with
+    different contraction configs cache side-by-side instead of clobbering
+    each other — ``r_scaler`` is part of the CV-STEM LMI (the ``R =
+    r_scaler·I`` Riccati term) just like ``lbd``/``w_lb``/``w_ub`` are, so it
+    belongs in the name too, not just in ``load_cached_cm_dataset``'s
+    in-file validation. The remaining config is still verified at load time
+    (``load_cached_cm_dataset``)."""
+    return f"{stem}_lbd{lbd:g}_wlb{w_lb:g}_wub{w_ub:g}_rs{r_scaler:g}.npz"
+
+
+def cm_dataset_cache_path(dynamics_data_path: str, *, lbd: float, w_lb: float,
+                          w_ub: float, r_scaler: float = 1.0) -> Path:
     """Where a synthesized CM dataset (``build_cm_dataset``'s ``{x, W}`` pairs)
     is cached for a given offline ``dynamics_data.npz`` — same directory, so the
     two caches (dynamics + CM) travel together per-env (see
-    ``load_offline_dynamics_data``)."""
-    return Path(dynamics_data_path).with_name("cm_data.npz")
+    ``load_offline_dynamics_data``) — with ``lbd``/``w_lb``/``w_ub``/``r_scaler``
+    encoded in the name (``cm_dataset_filename``) so each swept config keeps
+    its own file."""
+    return Path(dynamics_data_path).with_name(cm_dataset_filename(lbd, w_lb, w_ub, r_scaler))
 
 
 def load_cached_cm_dataset(
@@ -1147,4 +1163,7 @@ def train_cmg_ccm(
         "final_loss": final_loss,
         "val_loss_history": val_losses,
         "final_val_loss": final_val_loss,
+        # The exact states the CMG was trained over — for post-training
+        # diagnostics on the same distribution (e.g. condition-number stats).
+        "x": x_np,
     }

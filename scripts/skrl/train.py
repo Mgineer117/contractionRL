@@ -42,6 +42,11 @@ parser.add_argument("--use_empirical_dynamics", "--use-empirical-dynamics",
                     action="store_true", default=False,
                     help="Use a learned NeuralDynamics model instead of the env's exact analytical get_f_and_B "
                          "(classic envs only). When NOT passed, C3M/C2RL use analytical dynamics.")
+parser.add_argument("--eig_reshape", "--eig-reshape", type=float, default=None,
+                    help="ABLATION (c2rl_ppo classic only): reshape the Mahalanobis reward's M "
+                         "eigenvalue SPREAD to this target cond(M), keeping eigenvectors and "
+                         "geometric-mean scale fixed — isolates conditioning from what the C1/C2 "
+                         "fit converged to. See env_base.py's set_eig_reshape.")
 
 # W&B
 parser.add_argument("--no_wandb", "--no-wandb", action="store_true", default=False,
@@ -147,7 +152,7 @@ algorithm = args_cli.algorithm.lower()
 if algorithm in ("c2rl",):
     algorithm = f"{algorithm}_ppo"
 _CONTRACTION_ALGOS = {
-    "c3m", "lqr", "sdlqr",
+    "c3m", "lqr", "sdlqr", "cvstem-lqr", "cvstem_lqr",
     "c2rl-ppo", "c2rl-sac", "c2rl_ppo", "c2rl_sac",
 }
 
@@ -156,7 +161,7 @@ _CONTRACTION_ALGOS = {
 # same way SAC does) need far fewer parallel envs; PPO-based algorithms are
 # on-policy and benefit from massively parallel envs. Applies to both the
 # classic gymnasium route and the Isaac Sim route.
-_SAC_LIKE_ALGOS = {"sac", "c2rl-sac", "c2rl_sac", "c3m", "lqr", "sdlqr"}
+_SAC_LIKE_ALGOS = {"sac", "c2rl-sac", "c2rl_sac", "c3m", "lqr", "sdlqr", "cvstem-lqr", "cvstem_lqr"}
 _DEFAULT_NUM_ENVS_SAC = 64
 _DEFAULT_NUM_ENVS_PPO_CLASSIC = 1024
 
@@ -234,7 +239,7 @@ if _is_classic:
     # Classic contraction envs use the env's exact analytical get_f_and_B by
     # default (use_empirical_dynamics=False); pass --use_empirical_dynamics to
     # learn a NeuralDynamics instead. Classic envs only (Isaac forces empirical).
-    if algorithm in ["c3m", "c2rl_ppo", "c2rl_sac", "lqr", "sdlqr"]:
+    if algorithm in ["c3m", "c2rl_ppo", "c2rl_sac", "lqr", "sdlqr", "cvstem-lqr", "cvstem_lqr"]:
         agent_cfg["agent"]["use_empirical_dynamics"] = args_cli.use_empirical_dynamics
 
     _run_ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -315,12 +320,19 @@ if _is_classic:
         device = getattr(args_cli, "device", "cuda:0")
         
         env = gym.make(args_cli.task, num_envs=num_envs, device=device)
+        if args_cli.eig_reshape is not None:
+            if not hasattr(env.unwrapped, "set_eig_reshape"):
+                raise SystemExit("--eig_reshape requires a classic env_base env (got "
+                                 f"{type(env.unwrapped).__name__})")
+            env.unwrapped.set_eig_reshape(args_cli.eig_reshape)
+            print(f"[train] eig_reshape ACTIVE: Mahalanobis reward's M reshaped to "
+                  f"cond(M) = {args_cli.eig_reshape:g} every step")
         from train_utils import BatchedGymnasiumWrapper
         env = BatchedGymnasiumWrapper(env)
 
         from contractionRL.agents.skrl.contraction_metrics import StatManagerEnvWrapper
         env = StatManagerEnvWrapper(env)
-        
+
         import sys as _sys
         import os as _os
         _sys.path.append(_os.path.dirname(__file__))

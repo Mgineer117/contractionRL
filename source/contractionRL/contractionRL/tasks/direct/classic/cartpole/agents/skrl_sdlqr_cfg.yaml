@@ -17,3 +17,4 @@ agent:
 trainer:
   class: SequentialTrainer
   timesteps: 10000  # Total number of environment steps to train for
+  environment_info: log  # Enable logging of stability metrics from info["log"]
