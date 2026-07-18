@@ -228,20 +228,13 @@ def _prepare_skrl_cfg(cfg: dict, algo: str) -> tuple[dict, bool]:
     cfg = copy.deepcopy(cfg)
     a = cfg.setdefault("agent", {})
 
-    use_state = a.pop("use_state_norm", True)
+    a.pop("use_state_norm", None)  # state norm disabled everywhere (see module docstring)
     use_value = a.pop("use_value_norm", True)
     anneal = a.pop("anneal_log_std", False)
 
-    if use_state:
-        a["observation_preprocessor"] = "RunningStandardScaler"
-        a["observation_preprocessor_kwargs"] = None
-        if algo == "ppo":
-            a["state_preprocessor"] = "RunningStandardScaler"
-            a["state_preprocessor_kwargs"] = None
-    else:
-        for k in ("state_preprocessor", "state_preprocessor_kwargs",
-                  "observation_preprocessor", "observation_preprocessor_kwargs"):
-            a.pop(k, None)
+    for k in ("state_preprocessor", "state_preprocessor_kwargs",
+              "observation_preprocessor", "observation_preprocessor_kwargs"):
+        a.pop(k, None)
 
     if use_value and algo == "ppo":
         a["value_preprocessor"] = "RunningStandardScaler"

@@ -285,7 +285,16 @@ if _is_classic:
                     if key not in curr:
                         curr[key] = {}
                     curr = curr[key]
-                curr[keys[-1]] = v
+                # A sweep parameter whose value is itself a dict (wandb's
+                # nested-parameter form for jointly-sampled pairs, e.g.
+                # {w_lb, w_ub} — see lib_sweep_params.sh) must be merged into
+                # the existing sub-dict, not assigned — assigning would wipe
+                # out sibling keys already at that path (e.g. agent.class,
+                # agent.lbd) that this sweep parameter isn't sampling.
+                if isinstance(v, dict) and isinstance(curr.get(keys[-1]), dict):
+                    curr[keys[-1]].update(v)
+                else:
+                    curr[keys[-1]] = v
 
         _orig_add_scalar = _skrl_tb.SummaryWriter.add_scalar
         _scalar_metric_defined = [False]
@@ -357,7 +366,8 @@ if _is_classic:
         from contractionRL.agents.skrl.runner import CLActorRunner as Runner, CONTROL_BACKBONES
 
         _a = agent_cfg["agent"]
-        _use_state = _a.pop("use_state_norm", False)  # OFF by default (see agent configs / c2rl.py docstring)
+        _a.pop("use_state_norm", None)  # state norm disabled everywhere (see contraction_runner.py docstring)
+        _use_state = False
         _use_value = _a.pop("use_value_norm", True)
 
         num_envs = args_cli.num_envs if args_cli.num_envs is not None else _default_num_envs_classic(algorithm)
@@ -721,7 +731,8 @@ else:
 
         _a = agent_cfg["agent"]
         _alg = _a.get("class", "").lower()
-        _use_state = _a.pop("use_state_norm", False)  # OFF by default (see agent configs / c2rl.py docstring)
+        _a.pop("use_state_norm", None)  # state norm disabled everywhere (see contraction_runner.py docstring)
+        _use_state = False
         _use_value = _a.pop("use_value_norm", True)
         if _use_state:
             # [x, xref, uref] path-tracking layout needs the masked scaler (see
