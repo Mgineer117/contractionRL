@@ -1,0 +1,104 @@
+label: cvstem-lqr (online SDP, 1-episode eval)
+algorithm: cvstem-lqr
+# 64 envs, fixed. CV-STEM-LQR is ANALYTICAL — nothing is trained, so a trial is
+# a pure evaluation and more envs buys only a better mean. It is also the most
+# expensive controller per step (metric_source=online solves one SDP per env
+# PER STEP, on CPU, serially over the batch — see cvstem_lqr.py's
+# _compute_action_online), so the env count is the trial's cost knob. 64 keeps
+# a trial to one episode of 64 serial SDP solves per step.
+num_envs: 64
+
+metric:
+  # AUC of the normalized error curve e(t)/e(0) — minimized. Same metric the
+  # lqr/sdlqr sweeps optimize: it measures the certified contraction quantity
+  # directly rather than a training-reward proxy, which is the right target
+  # for an analytical controller that has no training reward to speak of.
+  name: "Stability/auc_mean"
+  goal: minimize
+
+runner:
+  # Trials run through sweep_runner.py rather than train.py directly.
+  wrapper: true
+  # Exactly one episode, then stop. The episode length is read from the env's
+  # own ENV_CONFIG (time_bound / dt) at launch, so it never drifts from the
+  # env definition: car/cartpole/segway 500, turtlebot 600, quadrotor 400.
+  one_episode: true
+  # An infeasible SDP at ANY state, in ANY of the 64 envs, aborts the trial
+  # immediately and records this AUC. The metric is MINIMIZED, so the poison
+  # value is a large one, and finite — inf/nan would break the surrogate bayes
+  # fits over these observations.
+  #
+  # Scale check (measured, classic-car-v0, lqr, 64 envs, one 500-step episode):
+  # Stability/auc_mean ≈ 61. So 1e3 sits about an order of magnitude above a
+  # real-but-poor controller, which is the intent. Note this is a sentinel, not
+  # a bound: a genuinely diverging FEASIBLE run can exceed it and thus rank
+  # below an infeasible one. That only affects ordering among already-terrible
+  # trials, but it does mean bad_value should stay well clear of the range real
+  # runs occupy — re-check it if the AUC definition or episode length changes.
+  #
+  # Related sharp edge: StatManagerEnvWrapper initializes _recent_auc_mean to
+  # 1e2, and reports that until every env has completed a full episode. One
+  # episode is exactly enough to replace it (verified: the value moves and
+  # auc_ci95 becomes nonzero), but 1e2 is the same order as a real AUC — so a
+  # trial that somehow logged before completing would look mediocre rather than
+  # obviously broken.
+  bad_value: 1000.0
+
+parameters:
+  # ── The deployed gain ────────────────────────────────────────────────── #
+  # R = r_scaler·I is used in BOTH the metric SDP's Riccati term AND the
+  # deployed gain K = R⁻¹BᵀM, so this single knob moves the certificate and
+  # the controller together — K stays the CERTIFIED CV-STEM gain.
+  agent.r_scaler:
+    distribution: log_uniform_values
+    min: 0.1
+    max: 10.0
+
+  # ── The CV-STEM LMI itself ───────────────────────────────────────────── #
+  #   A·W̄ + W̄·Aᵀ - 2ν·B R⁻¹Bᵀ + 2λ·W̄ ⪯ -ε·I,   ν ≤ 1/w_lb,  χ ≤ ν·w_ub
+  # Every knob below is a term of that inequality, i.e. this sweep asks which
+  # envelope actually contracts — which is also why infeasibility has to be a
+  # recorded datapoint (see runner.bad_value) rather than a dead run.
+  cm.lbd:
+    values: [0.1, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+  # ε, the strict-definiteness margin. Unlike a pure objective weight it
+  # tightens the constraint itself, so raising it can flip a solvable state
+  # infeasible while lowering it buys feasibility at the cost of a weaker
+  # certificate.
+  cm.cm_eps:
+    values: [0.001, 0.01, 0.1, 1.0]
+  # w_lb/w_ub must satisfy w_lb < w_ub, so they are swept as a JOINT
+  # categorical (wandb's nested-parameter form — flattens to the same
+  # cm.w_lb/cm.w_ub keys train.py reads) rather than two independent
+  # parameters that could sample an inverted pair. The list carries two
+  # high-gain (small w_lb) envelopes beyond the usual set: ncm_synthesis.py's
+  # module docstring measures segway at 0% feasible with w_lb=0.1 but 100% at
+  # 0.001, so the interesting feasibility boundary sits below the usual list.
+  cm:
+    values:
+      - {w_lb: 0.5, w_ub: 1.5}
+      - {w_lb: 1.0, w_ub: 3.0}
+      - {w_lb: 0.2, w_ub: 2.0}
+      - {w_lb: 0.5, w_ub: 5.0}
+      - {w_lb: 0.1, w_ub: 10.0}
+      - {w_lb: 0.01, w_ub: 10.0}
+      - {w_lb: 0.1, w_ub: 100.0}
+
+  # ── Pinned, not searched ─────────────────────────────────────────────── #
+  # Online per-step SDP solve — the truest reading of the certificate, and the
+  # only source that has no offline-regression fit standing between the SDP and
+  # the deployed gain. Pinned so a sweep of the LMI's own knobs can never be
+  # answered by a CMG's regression error instead.
+  agent.metric_source:
+    value: online
+  # No per-state λ-backoff: a state rescued by a reduced λ is not feasible at
+  # the λ this trial is being scored on, and silently accepting it would make
+  # the sweep report a contraction rate the certificate does not support.
+  cm.max_lambda_reductions:
+    value: 0
+  # Abort the whole trial on the first infeasible state, in any env. Without
+  # this the online path falls back to u = uref for that env and the trial
+  # finishes with a plausible-looking AUC produced by a controller that is
+  # partly open-loop. See cvstem_lqr.py's _compute_action_online.
+  cm.abort_on_infeasible:
+    value: true

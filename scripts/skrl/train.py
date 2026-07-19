@@ -26,6 +26,9 @@ if not _is_classic:
 parser = argparse.ArgumentParser(description="Train an RL agent with skrl.")
 parser.add_argument("--classic", action="store_true", default=False,
                     help="Use classic gymnasium environment (no Isaac Sim).")
+parser.add_argument("--headon", action="store_true", default=False,
+                    help="Show the Isaac Sim GUI. Isaac Sim runs headless by default; "
+                         "pass this to disable headless mode and render a window.")
 parser.add_argument("--task", type=str, default=None, help="Environment ID.")
 parser.add_argument(
     "--algorithm", "--algo", type=str, default="PPO",
@@ -36,6 +39,11 @@ parser.add_argument("--seed", type=int, default=None, help="Random seed.")
 parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint path to resume from.")
 parser.add_argument("--num_timesteps", "--num-timesteps", type=int, default=None,
                     help="Total training timesteps.")
+parser.add_argument("--skip_final_eval", "--skip-final-eval", action="store_true", default=False,
+                    help="Skip the post-training best-model evaluation rollout. That rollout is "
+                         "sequential over a single env and does NOT feed the swept "
+                         "Stability/* metrics (those come from the trainer loop), so sweeps "
+                         "skip it — see search/build_sweep.py.")
 parser.add_argument("--analytical", type=str, default="",
                     help="Pass 'dynamics' to use analytical dynamics (C3M/LQR).")
 parser.add_argument("--use_empirical_dynamics", "--use-empirical-dynamics",
@@ -120,6 +128,8 @@ if not _is_classic:
     AppLauncher.add_app_launcher_args(parser)
 
 args_cli, hydra_args = parser.parse_known_args()
+if not _is_classic:
+    args_cli.headless = not args_cli.headon
 if not _is_classic and args_cli.video:
     args_cli.enable_cameras = True
     if "--enable_cameras" not in sys.argv:
@@ -144,7 +154,7 @@ from datetime import datetime
 
 import gymnasium as gym
 import yaml
-from train_utils import _default_num_envs_classic, _inject_angle_idx, _max_step_reward, _generate_ref_trajs, _evaluate_classic_path_tracking, _evaluate_best_model
+from train_utils import _default_num_envs_classic, _inject_angle_idx, _generate_ref_trajs, _evaluate_classic_path_tracking, _evaluate_best_model
 
 algorithm = args_cli.algorithm.lower()
 # Bare "c2rl" (no -ppo/-sac suffix) defaults to the PPO variant, since it has
@@ -184,7 +194,6 @@ _VEL_TASK_TO_ROBOT = {"Quadruped": "quadruped", "Humanoid": "humanoid", "Manipul
 if _is_classic:
     import os as _os
     import sys as _sys
-    import random as _random
     import numpy as np
     import torch
 
@@ -260,7 +269,7 @@ if _is_classic:
         _wkw["sync_tensorboard"] = False
         # Force console capture even when stdout isn't a tty — sweep agents are
         # launched backgrounded with stdout/stderr redirected to a logfile
-        # (search/run_c3m_sweeps.sh: `wandb agent ... > logfile 2>&1 &`), which
+        # (search/search.sh: `wandb agent ... > logfile 2>&1 &`), which
         # is exactly the case where wandb's tty auto-detection for the Logs tab
         # can silently fail to capture anything. "wrap" forces it regardless.
         try:
@@ -287,7 +296,7 @@ if _is_classic:
                     curr = curr[key]
                 # A sweep parameter whose value is itself a dict (wandb's
                 # nested-parameter form for jointly-sampled pairs, e.g.
-                # {w_lb, w_ub} — see lib_sweep_params.sh) must be merged into
+                # {w_lb, w_ub} — see search/configs/) must be merged into
                 # the existing sub-dict, not assigned — assigning would wipe
                 # out sibling keys already at that path (e.g. agent.class,
                 # agent.lbd) that this sweep parameter isn't sampling.
@@ -342,8 +351,6 @@ if _is_classic:
         from contractionRL.agents.skrl.contraction_metrics import StatManagerEnvWrapper
         env = StatManagerEnvWrapper(env)
 
-        import sys as _sys
-        import os as _os
         _sys.path.append(_os.path.dirname(__file__))
         from wandb_plot_wrapper import WandbPlotWrapper
         env = WandbPlotWrapper(env, total_timesteps=agent_cfg["trainer"]["timesteps"])
@@ -361,8 +368,6 @@ if _is_classic:
 
     else:
         # PPO / SAC use the built-in skrl Runner
-        from gymnasium.vector import SyncVectorEnv
-        from skrl.envs.wrappers.torch import wrap_env
         from contractionRL.agents.skrl.runner import CLActorRunner as Runner, CONTROL_BACKBONES
 
         _a = agent_cfg["agent"]
@@ -381,9 +386,7 @@ if _is_classic:
 
         from contractionRL.agents.skrl.contraction_metrics import StatManagerEnvWrapper
         env = StatManagerEnvWrapper(env)
-        
-        import sys as _sys
-        import os as _os
+
         _sys.path.append(_os.path.dirname(__file__))
         from wandb_plot_wrapper import WandbPlotWrapper
         env = WandbPlotWrapper(env, total_timesteps=agent_cfg["trainer"]["timesteps"])
@@ -815,7 +818,7 @@ else:
         # All agents should use AUC if available.
         _patch_auc_checkpoint(runner.agent)
 
-        if _is_contraction and hasattr(runner.agent, "policy") and hasattr(runner.agent.policy, "cl_actor"):
+        if _alg in _CONTRACTION_ALGOS and hasattr(runner.agent, "policy") and hasattr(runner.agent.policy, "cl_actor"):
             _orig_post = runner.agent.post_interaction
 
             def _annealed_post(*, timestep: int, timesteps: int) -> None:
@@ -851,6 +854,7 @@ else:
             isaac_env=_isaac_env,
             skrl_env=_skrl_env,
             env_cfg=env_cfg,
+            args_cli=args_cli,
         )
 
         if "VelTracking" in (args_cli.task or ""):
@@ -860,6 +864,7 @@ else:
                 isaac_env=_isaac_env,
                 skrl_env=_skrl_env,
                 env_cfg=env_cfg,
+                args_cli=args_cli,
             )
 
         env.close()

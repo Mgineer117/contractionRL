@@ -15,11 +15,11 @@ Usage
         --num_trajs 2000 \\
         --headless
 
-Outputs (default --out_dir logs/{robot}, matching each path-tracking env's
+Outputs (default --out_dir data/{robot}, matching each path-tracking env's
 default `traj_path`)
 -------
-    logs/{robot}/dynamics_data.npz   — x, u, x_dot (consumed by TrajectoryBuffer)
-    logs/{robot}/{robot}.npz         — legacy states/actions-only archive
+    data/{robot}/dynamics_data.npz   — x, u, x_dot (consumed by TrajectoryBuffer)
+    data/{robot}/{robot}.npz         — legacy states/actions-only archive
 """
 
 from __future__ import annotations
@@ -40,13 +40,13 @@ parser.add_argument("--robot",      type=str, required=True, choices=["quadruped
 parser.add_argument("--num_envs",   type=int, default=128)
 parser.add_argument("--num_trajs",  type=int, default=2000, help="Target number of episodes to record")
 parser.add_argument("--out_dir",    type=str, default=None,
-                     help="Output directory. Defaults to logs/{robot}, matching each "
+                     help="Output directory. Defaults to data/{robot}, matching each "
                           "path-tracking env's default traj_path — override only if "
                           "you also override traj_path in the env config.")
 AppLauncher.add_app_launcher_args(parser)
 args, hydra_args = parser.parse_known_args()
 args.headless = True
-args.out_dir = args.out_dir or os.path.join("logs", args.robot)
+args.out_dir = args.out_dir or os.path.join("data", args.robot)
 sys.argv = [sys.argv[0]] + hydra_args
 
 app_launcher = AppLauncher(args)
@@ -62,7 +62,6 @@ import gymnasium as gym
 from skrl.utils.runner.torch import Runner
 
 from isaaclab.envs import DirectRLEnvCfg
-from isaaclab.utils.dict import print_dict
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
 from isaaclab_tasks.utils.hydra import hydra_task_config
 

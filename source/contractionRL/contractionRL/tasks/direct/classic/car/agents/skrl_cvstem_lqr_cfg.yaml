@@ -46,7 +46,7 @@ cm:
   max_lambda_reductions: 5  # per-state λ-backoff budget on SDP infeasibility
   # ── metric_source=pretrained only ──
   min_feasibility_rate: 0.5
-  cm_data_path: "logs/classic/car/cvstem_lqr_cm_data.npz"
+  cm_data_path: "data/classic/car/cvstem_lqr_cm_data.npz"
 
 # ── Offline CMG synthesis (metric_source=pretrained only) ──────────────────── #
 cmg:

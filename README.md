@@ -214,7 +214,7 @@ network's input (`agents/skrl/angle_utils.py`); the env/error/dynamics stay in r
 | **Termination** | non-terminating by default (`terminate_on_fall: False`) — episodes always run full length; the fall check (`base_height < 0.20/0.50 m`) still resets on divergence (NaN/exploded state) regardless | non-terminating by default, same divergence-reset | time-out only |
 | **Decimation / control freq** | 4 @ 1/200s → **50 Hz** | 4 @ 1/200s → **50 Hz** | 2 @ 1/120s → **60 Hz** |
 | **Episode length** | `episode_length_s=40.0` → **2000 steps** | `episode_length_s=40.0` → **2000 steps** | `episode_length_s=15.0` → **900 steps** |
-| **Reference file** | `logs/quadruped/dynamics_data.npz` | `logs/humanoid/dynamics_data.npz` | `logs/manipulator/dynamics_data.npz` |
+| **Reference file** | `data/quadruped/dynamics_data.npz` | `data/humanoid/dynamics_data.npz` | `data/manipulator/dynamics_data.npz` |
 
 #### Supported algorithms
 
@@ -368,7 +368,7 @@ python scripts/skrl/train.py --task Quadruped-VelTracking-v0 --algorithm sac \
 
 ### Path-tracking (contraction control)
 
-Requires a reference file at `logs/{robot}/dynamics_data.npz` (auto-generated after
+Requires a reference file at `data/{robot}/dynamics_data.npz` (auto-generated after
 vel-tracking training, or manually via `scripts/generate_ref_traj.py`).
 
 ```bash
@@ -410,34 +410,63 @@ python scripts/skrl/train.py --classic --task classic-car-v0 --algorithm sac --n
 
 ### Hyperparameter sweeps (W&B)
 
-**C3M — classic envs** (`search/run_c3m_sweeps.sh`):
+All sweeps go through one entry point, `search/search.sh`. It prompts for the
+algorithm, env, agent count and GPU, previews the exact space it will search, and
+launches detached (`nohup`) so the sweep survives closing the terminal:
 
 ```bash
-# Launches classic-cartpole-v0 / classic-turtlebot-v0 / classic-segway-v0 / classic-car-v0
-# sweeps in parallel across GPUs 0-3, 3 agents per env by default.
-./search/run_c3m_sweeps.sh          # or: ./search/run_c3m_sweeps.sh <num-agents-per-env>
+./search/search.sh                                   # fully interactive
+./search/search.sh --algorithm c3m --env all --gpu 0 -y
+./search/search.sh --algorithm cvstem-lqr --env car --num-agents 3 --gpu 0 -y
 ```
 
-This sweep optimizes **`Stability / contraction_score`** (`= contraction_rate / overshoot`,
-higher is better — see [W&B Logging](#wb-logging)), not raw reward, since maximizing reward
-alone doesn't guarantee the certified contraction property C3M is meant to produce.
+Every sweep lands in the single W&B project **`contractionRL-Search`**, named
+`<env>-<algorithm>` (e.g. `classic-car-v0-cvstem-lqr`) — so relaunching the same
+env+algorithm accumulates in one place instead of scattering across per-launch projects.
 
-**PPO/SAC — Isaac locomotion pre-training** (`scripts/search/`), a separate, unrelated sweep
-infrastructure for tuning the vel-tracking policies themselves (optimizes plain
-`Reward / Total reward (mean)` — reward is the right target here, there's no contraction
-certificate to check):
+**The searched space is not in the script.** It lives in `search/configs/`, one yaml
+per algorithm, each applying to *every* env — so `search.sh` never needs editing to
+change a range or add an algorithm (see `search/configs/README.md`):
+
+| config | metric optimized |
+|---|---|
+| `ppo`, `sac`, `c2rl-{ppo,sac}-ccm` | `Reward / Total reward (mean)` |
+| `c3m` | `Stability/contraction_score_mean` (`= contraction_rate / overshoot`) |
+| `lqr`, `sdlqr`, `cvstem-lqr`, `c2rl-{ppo,sac}-cvstem` | `Stability/auc_mean` (minimized) |
+
+C3M optimizes the contraction score rather than raw reward because maximizing reward
+alone doesn't guarantee the certified contraction property C3M is meant to produce.
+The LQR-family and CV-STEM configs optimize the normalized-error AUC, which measures
+the certified contraction quantity directly rather than a training proxy.
+
+**Infeasible SDPs are recorded, not skipped.** The CV-STEM configs sweep the knobs
+that decide whether the metric SDP is solvable at all, and much of that space is
+structurally infeasible. Those trials run through `search/sweep_runner.py`, which kills
+the trial on the first infeasibility and writes a poison AUC (`1e3` for `cvstem-lqr`,
+`1e4` for `c2rl-*-cvstem`). Without it an infeasible trial finishes with *no metric* —
+and a metric-less run is silently ignored by bayes bookkeeping, so the same dead corner
+gets resampled forever.
+
+`cvstem-lqr` is evaluated online: `metric_source=online` re-solves the SDP every step
+(no offline CMG regression standing between the certificate and the deployed gain), over
+64 envs for exactly one episode, with `cm.abort_on_infeasible` so a single infeasible
+state in any env aborts the trial instead of silently falling back to `u = u_ref`.
+
+**PPO/SAC — Isaac locomotion pre-training** uses the same entry point, via
+`search/configs/{ppo,sac}.yaml`. Those two optimize plain `Reward / Total reward (mean)`
+rather than a `Stability/*` metric — reward is the right target here, since there's no
+contraction certificate to check:
 
 ```bash
-bash scripts/search/run_quadruped_vel_search.bash --algorithm SAC
-bash scripts/search/run_quadruped_vel_search.bash --algorithm PPO
-# similarly: run_humanoid_vel_search.bash, run_manipulator_vel_search.bash
+bash search/search.sh --algorithm ppo --env Quadruped-VelTracking-v0
+bash search/search.sh --algorithm sac --env Quadruped-VelTracking-v0
 ```
 
 ---
 
 ## Reference Trajectory Generation
 
-Isaac path-tracking envs need a `.npz` trajectory buffer at `logs/{robot}/dynamics_data.npz`
+Isaac path-tracking envs need a `.npz` trajectory buffer at `data/{robot}/dynamics_data.npz`
 (keys `x`, `u`, `x_dot`, `lengths`, consumed by `TrajectoryBuffer`). Classic envs need no such
 file — see [Classic analytical environments](#classic-analytical-environments).
 
@@ -476,7 +505,7 @@ python scripts/generate_ref_traj.py \
     --headless
 ```
 
-Output defaults to `logs/{robot}/dynamics_data.npz` (matching each path-tracking env's default
+Output defaults to `data/{robot}/dynamics_data.npz` (matching each path-tracking env's default
 `traj_path`) — override `--out_dir` only if you've also overridden `traj_path` in the env config.
 
 ---
@@ -555,7 +584,7 @@ if you add new per-episode metrics to an env's `_reset_idx`.
 
 For classic C3M runs specifically, `Stability/*` (and `Reward/reward_mean`) come from
 `C3MSkrlTrainer.eval()`, called every `eval_interval` training steps (default 100 in each
-`skrl_c3m_cfg.yaml`) — this is also what `search/run_c3m_sweeps.sh`'s sweep optimizes
+`skrl_c3m_cfg.yaml`) — this is also what the `c3m` sweep in `search/configs/` optimizes
 (`Stability / contraction_score`, `goal: maximize`).
 
 ---
@@ -616,7 +645,7 @@ On classic envs with `use_analytical_dynamics: true`, the env's exact `get_f_and
 `cfg.lbd` is the *certified/target* contraction rate baked into the training loss; the
 `Stability/contraction_rate` W&B metric is the *empirically measured* rate on rollouts — they
 are related but not the same number, and `Stability/contraction_score` (`=contraction_rate/overshoot`)
-is what the hyperparameter sweep in `search/run_c3m_sweeps.sh` actually optimizes.
+is what the `c3m` hyperparameter sweep in `search/configs/` actually optimizes.
 
 **Normalization**: none. The policy/CMG networks are bare `nn.Module`s, never wrapped in a
 PPO/SAC base agent, so there is no observation/value preprocessor anywhere — every network call
@@ -768,20 +797,26 @@ tasks/direct/
 ```
 contractionRL/
 ├── search/
-│   └── run_c3m_sweeps.sh             # Launches classic C3M W&B bayes sweeps across GPUs
-│                                     #   (optimizes Stability / contraction_score)
+│   ├── search.sh                     # THE sweep entry point (interactive; nohup-detached)
+│   ├── build_sweep.py                # configs/<algo>.yaml + env -> a W&B sweep yaml
+│   ├── sweep_runner.py               # Trial wrapper: records a poison metric on an
+│   │                                 #   infeasible SDP instead of a metric-less run
+│   ├── configs/                      # THE searched space — one yaml per algorithm,
+│   │                                 #   applying to every env (see its README.md)
+│   └── logs/                         # Sweep launch logs + the generated sweep.yaml
+│                                     #   (gitignored; one dir per launch)
+├── data/                             # GENERATED DATA, gitignored — inputs to later runs
+│   ├── {robot}/dynamics_data.npz     #   reference trajectories path-tracking envs track
+│   └── classic/{env}/cm_data*.npz    #   synthesized contraction-metric caches
+├── logs/                             # RUN OUTPUT — checkpoints, tensorboard, eval json.
+│                                     #   Disposable: deleting it never forces a re-synthesis.
 ├── scripts/
 │   ├── list_envs.py                  # List all envs without Isaac Sim
 │   ├── generate_ref_traj.py          # Manually generate reference trajectories
-│   ├── skrl/
-│   │   ├── train.py                  # skrl training entry point (Isaac + --classic route);
-│   │   │                             #   ref-traj auto-generation lives here (_generate_ref_trajs)
-│   │   └── play.py                   # Evaluation + debug_vis (Isaac only)
-│   └── search/                       # PPO/SAC W&B bayes sweeps for vel-tracking pre-training
-│       ├── search_algo.py            #   (optimizes plain Reward / Total reward (mean))
-│       ├── run_quadruped_vel_search.bash
-│       ├── run_humanoid_vel_search.bash
-│       └── run_manipulator_vel_search.bash
+│   └── skrl/
+│       ├── train.py                  # skrl training entry point (Isaac + --classic route);
+│       │                             #   ref-traj auto-generation lives here (_generate_ref_trajs)
+│       └── play.py                   # Evaluation + debug_vis (Isaac only)
 │
 └── source/contractionRL/contractionRL/
     ├── agents/skrl/

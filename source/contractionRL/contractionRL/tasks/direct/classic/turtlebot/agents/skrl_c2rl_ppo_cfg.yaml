@@ -127,7 +127,7 @@ cm:
   #              Control is penalized via this Riccati term, not bounded over an
   #              action range — see ncm_synthesis.py module docstring.
   cmg_method: cvstem
-  cvstem_r_scaler: 0.1  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only
+  cvstem_r_scaler: 1.0  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only
   # On SDP infeasibility AT A GIVEN STATE, retry that state alone with λ
   # halved, up to this many times, before giving up on it and dropping it from
   # the dataset — 0 disables this and reverts to dropping immediately. Warns
@@ -140,7 +140,7 @@ cm:
   # minutes; unused by "ccm", which has no cache). Reused on a later run as long
   # as lbd/w_lb/w_ub/cm_eps/cm_solver/cvstem_r_scaler/cmg_memory_size below all
   # still match too; re-solved and overwritten otherwise. "cvstem" only.
-  cm_data_path: "logs/classic/turtlebot/cm_data.npz"
+  cm_data_path: "data/classic/turtlebot/cm_data.npz"
 
 # ── Offline CMG synthesis (Phase A, always runs before Phase B) ───────────── #
 # Sample cmg_memory_size states (uniformly from the classic env's analytic

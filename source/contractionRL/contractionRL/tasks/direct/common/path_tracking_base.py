@@ -23,7 +23,7 @@ from isaaclab.envs import DirectRLEnv
 
 from contractionRL.agents.skrl.angle_utils import wrap_diff
 
-from .eval_metrics import fit_exponential_envelope, mean_confidence_interval
+from .eval_metrics import fit_exponential_envelope
 from .state_guard import carry_forward_nonfinite
 from .traj_buffer import TrajectoryBuffer
 
@@ -155,6 +155,15 @@ class PathTrackingBase(DirectRLEnv):
 
         # Contraction interface — dynamics model injected by ContractionRunner
         self._dynamics_model = None
+        # Frozen CMG (contraction metric generator) — injected via set_ccm()
+        # for C2RL's Phase B. None for PPO/SAC/LQR/SD-LQR, which never call
+        # set_ccm and so keep the plain -(error_norm**2) reward in
+        # _get_rewards unchanged. Defaults match that plain reward's implicit
+        # weights (identity tracking weight, no control penalty) so enabling
+        # the CCM branch doesn't also silently reweight the objective.
+        self.ccm_gen = None
+        self.tracking_scaler = 1.0
+        self.control_scaler = 0.0
         # Certified/target contraction rate + metric-conditioning inputs for
         # the THEORETICAL exponential bound on the PathTracking figure. All
         # None by default (curve omitted) — set via set_contraction_certificate().
@@ -170,6 +179,17 @@ class PathTrackingBase(DirectRLEnv):
     def set_dynamics_model(self, model) -> None:
         """Inject a NeuralDynamics model for get_f_and_B (required for Isaac envs)."""
         self._dynamics_model = model
+
+    def set_ccm(self, ccm_gen, w_lb, device) -> None:
+        """Inject the frozen CMG for C2RL's Phase B Mahalanobis reward.
+
+        Mirrors classic/common/env_base.py's BaseEnv.set_ccm exactly (same
+        signature) so C2RLSkrlTrainer.train() can call it identically for
+        both env families — see _get_rewards for the reward this enables.
+        """
+        self.ccm_gen = ccm_gen
+        self.w_lb = w_lb
+        self.ccm_device = device
 
     def set_contraction_certificate(
         self,
@@ -493,9 +513,36 @@ class PathTrackingBase(DirectRLEnv):
             self._viz_pos_live[rows, idx] = pos[in_range].detach().cpu().numpy()
             self._viz_state_live[rows, idx] = x[:viz_n][in_range].detach().cpu().numpy()
 
-        # -||error||_I^2, using the sanitized+clamped norm so a diverged step
-        # can't emit a huge/NaN reward that wrecks the value fn / normalizers.
-        reward = -(error_norm * error_norm)
+        if self.ccm_gen is not None:
+            # C2RL Phase B: Lyapunov-decrease reward tracking_scaler*(V - next_V)
+            # - control_scaler*||u||^2, V = error^T M error, M = the frozen
+            # CMG's metric at the corresponding state — mirrors classic
+            # env_base.py's get_rewards exactly. _get_rewards only ever sees
+            # the POST-transition state (no separate "prev x" lookup buffer
+            # like the reference trajectory has), so the previous step's
+            # error vector + metric are cached explicitly in
+            # _prev_error/_prev_M (seeded at _reset_idx) rather than
+            # recomputed from a stored trajectory.
+            from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
+            with torch.no_grad():
+                next_W_raw, _ = self.ccm_gen(x)
+                next_W = bound_W(next_W_raw, self.w_lb, error.shape[-1], getattr(self.ccm_gen, "bounded", False))
+                next_M = spd_inverse(next_W)
+
+                prev_err_t = self._prev_error.unsqueeze(-1)
+                next_err_t = error.unsqueeze(-1)
+                V = torch.bmm(torch.bmm(prev_err_t.transpose(1, 2), self._prev_M), prev_err_t).squeeze(-1).squeeze(-1)
+                next_V = torch.bmm(torch.bmm(next_err_t.transpose(1, 2), next_M), next_err_t).squeeze(-1).squeeze(-1)
+
+                control_effort = torch.norm(self._actions, p=2, dim=-1) ** 2
+                reward = self.tracking_scaler * (V - next_V) - self.control_scaler * control_effort
+
+                self._prev_error = error.clone()
+                self._prev_M = next_M
+        else:
+            # -||error||_I^2, using the sanitized+clamped norm so a diverged step
+            # can't emit a huge/NaN reward that wrecks the value fn / normalizers.
+            reward = -(error_norm * error_norm)
         self._episode_reward += reward
         return reward
 
@@ -602,3 +649,21 @@ class PathTrackingBase(DirectRLEnv):
         # new episode.
         if self._last_valid_state is not None:
             self._last_valid_state[env_ids] = self._get_physical_state()[env_ids]
+
+        # seed the CCM Lyapunov cache (_get_rewards) from the freshly-reset
+        # state, so the first step of the new episode compares against a
+        # meaningful V rather than a stale value from the env's previous
+        # episode — mirrors classic env_base.py's reset_idx M-seeding.
+        if self.ccm_gen is not None:
+            from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
+            if not hasattr(self, "_prev_M"):
+                state_dim = self._traj_buf.state_dim
+                self._prev_error = torch.zeros(self.num_envs, state_dim, device=self.device)
+                self._prev_M = torch.zeros(self.num_envs, state_dim, state_dim, device=self.device)
+            with torch.no_grad():
+                x0 = self._get_physical_state()[env_ids]
+                error0 = wrap_diff(x0 - x_ref_init, self.angle_idx)
+                W0_raw, _ = self.ccm_gen(x0)
+                W0 = bound_W(W0_raw, self.w_lb, x0.shape[-1], getattr(self.ccm_gen, "bounded", False))
+                self._prev_error[env_ids] = error0
+                self._prev_M[env_ids] = spd_inverse(W0)

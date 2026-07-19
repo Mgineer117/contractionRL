@@ -74,7 +74,7 @@ agent:
   num_controls_per_state: 3
   dynamics_lr: 1.0e-3  # Learning rate for the NeuralDynamics network
   dynamics_pretrain_epochs: 500  # Number of epochs for offline data, or number of rollouts for online fallback
-  dynamics_pretrain_data_path: "logs/quadruped/dynamics_data.npz"  # Path to offline dynamics data
+  dynamics_pretrain_data_path: "data/quadruped/dynamics_data.npz"  # Path to offline dynamics data
   dynamics_batch_size: 4096
   emp_dynamics_memory_size: 8192  # fixed pretraining buffer, uniformly subsampled from dynamics_pretrain_data_path
                                    # (capped + warned if this exceeds the data on disk)

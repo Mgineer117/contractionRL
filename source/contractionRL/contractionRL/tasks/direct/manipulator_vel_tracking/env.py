@@ -48,7 +48,7 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
             device=self.device,
         )
 
-        self._actions = torch.zeros(self.num_envs, self.action_space.shape[0], device=self.device)
+        self._actions = torch.zeros(self.num_envs, len(self._arm_ids), device=self.device)
         self._prev_actions = torch.zeros_like(self._actions)
         self._cmd = VelCommands(self.num_envs, self.device, self.cfg.vel_cmd)
         self._episode_vel_auc = torch.zeros(self.num_envs, device=self.device)

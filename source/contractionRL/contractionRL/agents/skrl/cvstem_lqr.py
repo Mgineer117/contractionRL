@@ -34,7 +34,10 @@ Metric source (``metric_source`` config)
   certificate — every deployed ``M`` is a verified feasible metric — but needs
   cvxpy/an SDP solver at deploy time and runs one solve per env per step (a
   Python loop on CPU, like SD-LQR's CARE loop). Infeasible states fall back to
-  zero feedback (``u = u_ref``), same as SD-LQR's non-stabilizable fallback.
+  zero feedback (``u = u_ref``), same as SD-LQR's non-stabilizable fallback —
+  unless ``abort_on_infeasible`` is set, which raises ``CVSTEMInfeasibleError``
+  on the first infeasible state in any env instead (used by the sweep, where a
+  silent part-open-loop rollout would be scored as a valid certificate).
 * ``"pretrained"``: synthesize a frozen CMG network ONCE at construction
   (Tsukamoto NCM — ``build_cm_dataset`` per-state SDP + ``regress_cmg`` MSE fit,
   cached to ``cm_data_path``), then ``M(x)`` is a cheap batched network forward
@@ -63,6 +66,21 @@ from .ncm_synthesis import _solve_cm_metric_with_backoff
 from .rl_glue import filter_cfg_fields
 
 
+# Printed verbatim on the abort path. search/sweep_runner.py greps the child's
+# output for this exact string, so the two must stay in sync — it is the signal
+# that turns an infeasible trial into a recorded bad datapoint.
+INFEASIBLE_MARKER = "CVSTEM-LQR INFEASIBLE"
+
+
+class CVSTEMInfeasibleError(RuntimeError):
+    """Raised when the online CV-STEM SDP is infeasible and abort_on_infeasible.
+
+    Deliberately a distinct type rather than a bare RuntimeError so a caller can
+    tell "this (λ, ε, w_lb, w_ub) point is not solvable" apart from an ordinary
+    crash — the two mean very different things to a sweep.
+    """
+
+
 # ─────────────────────────────────────────────────────────────────────────── #
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -88,6 +106,20 @@ class CVSTEMLQRCfg(AgentCfg):
     cm_eps: float = 0.01         # strict-definiteness margin on the LMI
     cm_solver: str = "SCS"       # cvxpy SDP solver (SCS | CLARABEL | MOSEK)
     max_lambda_reductions: int = 5  # per-state λ-backoff budget on infeasibility
+
+    # "online" only. False (default) keeps the historical behavior: an infeasible
+    # state falls back to zero feedback (u = u_ref) for that env and the rollout
+    # continues. True raises CVSTEMInfeasibleError on the FIRST infeasible state
+    # in ANY env instead.
+    #
+    # The fallback is the right default for a deploy-style rollout — one
+    # unsolvable state should not kill the episode — but it is exactly wrong for
+    # a sweep scoring THIS (λ, ε, w_lb, w_ub, r_scaler) point: the run finishes
+    # with a plausible AUC produced by a controller that was silently part
+    # open-loop, and the sweep credits the certificate for it. Set True by
+    # search/configs/cvstem-lqr.yaml so infeasibility becomes a recorded bad
+    # trial rather than an invisible one.
+    abort_on_infeasible: bool = False
 
     # ── "pretrained" only: offline CMG synthesis (mirrors the yaml `cmg:` block
     #    and C2RL's _synthesize_cmg_cvstem) ──────────────────────────────────── #
@@ -308,9 +340,22 @@ class CVSTEMLQRAgent(Agent):
                 max_lambda_reductions=cfg.max_lambda_reductions,
             )
             if W is None:
-                # Infeasible at this state even after λ-backoff → zero feedback
-                # (u = uref), rather than aborting the batch. Same policy as
-                # SD-LQR's non-stabilizable CARE fallback.
+                # Infeasible at this state even after λ-backoff.
+                if cfg.abort_on_infeasible:
+                    # Abort the WHOLE rollout on the first miss in any env — one
+                    # unsolvable state means this parameter point does not
+                    # certify, and continuing would score a part-open-loop
+                    # controller as if it did. See the cfg field's comment.
+                    msg = (
+                        f"{INFEASIBLE_MARKER}: env {i}/{batch_size} has no feasible "
+                        f"CV-STEM metric at lbd={cfg.lbd}, cm_eps={cfg.cm_eps}, "
+                        f"w_lb={cfg.w_lb}, w_ub={cfg.w_ub}, r_scaler={cfg.r_scaler} "
+                        f"(max_lambda_reductions={cfg.max_lambda_reductions})."
+                    )
+                    print(msg, flush=True)
+                    raise CVSTEMInfeasibleError(msg)
+                # Otherwise: zero feedback (u = uref) rather than aborting the
+                # batch. Same policy as SD-LQR's non-stabilizable CARE fallback.
                 actions[i] = uref[i]
                 continue
             M = np.linalg.inv(W.astype(np.float64))       # W = M⁻¹ → M

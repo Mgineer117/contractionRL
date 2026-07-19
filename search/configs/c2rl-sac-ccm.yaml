@@ -1,0 +1,51 @@
+label: c2rl (rl=sac, cm=ccm)
+algorithm: c2rl-sac
+num_envs: 64
+
+metric:
+  name: "Reward / Total reward (mean)"
+  goal: maximize
+
+parameters:
+  agent.discount_factor:
+    values: [0.1, 0.3, 0.5, 0.7, 0.9, 0.99, 0.999]
+  agent.models.policy.backbone:
+    # mlp (plain MLP, u = MLP(obs)) | control (CLActor, u = uref + feedback(x-xref))
+    values: [mlp, control]
+  cm.cm_eps:
+    distribution: log_uniform_values
+    min: 1.0e-3
+    max: 1.0
+  cm.lbd:
+    distribution: uniform
+    min: 0.01
+    max: 3.0
+  agent.polyak:
+    distribution: log_uniform_values
+    min: 1.0e-3
+    max: 1.0e-1
+  # ccm has no SDP, so the CMG's own direct-synthesis learning rate is swept
+  # (cvstem instead sweeps cvstem_r_scaler, which sets R in the SDP's Riccati
+  # term) — see c2rl.py's module docstring on cmg_method.
+  cmg.cmg_regress_lr:
+    distribution: log_uniform_values
+    min: 1.0e-4
+    max: 1.0e-2
+  # w_lb/w_ub bound W(x)'s eigenvalues (w_lb·I ⪯ W ⪯ w_ub·I) and must stay
+  # w_lb < w_ub — sweeping them as two independent flat parameters risks
+  # bayes sampling an inverted/degenerate pair. A categorical parameter
+  # whose values are {w_lb, w_ub} dicts is wandb's nested-parameter form —
+  # it flattens to the SAME "cm.w_lb"/"cm.w_ub" CLI flags as flat keys
+  # would (see W&B sweep docs on nested parameters), but samples each pair
+  # jointly so w_lb < w_ub always holds. ccm-only: cvstem already fixes them
+  # indirectly via its cm_data_path cache key.
+  cm:
+    values:
+      - {w_lb: 0.5, w_ub: 1.5}
+      - {w_lb: 1.0, w_ub: 3.0}
+      - {w_lb: 0.1, w_ub: 1.0}
+      - {w_lb: 1.0, w_ub: 10.0}
+      - {w_lb: 0.1, w_ub: 10.0}
+      - {w_lb: 1.0, w_ub: 100.0}
+  cm.cmg_method:
+    value: ccm

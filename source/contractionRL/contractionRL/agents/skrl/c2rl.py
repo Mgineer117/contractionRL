@@ -978,22 +978,17 @@ class C2RLSkrlTrainer(Trainer):
         while hasattr(_env, "unwrapped") and getattr(_env, "unwrapped") is not _env:
             _env = getattr(_env, "unwrapped")
 
-        agent._is_classic_env = False
         import copy
         env_device = agent.device
         env_ccm = copy.deepcopy(agent._ccm_gen).to(env_device)
-        
+
         if hasattr(_env, "envs"):
             for e in _env.envs:
                 inner = e.unwrapped if hasattr(e, "unwrapped") else e
-                if not agent._is_classic_env:
-                    agent._is_classic_env = "classic" in type(inner).__module__
-                if agent._is_classic_env and hasattr(inner, "set_ccm"):
+                if hasattr(inner, "set_ccm"):
                     inner.set_ccm(env_ccm, agent._cfg.w_lb, env_device)
-        else:
-            agent._is_classic_env = "classic" in type(_env).__module__
-            if agent._is_classic_env and hasattr(_env, "set_ccm"):
-                _env.set_ccm(env_ccm, agent._cfg.w_lb, env_device)
+        elif hasattr(_env, "set_ccm"):
+            _env.set_ccm(env_ccm, agent._cfg.w_lb, env_device)
 
         observations, infos = env.reset()
         states = env.state() if hasattr(env, "state") else None

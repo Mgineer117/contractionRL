@@ -1,14 +1,20 @@
 import os
-import random
 import sys
 import torch
-import numpy as np
 
 _SAC_LIKE_ALGOS = {"sac", "c2rl-sac", "c2rl_sac", "c3m", "lqr", "sdlqr", "cvstem-lqr", "cvstem_lqr"}
 _DEFAULT_NUM_ENVS_SAC = 64
 _DEFAULT_NUM_ENVS_PPO_CLASSIC = 1024
 _VEL_TASK_TO_ROBOT = {"Quadruped": "quadruped", "Humanoid": "humanoid", "Manipulator": "manipulator"}
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Generated DATA lives under data/, not logs/. The distinction is lifetime and
+# role, not format: logs/ holds the output of one run (checkpoints, tensorboard
+# events, eval json) and is disposable per run, while data/ holds artifacts that
+# are INPUTS to later runs of other algorithms — dynamics_data.npz (the
+# reference trajectories path-tracking envs track) and the cm_data*.npz metric
+# caches synthesized from it. Deleting logs/ must never force a re-synthesis.
+_DATA_ROOT = os.path.join(_ROOT, "data")
 
 def _default_num_envs_classic(algo: str) -> int:
     return _DEFAULT_NUM_ENVS_SAC if algo.lower() in _SAC_LIKE_ALGOS else _DEFAULT_NUM_ENVS_PPO_CLASSIC
@@ -37,13 +43,24 @@ def _inject_angle_idx(agent_cfg: dict, angle_idx: list) -> None:
 def _max_step_reward(robot: str, env_cfg) -> float:
     """Best-case per-step reward for a vel-tracking env's reward function.
 
-    quadruped/humanoid: alive bonus + exp-tracking terms, each of which saturates
-    at its scale when the tracking error is 0; every other term is `nonneg * a
-    non-positive scale`, so its best case is 0. manipulator has no alive bonus
-    and every term is `error * negative_scale`, so its best case is exactly 0.
+    Sum of the maxima of every reward term that can be positive; terms of the
+    form `nonneg_quantity * non_positive_scale` (all the tracking/regularization
+    penalties) have a best case of 0 and are omitted.
+
+    quadruped/humanoid: alive bonus + the two exp-tracking terms (each saturates
+    at its scale when the tracking error is 0). The quadruped ALSO has a gait
+    term `(2*gait_score - 1) * rew_gait`, gait_score in [0, 1], whose best case
+    is `+rew_gait` (>0) — it MUST be included or the "theoretical max" it feeds
+    (0.5 * max * T for the ref-traj quality gate) is under-counted, so an
+    actually-achievable return can exceed it (observed: a real run hit ~6200
+    against a mis-computed 5200 ceiling). Humanoid has no gait term. manipulator
+    has no alive bonus and every term is `error * negative_scale`, best case 0.
     """
     if robot in ("quadruped", "humanoid"):
-        return env_cfg.rew_alive + env_cfg.rew_lin_vel + env_cfg.rew_yaw_rate
+        # rew_gait absent on humanoid (getattr default 0.0); its max contribution
+        # is +rew_gait (gait_score = 1 → (2*1 - 1)*rew_gait).
+        return (env_cfg.rew_alive + env_cfg.rew_lin_vel + env_cfg.rew_yaw_rate
+                + max(0.0, getattr(env_cfg, "rew_gait", 0.0)))
     if robot == "manipulator":
         return 0.0
     raise ValueError(f"no max-reward formula for robot '{robot}'")
@@ -59,7 +76,7 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
         print(f"[RefTraj] No robot mapping for task '{task}'; skipping.")
         return
 
-    out_dir = os.path.join(_ROOT, "logs", robot)
+    out_dir = os.path.join(_DATA_ROOT, robot)
     out_path = os.path.join(out_dir, "dynamics_data.npz")
     T = int(env_cfg.episode_length_s / (env_cfg.sim.dt * env_cfg.decimation))
     # Quality threshold = half of the theoretical best-case total episode reward
@@ -79,7 +96,7 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
         print(f"[RefTraj] Loading best checkpoint: {best_ckpt}")
         agent.load(best_ckpt)
     else:
-        print(f"[RefTraj] WARNING: best_agent.pt not found; using final weights.")
+        print("[RefTraj] WARNING: best_agent.pt not found; using final weights.")
     _skrl_log.setLevel(_prev_level)
     for model in agent.models.values():
         if model is not None:
@@ -88,39 +105,59 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
     def _get_obs(o):
         return o["policy"] if isinstance(o, dict) else o
 
+    unwrapped = isaac_env.unwrapped
+    _act_low = torch.as_tensor(skrl_env.action_space.low, dtype=torch.float32, device=skrl_env.device)
+    _act_high = torch.as_tensor(skrl_env.action_space.high, dtype=torch.float32, device=skrl_env.device)
+
     # Quality gate: 1 full episode across all parallel environments
     if min_reward > 0:
         print(f"\n[RefTraj] Evaluating quality (threshold: mean total reward >= {min_reward}) …")
 
-        # SkrlVecEnvWrapper auto-resets each env individually on done, so we
-        # must NOT mask out rewards after done — the env is already running its
-        # next episode. We evaluate exactly 1 full episode for all parallel envs
-        # to prevent aggressively selecting early-terminating failure episodes.
+        # This gate measures the SAME quantity as the training-time
+        # "Reward / Total reward (mean)" wandb metric, and that is deliberate:
+        # min_reward is calibrated as 0.5 * best-case-per-step * T (see
+        # _max_step_reward), i.e. on the scale of a full TRAINING episode's
+        # return. So the gate rollout must reproduce training's episode
+        # structure — fall termination left at its cfg default (True), and the
+        # policy's own (stochastic) actions, exactly as the trainer collected
+        # the reward the threshold was derived from.
+        #
+        # It must NOT disable terminate_on_fall the way _evaluate_best_model
+        # does: with fall termination OFF, a fallen robot keeps flailing for
+        # the full T steps, accumulating the reward function's deliberate
+        # lying-down penalties (rew_flat, rew_base_height, zero tracking) at
+        # roughly -2.5/step — a large NEGATIVE tail that training never sees
+        # (it resets on fall). That non-terminating measurement produced gate
+        # values like -545 against a +2600 threshold — structurally
+        # unreachable regardless of policy quality — even while the same
+        # policy's training "Total reward (mean)" was well positive. Fall
+        # termination ON keeps a fallen episode SHORT (small return) instead of
+        # a huge negative, so the gate number stays on the threshold's scale.
         ep_rewards = []
         ep_r = torch.zeros(skrl_env.num_envs, device=skrl_env.device)
         finished = torch.zeros(skrl_env.num_envs, dtype=torch.bool, device=skrl_env.device)
-        
+
         if hasattr(skrl_env, "_reset_once"):
             skrl_env._reset_once = True
         obs_dict, _ = skrl_env.reset()
         obs = _get_obs(obs_dict)
-        
+
         # We run for slightly more than T steps to ensure all envs finish their first episode
         for _ in range(T + 1):
             with torch.no_grad():
                 actions, _ = agent.act(obs, None, timestep=0, timesteps=0)
             obs_dict, rewards, terminated, truncated, _ = skrl_env.step(actions)
             obs = _get_obs(obs_dict)
-            
+
             # accumulate reward only for envs that haven't finished their first episode
             ep_r += rewards.squeeze(-1) * (~finished).float()
             done = (terminated | truncated).squeeze(-1)
-            
+
             # only record the reward when an env finishes its first episode
             just_finished = done & (~finished)
             for i in just_finished.nonzero(as_tuple=True)[0]:
                 ep_rewards.append(ep_r[i.item()].item())
-            
+
             finished |= done
             if finished.all():
                 break
@@ -159,7 +196,6 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
     pool_target = max(num_trajs, int(math.ceil(num_trajs * max(1.0, args_cli.ref_oversample_factor))))
     print(f"[RefTraj] Collecting a candidate pool of {pool_target} trajectories "
           f"(oversample x{args_cli.ref_oversample_factor:g}), keeping the longest {num_trajs} → {out_path}")
-    unwrapped = isaac_env.unwrapped
     num_envs = skrl_env.num_envs
     all_states, all_actions, all_lengths = [], [], []
     if hasattr(skrl_env, "_reset_once"):
@@ -167,16 +203,15 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
     obs_dict, _ = skrl_env.reset()
     obs = _get_obs(obs_dict)
 
-    # Action-space bounds — used ONLY when writing into the saved `u` array
-    # below, never to modify what's stepped through the env. The policy
-    # samples with clip_actions=False (clipping inside the actor corrupts the
-    # log-prob), and the env already enforces action bounds on its own (its
-    # actuator/physics pipeline), so re-clipping before `skrl_env.step()` would
-    # be redundant. But the *saved* dynamics_data.npz must record actions
-    # within the declared action space — an unclipped, possibly out-of-range
-    # sample is not a valid "u" for fitting f(x) + B(x)u.
-    _act_low = torch.as_tensor(skrl_env.action_space.low, dtype=torch.float32, device=skrl_env.device)
-    _act_high = torch.as_tensor(skrl_env.action_space.high, dtype=torch.float32, device=skrl_env.device)
+    # _act_low/_act_high (defined above, alongside `unwrapped`) are used ONLY
+    # when writing into the saved `u` array below, never to modify what's
+    # stepped through the env. The policy samples with clip_actions=False
+    # (clipping inside the actor corrupts the log-prob), and the env already
+    # enforces action bounds on its own (its actuator/physics pipeline), so
+    # re-clipping before `skrl_env.step()` would be redundant. But the *saved*
+    # dynamics_data.npz must record actions within the declared action space —
+    # an unclipped, possibly out-of-range sample is not a valid "u" for
+    # fitting f(x) + B(x)u.
 
     # Pre-allocate tensors to avoid massive python list overhead
     with torch.no_grad():
@@ -270,7 +305,13 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
     lengths_arr = all_lengths_np[keep]
 
     os.makedirs(out_dir, exist_ok=True)
-    
+
+    # The diagnostic plot is a LOG, not data — it documents this generation run
+    # rather than feeding a later one, so it goes to logs/ and leaves data/
+    # holding only the npz artifacts other algorithms consume.
+    plot_dir = os.path.join(_ROOT, "logs", robot)
+    os.makedirs(plot_dir, exist_ok=True)
+
     # Plot absolute position of 10 sampled trajectories
     try:
         import matplotlib.pyplot as plt
@@ -281,7 +322,7 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
         plt.ylabel("Y Position (m, relative)")
         plt.title("Sampled Reference Trajectories (Relative Position)")
         plt.legend()
-        plot_path = os.path.join(out_dir, "position_plot.png")
+        plot_path = os.path.join(plot_dir, "position_plot.png")
         plt.savefig(plot_path)
         plt.close()
         print(f"[RefTraj] Saved position plot → {plot_path}")
@@ -360,7 +401,20 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
     Reports mean +/- 95% CI of: total reward, error AUC (normalized error,
     trapezoid), and overshoot C / contraction rate lambda from the minimal-AUC
     exponential envelope C * exp(-lambda * k * dt).
+
+    Skipped entirely by ``--skip_final_eval``. This rollout is SEQUENTIAL over a
+    single env instance (50 episodes by default), which is fine as a one-off
+    end-of-training report but is dead weight inside a sweep: it does not feed
+    the sweep metric at all. The swept ``Stability/auc_mean`` comes from
+    StatManagerEnvWrapper during the trainer loop; the ``auc_mean`` computed
+    here is a separate, differently-scoped number written to eval.json. For an
+    analytical controller that solves an SDP per env per step (CV-STEM-LQR
+    online) it is also the single most expensive thing in the trial.
     """
+    if getattr(args_cli, "skip_final_eval", False):
+        print("[Eval] SKIPPED — --skip_final_eval (does not feed the sweep metric).")
+        return
+
     import json
 
     import gymnasium as gym
@@ -492,7 +546,14 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
 
     Results are printed, logged to wandb (if active), and saved as
     eval_results.json next to the checkpoints.
+
+    Skipped entirely by ``--skip_final_eval`` — see
+    _evaluate_classic_path_tracking for why a sweep does not want this.
     """
+    if getattr(args_cli, "skip_final_eval", False):
+        print("[Eval] SKIPPED — --skip_final_eval (does not feed the sweep metric).")
+        return
+
     import json
 
     import numpy as np
@@ -650,7 +711,6 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
 # CLASSIC ROUTE  (--classic flag)
 # ══════════════════════════════════════════════════════════════════════════════
 from skrl.envs.wrappers.torch.gymnasium_envs import GymnasiumWrapper
-import torch
 import gymnasium
 
 class BatchedGymnasiumWrapper(GymnasiumWrapper):

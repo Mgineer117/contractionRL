@@ -1,0 +1,48 @@
+label: c2rl (rl=ppo, cm=cvstem)
+algorithm: c2rl-ppo
+num_envs: 1024
+
+metric:
+  # AUC, not reward. Large parts of the CV-STEM {w_lb, w_ub} x lbd x r_scaler
+  # grid are structurally infeasible, so this sweep is as much a feasibility
+  # question as a tuning one — and AUC measures the certified contraction
+  # quantity directly, on the same scale as the infeasibility poison value.
+  name: "Stability/auc_mean"
+  goal: minimize
+
+runner:
+  # An infeasible SDP would otherwise either grind through all 131072 per-state
+  # solves before build_cm_dataset raises, or train a full run on a CMG
+  # regressed onto a handful of surviving states. Either way the run dies or
+  # finishes WITHOUT writing the metric — and a metric-less run is simply
+  # IGNORED by bayes bookkeeping, so nothing is learned and the same dead
+  # region gets sampled again. The wrapper makes the wall a real datapoint the
+  # surrogate can learn to avoid.
+  wrapper: true
+  bad_value: 10000.0
+
+parameters:
+  agent.discount_factor:
+    values: [0.1, 0.3, 0.5, 0.7, 0.9, 0.99, 0.999]
+  agent.models.policy.backbone:
+    # mlp (plain MLP, u = MLP(obs)) | control (CLActor, u = uref + feedback(x-xref))
+    values: [mlp, control]
+  cm.cm_eps:
+    values: [0.01, 0.1, 0.5, 1.0]
+  cm.lbd:
+    values: [0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0]
+  agent.gae_lambda:
+    values: [0.9, 0.95, 0.975, 1.0]
+  # R = cvstem_r_scaler·I in the SDP's Riccati term.
+  cm.cvstem_r_scaler:
+    distribution: log_uniform_values
+    values: [0.01, 0.1, 0.5, 1.0, 5.0, 10.0]
+  # Pinned — these make the child strict about infeasibility so its own raise
+  # and the wrapper's early kill agree, instead of a per-state λ-backoff or a
+  # permissive feasibility rate papering over a miss.
+  cm.max_lambda_reductions:
+    value: 0
+  cm.min_feasibility_rate:
+    value: 1.0
+  cm.cmg_method:
+    value: cvstem

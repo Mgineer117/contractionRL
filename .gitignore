@@ -63,6 +63,23 @@ nohup.out
 **/*tfevents*
 /checkpoints/
 
+# Torch checkpoints — regenerable run artifacts, never committed.
+**/*.pt
+**/*.pth
+**/*.ckpt
+
+# Generated DATA (dynamics_data.npz, cm_data*.npz). Separate from logs/ because
+# these are INPUTS to later runs of other algorithms rather than the output of
+# one run — deleting logs/ must never force a re-synthesis. Ignored purely on
+# size: the current set is ~800 MB (a single dynamics_data.npz is 154 MB), far
+# past what belongs in git. The small tracked npz under visualization/cache/ is
+# a deliberate exception and stays versioned.
+/data/
+
+# Per-launch generated W&B sweep yamls (search.sh writes one per sweep, into
+# logs/search/). The searched space itself is versioned in search/configs/.
+search/sweep_*.yaml
+
 # Pre-Trained Checkpoints
 /.pretrained_checkpoints/
 
