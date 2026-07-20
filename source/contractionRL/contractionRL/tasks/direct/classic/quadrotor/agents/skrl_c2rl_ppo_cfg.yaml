@@ -134,7 +134,7 @@ cm:
   # per reduced state + an aggregate summary (build_cm_dataset). "cvstem" only.
   # See ncm_synthesis._solve_cm_metric_with_backoff.
   max_lambda_reductions: 5
-  min_feasibility_rate: 0.5  # raise before CMG regression if fewer than 50% of sampled states are feasible; "cvstem" only
+  min_feasibility_rate: 0.95  # raise before CMG regression if fewer than 95% of sampled states are feasible; "cvstem" only
   # Cache the synthesized {x, W} CM dataset here (build_cm_dataset's per-state SDP
   # solve is the expensive part of "cvstem" synthesis — 131072 states can take
   # minutes; unused by "ccm", which has no cache). Reused on a later run as long

@@ -41,12 +41,15 @@ parameters:
     max: 5.0
   agent.learning_rate_scheduler_kwargs.kl_threshold:
     values: [0.01, 0.02, 0.03, 0.05, 0.1]
-  # Pinned — these make the child strict about infeasibility so its own raise
-  # and the wrapper's early kill agree, instead of a per-state λ-backoff or a
-  # permissive feasibility rate papering over a miss.
+  # Pinned. C2RL consumes the metric only as a REWARD (not a deployed
+  # certificate), so a little per-state λ-backoff and a <100% bar are
+  # acceptable: the offline synthesis samples the FULL uniform state box,
+  # whose far-from-reference tail (e.g. cartpole |θ|→π/3) is genuinely
+  # infeasible at λ and would otherwise fail an all-or-nothing bar even
+  # though the deployed policy rarely operates there.
   cm.max_lambda_reductions:
-    value: 0
+    value: 5   # rescue an infeasible state with up to 5 λ-halvings before dropping it
   cm.min_feasibility_rate:
-    value: 1.0
+    value: 0.95   # tolerate up to 5% of the box still dropped after backoff
   cm.cmg_method:
     value: cvstem
