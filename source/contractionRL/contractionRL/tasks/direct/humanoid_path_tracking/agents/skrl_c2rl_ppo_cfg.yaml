@@ -33,8 +33,8 @@ models:
     network:
     - name: net
       input: STATE_ACTION
-      layers: [256, 256]
-      activations: relu
+      layers: [128, 128]
+      activations: tanh
   # A `cmg` (class: CMG) model is always built (see c2rl.py module docstring) —
   # omitted here so ContractionRunner falls back to its default [256, 256]/tanh
   # architecture; add a `cmg:` block above (like classic/car's) to customize it.

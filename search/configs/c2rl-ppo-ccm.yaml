@@ -12,12 +12,15 @@ parameters:
   agent.models.policy.backbone:
     # mlp (plain MLP, u = MLP(obs)) | control (CLActor, u = uref + feedback(x-xref))
     values: [mlp, control]
-  cm.cm_eps:
-    values: [0.01, 0.1, 0.5, 1.0]
-  cm.lbd:
-    values: [0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0]
+  # Pinned at the standalone-PPO-baseline defaults for this env — not swept.
+  agent.rollouts:
+    value: 24
   agent.gae_lambda:
-    values: [0.9, 0.95, 0.975, 1.0]
+    value: 0.95
+  agent.ratio_clip:
+    value: 0.2
+  agent.std_dev_annealing_kwargs.schedule:
+    value: exponential
   # ccm has no SDP, so the CMG's own direct-synthesis learning rate is swept
   # (cvstem instead sweeps cvstem_r_scaler, which sets R in the SDP's Riccati
   # term) — see c2rl.py's module docstring on cmg_method.
@@ -41,3 +44,9 @@ parameters:
       - {w_lb: 1.0, w_ub: 100.0}
   cm.cmg_method:
     value: ccm
+  cm.control_scaler:
+    distribution: uniform
+    min: 0.0
+    max: 5.0
+  agent.learning_rate_scheduler_kwargs.kl_threshold:
+    values: [0.01, 0.02, 0.03, 0.05, 0.1]

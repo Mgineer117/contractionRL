@@ -43,7 +43,7 @@ models:
     - name: net
       input: STATE_ACTION
       layers: [128, 128]
-      activations: relu
+      activations: tanh
 
 memory:
   class: RandomMemory

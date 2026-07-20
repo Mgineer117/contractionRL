@@ -34,7 +34,7 @@ models:
     - name: net
       input: STATE_ACTION
       layers: [128, 128]
-      activations: relu
+      activations: tanh
   # Always built (see c2rl.py module docstring). cmg_method=cvstem (below):
   # trained via CV-STEM SDP regression. Always a BoundedCCM_Generator
   # regardless of constrain_eigenvalues here — the runner forces it.

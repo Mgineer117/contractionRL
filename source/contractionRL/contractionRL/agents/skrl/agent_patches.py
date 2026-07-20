@@ -79,13 +79,17 @@ def patch_ppo_std_annealing(agent, std_dev_annealing: bool, kwargs: dict | None 
     log_std_parameter from its initial value down to `final_log_std` over the
     total training timesteps, following the chosen schedule.
 
-    `std_dev_annealing` is not a yaml flag: callers (train.py / c2rl.py)
-    auto-derive it from whether the policy's backbone is one of
-    ``runner.CONTROL_BACKBONES`` (``"control"``/``"contraction"``) — those
-    backbones freeze ``log_std_parameter`` (``requires_grad=False``, see
-    ``CLActor``'s ``anneal_stddev=True``) specifically so it's driven by this
-    schedule instead of PPO's gradient. Only the schedule itself is
-    yaml-configurable::
+    `std_dev_annealing` is not a yaml flag: callers auto-derive it. train.py's
+    standalone PPO/SAC route still derives it from whether the policy's
+    backbone is one of ``runner.CONTROL_BACKBONES`` (``"control"``/
+    ``"contraction"``). c2rl.py instead derives it from
+    ``self._base_algorithm == "PPO"`` — i.e. always on for PPO regardless of
+    backbone, and always off for SAC (which learns log_std via its own
+    automatic entropy tuning; see ``SquashedCLActorModel``'s docstring in
+    models.py). Either way, this function freezes ``log_std_parameter``
+    (``requires_grad=False``) itself and no-ops if the policy has no such
+    attribute (e.g. a state-dependent log_std head, as in
+    ``mlp-squashed``). Only the schedule itself is yaml-configurable::
 
         agent:
           std_dev_annealing_kwargs:

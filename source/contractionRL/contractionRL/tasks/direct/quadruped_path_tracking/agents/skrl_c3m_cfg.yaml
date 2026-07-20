@@ -41,8 +41,8 @@ models:
     network:
     - name: net
       input: STATE_ACTION
-      layers: [512, 512, 512, 512]
-      activations: leakyrelu
+      layers: [128, 128]
+      activations: tanh
 memory:
   class: RandomMemory
   memory_size: 131072  # Capacity of the experience replay buffer (-1 means dynamic/infinite)

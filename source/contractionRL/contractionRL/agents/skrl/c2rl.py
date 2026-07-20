@@ -504,11 +504,13 @@ class C2RLAgent(Agent):
             patch_ppo_std_annealing,
             patch_sac_entropy_clamp,
         )
-        from contractionRL.agents.skrl.models import CLActorModel
         patch_kl_logging(self._rl_agent)
         patch_sac_entropy_clamp(self._rl_agent)
         _std_dev_annealing_kwargs = parsed_cfg.std_dev_annealing_kwargs
-        patch_ppo_std_annealing(self._rl_agent, isinstance(models.get("policy"), CLActorModel), _std_dev_annealing_kwargs)
+        # Always anneal for PPO, regardless of the policy's backbone — SAC keeps
+        # this off since it learns log_std via its own automatic entropy tuning
+        # (see SquashedCLActorModel's docstring in models.py).
+        patch_ppo_std_annealing(self._rl_agent, self._base_algorithm == "PPO", _std_dev_annealing_kwargs)
 
         self._rl_agent.init()
 

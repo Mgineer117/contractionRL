@@ -41,8 +41,8 @@ models:
     network:
     - name: net
       input: STATE_ACTION
-      layers: [256, 256]
-      activations: relu
+      layers: [128, 128]
+      activations: tanh
 
 memory:
   class: RandomMemory
