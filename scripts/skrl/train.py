@@ -248,7 +248,12 @@ if _is_classic:
     # Classic contraction envs use the env's exact analytical get_f_and_B by
     # default (use_empirical_dynamics=False); pass --use_empirical_dynamics to
     # learn a NeuralDynamics instead. Classic envs only (Isaac forces empirical).
-    if algorithm in ["c3m", "c2rl_ppo", "c2rl_sac", "lqr", "sdlqr", "cvstem-lqr", "cvstem_lqr"]:
+    # _CONTRACTION_ALGOS (not a hand-written list): it carries BOTH the hyphen
+    # and underscore spellings of the c2rl variants. The old inline list had
+    # only "c2rl_ppo"/"c2rl_sac", so the README-documented "--algorithm c2rl-ppo"
+    # silently dropped --use_empirical_dynamics and trained on analytical
+    # dynamics instead.
+    if algorithm in _CONTRACTION_ALGOS:
         agent_cfg["agent"]["use_empirical_dynamics"] = args_cli.use_empirical_dynamics
 
     _run_ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")

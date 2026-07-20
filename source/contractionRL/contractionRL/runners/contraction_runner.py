@@ -647,7 +647,8 @@ class ContractionRunner:
         from skrl.trainers.torch.base import TrainerCfg
         import dataclasses
 
-        agent_cfg = {**agent_cfg, **(cm_cfg or {}), **(cmg_cfg or {})}
+        # agent_cfg LAST so CLI overrides survive — see _setup_c2rl's identical merge.
+        agent_cfg = {**(cm_cfg or {}), **(cmg_cfg or {}), **agent_cfg}
         angle_idx = list(angle_idx or [])
         w_lb = agent_cfg.get("w_lb", 0.1)
         w_ub = agent_cfg.get("w_ub", 10.0)
@@ -730,7 +731,12 @@ class ContractionRunner:
         angle_idx = list(angle_idx or [])
         from contractionRL.agents.skrl.c2rl import C2RLAgent, C2RLSkrlTrainer, C2RLTrainerCfg
 
-        agent_cfg = {**agent_cfg, **(cm_cfg or {}), **(cmg_cfg or {}), **(empirical_dynamics_cfg or {})}
+        # agent_cfg LAST so it wins: train.py injects CLI overrides (e.g.
+        # --use_empirical_dynamics) into the `agent:` block, and merging the
+        # yaml category blocks after it silently clobbered them with the yaml
+        # default. No yaml declares the same key in two blocks, so for a
+        # yaml-only run the merge order makes no difference.
+        agent_cfg = {**(cm_cfg or {}), **(cmg_cfg or {}), **(empirical_dynamics_cfg or {}), **agent_cfg}
 
         base_algorithm = base_algorithm.upper()
 

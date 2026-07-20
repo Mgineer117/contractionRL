@@ -897,20 +897,6 @@ class C2RLSkrlTrainer(Trainer):
     """skrl Trainer for C2RL — offline CMG synthesis (Phase A), then
     single-policy RL against the frozen CMG's Mahalanobis reward (Phase B)."""
 
-    def _env_scalar_attr(self, *names):
-        """See the identical helper on C3M's trainer — cross-backend env attr lookup."""
-        for name in names:
-            val = getattr(self.env, name, None)
-            if val is not None:
-                return val
-        if hasattr(self.env, "get_attr"):
-            for name in names:
-                try:
-                    return self.env.get_attr(name)[0]
-                except Exception:
-                    continue
-        raise AttributeError(f"none of {names} found on env {self.env!r}")
-
     @staticmethod
     def _forward_env_log(agent, infos) -> None:
         """Forward the env's per-episode ``extras['log']`` (path_tracking_base's /

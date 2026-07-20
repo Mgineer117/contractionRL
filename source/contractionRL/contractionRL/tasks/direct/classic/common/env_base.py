@@ -48,6 +48,10 @@ class BaseEnv(gym.Env):
         self.tracking_scaler = env_config["q"]
         self.control_scaler = env_config["r"]
         self.use_learned_dynamics = False
+        # State/control sampling distribution for get_rollout's "dynamics" mode.
+        # _build_cfg() puts this in the config dict; it must be read out here or
+        # get_rollout raises AttributeError on the first learned-dynamics draw.
+        self.sample_mode = env_config.get("sample_mode", "uniform")
 
         ref_unit_min = torch.cat([self.X_MIN, self.UREF_MIN])
         ref_unit_max = torch.cat([self.X_MAX, self.UREF_MAX])
@@ -83,6 +87,18 @@ class BaseEnv(gym.Env):
         if time_bound is not None: cfg["time_bound"] = time_bound
         if dt is not None: cfg["dt"] = dt
         return cfg
+
+    # Same names PathTrackingBase exposes, so ContractionRunner reads the state/
+    # control dimensions identically for both env families (it looks for
+    # x_dim/u_dim; without these, a classic env building a NeuralDynamics —
+    # use_empirical_dynamics=true — got None for both).
+    @property
+    def x_dim(self) -> int:
+        return self.num_dim_x
+
+    @property
+    def u_dim(self) -> int:
+        return self.num_dim_control
 
     def get_horizon_matched_gamma(self, scale: float = 1.0):
         scale = max(1e-3, min(scale, 1.0))
@@ -294,10 +310,7 @@ class BaseEnv(gym.Env):
                 f_x, B_x, Bbot_x = self.learned_dynamics_model(self.wrap_angles(x))
             return f_x, B_x, Bbot_x
         
-        # fallback for envs that don't implement _B_null_logic
-        if hasattr(self, "_B_null_logic"):
-            return self._f_logic(x), self._B_logic(x), self._B_null_logic(x)
-        return self._f_logic(x), self._B_logic(x)
+        return self._f_logic(x), self._B_logic(x), self._B_null_logic(x)
 
     def get_rollout(self, buffer_size: int, mode: str, num_control_per_state: int | None = None):
         if mode == "c3m":
@@ -328,12 +341,16 @@ class BaseEnv(gym.Env):
         u_list = [u[torch.randperm(batch_size)] for _ in range(n_control_per_x)]
         u = torch.cat(u_list, dim=0)
         
-        f, B = self.get_f_and_B(x)
+        f, B, _ = self.get_f_and_B(x)
         x_dot = f + torch.bmm(B, u.unsqueeze(-1)).squeeze(-1)
+        # "x_dot", not "x_next": every consumer of a "dynamics" rollout
+        # (dynamics_pretrain.pretrain_dynamics, C3M/C2RL._train_dynamics) fits
+        # NeuralDynamics against ẋ directly, matching PathTrackingBase's
+        # _get_dynamics_rollout on the Isaac side.
         return {
             "x": x,
             "u": u,
-            "x_next": x + x_dot * self.dt,
+            "x_dot": x_dot,
         }
 
     def wrap_angles(self, x: torch.Tensor):
