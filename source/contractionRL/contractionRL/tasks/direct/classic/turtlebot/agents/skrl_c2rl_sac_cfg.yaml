@@ -85,7 +85,7 @@ cm:
   cm_solver: MOSEK  # cvxpy SDP solver: SCS (default, no license) | CLARABEL (no license, tighter/slower) | MOSEK (commercial license, tightest/fastest — see README.md Installation)
   # cvstem-only SDP-synthesis feasibility knobs (unused under the default
   # cmg_method="ccm"; take effect with --cm.cmg_method=cvstem).
-  max_lambda_reductions: 5    # per-state λ-backoff budget on SDP infeasibility
+  max_lambda_reductions: 10   # per-state λ-backoff budget on SDP infeasibility
   min_feasibility_rate: 0.95  # raise before CMG regression if fewer than 95% of sampled states are feasible
 
 # ── Offline CMG synthesis (Phase A, always runs before Phase B) ───────────── #

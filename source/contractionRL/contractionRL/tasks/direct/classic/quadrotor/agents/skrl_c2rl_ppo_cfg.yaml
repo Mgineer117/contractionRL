@@ -133,7 +133,7 @@ cm:
   # the dataset — 0 disables this and reverts to dropping immediately. Warns
   # per reduced state + an aggregate summary (build_cm_dataset). "cvstem" only.
   # See ncm_synthesis._solve_cm_metric_with_backoff.
-  max_lambda_reductions: 5
+  max_lambda_reductions: 10
   min_feasibility_rate: 0.95  # raise before CMG regression if fewer than 95% of sampled states are feasible; "cvstem" only
   # Cache the synthesized {x, W} CM dataset here (build_cm_dataset's per-state SDP
   # solve is the expensive part of "cvstem" synthesis — 131072 states can take
