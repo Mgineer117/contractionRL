@@ -53,7 +53,15 @@ _repo
 _build
 .lastformat
 
-# RL-Games
+# Run artifacts. Three separate trees, by what the files ARE (not who wrote
+# them) — see /data/ below for the third:
+#   logs/        — RUN INFORMATION only (tfevents, per-run *.log, eval_results
+#                  .json, checkpoints). Regenerable; safe to delete wholesale.
+#   search/logs/ — hyperparameter-sweep run information (per-agent logs, the
+#                  generated sweep.yaml, nohup redirects). Same character as
+#                  logs/, kept beside search/ so a sweep is self-contained.
+#                  Covered by the same **/logs/* rule below.
+# The old logs/search/ location is retired — sweeps write to search/logs/ now.
 **/runs/*
 **/logs/*
 **/recordings/*
@@ -77,7 +85,7 @@ nohup.out
 /data/
 
 # Per-launch generated W&B sweep yamls (search.sh writes one per sweep, into
-# logs/search/). The searched space itself is versioned in search/configs/.
+# search/logs/). The searched space itself is versioned in search/configs/.
 search/sweep_*.yaml
 
 # Pre-Trained Checkpoints
