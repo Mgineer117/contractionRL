@@ -11,28 +11,22 @@ metric:
   goal: maximize
 
 parameters:
+  # c3m's contraction knobs live under `agent:`, so these are the same λ/ε the
+  # c2rl configs sweep as cm.lbd/cm.cm_eps — same value lists.
   agent.lbd:
-    distribution: uniform
-    min: 0.01
-    max: 3.0
+    values: [0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0]
   agent.eps:
-    distribution: log_uniform_values
-    min: 1.0e-3
-    max: 1.0
+    values: [0.01, 0.1, 0.5, 1.0]
   agent.W_lr:
-    distribution: log_uniform_values
-    min: 1.0e-5
-    max: 1.0e-3
+    values: [1.0e-5, 3.0e-5, 1.0e-4, 3.0e-4, 1.0e-3]
   agent.c1_c2_scale:
-    distribution: uniform
-    min: 0.01
-    max: 1.0
+    values: [0.01, 0.05, 0.1, 0.3, 0.5, 1.0]
+  # control backbones only — c3m's certificate needs u = uref + feedback(x-xref),
+  # so plain `mlp` is not a valid option here (see the squashed-backbone policy).
   agent.models.policy.backbone:
     values: [control, control-squashed]
   agent.actor_lr:
-    distribution: log_uniform_values
-    min: 1.0e-5
-    max: 1.0e-3
+    values: [1.0e-5, 3.0e-5, 1.0e-4, 3.0e-4, 1.0e-3]
   agent.actor_architecture:
     values:
       - [64, 64]
@@ -48,8 +42,9 @@ parameters:
   agent:
     values:
       - {w_lb: 0.5, w_ub: 1.5}
-      - {w_lb: 1.0, w_ub: 3.0}
-      - {w_lb: 0.1, w_ub: 1.0}
-      - {w_lb: 1.0, w_ub: 10.0}
+      - {w_lb: 0.3, w_ub: 1.5}
+      - {w_lb: 0.2, w_ub: 2.0}
+      - {w_lb: 0.5, w_ub: 5.0}
       - {w_lb: 0.1, w_ub: 10.0}
-      - {w_lb: 1.0, w_ub: 100.0}
+      - {w_lb: 0.01, w_ub: 10.0}
+      - {w_lb: 0.1, w_ub: 100.0}

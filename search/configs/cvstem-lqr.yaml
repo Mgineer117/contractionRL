@@ -28,20 +28,23 @@ runner:
   # value is a large one, and finite — inf/nan would break the surrogate bayes
   # fits over these observations.
   #
-  # Scale check (measured, classic-car-v0, lqr, 64 envs, one 500-step episode):
-  # Stability/auc_mean ≈ 61. So 1e3 sits about an order of magnitude above a
-  # real-but-poor controller, which is the intent. Note this is a sentinel, not
-  # a bound: a genuinely diverging FEASIBLE run can exceed it and thus rank
+  # Scale check (measured, classic-cartpole-v0, lqr, 64 envs, one 500-step
+  # episode): Stability/auc_mean ≈ 7.5. So 1e3 sits ~two orders of magnitude
+  # above a working controller, which is the intent. Note this is a sentinel,
+  # not a bound: a genuinely diverging FEASIBLE run can exceed it and thus rank
   # below an infeasible one. That only affects ordering among already-terrible
   # trials, but it does mean bad_value should stay well clear of the range real
   # runs occupy — re-check it if the AUC definition or episode length changes.
   #
-  # Related sharp edge: StatManagerEnvWrapper initializes _recent_auc_mean to
-  # 1e2, and reports that until every env has completed a full episode. One
-  # episode is exactly enough to replace it (verified: the value moves and
-  # auc_ci95 becomes nonzero), but 1e2 is the same order as a real AUC — so a
-  # trial that somehow logged before completing would look mediocre rather than
-  # obviously broken.
+  # The earlier note here read "lqr ≈ 61", and that number was an ARTIFACT:
+  # StatManagerEnvWrapper logged its 1e2 constructor sentinel on every step
+  # before the buffer's first completion, and skrl's write_interval averaged
+  # the sentinel together with the one real value, yielding
+  # ≈ 60 + 0.4·true_auc. Fixed 2026-07-19 — the wrapper now emits no
+  # Stability/* key at all until a real value exists (see the _compute_count
+  # gate in contraction_metrics.py's step()). Sweep results recorded before
+  # that fix are on the old, offset-and-compressed scale and are NOT
+  # comparable to ones recorded after it.
   bad_value: 1000.0
 
 parameters:

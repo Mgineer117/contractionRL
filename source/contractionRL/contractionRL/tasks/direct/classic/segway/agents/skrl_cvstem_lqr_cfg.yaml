@@ -25,9 +25,9 @@ agent:
   metric_source: online
   # R = r_scaler·I, used in BOTH the metric SDP's Riccati term AND the deployed
   # gain K = R⁻¹BᵀM — a single knob so K stays the CERTIFIED CV-STEM gain.
-  r_scaler: 0.01
+  r_scaler: 1.0
   experiment:
-    directory: "car_cvstem_lqr"
+    directory: "segway_cvstem_lqr"
     experiment_name: ""
     write_interval: "auto"
     checkpoint_interval: "auto"
@@ -39,14 +39,14 @@ agent:
 # ── Contraction metric SDP (both metric sources) ───────────────────────────── #
 cm:
   w_ub: 10.0    # Upper eigenvalue bound for W (M ≥ 1/w_ub)
-  w_lb: 0.01    # Lower eigenvalue bound for W (M ≤ 1/w_lb)
-  lbd: 2.0      # Contraction rate λ
-  cm_eps: 1.0   # Strict-definiteness margin on the contraction LMI
+  w_lb: 0.1     # Lower eigenvalue bound for W (M ≤ 1/w_lb)
+  lbd: 0.1      # Contraction rate λ
+  cm_eps: 0.01  # Strict-definiteness margin on the contraction LMI
   cm_solver: MOSEK  # SCS (no license) | CLARABEL | MOSEK (tightest/fastest; see README)
   max_lambda_reductions: 5  # per-state λ-backoff budget on SDP infeasibility
   # ── metric_source=pretrained only ──
   min_feasibility_rate: 0.5
-  cm_data_path: "data/classic/car/cvstem_lqr_cm_data.npz"
+  cm_data_path: "data/classic/segway/cvstem_lqr_cm_data.npz"
 
 # ── Offline CMG synthesis (metric_source=pretrained only) ──────────────────── #
 cmg:

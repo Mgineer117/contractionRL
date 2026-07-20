@@ -488,7 +488,23 @@ class StatManagerEnvWrapper:
 
             # Inject metrics into info["log"] so skrl's trainer (cfg
             # `environment_info: log`, scalar tensors only) tracks them.
-            if self._initialized and isinstance(info, dict):
+            #
+            # Gated on _compute_count: before the first buffer round completes,
+            # stability_summary() returns the CONSTRUCTOR SENTINELS (auc_mean
+            # and C = 1e2), and the buffer only completes at the END of an
+            # episode. Logging them from step 0 meant ~498 of a 500-step
+            # episode reported 1e2, and skrl's write_interval averages its
+            # window — so the value that reached wandb (and the sweep) was a
+            # BLEND of sentinel and truth, not the truth:
+            #     Stability/auc_mean ≈ 60 + 0.4·true_auc
+            # (measured, classic-cartpole-v0 + lqr: true 7.52 → logged 63.01;
+            # overshoot 3.95 → logged 61.58, the same 60/40 mix). Worse, the
+            # blend ratio depends on where buffer completion lands inside the
+            # write window, so it varied run to run — noise of the same order
+            # as the real differences the sweeps are trying to resolve.
+            # Emitting nothing until there is a real value keeps the key
+            # absent instead of wrong; skrl simply has no datapoint to average.
+            if self._initialized and self._compute_count > 0 and isinstance(info, dict):
                 if "log" not in info or not isinstance(info["log"], dict):
                     info["log"] = {}
                 info["log"].update(stability_log_dict(self.stability_summary(), self._device()))

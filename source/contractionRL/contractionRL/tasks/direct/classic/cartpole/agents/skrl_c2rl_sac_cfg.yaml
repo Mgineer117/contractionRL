@@ -75,13 +75,14 @@ agent:
 cm:
   # Mahalanobis reward
   w_ub: 10.0  # Upper eigenvalue bound for the metric M(x)
-  w_lb: 0.1   # Lower eigenvalue bound for the metric M(x)
-  lbd: 0.5    # Contraction rate λ — used by cmg_method's synthesis loss (default "ccm": CMG C1 loss)
+  w_lb: 0.01  # Lower eigenvalue bound for the metric M(x)
+  lbd: 2.0    # Contraction rate λ — used by cmg_method's synthesis loss (default "ccm": CMG C1 loss)
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled)
   # SDP contraction metric (cm_eps used by both cmg_method paths; cm_solver "cvstem" only)
-  cm_eps: 0.01  # Strict-definiteness margin on the contraction LMI
+  cm_eps: 0.1   # Strict-definiteness margin on the contraction LMI
   cm_solver: MOSEK  # cvxpy SDP solver: SCS (default, no license) | CLARABEL (no license, tighter/slower) | MOSEK (commercial license, tightest/fastest — see README.md Installation)
+  cvstem_r_scaler: 0.01  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term; "cvstem" only (this config's cmg_method default)
 
 # ── Offline CMG synthesis (Phase A, always runs before Phase B) ───────────── #
 cmg:

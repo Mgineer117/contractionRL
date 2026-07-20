@@ -31,6 +31,26 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_DIR="$SCRIPT_DIR/configs"
 
+# ── Pretty output ───────────────────────────────────────────────────────── #
+# Colors only when stdout is a real terminal — this script also runs headless
+# under nohup (see "Detach" below), where raw ANSI codes would just pollute
+# the log file.
+if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
+    C_BOLD="$(tput bold)"; C_DIM="$(tput dim)"; C_RESET="$(tput sgr0)"
+    C_CYAN="$(tput setaf 6)"; C_GREEN="$(tput setaf 2)"; C_YELLOW="$(tput setaf 3)"
+    C_RED="$(tput setaf 1)"; C_BLUE="$(tput setaf 4)"; C_MAGENTA="$(tput setaf 5)"
+else
+    C_BOLD=""; C_DIM=""; C_RESET=""; C_CYAN=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_BLUE=""; C_MAGENTA=""
+fi
+
+_rule() { printf '%s\n' "${C_DIM}────────────────────────────────────────────────────────────${C_RESET}" >&2; }
+_header() { echo "" >&2; _rule; printf '%s\n' "${C_BOLD}${C_CYAN}  $1${C_RESET}" >&2; _rule; }
+_info()    { printf '%s\n' "  ${C_BLUE}ℹ${C_RESET}  $1" >&2; }
+_success() { printf '%s\n' "  ${C_GREEN}✓${C_RESET}  $1" >&2; }
+_warn()    { printf '%s\n' "  ${C_YELLOW}⚠${C_RESET}  $1" >&2; }
+_error()   { printf '%s\n' "  ${C_RED}✗${C_RESET}  $1" >&2; }
+_kv()      { printf '  %s%-18s%s %s\n' "${C_DIM}" "$1" "${C_RESET}" "${C_BOLD}$2${C_RESET}" >&2; }
+
 NUM_AGENTS=""
 ALGORITHM=""
 ENV_ARG=""
@@ -62,28 +82,34 @@ done
 prompt_choice() {
     local prompt_text="$1"; shift
     local opts=("$@") opt
-    echo "$prompt_text" >&2
+    printf '\n%s\n' "  ${C_MAGENTA}?${C_RESET} ${C_BOLD}$prompt_text${C_RESET}" >&2
+    PS3="  ${C_DIM}› ${C_RESET}"
     select opt in "${opts[@]}"; do
         if [[ -n "$opt" ]]; then echo "$opt"; return; fi
-        echo "Invalid choice, try again." >&2
+        _warn "Invalid choice, try again."
     done
 }
+
+if [[ "$DETACHED" -ne 1 ]]; then
+    _header "contractionRL sweep launcher"
+fi
 
 # ── Algorithm ───────────────────────────────────────────────────────────── #
 # Discovered by globbing configs/ — adding a yaml there is all it takes to make
 # a new algorithm selectable here.
 mapfile -t ALGOS < <(find "$CONFIG_DIR" -maxdepth 1 -name '*.yaml' -printf '%f\n' | sed 's/\.yaml$//' | sort)
 if [[ "${#ALGOS[@]}" -eq 0 ]]; then
-    echo "No algorithm configs found in $CONFIG_DIR." >&2
+    _error "No algorithm configs found in $CONFIG_DIR."
     exit 1
 fi
 if [[ -z "$ALGORITHM" ]]; then
     ALGORITHM=$(prompt_choice "Select algorithm to sweep:" "${ALGOS[@]}")
 fi
 if [[ ! -f "$CONFIG_DIR/$ALGORITHM.yaml" ]]; then
-    echo "No config '$ALGORITHM.yaml' in $CONFIG_DIR. Available: ${ALGOS[*]}" >&2
+    _error "No config '$ALGORITHM.yaml' in $CONFIG_DIR. Available: ${ALGOS[*]}"
     exit 1
 fi
+[[ "$DETACHED" -ne 1 ]] && _success "Algorithm: ${C_BOLD}$ALGORITHM${C_RESET}"
 
 # ── Env ─────────────────────────────────────────────────────────────────── #
 CLASSIC_ENVS=("classic-car-v0" "classic-cartpole-v0" "classic-segway-v0" "classic-turtlebot-v0" "classic-quadrotor-v0")
@@ -115,11 +141,14 @@ else
             ;;
     esac
 fi
+[[ "$DETACHED" -ne 1 ]] && _success "Env(s): ${C_BOLD}${ENVS[*]}${C_RESET}"
 
 if [[ -z "$NUM_AGENTS" ]]; then
-    read -r -p "Number of parallel wandb agents to spawn per env [3]: " NUM_AGENTS
+    printf '\n%s' "  ${C_MAGENTA}?${C_RESET} ${C_BOLD}Number of parallel wandb agents to spawn per env${C_RESET} ${C_DIM}[3]${C_RESET}: " >&2
+    read -r NUM_AGENTS
     NUM_AGENTS="${NUM_AGENTS:-3}"
 fi
+[[ "$DETACHED" -ne 1 ]] && _success "Agents per env: ${C_BOLD}$NUM_AGENTS${C_RESET}"
 
 # ── GPU ─────────────────────────────────────────────────────────────────── #
 # CUDA_VISIBLE_DEVICES=<index> for a nonexistent index silently hides the only
@@ -127,7 +156,7 @@ fi
 # actually reports rather than trusted.
 NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 if [[ "$NUM_GPUS" -lt 1 ]]; then
-    echo "nvidia-smi reports 0 GPUs — aborting." >&2
+    _error "nvidia-smi reports 0 GPUs — aborting."
     exit 1
 fi
 if [[ -z "$GPU_ARG" ]]; then
@@ -137,37 +166,50 @@ if [[ -z "$GPU_ARG" ]]; then
 fi
 if [[ -n "$GPU_ARG" ]]; then
     if ! [[ "$GPU_ARG" =~ ^[0-9]+$ ]] || [[ "$GPU_ARG" -ge "$NUM_GPUS" ]]; then
-        echo "--gpu $GPU_ARG is out of range — nvidia-smi reports $NUM_GPUS GPU(s) (0-$((NUM_GPUS - 1)))." >&2
+        _error "--gpu $GPU_ARG is out of range — nvidia-smi reports $NUM_GPUS GPU(s) (0-$((NUM_GPUS - 1)))."
         exit 1
     fi
 fi
+[[ "$DETACHED" -ne 1 ]] && _success "GPU: ${C_BOLD}${GPU_ARG:-all detected (round-robin)}${C_RESET}"
 
 cd "$SCRIPT_DIR/.."
 
 # ── Preview ─────────────────────────────────────────────────────────────── #
 if [[ "$DETACHED" -ne 1 ]]; then
-    echo ""
-    echo "=========================================="
-    echo "About to sweep: $ALGORITHM   (method: $METHOD)"
-    echo "Env(s): ${ENVS[*]}"
-    echo "Agents per env: $NUM_AGENTS   GPU: ${GPU_ARG:-all detected (round-robin)}"
+    _header "Sweep summary"
+    _kv "Algorithm"       "$ALGORITHM"
+    _kv "Method"          "$METHOD"
+    _kv "Env(s)"          "${ENVS[*]}"
+    _kv "Agents per env"  "$NUM_AGENTS"
+    _kv "GPU"             "${GPU_ARG:-all detected (round-robin)}"
     if [[ "$RUNS_PER_AGENT" -gt 0 ]]; then
-        echo "Runs per agent: $RUNS_PER_AGENT (total per env: $((RUNS_PER_AGENT * NUM_AGENTS)))"
+        _kv "Runs per agent" "$RUNS_PER_AGENT (total per env: $((RUNS_PER_AGENT * NUM_AGENTS)))"
     else
-        echo "Runs per agent: unbounded (bayes never exhausts — kill to stop)"
+        _kv "Runs per agent" "unbounded (bayes never exhausts — kill to stop)"
     fi
-    echo "=========================================="
+    _rule
+
+    _header "Generated sweep (${ENVS[0]})"
     # Preview the REAL generated sweep, not a re-description of it — what is
-    # shown here is exactly what wandb will be handed.
-    python search/build_sweep.py --algorithm "$ALGORITHM" --env "${ENVS[0]}" \
-        --method "$METHOD"
-    echo "=========================================="
-    echo ""
+    # shown here is exactly what wandb will be handed. Colored a bit if `pygmentize`
+    # or `bat` happen to be around; a plain cat otherwise, so this never gains a
+    # hard dependency just for a nicer preview.
+    _SWEEP_PREVIEW="$(python search/build_sweep.py --algorithm "$ALGORITHM" --env "${ENVS[0]}" --method "$METHOD")"
+    if command -v bat >/dev/null 2>&1; then
+        echo "$_SWEEP_PREVIEW" | bat -l yaml --style=plain --color=always --paging=never >&2
+    elif [[ -n "$C_CYAN" ]]; then
+        echo "$_SWEEP_PREVIEW" | sed -E "s/^([A-Za-z_.]+):/${C_CYAN}\1${C_RESET}:/" >&2
+    else
+        echo "$_SWEEP_PREVIEW" >&2
+    fi
+    _rule
+    echo "" >&2
 
     if [[ "$YES" -ne 1 ]]; then
-        read -r -p "Launch this sweep now, detached via nohup? [y/N] " CONFIRM
+        printf '%s' "  ${C_MAGENTA}?${C_RESET} ${C_BOLD}Launch this sweep now, detached via nohup?${C_RESET} ${C_DIM}[y/N]${C_RESET} " >&2
+        read -r CONFIRM
         if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-            echo "Aborted — nothing launched."
+            _warn "Aborted — nothing launched."
             exit 0
         fi
     fi
@@ -188,8 +230,9 @@ if [[ "$DETACHED" -ne 1 ]]; then
         ${GPU_ARG:+--gpu "$GPU_ARG"} \
         --detached > "$NOHUP_LOG" 2>&1 &
     disown
-    echo "Launched (PID $!) — detached via nohup, safe to close this terminal."
-    echo "Tail progress with: tail -f $NOHUP_LOG"
+    _success "Launched (PID $!) — detached via nohup, safe to close this terminal."
+    _info "Tail progress with: ${C_BOLD}tail -f $NOHUP_LOG${C_RESET}"
+    echo "" >&2
     exit 0
 fi
 
@@ -203,9 +246,7 @@ for i in "${!ENVS[@]}"; do
     LOG_DIR="$SCRIPT_DIR/logs/${ALGORITHM}_${ENV}_${RUN_TS}"
     mkdir -p "$LOG_DIR"
 
-    echo "=========================================="
-    echo "Initializing WandB Sweep for $ENV ($ALGORITHM) on GPU $GPU..."
-    echo "=========================================="
+    _header "$ENV  ${C_DIM}(${ALGORITHM}, GPU ${GPU})${C_RESET}"
 
     # Project and sweep name both come from build_sweep.py: ONE fixed project
     # (contractionRL-Search) for everything, with the sweep named
@@ -223,7 +264,7 @@ for i in "${!ENVS[@]}"; do
     # remaining env down with it instead of being skipped.
     if ! python search/build_sweep.py --algorithm "$ALGORITHM" --env "$ENV" \
             --method "$METHOD" --out "$SWEEP_YAML" > /dev/null; then
-        echo "Failed to build a sweep yaml for $ENV — skipping."
+        _error "Failed to build a sweep yaml for $ENV — skipping."
         continue
     fi
 
@@ -235,16 +276,16 @@ for i in "${!ENVS[@]}"; do
     SWEEP_INIT_OUTPUT=$(wandb sweep "$SWEEP_YAML" 2>&1) || true
     SWEEP_ID=$(echo "$SWEEP_INIT_OUTPUT" | grep -oE "wandb agent .*" | awk '{print $3}' || true)
     if [[ -z "$SWEEP_ID" || "$SWEEP_ID" == *"Error"* ]]; then
-        echo "Failed to create sweep for $ENV."
-        echo "Output: $SWEEP_INIT_OUTPUT"
+        _error "Failed to create sweep for $ENV."
+        echo "$SWEEP_INIT_OUTPUT" | sed 's/^/      /' >&2
         continue
     fi
-    echo "Sweep ID created: $SWEEP_ID"
-    echo "Starting $NUM_AGENTS self-restarting agents in parallel..."
+    _success "Sweep ID created: ${C_BOLD}$SWEEP_ID${C_RESET}"
+    _info "Starting $NUM_AGENTS self-restarting agent(s) in parallel..."
 
     for j in $(seq 1 "$NUM_AGENTS"); do
         LOGFILE="$LOG_DIR/agent_${j}.log"
-        echo "Starting Agent $j (auto-restart, ${PER_RUN_TIMEOUT} watchdog)... Logging to $LOGFILE"
+        _info "  Agent $j (auto-restart, ${PER_RUN_TIMEOUT} watchdog) → ${C_DIM}${LOGFILE}${C_RESET}"
         (
             run_count=0
             while true; do
@@ -264,10 +305,11 @@ for i in "${!ENVS[@]}"; do
         ) &
     done
 
-    echo "All $NUM_AGENTS agents for $ENV launched in the background."
-    echo ""
+    _success "All $NUM_AGENTS agent(s) for $ENV launched in the background."
 done
 
-echo "Monitor progress on your W&B dashboard!"
-echo "Each agent restarts itself — kill this script's process group to stop."
+_header "All sweeps launched"
+_info "Monitor progress on your W&B dashboard."
+_info "Each agent restarts itself — kill this script's process group to stop."
+echo "" >&2
 wait

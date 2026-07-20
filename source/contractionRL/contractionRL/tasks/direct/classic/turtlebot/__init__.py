@@ -12,5 +12,6 @@ gym.register(
         "skrl_c2rl_sac_cfg_entry_point": f"{__name__}.agents:skrl_c2rl_sac_cfg.yaml",
         "skrl_lqr_cfg_entry_point": f"{__name__}.agents:skrl_lqr_cfg.yaml",
         "skrl_sdlqr_cfg_entry_point": f"{__name__}.agents:skrl_sdlqr_cfg.yaml",
+        "skrl_cvstem_lqr_cfg_entry_point": f"{__name__}.agents:skrl_cvstem_lqr_cfg.yaml",
     },
 )

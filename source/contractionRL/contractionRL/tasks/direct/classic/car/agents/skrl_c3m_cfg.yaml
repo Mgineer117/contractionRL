@@ -55,13 +55,13 @@ agent:
   learning_rate_scheduler: "ExponentialLR"  # mild per-step decay so a long run doesn't collapse LR to ~0
   learning_rate_scheduler_kwargs:
     gamma: 0.9999  # shared by the CMG (W) and policy (u) optimizers; stepped once per training iteration
-  W_lr: 1.0e-3  # Learning rate for the Contraction Metric Generator (CMG) network
+  W_lr: 8.0e-5  # Learning rate for the Contraction Metric Generator (CMG) network
   u_lr: 1.0e-3  # Learning rate for the Policy (Actor) network
-  lbd: 0.5  # Contraction rate parameter (lambda) enforcing the exponential stability bound
-  eps: 0.01  # Margin parameter (epsilon) ensuring strict definiteness of the metric
-  w_ub: 10.0  # Upper bound clipping value for the generated metric M(x)
-  w_lb: 0.1  # Lower bound clipping value for the generated metric M(x)
-  c1_c2_scale: 0.5  # Multiplies (c1_loss + c2_loss) in the total loss: loss = os_loss + pd_loss +
+  lbd: 2.0  # Contraction rate parameter (lambda) enforcing the exponential stability bound
+  eps: 0.06  # Margin parameter (epsilon) ensuring strict definiteness of the metric
+  w_ub: 100.0  # Upper bound clipping value for the generated metric M(x)
+  w_lb: 1.0  # Lower bound clipping value for the generated metric M(x)
+  c1_c2_scale: 0.80  # Multiplies (c1_loss + c2_loss) in the total loss: loss = os_loss + pd_loss +
   # c1_c2_scale * (c1_loss + c2_loss). Set e.g. 0.1 to downweight the open-loop C1/C2
   # feasibility terms relative to pd_loss (the closed-loop Cu certificate).
   detach_warmup_frac: 0.0  # Fraction of training freezing M in the contraction term

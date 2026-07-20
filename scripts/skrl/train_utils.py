@@ -20,6 +20,26 @@ def _default_num_envs_classic(algo: str) -> int:
     return _DEFAULT_NUM_ENVS_SAC if algo.lower() in _SAC_LIKE_ALGOS else _DEFAULT_NUM_ENVS_PPO_CLASSIC
 
 
+def _run_metadata(args_cli, task: str) -> dict:
+    """Identity of the run that produced an eval_results.json.
+
+    The metrics in eval_results.json are anonymous on their own — the run
+    directory is named by timestamp only, so nothing in the file says which
+    seed/env/algorithm it came from. Multi-seed aggregation (run_seeds.sh +
+    scripts/aggregate_seeds.py) needs exactly that to group runs, so it is
+    written INTO the json rather than parsed back out of a path.
+
+    CRL_RUN_TAG is set by run_seeds.sh to a per-launch tag, so the aggregator
+    can select one batch of seeds instead of every historical run under logs/.
+    """
+    return {
+        "task": task,
+        "algorithm": getattr(args_cli, "algorithm", None),
+        "seed": getattr(args_cli, "seed", None),
+        "run_tag": os.environ.get("CRL_RUN_TAG", ""),
+    }
+
+
 
 def _inject_angle_idx(agent_cfg: dict, angle_idx: list) -> None:
     """Inject ``angle_idx`` into every model sub-block of agent_cfg["models"].
@@ -495,6 +515,7 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
     C_mean, C_ci = mean_confidence_interval(C_list)
     lbd_mean, lbd_ci = mean_confidence_interval(lbd_list)
     results = {
+        **_run_metadata(args_cli, task),
         "checkpoint": best_ckpt if os.path.exists(best_ckpt) else "final",
         "num_episodes": num_groups * episodes_per_group,
         "total_reward_mean": rew_mean, "total_reward_ci95": rew_ci,
@@ -665,6 +686,7 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
     rew_mean, rew_ci = mean_confidence_interval(rew_np)
     auc_mean, auc_ci = mean_confidence_interval(auc_np)
     results = {
+        **_run_metadata(args_cli, task),
         "checkpoint": best_ckpt if os.path.exists(best_ckpt) else "final",
         "num_episodes": int(num_envs),
         "episode_steps": int(T),

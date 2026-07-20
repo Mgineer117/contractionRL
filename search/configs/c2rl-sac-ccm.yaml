@@ -13,24 +13,17 @@ parameters:
     # mlp (plain MLP, u = MLP(obs)) | control (CLActor, u = uref + feedback(x-xref))
     values: [mlp, control]
   cm.cm_eps:
-    distribution: log_uniform_values
-    min: 1.0e-3
-    max: 1.0
+    values: [0.01, 0.1, 0.5, 1.0]
   cm.lbd:
-    distribution: uniform
-    min: 0.01
-    max: 3.0
+    values: [0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0]
+  # SAC's target-network step, in place of the PPO configs' gae_lambda.
   agent.polyak:
-    distribution: log_uniform_values
-    min: 1.0e-3
-    max: 1.0e-1
+    values: [0.001, 0.005, 0.01, 0.05, 0.1]
   # ccm has no SDP, so the CMG's own direct-synthesis learning rate is swept
   # (cvstem instead sweeps cvstem_r_scaler, which sets R in the SDP's Riccati
   # term) — see c2rl.py's module docstring on cmg_method.
   cmg.cmg_regress_lr:
-    distribution: log_uniform_values
-    min: 1.0e-4
-    max: 1.0e-2
+    values: [1.0e-4, 3.0e-4, 1.0e-3, 3.0e-3, 1.0e-2]
   # w_lb/w_ub bound W(x)'s eigenvalues (w_lb·I ⪯ W ⪯ w_ub·I) and must stay
   # w_lb < w_ub — sweeping them as two independent flat parameters risks
   # bayes sampling an inverted/degenerate pair. A categorical parameter
