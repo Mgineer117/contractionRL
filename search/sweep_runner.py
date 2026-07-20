@@ -34,18 +34,27 @@ of a hole — which is also what makes bayes usable over a partly-infeasible
 space: the wall is an observation the surrogate can learn to avoid.
 
 Nothing in the solver path is modified; detection is pure output inspection.
-The configs pin the child to match this strictness:
+Crucially, the child's OWN config decides what counts as a terminal miss — this
+wrapper only watches for the signals that mean the child actually dropped a
+state or aborted. Strictness is a per-algorithm choice made in the config:
 
-    cm.max_lambda_reductions: 0      # no per-state λ-backoff papering over a miss
+    cm.max_lambda_reductions: 0      # strict offline: a miss can't be rescued,
+                                     #   the state drops and the ratio/rate fires
     cm.min_feasibility_rate:  1.0    # offline: child raises if ANY state is dropped
-    cm.abort_on_infeasible:   true   # online: child raises on the FIRST miss
+    cm.abort_on_infeasible:   true   # online (cvstem-lqr): raise on the FIRST miss
+
+C2RL offline runs the OPPOSITE way on purpose: ``max_lambda_reductions: 10`` lets
+a per-state λ-backoff rescue a miss, and ``min_feasibility_rate: 0.95`` tolerates
+a few genuine drops. A rescued state is feasible, so it never trips a detection
+signal — which is why the ``infeasible at λ=`` rescue WARNING is NOT a kill
+signal (see ``_HARD_MARKERS``). Only a state the child could not rescue (dropped)
+reaches the wrapper, via the ratio/rate paths.
 
 Detection signals:
   * ``CVSTEM-LQR INFEASIBLE``                            — the online abort
     (``cvstem_lqr.INFEASIBLE_MARKER``; the two must stay in sync)
   * tqdm postfix ``feasible=<k>/<i>`` with ``k < i``     — earliest offline signal,
-    fires within the first 128 states
-  * ``WARNING: state <i> infeasible at λ=...``           — λ-backoff rescue
+    fires within the first 128 states (a DROPPED, not rescued, state)
   * ``NCM synthesis: <k>/<n> states feasible`` with k<n  — end-of-solve summary
   * ``produced 0 feasible metrics`` / ``below min_feasibility_rate`` — the raises
 
@@ -82,9 +91,15 @@ _HARD_MARKERS = (
     "CVSTEMInfeasibleError",       # same, as it appears in the traceback
     "produced 0 feasible metrics",
     "below min_feasibility_rate",
-    "infeasible at λ=",
-    "infeasible at lambda=",
 )
+# NOTE: "infeasible at λ=" is deliberately NOT a hard marker. ncm_synthesis only
+# prints that line when `reductions > 0 and Wv is not None` — i.e. on a
+# SUCCESSFUL λ-backoff rescue, not a real miss. With cm.max_lambda_reductions=0
+# a genuine miss can't be rescued, so the state is dropped silently and surfaces
+# through the k<n ratio / min_feasibility_rate paths below. With
+# max_lambda_reductions>0 (c2rl offline) the rescue is the intended, healthy
+# behaviour, so killing on the warning would be a false positive. Strictness is
+# governed by max_lambda_reductions (+ min_feasibility_rate), NOT by this line.
 # tqdm postfix (`pbar.set_postfix(feasible=f"{len(xs)}/{i+1}")`) and the final
 # summary line — both carry a k/n pair that is only healthy when k == n.
 _RATIO_PATTERNS = (
