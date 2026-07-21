@@ -35,15 +35,15 @@ memory:
 
 agent:
   class: PPO
-  rollouts: 24        # num_envs=4, 300 steps → 1200 samples/update; covers ~9s episode at dt=0.03
+  rollouts: 4         # Number of environment steps per parallel environment per update
   learning_epochs: 5  # Number of gradient descent passes over the collected batch
   mini_batches: 4  # Number of subsets to divide the batch into for stochastic optimization
   discount_factor: 0.01  # Gamma discount factor weighting future rewards
-  gae_lambda: 0.95  # Lambda parameter for Generalized Advantage Estimation (GAE)
+  gae_lambda: 0.99  # Lambda parameter for Generalized Advantage Estimation (GAE)
   learning_rate: 1.0e-6    # Global step size for neural network optimization
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.01
+    kl_threshold: 0.02
   kl_threshold: 0.02 # Early stopping threshold based on Kullback-Leibler divergence
   std_dev_annealing_kwargs:
     schedule: exponential
@@ -52,11 +52,23 @@ agent:
   random_timesteps: 0
   learning_starts: 0
   grad_norm_clip: 0.5  # Maximum permitted magnitude for gradients (prevents exploding gradients)
-  ratio_clip: 0.2  # PPO trust region clipping bound for the objective ratio
+  ratio_clip: 0.3  # PPO trust region clipping bound for the objective ratio
   value_clip: 0.0  # Clipping bound for the value function update
   entropy_loss_scale: 0.0
   value_loss_scale: 0.5  # Weight coefficient for the value function loss term
   
+  # ── CAPS action smoothness (Mysore et al. 2021) ─────────────────────────── #
+  # Added to the POLICY LOSS, not the reward, so the MDP / observation layout /
+  # dynamics are all untouched. Temporal term only by default: the spatial term
+  # buys robustness to state noise and model error, which the analytically
+  # modeled classic envs do not have. Both 0.0 = off, at which the patch no-ops
+  # entirely (no hooks, no extra memory tensors). Override per-run with
+  # --caps_temporal_scale / --caps_spatial_scale / --caps_spatial_std.
+  # See agent_patches.patch_caps_regularizer.
+  caps_temporal_scale: 0.0   # weight on ||pi(s_t) - pi(s_t+1)||^2
+  caps_spatial_scale: 0.0    # weight on ||pi(s) - pi(s_bar)||^2, s_bar ~ N(s, sigma^2)
+  caps_spatial_std: 0.05     # sigma, in RAW observation units; inert while the scale is 0.0
+
   experiment:
     directory: "car_ppo"
     experiment_name: ""

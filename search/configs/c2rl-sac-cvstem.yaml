@@ -2,59 +2,80 @@ label: c2rl (rl=sac, cm=cvstem)
 algorithm: c2rl-sac
 num_envs: 64
 
+# Exhaustive grid, not bayes — see c2rl-ppo-cvstem.yaml. Every parameter below
+# must be a discrete `values:` list; build_sweep.py rejects a `distribution:`
+# under method: grid (W&B would silently drop it).
+method: grid
+
 metric:
-  # AUC, not reward. Large parts of the CV-STEM {w_lb, w_ub} x lbd x r_scaler
-  # grid are structurally infeasible, so this sweep is as much a feasibility
-  # question as a tuning one — and AUC measures the certified contraction
-  # quantity directly, on the same scale as the infeasibility poison value.
   name: "Stability/auc_mean"
   goal: minimize
 
 runner:
-  # An infeasible SDP would otherwise either grind through all 131072 per-state
-  # solves before build_cm_dataset raises, or train a full run on a CMG
-  # regressed onto a handful of surviving states. Either way the run dies or
-  # finishes WITHOUT writing the metric — and a metric-less run is simply
-  # IGNORED by bayes bookkeeping, so nothing is learned and the same dead
-  # region gets sampled again. The wrapper makes the wall a real datapoint the
-  # surrogate can learn to avoid.
   wrapper: true
-  bad_value: 10000.0
+  # Matches c2rl-ppo-cvstem.yaml. The two sweeps optimize the SAME metric, so a
+  # poison value an order of magnitude apart made their leaderboards
+  # incomparable at a glance — and inflated SAC's apparent spread.
+  bad_value: 100.0
 
 parameters:
   agent.discount_factor:
+    # Narrower than the PPO sweep's, deliberately. At gamma -> 0 SAC's critic
+    # degenerates to Q ~= r, so the policy greedily optimizes the
+    # ENTROPY-REGULARIZED one-step reward and alpha dominates the objective —
+    # a failure mode PPO does not share (GAE still yields a usable, if myopic,
+    # advantage there). Low gamma is left to the PPO sweep.
     values: [0.1, 0.3, 0.5, 0.7, 0.9, 0.99, 0.999]
-  agent.models.policy.backbone:
-    # mlp (plain MLP, u = MLP(obs)) | control (CLActor, u = uref + feedback(x-xref))
-    values: [mlp, control]
-  agent.gradient_steps:
-    values: [1, 5, 10]
-  agent.batch_size:
-    values: [128, 512, 1024]
+  # NOTE the key: `models.` — NOT `agent.models.`. train.py resolves a sweep key
+  # by splitting on '.' and walking agent_cfg from the ROOT, and `models:` is a
+  # TOP-LEVEL yaml block. The old `agent.models.policy.backbone` wrote into a
+  # dangling agent_cfg["agent"]["models"] subtree that nothing reads, so the
+  # backbone was silently never swept.
+  models.policy.backbone:
+    # SAC needs a BOUNDED action distribution — an unbounded Gaussian's log_prob
+    # has no fixed point for automatic entropy tuning. runner.py hard-rejects
+    # mlp/control for the SAC family, so only the squashed pair is valid here.
+    values: [control-squashed, mlp-squashed]
   agent.learn_entropy:
     values: [true, false]
-  agent.polyak:
-    distribution: log_uniform_values
-    min: 0.001
-    max: 1.0
-  agent.learning_rate:
-    distribution: log_uniform_values
-    min: 1.0e-4
-    max: 1.0e-2
-  
+  agent.initial_entropy_value:
+    # With learn_entropy=false this IS alpha for the whole run; with true it is
+    # only the starting point. Worth sweeping either way: alpha is weighed
+    # against the RAW Mahalanobis reward in the critic target, whose scale
+    # depends on w_lb/w_ub, so a single default cannot be right across configs.
+    values: [0.05, 0.2, 1.0]
+  # SAC has no equivalent of PPO's value normalization (rl_glue gates
+  # use_value_norm on PPO) and regresses Q on the raw, heavy-tailed Mahalanobis
+  # reward — so this matters considerably more here than on the PPO side.
+  agent.use_reward_norm:
+    values: [true, false]
   cm.control_scaler:
-    distribution: uniform
-    min: 0.0
-    max: 5.0
-  # Pinned. C2RL consumes the metric only as a REWARD (not a deployed
-  # certificate), so a little per-state λ-backoff and a <100% bar are
-  # acceptable: the offline synthesis samples the FULL uniform state box,
-  # whose far-from-reference tail (e.g. cartpole |θ|→π/3) is genuinely
-  # infeasible at λ and would otherwise fail an all-or-nothing bar even
-  # though the deployed policy rarely operates there.
+    values: [0.0, 0.1, 0.5, 1.0, 2.0, 5.0]
+  # ── CAPS action smoothness — see c2rl-ppo-cvstem.yaml ───────────────────── #
+  # Temporal term only; the spatial term is pinned off (these envs are
+  # analytically modeled and noise-free, which is what it would buy robustness
+  # against). 0.0 stays in the ladder as the regularizer-free control.
+  agent.caps_temporal_scale:
+    values: [0.0, 0.01, 0.05, 0.2, 1.0, 5.0]
+  agent.caps_spatial_scale:
+    value: 0.0
+  agent.caps_spatial_std:
+    value: 0.05   # inert while caps_spatial_scale is 0.0
+  # Pinned at the per-env yaml values. The earlier bayes sweep covered these
+  # four thoroughly and they are not what this grid is asking about; leaving
+  # them in would multiply the enumeration by ~50x. Re-open one at a time.
+  agent.gradient_steps:
+    value: 10
+  agent.batch_size:
+    value: 1024
+  agent.polyak:
+    values: [0.005, 0.1, 0.5, 1.0]
+  agent.learning_rate:
+    values: [1.0e-4, 5e-4, 1.0e-3, 5e-3, 1.0e-2]
+  # Pinned — see c2rl-ppo-cvstem.yaml for the feasibility-bar rationale.
   cm.max_lambda_reductions:
-    value: 10   # rescue an infeasible state with up to 10 λ-halvings before dropping it
+    value: 10
   cm.min_feasibility_rate:
-    value: 0.95   # tolerate up to 5% of the box still dropped after backoff
+    value: 0.95
   cm.cmg_method:
     value: cvstem

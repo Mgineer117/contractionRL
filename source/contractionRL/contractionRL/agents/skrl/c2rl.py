@@ -42,16 +42,15 @@ warning if ``cmg_memory_size`` asks for more samples than are on disk).
 
 Phase B — the single-policy rollout loop — is the same regardless of
 ``cmg_method`` (see ``C2RLSkrlTrainer``), since both hand off an identical
-frozen ``ccm_gen``:
-
-  * **SAC** overwrites each replayed transition's reward with the Mahalanobis
-    reward inside a patched ``memory.sample()`` — the frozen CMG is
-    re-evaluated per sampled mini-batch (cheap, static metric, see
-    ``_setup_frozen_cmg_sample``).
-  * **PPO** discards its on-policy rollout each update, so there is nothing to
-    cache: it computes the Mahalanobis reward over the whole fresh rollout batch
-    in ``update_policy`` and overwrites that rollout's rewards right before the
-    PPO update.
+frozen ``ccm_gen``. The reward is NOT overwritten anywhere on the agent side:
+``C2RLSkrlTrainer.train`` injects the frozen CMG into the env itself
+(``_inject_ccm`` → the env's ``set_ccm``), and from then on the env's own
+``get_rewards()`` returns the Mahalanobis reward natively. So the reward that
+reaches ``record_transition`` — and therefore PPO's GAE and SAC's replayed
+critic target alike — is already the right one, with no per-algorithm reward
+plumbing to keep in sync. That injection is a hard requirement, not a best
+effort: ``_inject_ccm`` raises if no env accepted the CMG, since silently
+missing it means training on the plain baseline reward instead.
 
 Normalization: the CMG metric / CM SDP and the Mahalanobis reward always use
 RAW observations — ``M(x)`` and the tracking error ``e = x - xref`` are defined
@@ -129,6 +128,13 @@ class C2RLPPOCfg(AgentCfg):
     use_reward_norm: bool = False  # non-biasing running-std reward normalizer (r/std) — see rl_glue.make_base_rl_cfg
     rewards_shaper_scale: float = 1.0  # yaml convenience for PPO_CFG's rewards_shaper — see rl_glue.make_base_rl_cfg
     std_dev_annealing_kwargs: dict | None = None  # forwarded to patch_ppo_std_annealing()
+    # CAPS action-smoothness regularization on the POLICY LOSS (both 0 = off).
+    # Not a reward term: it leaves the MDP, the observation and the dynamics
+    # untouched, so the offline CV-STEM synthesis stays valid. See
+    # agent_patches.patch_caps_regularizer.
+    caps_temporal_scale: float = 0.0  # weight on ||pi(s_t) - pi(s_{t+1})||^2
+    caps_spatial_scale: float = 0.0   # weight on ||pi(s) - pi(s_bar)||^2, s_bar ~ N(s, sigma^2)
+    caps_spatial_std: float = 0.05    # sigma, in RAW observation units (see patch_caps_regularizer)
     # Set by ContractionRunner from the yaml `memory:` block's memory_size, NOT
     # read from `agent:` directly; declared purely so filter_cfg_fields()
     # recognizes it instead of warning.
@@ -271,7 +277,11 @@ class C2RLPPOCfg(AgentCfg):
 @dataclass
 class C2RLSACCfg(AgentCfg):
     """C2RL config for base_algorithm="SAC". SAC fields mirror skrl's SAC_CFG."""
-    rollouts: int = 16  # not a real SAC_CFG field — sizes the RandomMemory buffer (see C2RLAgent)
+    # Not a real SAC_CFG field, and NOT the replay buffer size (that's
+    # memory_size): it's how many env steps C2RLSkrlTrainer takes per outer
+    # iteration, i.e. the cadence of the outer agent's checkpoint/flush pass.
+    # SAC still updates every single step within that chunk.
+    rollouts: int = 16
     gradient_steps: int = 1
     batch_size: int = 64
     polyak: float = 0.005
@@ -287,6 +297,10 @@ class C2RLSACCfg(AgentCfg):
     use_reward_norm: bool = False  # non-biasing running-std reward normalizer (r/std) — see rl_glue.make_base_rl_cfg
     rewards_shaper_scale: float = 1.0  # yaml convenience for SAC_CFG's rewards_shaper — see rl_glue.make_base_rl_cfg
     std_dev_annealing_kwargs: dict | None = None  # forwarded to patch_ppo_std_annealing()
+    # CAPS action-smoothness regularization — see C2RLPPOCfg / patch_caps_regularizer.
+    caps_temporal_scale: float = 0.0
+    caps_spatial_scale: float = 0.0
+    caps_spatial_std: float = 0.05
     memory_size: int = -1
     discount_factor: float = 0.99
     # ── Metric source: ALWAYS a frozen CMG network — cmg_method selects how it's
@@ -453,18 +467,19 @@ class C2RLAgent(Agent):
                 )
 
         # ── Phase B: a real skrl PPO/SAC agent for the deployed policy ───── #
+        # PPO's memory holds exactly one on-policy rollout chunk. SAC's is a
+        # persistent replay buffer, sized per-parallel-env (memory_size rows ×
+        # num_envs) so Isaac Sim's 1000+ envs don't multiply skrl's usual ~1M
+        # default up to an OOM; memory_size=-1 falls back to a modest default.
+        _DEFAULT_SAC_BUFFER_ROWS = 10000
         if self._base_algorithm == "PPO":
             mem_size = parsed_cfg.rollouts
         else:
-            # A per-parallel-env buffer, so Isaac Sim's 1000+ envs don't try to
-            # allocate skrl's usual ~1M default × num_envs and OOM.
             mem_size = parsed_cfg.memory_size
             if mem_size == -1:
-                mem_size = 10000
+                mem_size = _DEFAULT_SAC_BUFFER_ROWS
         memory = RandomMemory(memory_size=mem_size, num_envs=num_envs, device=device)
         self._memory = memory
-
-
 
         rl_kwargs = dict(
             observation_space=observation_space,
@@ -500,12 +515,21 @@ class C2RLAgent(Agent):
         self._rl_agent = BaseRLAgent(cfg=base_cfg, models=rl_models, memory=memory, **rl_kwargs)
 
         from contractionRL.agents.skrl.agent_patches import (
+            patch_caps_regularizer,
             patch_kl_logging,
             patch_ppo_std_annealing,
             patch_sac_entropy_clamp,
         )
         patch_kl_logging(self._rl_agent)
         patch_sac_entropy_clamp(self._rl_agent)
+        # Applied to the INNER PPO/SAC sub-agent: C2RL's outer agent has no
+        # .policy/.scaler of its own for the patch to hook.
+        patch_caps_regularizer(
+            self._rl_agent,
+            temporal_scale=parsed_cfg.caps_temporal_scale,
+            spatial_scale=parsed_cfg.caps_spatial_scale,
+            spatial_std=parsed_cfg.caps_spatial_std,
+        )
         _std_dev_annealing_kwargs = parsed_cfg.std_dev_annealing_kwargs
         # Always anneal for PPO, regardless of the policy's backbone — SAC keeps
         # this off since it learns log_std via its own automatic entropy tuning
@@ -567,48 +591,48 @@ class C2RLAgent(Agent):
     # ── skrl Agent interface ────────────────────────────────────────────── #
 
     def act(self, observations, states, *, timestep: int, timesteps: int):
+        """Evaluation entry point (play.py / train_utils' rollouts call this).
+
+        Goes to the policy MODEL rather than delegating to ``self._rl_agent.act``
+        so a nonzero ``random_timesteps`` can't turn an eval rollout — which
+        always passes ``timestep=0`` — into uniform random actions. The
+        observation preprocessor is applied by hand for the same reason it is
+        applied inside the sub-agent's own act(): skipping it would evaluate the
+        policy on a different input scale than it was trained on whenever
+        ``use_state_norm`` is enabled (it is off in every shipped config, so
+        this is identity today).
+        """
         with torch.no_grad():
-            result = self._rl_agent.models["policy"].act({"observations": observations}, role="policy")
-            actions = result[0]
-            outputs = result[-1] if len(result) > 2 else result[1]
+            inputs = {"observations": self._rl_agent._observation_preprocessor(observations)}
+            actions, outputs = self._rl_agent.models["policy"].act(inputs, role="policy")
         return actions, outputs
 
+    # act/pre_interaction/post_interaction/update are all abstract on skrl's
+    # Agent, so they must be defined even where the base behavior is all we
+    # want. record_transition is NOT abstract and we add nothing to it, so it's
+    # left inherited. C2RLSkrlTrainer drives the actual Phase B update itself
+    # (see update_policy), so update() here stays a no-op.
     def pre_interaction(self, *, timestep: int, timesteps: int) -> None:
         pass
-
-    def record_transition(
-        self, *, observations, states, actions, rewards, next_observations,
-        next_states, terminated, truncated, infos, timestep, timesteps,
-    ) -> None:
-        super().record_transition(
-            observations=observations, states=states, actions=actions,
-            rewards=rewards, next_observations=next_observations,
-            next_states=next_states, terminated=terminated, truncated=truncated,
-            infos=infos, timestep=timestep, timesteps=timesteps,
-        )
 
     def post_interaction(self, *, timestep: int, timesteps: int) -> None:
         super().post_interaction(timestep=timestep, timesteps=timesteps)
 
     def update(self, *, timestep: int, timesteps: int) -> None:
-        # C2RLSkrlTrainer drives update_policy (Phase B) directly.
         pass
 
     # ── Phase B update ──────────────────────────────────────────────────── #
 
-    def update_policy(
-        self, *, timestep: int, timesteps: int,
-    ) -> dict:
-        """Drive the base RL agent's update.
+    def update_policy(self, *, timestep: int, timesteps: int) -> None:
+        """Drive the inner RL agent's update, once per trainer rollout chunk.
 
-        The Mahalanobis reward is computed directly by the env's get_rewards()
-        (via the injected frozen CCM), so no reward overwrite is needed here.
-        PPO: call update() once per rollout chunk.
-        SAC: no-op (post_interaction drives the gradient step).
+        PPO consumes a whole on-policy chunk at a time, so its update belongs
+        here. SAC updates every step, driven by its own ``post_interaction`` —
+        nothing to do. Neither branch touches rewards: the env already returns
+        the Mahalanobis reward (see the module docstring).
         """
         if self._base_algorithm == "PPO":
             self._rl_agent.update(timestep=timestep, timesteps=timesteps)
-        return {}
 
     def _train_dynamics(self, data: dict) -> float:
         """MSE training of NeuralDynamics on (x, u, x_dot) data (same as C3M).
@@ -916,6 +940,45 @@ class C2RLSkrlTrainer(Trainer):
             elif isinstance(v, (int, float)):
                 agent.track_data(key, float(v))
 
+    @staticmethod
+    def _inject_ccm(env, agent) -> None:
+        """Hand a frozen copy of the synthesized CMG to the env(s) so their own
+        ``get_rewards()`` returns the Mahalanobis reward natively (see the
+        module docstring — this is the ONLY reward path).
+
+        Raises if no env accepted it: a missing ``set_ccm`` means the run would
+        silently train on the plain baseline reward, which is exactly the
+        classic-vs-isaaclab parity bug this guard exists to prevent. A DEEPCOPY,
+        not the agent's own module, so the env holds a stable frozen metric even
+        if the agent's ``_ccm_gen`` were ever touched again.
+        """
+        import copy
+
+        # Peel wrappers down to the concrete env: first the ._env chain
+        # (BatchedGymnasiumWrapper etc.), then gymnasium's .unwrapped.
+        inner = env
+        while hasattr(inner, "_env") and getattr(inner, "_env") is not inner:
+            inner = inner._env
+        while hasattr(inner, "unwrapped") and getattr(inner, "unwrapped") is not inner:
+            inner = inner.unwrapped
+
+        device = agent.device
+        ccm = copy.deepcopy(agent._ccm_gen).to(device)
+        # A classic SyncVectorEnv exposes per-env instances via .envs; an Isaac
+        # env is a single batched env that takes set_ccm directly.
+        targets = list(getattr(inner, "envs", [])) or [inner]
+        injected = 0
+        for e in targets:
+            e = e.unwrapped if hasattr(e, "unwrapped") else e
+            if hasattr(e, "set_ccm"):
+                e.set_ccm(ccm, agent._cfg.w_lb, device)
+                injected += 1
+        if injected == 0:
+            raise RuntimeError(
+                "[C2RL] no env accepted set_ccm — Phase B would train on the plain "
+                f"baseline reward instead of the Mahalanobis one. Env type: {type(inner).__name__}."
+            )
+
     def train(self) -> None:
         agent: C2RLAgent = self.agents if not isinstance(self.agents, list) else self.agents[0]
         env = self.env
@@ -958,25 +1021,7 @@ class C2RLSkrlTrainer(Trainer):
         rl_agent.enable_training_mode(True)
         rollout_steps = agent._cfg.rollouts
 
-        # Inject the frozen CMG into each sub-env so get_rewards() uses
-        # the Mahalanobis reward natively.
-        _env = env
-        while hasattr(_env, "_env") and getattr(_env, "_env") is not _env:
-            _env = getattr(_env, "_env")
-        while hasattr(_env, "unwrapped") and getattr(_env, "unwrapped") is not _env:
-            _env = getattr(_env, "unwrapped")
-
-        import copy
-        env_device = agent.device
-        env_ccm = copy.deepcopy(agent._ccm_gen).to(env_device)
-
-        if hasattr(_env, "envs"):
-            for e in _env.envs:
-                inner = e.unwrapped if hasattr(e, "unwrapped") else e
-                if hasattr(inner, "set_ccm"):
-                    inner.set_ccm(env_ccm, agent._cfg.w_lb, env_device)
-        elif hasattr(_env, "set_ccm"):
-            _env.set_ccm(env_ccm, agent._cfg.w_lb, env_device)
+        self._inject_ccm(env, agent)
 
         observations, infos = env.reset()
         states = env.state() if hasattr(env, "state") else None

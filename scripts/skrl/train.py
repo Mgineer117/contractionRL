@@ -50,6 +50,19 @@ parser.add_argument("--use_empirical_dynamics", "--use-empirical-dynamics",
                     action="store_true", default=False,
                     help="Use a learned NeuralDynamics model instead of the env's exact analytical get_f_and_B "
                          "(classic envs only). When NOT passed, C3M/C2RL use analytical dynamics.")
+parser.add_argument("--caps_temporal_scale", "--caps-temporal-scale", type=float, default=None,
+                    help="CAPS temporal action-smoothness weight on ||pi(s_t) - pi(s_t+1)||^2, added "
+                         "to the POLICY LOSS (not the reward — the MDP/observation/dynamics are "
+                         "untouched, so the CV-STEM certificate stays valid). Overrides the yaml "
+                         "agent.caps_temporal_scale. 0 (default) disables it. "
+                         "See agent_patches.patch_caps_regularizer.")
+parser.add_argument("--caps_spatial_scale", "--caps-spatial-scale", type=float, default=None,
+                    help="CAPS spatial action-smoothness weight on ||pi(s) - pi(s_bar)||^2 with "
+                         "s_bar ~ N(s, caps_spatial_std^2) — penalizes policy state-gain rather "
+                         "than chatter. Overrides the yaml agent.caps_spatial_scale.")
+parser.add_argument("--caps_spatial_std", "--caps-spatial-std", type=float, default=None,
+                    help="Sigma for the CAPS spatial perturbation, in the units the policy sees "
+                         "in RAW observation units. Overrides the yaml agent.caps_spatial_std.")
 parser.add_argument("--eig_reshape", "--eig-reshape", type=float, default=None,
                     help="ABLATION (c2rl_ppo classic only): reshape the Mahalanobis reward's M "
                          "eigenvalue SPREAD to this target cond(M), keeping eigenvectors and "
@@ -154,7 +167,7 @@ from datetime import datetime
 
 import gymnasium as gym
 import yaml
-from train_utils import _default_num_envs_classic, _inject_angle_idx, _generate_ref_trajs, _evaluate_classic_path_tracking, _evaluate_best_model
+from train_utils import _default_num_envs_classic, _inject_angle_idx, _generate_ref_trajs, _evaluate_classic_path_tracking, _evaluate_best_model, _resolve_caps_kwargs
 
 algorithm = args_cli.algorithm.lower()
 # Bare "c2rl" (no -ppo/-sac suffix) defaults to the PPO variant, since it has
@@ -360,7 +373,20 @@ if _is_classic:
         from wandb_plot_wrapper import WandbPlotWrapper
         env = WandbPlotWrapper(env, total_timesteps=agent_cfg["trainer"]["timesteps"])
 
+        # C2RL applies the CAPS patch itself, off its own cfg fields — this just
+        # folds any --caps_* override back into the dict it will read.
+        _resolve_caps_kwargs(agent_cfg, args_cli, pop=False)
+
         runner = ContractionRunner(env, agent_cfg, task_id=args_cli.task, num_envs=num_envs, is_classic=True)
+        # Best-checkpoint metric split (same rule as the Isaac route): c3m/cvstem-lqr
+        # pick best_agent.pt by contraction_score; lqr/sdlqr/c2rl by AUC. See
+        # best_metric_for. Without this, classic runs fell back to skrl's raw-reward
+        # default for "best".
+        from contractionRL.agents.skrl.agent_patches import (
+            patch_auc_checkpoint as _patch_auc_checkpoint,
+            best_metric_for as _best_metric_for,
+        )
+        _patch_auc_checkpoint(runner.agent, metric=_best_metric_for(algorithm))
         if args_cli.checkpoint:
             runner.load(args_cli.checkpoint)
         runner.run()
@@ -433,17 +459,27 @@ if _is_classic:
             agent_cfg.get("models", {}).get("policy", {}).get("backbone") in CONTROL_BACKBONES
         )
 
+        # Read (and remove) the caps_* keys BEFORE Runner builds a PPO_CFG/SAC_CFG
+        # from this dict — see _resolve_caps_kwargs.
+        _caps = _resolve_caps_kwargs(agent_cfg, args_cli, pop=True)
+
         runner = Runner(env, agent_cfg)
         from contractionRL.agents.skrl.agent_patches import (
             patch_algo_namespace as _patch_algo_namespace,
+            patch_caps_regularizer as _patch_caps_regularizer,
             patch_kl_logging as _patch_kl_logging,
             patch_ppo_std_annealing as _patch_ppo_std_annealing,
             patch_sac_entropy_clamp as _patch_sac_entropy_clamp,
+            patch_auc_checkpoint as _patch_auc_checkpoint,
         )
         _patch_kl_logging(runner.agent)
         _patch_sac_entropy_clamp(runner.agent)
         _patch_ppo_std_annealing(runner.agent, _std_dev_annealing, _std_dev_annealing_kwargs)
+        _patch_caps_regularizer(runner.agent, **_caps)
         _patch_algo_namespace(runner.agent, algorithm.upper())
+        # Standalone PPO/SAC pick best_agent.pt by AUC (learned RL policies never
+        # certify a contraction_score). See best_metric_for / the Isaac route.
+        _patch_auc_checkpoint(runner.agent, metric="auc")
         if args_cli.checkpoint:
             runner.agent.load(args_cli.checkpoint)
         runner.run()
@@ -790,6 +826,11 @@ else:
             agent_cfg.get("models", {}).get("policy", {}).get("backbone") in CONTROL_BACKBONES
         )
 
+        # C2RL reads the caps_* keys off its own cfg dataclass, so they must stay
+        # in the dict there; skrl's Runner would reject them, so they are popped
+        # on the standalone branch. See _resolve_caps_kwargs.
+        _caps = _resolve_caps_kwargs(agent_cfg, args_cli, pop=_alg not in _CONTRACTION_ALGOS)
+
         if _alg in _CONTRACTION_ALGOS:
             from contractionRL.runners import ContractionRunner
             # Isaac envs have no closed-form dynamics, so they ALWAYS learn a
@@ -803,25 +844,29 @@ else:
 
         from contractionRL.agents.skrl.agent_patches import (
             patch_algo_namespace as _patch_algo_namespace,
+            patch_caps_regularizer as _patch_caps_regularizer,
             patch_kl_logging as _patch_kl_logging,
             patch_ppo_std_annealing as _patch_ppo_std_annealing,
             patch_sac_entropy_clamp as _patch_sac_entropy_clamp,
             patch_auc_checkpoint as _patch_auc_checkpoint,
+            best_metric_for as _best_metric_for,
         )
         # No-ops for C2RL's outer agent (it has no .policy/.scheduler/.entropy_optimizer
-        # of its own) — C2RLAgent applies these directly to its con_agent/opt_agent
-        # sub-agents internally (see c2rl.py), which is where they actually matter.
+        # of its own) — C2RLAgent applies these directly to its inner PPO/SAC
+        # sub-agent internally (see c2rl.py), which is where they actually matter.
         _patch_kl_logging(runner.agent)
         _patch_sac_entropy_clamp(runner.agent)
         _patch_ppo_std_annealing(runner.agent, _std_dev_annealing, _std_dev_annealing_kwargs)
+        _patch_caps_regularizer(runner.agent, **_caps)
         if _alg not in _CONTRACTION_ALGOS:
             # C3M/C2RL/LQR/SD-LQR already namespace their own track_data() keys
-            # ("Loss / C3M/...", "Loss / C2RL/...", "Con / "/"Opt / " wrapping);
-            # this is standalone PPO/SAC's equivalent (see patch_algo_namespace).
+            # ("Loss / C3M/...", "Loss / C2RL/...", etc.); this is standalone
+            # PPO/SAC's equivalent (see patch_algo_namespace).
             _patch_algo_namespace(runner.agent, _alg.upper())
 
-        # All agents should use AUC if available.
-        _patch_auc_checkpoint(runner.agent)
+        # Best-checkpoint metric split: c3m/cvstem-lqr pick by contraction_score,
+        # every other algorithm (ppo/sac/c2rl/lqr/sdlqr) by AUC. See best_metric_for.
+        _patch_auc_checkpoint(runner.agent, metric=_best_metric_for(_alg))
 
         if _alg in _CONTRACTION_ALGOS and hasattr(runner.agent, "policy") and hasattr(runner.agent.policy, "cl_actor"):
             _orig_post = runner.agent.post_interaction

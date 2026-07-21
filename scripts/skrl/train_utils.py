@@ -60,6 +60,42 @@ def _inject_angle_idx(agent_cfg: dict, angle_idx: list) -> None:
 
 
 
+def _resolve_caps_kwargs(agent_cfg: dict, args_cli, *, pop: bool) -> dict:
+    """Resolve CAPS coefficients from ``agent:`` yaml, overridden by ``--caps_*``.
+
+    Shared by both of train.py's routes (classic ``--classic`` and Isaac Lab) and
+    by both agent families, so one flag means the same thing everywhere. Returns
+    kwargs for ``agent_patches.patch_caps_regularizer``.
+
+    ``pop=True`` for the STANDALONE PPO/SAC route: there ``agent_cfg["agent"]``
+    is handed to skrl's Runner, which builds a PPO_CFG/SAC_CFG from it and
+    rejects unknown fields — so the caps_* keys have to leave the dict once
+    read, and the caller applies the returned kwargs itself.
+
+    ``pop=False`` for the C2RL route: C2RL declares caps_* as real fields on
+    C2RLPPOCfg/C2RLSACCfg and applies the patch to its own inner PPO/SAC
+    sub-agent, so the keys stay — and any ``--caps_*`` override is written BACK
+    into the dict, which is the only way the flag reaches that route at all.
+
+    Sweeps set these through ``agent.caps_*`` (see search/configs/); the CLI
+    flags are for one-off runs and win over the yaml when passed.
+    """
+    block = agent_cfg.get("agent", {})
+    read = block.pop if pop else block.get
+    kwargs = {}
+    for flag, key, default in (("caps_temporal_scale", "temporal_scale", 0.0),
+                               ("caps_spatial_scale", "spatial_scale", 0.0),
+                               ("caps_spatial_std", "spatial_std", 0.05)):
+        value = read(flag, default)
+        override = getattr(args_cli, flag, None)
+        if override is not None:
+            value = override
+            if not pop:
+                block[flag] = value
+        kwargs[key] = float(value)
+    return kwargs
+
+
 def _max_step_reward(robot: str, env_cfg) -> float:
     """Best-case per-step reward for a vel-tracking env's reward function.
 

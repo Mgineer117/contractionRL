@@ -2,6 +2,14 @@ label: c2rl (rl=ppo, cm=cvstem)
 algorithm: c2rl-ppo
 num_envs: 1024
 
+# Exhaustive grid, not bayes. The remaining axes are few and mostly categorical
+# (reward normalization on/off, CAPS coefficients), and the earlier bayes runs
+# had already collapsed the PPO trust-region knobs — so what is left is a
+# question of coverage, not of surrogate-guided exploration. Every parameter
+# below must therefore be a discrete `values:` list; build_sweep.py rejects a
+# `distribution:` under method: grid (W&B would silently drop it).
+method: grid
+
 metric:
   # AUC, not reward. Large parts of the CV-STEM {w_lb, w_ub} x lbd x r_scaler
   # grid are structurally infeasible, so this sweep is as much a feasibility
@@ -16,31 +24,44 @@ runner:
   # regressed onto a handful of surviving states. Either way the run dies or
   # finishes WITHOUT writing the metric — and a metric-less run is simply
   # IGNORED by bayes bookkeeping, so nothing is learned and the same dead
-  # region gets sampled again. The wrapper makes the wall a real datapoint the
-  # surrogate can learn to avoid.
+  # region gets sampled again. The wrapper makes the wall a real datapoint.
   wrapper: true
   bad_value: 100.0
 
+# NOTE — the PPO trust-region block (rollouts, gae_lambda, ratio_clip,
+# std_dev_annealing_kwargs.schedule, learning_rate_scheduler_kwargs.kl_threshold)
+# and models.policy.backbone are NO LONGER SWEPT: that search concluded and its
+# result is pinned in the per-env yaml (rollouts 4, gae_lambda 0.99, ratio_clip
+# 0.3, exponential annealing, kl_threshold 0.02, backbone control). Re-add them
+# here only to re-open that question.
 parameters:
   agent.discount_factor:
     values: [0.1, 0.3, 0.5, 0.7, 0.9, 0.99, 0.999]
-  agent.models.policy.backbone:
-    # mlp (plain MLP, u = MLP(obs)) | control (CLActor, u = uref + feedback(x-xref))
-    values: [mlp, control]
-  agent.rollouts:
-    values: [4, 12, 24, 36]
-  agent.gae_lambda:
-    values: [0.9, 0.95, 0.975, 1.0]
-  agent.ratio_clip:
-    values: [0.1, 0.2, 0.3]
-  agent.std_dev_annealing_kwargs.schedule:
-    values: [exponential, linear]
+  # Non-biasing running-std reward normalizer (r/std, no centering). The
+  # Mahalanobis reward's scale swings with w_lb/w_ub across the state box, and
+  # PPO's advantage normalization only partly absorbs that — see rl_glue.
+  agent.use_reward_norm:
+    values: [true, false]
   cm.control_scaler:
-    distribution: uniform
-    min: 0.0
-    max: 5.0
-  agent.learning_rate_scheduler_kwargs.kl_threshold:
-    values: [0.01, 0.02, 0.03, 0.05, 0.1]
+    values: [0.0, 0.1, 0.5, 1.0, 2.0, 5.0]
+  # ── CAPS action smoothness (policy-loss regularizer, NOT a reward term) ──── #
+  # Only the TEMPORAL term ||pi(s_t) - pi(s_t+1)||^2 is searched. CAPS' own
+  # paper notes that temporal smoothness alone "would likely be sufficient for
+  # the desired control smoothness in well-modeled environments": the spatial
+  # term ||pi(s) - pi(s_bar)||^2 buys robustness to state NOISE and model
+  # error, and the classic envs are analytically modeled and noise-free. So
+  # caps_spatial_scale is pinned at 0.0 — patch_caps_regularizer then skips
+  # that forward pass entirely, and caps_spatial_std below is inert. Re-open it
+  # by giving it a values list. 0.0 stays in the temporal ladder so the grid
+  # always contains the regularizer-free control condition (at which the patch
+  # no-ops completely — no hooks, no extra memory tensors).
+  # See agent_patches.patch_caps_regularizer.
+  agent.caps_temporal_scale:
+    values: [0.0, 0.01, 0.05, 0.2, 1.0, 5.0]
+  agent.caps_spatial_scale:
+    value: 0.0
+  agent.caps_spatial_std:
+    value: 0.05   # inert while caps_spatial_scale is 0.0
   # Pinned. C2RL consumes the metric only as a REWARD (not a deployed
   # certificate), so a little per-state λ-backoff and a <100% bar are
   # acceptable: the offline synthesis samples the FULL uniform state box,

@@ -195,6 +195,16 @@ class StatManagerEnvWrapper:
         self._traj_xref_buf = None
         self._recent_trajs = ({}, {}, {})
 
+        # Action volatility (see _track_action_volatility). Lazily allocated on
+        # the first step, from the action tensor's own shape/device — the action
+        # dimension is not among the attributes _ensure_stats can discover.
+        self._prev_action = None
+        self._prev_done = None
+        self._vol_sum = None
+        self._vol_count = None
+        self._episode_volatility = None
+        self._episode_volatility_seen = None
+
     def __getattr__(self, name):
         if name == "env":
             raise AttributeError(name)
@@ -475,13 +485,112 @@ class StatManagerEnvWrapper:
         if self._initialized:
             self._tracking_env_ids.fill_(-1)
             self._completed_slots.fill_(False)
+        self._reset_action_volatility()
         o = self._obs_tensor(obs)
         if o is not None:
             self._record(o, info if isinstance(info, dict) else None)
         return obs, info
 
+    def _reset_action_volatility(self) -> None:
+        """Drop every in-flight action-volatility accumulator.
+
+        Mirrors what reset() does to the eval slots: an external reset breaks
+        the action sequence, so any partially accumulated episode would splice
+        pre- and post-reset actions into one average. Completed per-episode
+        values are KEPT — they are already-finished measurements, and the
+        summary would otherwise go empty (and the key silently vanish from
+        wandb) after every external reset.
+        """
+        self._prev_action = None
+        self._prev_done = None
+        if self._vol_sum is not None:
+            self._vol_sum.zero_()
+            self._vol_count.zero_()
+
+    def _track_action_volatility(self, action, terminated, truncated) -> None:
+        """Accumulate per-step ``||u_t - u_{t-1}||_2`` into per-episode means.
+
+        This is a MEASUREMENT of the deployed action sequence, not a penalty —
+        it is the executed action (exploration noise included), whereas CAPS'
+        temporal term regularizes the policy MEAN over sampled states. The two
+        are deliberately different quantities: this one is what the actuator
+        actually sees, so it stays meaningful for algorithms with no CAPS term
+        at all and is the thing to read when asking whether a policy is
+        physically deployable.
+
+        AUTORESET. Both env families reset done envs INSIDE ``step()`` and
+        return the fresh episode's first observation (see ``_init_flags``), so
+        the action taken on the step AFTER a done is computed from an unrelated
+        initial state. Differencing across that boundary would report a large
+        spurious jump whose size depends on the reset distribution rather than
+        on the policy. Pairs are therefore skipped whenever the PREVIOUS step
+        terminated or truncated for that env — which is also why the previous
+        done flags are carried on ``_prev_done`` rather than read from the
+        current step.
+
+        Units are raw action units per step (NOT per second): dividing by dt
+        would make the number depend on the integrator step, and dt is fixed
+        within an env anyway. Compare across configs of one env, not across
+        envs with different dt.
+        """
+        if not torch.is_tensor(action):
+            return
+        a = action.detach().reshape(action.shape[0], -1).float()
+        n = a.shape[0]
+
+        done = (terminated | truncated) if torch.is_tensor(terminated) else None
+        done = torch.zeros(n, dtype=torch.bool, device=a.device) if done is None \
+            else done.detach().reshape(-1).to(a.device)
+
+        if self._vol_sum is None or self._vol_sum.shape[0] != n:
+            z = torch.zeros(n, dtype=torch.float32, device=a.device)
+            self._vol_sum, self._vol_count = z.clone(), z.clone()
+            self._episode_volatility = z.clone()
+            self._episode_volatility_seen = torch.zeros(n, dtype=torch.bool, device=a.device)
+            self._prev_action, self._prev_done = None, None
+
+        if self._prev_action is not None and self._prev_action.shape == a.shape:
+            valid = ~self._prev_done                      # skip pairs across a reset
+            step_delta = (a - self._prev_action).norm(dim=-1)
+            self._vol_sum += torch.where(valid, step_delta, torch.zeros_like(step_delta))
+            self._vol_count += valid.float()
+
+        # Finalize the episodes that ended on THIS step, then clear their
+        # accumulators so the next episode starts from zero.
+        if bool(done.any()):
+            finished = done & (self._vol_count > 0)
+            if bool(finished.any()):
+                mean_delta = self._vol_sum / self._vol_count.clamp(min=1.0)
+                self._episode_volatility = torch.where(
+                    finished, mean_delta, self._episode_volatility)
+                self._episode_volatility_seen |= finished
+            self._vol_sum = torch.where(done, torch.zeros_like(self._vol_sum), self._vol_sum)
+            self._vol_count = torch.where(done, torch.zeros_like(self._vol_count), self._vol_count)
+
+        self._prev_action = a.clone()
+        self._prev_done = done
+
+    def _action_volatility_summary(self) -> dict[str, float]:
+        """``action_volatility_{mean,ci95,max}`` over envs with a finished episode.
+
+        Returns {} until at least one episode has completed, so the key is
+        ABSENT rather than zero — same rule the step() gate applies to the
+        other stability metrics, and for the same reason: skrl's write_interval
+        averages its window, so a placeholder would blend into the real value.
+        """
+        if self._episode_volatility_seen is None or not bool(self._episode_volatility_seen.any()):
+            return {}
+        v = self._episode_volatility[self._episode_volatility_seen].detach().cpu().numpy()
+        m, ci = mean_confidence_interval(v)
+        return {
+            "action_volatility_mean": m,
+            "action_volatility_ci95": ci,
+            "action_volatility_max": float(np.max(v)),
+        }
+
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
+        self._track_action_volatility(action, terminated, truncated)
         o = self._obs_tensor(obs)
         if o is not None:
             self._record(o, info if isinstance(info, dict) else None)
@@ -514,6 +623,10 @@ class StatManagerEnvWrapper:
     def stability_summary(self) -> dict[str, float]:
         if not self._initialized:
             return {}
+        # Measured from actions alone, so it needs none of the buffer machinery
+        # below — merged in only once an episode has finished (see
+        # _action_volatility_summary).
+        volatility = self._action_volatility_summary()
         # Every metric carries the "{name}_mean"/"{name}_ci95" key shape that
         # track_stability_summary documents and patch_auc_checkpoint
         # (agent_patches.py) looks up. C is a single shared scalar, so its
@@ -527,6 +640,7 @@ class StatManagerEnvWrapper:
             "overshoot_ci95": 0.0,
             "contraction_score_mean": self._recent_score_mean,
             "contraction_score_ci95": self._recent_score_ci95,
+            **volatility,
         }
 
     def trajectories(self):

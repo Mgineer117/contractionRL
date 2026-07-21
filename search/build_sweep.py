@@ -110,7 +110,47 @@ def load_config(algorithm: str) -> dict:
                 f"{path}: metric.goal is maximize, so runner.bad_value must be a LARGE "
                 f"NEGATIVE number (got {bad}) — otherwise infeasible trials rank as the best."
             )
+    assert_method_compatible(cfg, path)
     return cfg
+
+
+def assert_method_compatible(cfg: dict, path) -> None:
+    """Reject a ``method: grid`` config that still declares a continuous range.
+
+    W&B's grid search enumerates the CROSS PRODUCT of discrete value lists; it
+    has no way to enumerate a ``distribution:``. Given one, the controller does
+    not error — it silently drops that parameter, so the sweep runs a grid over
+    everything else with the continuous knob pinned at its yaml default and
+    nobody notices the dimension went missing. Catch it at build time instead.
+    """
+    if str(cfg.get("method", "")).lower() != "grid":
+        return
+    continuous = sorted(
+        name for name, spec in (cfg.get("parameters") or {}).items()
+        if isinstance(spec, dict) and "distribution" in spec
+    )
+    if continuous:
+        raise SystemExit(
+            f"{path}: method is 'grid' but these parameters declare a continuous "
+            f"distribution, which grid search cannot enumerate (they would be "
+            f"silently dropped): {continuous}. Give each an explicit 'values:' "
+            f"list, or switch the config back to method: bayes."
+        )
+
+
+def grid_size(cfg: dict) -> int:
+    """Number of trials a ``method: grid`` sweep will enumerate (0 if not grid).
+
+    Printed by ``--count`` so an accidentally combinatorial grid is visible
+    BEFORE launch rather than after a week of agents chewing through it.
+    """
+    if str(cfg.get("method", "")).lower() != "grid":
+        return 0
+    total = 1
+    for spec in (cfg.get("parameters") or {}).values():
+        if isinstance(spec, dict) and "values" in spec:
+            total *= max(1, len(spec["values"]))
+    return total
 
 
 def episode_length(env: str) -> int:
@@ -195,7 +235,11 @@ def build(algorithm: str, env: str, *, method: str, project: str) -> dict:
         # single place instead of being scattered across per-launch projects.
         "project": project,
         "name": f"{env}-{algorithm}",
-        "method": method,
+        # The config's own `method:` wins over the CLI default: whether a search
+        # space is enumerable at all is a property of that space (grid needs
+        # every parameter discrete — see assert_method_compatible), not of how
+        # the sweep happened to be launched.
+        "method": str(cfg.get("method", method)),
         "metric": cfg["metric"],
         "parameters": cfg["parameters"],
         "command": command,
@@ -207,12 +251,21 @@ def main() -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--algorithm", required=True, choices=available_algorithms())
     parser.add_argument("--env", required=True, choices=[*CLASSIC_ENVS, *ISAACLAB_ENVS])
-    parser.add_argument("--method", default="bayes", choices=["bayes", "grid", "random"])
+    parser.add_argument("--method", default="bayes", choices=["bayes", "grid", "random"],
+                        help="Fallback only — a config that sets its own `method:` overrides this.")
+    parser.add_argument("--count", action="store_true",
+                        help="Print the number of trials a grid sweep enumerates, then exit.")
     parser.add_argument("--project", default=DEFAULT_PROJECT,
                         help=f"W&B project for this sweep (default {DEFAULT_PROJECT}). Sweeps are "
                              "distinguished by their NAME (env-algorithm), not by project.")
     parser.add_argument("--out", default="-", help="Output path, or '-' for stdout.")
     args = parser.parse_args()
+
+    if args.count:
+        size = grid_size(load_config(args.algorithm))
+        print(f"{args.algorithm}: {size} grid trials" if size
+              else f"{args.algorithm}: not a grid sweep (method is not 'grid')")
+        return 0
 
     sweep = build(args.algorithm, args.env, method=args.method, project=args.project)
     text = yaml.safe_dump(sweep, sort_keys=False, default_flow_style=False, width=100)

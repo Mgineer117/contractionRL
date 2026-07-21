@@ -1,11 +1,15 @@
 """Generic post-construction patches for skrl PPO/SAC agent instances.
 
 Shared between the standalone PPO/SAC path (scripts/skrl/train.py, which
-patches ``runner.agent`` directly) and C2RL (c2rl.py, which patches its two
-inner ``con_agent``/``opt_agent`` PPO or SAC sub-agents individually — C2RL's
-own outer agent has no ``.policy``/``.scheduler``/etc. attributes for these to
-find). Each patch inspects the given agent for the attributes it needs and
-no-ops if they're absent, so it's safe to call unconditionally on any agent.
+patches ``runner.agent`` directly) and C2RL (c2rl.py, which patches its inner
+PPO/SAC sub-agent — C2RL's own outer agent has no ``.policy``/``.scheduler``/
+etc. attributes for these to find). Each patch inspects the given agent for the
+attributes it needs and no-ops if they're absent, so it's safe to call
+unconditionally on any agent.
+
+Every call site patches BEFORE ``agent.init()``, which is where skrl allocates
+the memory tensors and the trainer, in turn, only calls at ``train()`` time.
+``patch_caps_regularizer`` relies on that ordering.
 """
 
 from __future__ import annotations
@@ -147,6 +151,274 @@ def patch_ppo_std_annealing(agent, std_dev_annealing: bool, kwargs: dict | None 
 
     agent.post_interaction = _annealed_post
 
+
+def _resolve_x_dim(policy) -> int | None:
+    """Length of the leading ``x`` block of a ``[x, xref, uref]`` observation,
+    or ``None`` for a policy over a flat observation with no such split.
+
+    Every path-tracking backbone knows this number, but they spell it
+    differently and none of the spellings is universal: the residual/squashed
+    MLPs store it as ``_x_dim`` (``None`` when they were built for a
+    vel-tracking layout), while ``CLActorModel``/``SquashedCLActorModel`` keep
+    it only on the ``cl_actor`` submodule they delegate to. Missing that last
+    case silently returned ``None`` for exactly the two backbones whose control
+    law makes the x-only restriction load-bearing — see
+    ``patch_caps_regularizer``'s note on uref pass-through.
+    """
+    for owner, attr in ((policy, "x_dim"), (policy, "_x_dim"),
+                        (getattr(policy, "cl_actor", None), "x_dim")):
+        x_dim = getattr(owner, attr, None) if owner is not None else None
+        if x_dim:
+            return int(x_dim)
+    return None
+
+
+def patch_caps_regularizer(
+    agent,
+    *,
+    temporal_scale: float = 0.0,
+    spatial_scale: float = 0.0,
+    spatial_std: float = 0.05,
+    batch_size: int = 1024,
+) -> None:
+    """Add CAPS action-smoothness regularization to the POLICY LOSS.
+
+    CAPS (Mysore et al. 2021, *Regularizing Action Policies for Smooth
+    Control*) penalizes two distinct kinds of non-smoothness in the policy MEAN
+    (never the sampled action — exploration noise is not what we want to
+    suppress, and its gradient would fight std annealing / SAC entropy tuning)::
+
+        L_T = temporal_scale * || pi(s_t)  - pi(s_{t+1}) ||^2   (chatter in time)
+        L_S = spatial_scale  * || pi(s)    - pi(s_bar)   ||^2,  s_bar ~ N(s, sigma^2)
+                                                               (high state gain)
+
+    Why a LOSS term rather than a reward term. A ``-||u_t - u_{t-1}||^2`` reward
+    makes the return depend on u_{t-1}, which is not in the observation — that
+    is a different (partially observed) MDP, and the critic can only model the
+    extra term as noise. Putting u_{t-1} INTO the observation is also not free
+    here: it changes obs_dim and so trips the ``obs_dim == 2*x_dim + u_dim``
+    layout assertion the CLActor backbones rely on (see runner.py). And the
+    spatial term is not expressible as a reward at all — the environment has no
+    handle on pi to evaluate it at a second, perturbed state. As a policy-loss
+    term CAPS touches none of that: same MDP, same observation, same dynamics,
+    so the offline CV-STEM synthesis and the contraction certificate it produces
+    remain valid.
+
+    WHERE THE STATES COME FROM — the agent's OWN memory, so CAPS inherits each
+    algorithm's data distribution instead of imposing a third one: for SAC the
+    persistent replay buffer its critic is trained on, for PPO the rollout
+    memory, whose ``memory_size`` is ``rollouts`` — exactly the on-policy batch
+    the policy gradient uses and nothing older.
+
+    The (s_t, s_t+1) pairing needs a ``next_observations`` column, which SAC
+    allocates itself (its target computation needs it) but PPO never does. This
+    patch allocates it unconditionally: ``create_tensor`` is idempotent for a
+    matching name/size/dtype, and since every call site patches BEFORE
+    ``agent.init()`` (see the module docstring) the memory is still empty either
+    way, so there is no per-algorithm branch to get wrong. It is then filled
+    through the SAME ``add_samples`` call the agent already makes — injected via
+    a wrapper rather than a second call, so the memory index still advances
+    exactly once per transition (and for SAC the injected value is simply the
+    one the agent was passing anyway).
+
+    The pairing is read with a separate ``sample_by_index``, never by extending
+    ``_tensors_names``: both agents unpack ``memory.sample(...)`` into a
+    fixed-arity tuple, and one extra name there would raise.
+
+    AUTORESET. A transition whose ``next_observations`` straddles an episode
+    boundary is not a real (s_t, s_{t+1}) pair, and asking the policy to be
+    smooth across a reset is asking it to be smooth across a discontinuity it
+    cannot control. Both env families here reset IN PLACE at the terminating
+    step (classic ``env_base.step`` calls ``reset_idx`` and returns the
+    post-reset observation, keeping the true final one in
+    ``info["final_observation"]``; Isaac Lab does the same), so the bogus pair
+    is the one flagged ``terminated | truncated``. The stored ``caps_valid``
+    mask ALSO drops the step immediately after a done, which is what a
+    next-step-autoreset env would flag instead — so the mask is correct under
+    either convention without having to detect which is in play. The cost is at
+    most two transitions per episode (<1% at the ~300-step episodes here);
+    splicing ``info["final_observation"]`` back in would recover them, but for
+    SAC that would mean rewriting the ``next_observations`` its critic target
+    bootstraps from, which is not this patch's business.
+
+    Where the loss is injected. Both skrl PPO and SAC route every policy
+    backward through ``self.scaler.scale(<loss>).backward()``, immediately after
+    the one grad-enabled ``policy.act(..., role="policy")`` of that update. This
+    arms on that act() and consumes on the next scale(), so the CAPS gradient
+    lands in the same backward as the policy loss — and therefore INSIDE the
+    subsequent ``grad_norm_clip``, which a separate ``.backward()`` before
+    ``optimizer.step()`` would have escaped. SAC's critic-loss scale() call
+    precedes the policy act() and its entropy-loss call follows the consume, so
+    neither is affected. PPO's ``kl_threshold`` early stop breaks out between
+    the act() and the scale(), leaving the flag armed; the next scale() to run
+    is the next update's policy scale, so the invariant that survives is the one
+    that matters — at most one CAPS term per policy backward, never on a critic
+    or entropy one.
+
+    Which observation dimensions get perturbed (spatial term). For the
+    ``control``/``control-squashed`` backbones the observation is
+    ``[x, xref, uref]`` and the control law is ``u = uref + feedback(x - xref)``,
+    so perturbing ``uref`` shifts the output by exactly that perturbation. That
+    is pure feedforward pass-through, structurally required and NOT reducible by
+    the network — penalizing it would put an irreducible floor on L_S and push
+    the policy to suppress its own uref term. Only the leading ``x`` block is
+    perturbed when the policy exposes an ``x_dim``; otherwise (a flat
+    observation with no such split, e.g. velocity tracking) the whole
+    observation is. ``_resolve_x_dim`` covers every backbone's spelling of it.
+
+    ``spatial_std`` is in RAW observation units: the perturbation is added to
+    the stored observation and the preprocessor is applied afterwards, so
+    turning ``use_state_norm`` on would shrink the perturbation the policy
+    actually sees by that dimension's running std rather than leaving sigma in
+    normalized units. Inert today (state normalization is off in every config
+    and train.py force-disables it), but the scale is per-dimension either way —
+    a state component with a much wider range than the rest is effectively
+    under-regularized at a single scalar sigma.
+
+    No-op unless at least one scale is positive, and no-op for agents without
+    ``policy``/``scaler``/``memory`` (C2RL's outer agent — it patches its inner
+    PPO/SAC sub-agent directly, see c2rl.py).
+    """
+    temporal_scale = float(temporal_scale)
+    spatial_scale = float(spatial_scale)
+    if temporal_scale <= 0.0 and spatial_scale <= 0.0:
+        return
+    policy = getattr(agent, "policy", None)
+    scaler = getattr(agent, "scaler", None)
+    memory = getattr(agent, "memory", None)
+    if policy is None or scaler is None or memory is None:
+        return
+
+    device = getattr(memory, "device", None) or next(policy.parameters()).device
+    x_dim = _resolve_x_dim(policy)
+
+    # skrl's own "no preprocessor" fallback is _empty_preprocessor, which already
+    # swallows the train= kwarg — so both branches are callable the same way.
+    def _identity(t, **_kwargs):
+        return t
+
+    obs_pre = getattr(agent, "_observation_preprocessor", None) or _identity
+    state_pre = getattr(agent, "_state_preprocessor", None) or _identity
+    _orig_act = policy.act
+
+    # ── make the (s_t, s_t+1) pairing readable from the agent's own memory ──
+    # create_tensor is idempotent for a matching name/size/dtype, so this is a
+    # no-op for whichever columns the agent allocates for itself in init().
+    # next_states returns False (nothing allocated) when state_space is None,
+    # which is the norm here; sample_by_index then yields None for that name and
+    # the policy gets states=None, exactly as it does during a normal update.
+    memory.create_tensor(name="next_observations", size=agent.observation_space, dtype=torch.float32)
+    memory.create_tensor(name="next_states", size=agent.state_space, dtype=torch.float32)
+    memory.create_tensor(name="caps_valid", size=1, dtype=torch.bool)
+
+    _names = ["observations", "next_observations", "caps_valid", "states", "next_states"]
+
+    _prev_done = torch.zeros((memory.num_envs, 1), dtype=torch.bool, device=device)
+    _pending: dict = {}
+
+    # Injected into the agent's existing add_samples call rather than added by a
+    # second one: add_samples advances memory_index itself, so calling it twice
+    # per transition would desynchronize our columns from the agent's.
+    _orig_add_samples = memory.add_samples
+
+    def _add_samples(**tensors):
+        if _pending:
+            tensors.update(_pending)
+            _pending.clear()
+        return _orig_add_samples(**tensors)
+
+    memory.add_samples = _add_samples
+
+    _orig_record = agent.record_transition
+
+    def _record(*, observations, states, actions, rewards, next_observations, next_states,
+                terminated, truncated, infos, timestep, timesteps):
+        done = terminated | truncated
+        _pending["caps_valid"] = ~done & ~_prev_done   # see AUTORESET in the docstring
+        _pending["next_observations"] = next_observations
+        _pending["next_states"] = next_states
+        _prev_done.copy_(done)
+        return _orig_record(
+            observations=observations, states=states, actions=actions, rewards=rewards,
+            next_observations=next_observations, next_states=next_states,
+            terminated=terminated, truncated=truncated, infos=infos,
+            timestep=timestep, timesteps=timesteps,
+        )
+
+    agent.record_transition = _record
+
+    # ── the CAPS loss itself ────────────────────────────────────────────────
+    # _orig_act, not policy.act: the arming wrapper installed below must not see
+    # these forwards, and calling the pre-patch method is what keeps it from
+    # doing so — there is no re-entrancy to guard against.
+    def _policy_mean(obs, states):
+        inputs = {"observations": obs_pre(obs, train=False),
+                  "states": states if states is None else state_pre(states, train=False)}
+        _, outputs = _orig_act(inputs, role="policy")
+        return outputs["mean_actions"]
+
+    def _caps_loss():
+        size = len(memory)
+        if size == 0:
+            return None
+        # sample_by_index rather than sample(): the latter also overwrites
+        # memory.sampling_indexes, which belongs to the agent's own update.
+        indexes = torch.randint(0, size, (min(batch_size, size),), device=device)
+        obs, next_obs, valid, states, next_states = memory.sample_by_index(
+            names=_names, indexes=indexes
+        )[0]
+
+        mean = _policy_mean(obs, states)
+        loss = None
+
+        if temporal_scale > 0.0 and bool(valid.any()):
+            next_mean = _policy_mean(next_obs, next_states)
+            # Masked mean over surviving pairs, not sum/N — otherwise the
+            # effective coefficient would silently shrink with the episode-
+            # boundary fraction (and swing with termination rate as the
+            # policy improves).
+            sq = ((mean - next_mean) ** 2).sum(dim=-1, keepdim=True)
+            l_t = (sq * valid).sum() / valid.sum().clamp(min=1)
+            agent.track_data("Loss / CAPS temporal", l_t.item())
+            loss = temporal_scale * l_t
+
+        if spatial_scale > 0.0:
+            noise = torch.randn_like(obs) * spatial_std
+            if x_dim:
+                noise[:, x_dim:] = 0.0  # see docstring: never perturb xref/uref
+            bar_mean = _policy_mean(obs + noise, states)
+            l_s = ((mean - bar_mean) ** 2).sum(dim=-1).mean()
+            agent.track_data("Loss / CAPS spatial", l_s.item())
+            loss = spatial_scale * l_s if loss is None else loss + spatial_scale * l_s
+
+        return loss
+
+    # ── arm on the update's policy forward, consume on the next scale() ─────
+    armed = False
+
+    def _act(inputs, *, role: str = ""):
+        nonlocal armed
+        out = _orig_act(inputs, role=role)
+        if role == "policy" and torch.is_grad_enabled():
+            armed = True
+        return out
+
+    policy.act = _act
+
+    _orig_scale = scaler.scale
+
+    def _scale(loss):
+        nonlocal armed
+        if armed:
+            armed = False
+            caps = _caps_loss()
+            if caps is not None:
+                loss = loss + caps
+        return _orig_scale(loss)
+
+    scaler.scale = _scale
+
+
 def patch_algo_namespace(agent, algo_name: str) -> None:
     """Namespace this agent's own track_data() keys under ``algo_name``.
 
@@ -180,27 +452,54 @@ def patch_algo_namespace(agent, algo_name: str) -> None:
     agent.track_data = _wrapped
 
 
-def patch_auc_checkpoint(agent) -> None:
-    """Override agent.post_interaction to save the best checkpoint using contraction_score.
+def best_metric_for(algorithm: str) -> str:
+    """Which stability metric an algorithm's best_agent.pt should track.
 
-    skrl natively saves best_agent.pt by tracking the highest 'Reward / Total reward (mean)'.
-    contraction_score (= lambda / overshoot, see contraction_metrics.py) is the composite
-    stability metric — higher is better, so it plugs directly into skrl's "maximize reward"
-    checkpoint rule with no sign flip. Falls back to negative AUC (lower AUC = better,
-    hence the flip) for any run/env where contraction_score isn't logged.
+    The two hard per-step contraction controllers that certify a metric
+    directly — ``c3m`` and ``cvstem-lqr`` — pick their best checkpoint by
+    ``contraction_score`` (λ/overshoot; higher is better). Every learned RL
+    policy (``ppo``/``sac``/``c2rl-ppo``/``c2rl-sac``) and the remaining
+    analytical baselines (``lqr``/``sdlqr``) pick by AUC (lower is better).
+
+    Accepts either the hyphen (Isaac ``_alg``: ``"cvstem-lqr"``/``"c2rl-ppo"``)
+    or underscore (classic ``algorithm``: ``"cvstem_lqr"``/``"c2rl_ppo"``)
+    spelling — both normalize to hyphens before the set check.
+    """
+    norm = str(algorithm).lower().replace("_", "-")
+    return "contraction_score" if norm in ("c3m", "cvstem-lqr") else "auc"
+
+
+def patch_auc_checkpoint(agent, metric: str = "auc") -> None:
+    """Override agent.post_interaction to pick best_agent.pt by ``metric``.
+
+    skrl natively saves best_agent.pt by tracking the highest
+    'Reward / Total reward (mean)'. This redirects that checkpoint rule to a
+    stability metric by injecting into the SAME key (see patch_algo_namespace's
+    docstring for why 'Reward / Total reward (mean)' is the injection target —
+    base skrl reads exactly that key in post_interaction to choose the best).
+
+    ``metric="contraction_score"`` (c3m/cvstem-lqr): use
+    ``Stability/contraction_score_mean`` — higher is better, so it plugs into
+    skrl's "maximize reward" rule with no sign flip. ``metric="auc"``
+    (everything else): use ``-Stability/auc_mean`` (or ``-Episode/auc`` for
+    velocity-tracking envs) — lower AUC = better, hence the flip. If the chosen
+    metric isn't logged in a given step, the base reward is left untouched (the
+    c3m↔cvstem vs. AUC split is explicit — no cross-fallback). See
+    ``best_metric_for`` for the algorithm→metric mapping callers use.
     """
     _orig_post = getattr(agent, "post_interaction", None)
     if _orig_post is None:
         return
 
-    def _auc_post(*, timestep: int, timesteps: int) -> None:
+    def _metric_post(*, timestep: int, timesteps: int) -> None:
         # Stability/contraction_score and Stability/auc are logged with a
         # "_mean" suffix (see contraction_metrics.py's track_stability_summary);
         # Episode/auc (velocity-tracking envs) has no such suffix — it's a
         # single value from a different, unrelated logging path.
-        score_list = agent.tracking_data.get("Stability/contraction_score_mean")
-        if score_list:
-            agent.track_data("Reward / Total reward (mean)", score_list[-1])
+        if metric == "contraction_score":
+            score_list = agent.tracking_data.get("Stability/contraction_score_mean")
+            if score_list:
+                agent.track_data("Reward / Total reward (mean)", score_list[-1])
         else:
             # Prioritize Stability/auc (path tracking) over Episode/auc (velocity tracking)
             score_list = agent.tracking_data.get("Stability/auc_mean") or agent.tracking_data.get("Episode/auc")
@@ -208,4 +507,4 @@ def patch_auc_checkpoint(agent) -> None:
                 agent.track_data("Reward / Total reward (mean)", -score_list[-1])
         _orig_post(timestep=timestep, timesteps=timesteps)
 
-    agent.post_interaction = _auc_post
+    agent.post_interaction = _metric_post

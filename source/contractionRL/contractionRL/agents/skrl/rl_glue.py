@@ -69,9 +69,9 @@ def make_base_rl_cfg(
 
     # YAML 1.1 (PyYAML) parses unquoted scientific notation WITHOUT a
     # decimal point (e.g. `1e-5`) as a str, not a float. skrl's Runner
-    # normally rescues this via _process_cfg's eval(), but con_agent/
-    # opt_agent bypass Runner entirely, so a `learning_rate: 1e-5` would
-    # reach torch.optim.Adam as the string "1e-5" and blow up with
+    # normally rescues this via _process_cfg's eval(), but C2RL's inner
+    # PPO/SAC sub-agent bypasses Runner entirely, so a `learning_rate: 1e-5`
+    # would reach torch.optim.Adam as the string "1e-5" and blow up with
     # "'<=' not supported between instances of 'float' and 'str'".
     # Coerce any numeric-looking string scalar back to float here (the
     # `learning_rate_scheduler` name string is handled just below and is
@@ -86,7 +86,7 @@ def make_base_rl_cfg(
     # Resolve a string "learning_rate_scheduler" (e.g. "KLAdaptiveLR",
     # yaml's usual way of naming it) to the real class — skrl's Runner
     # does this via _process_cfg's eval(), which doesn't run here since
-    # con_agent/opt_agent bypass Runner entirely.
+    # C2RL's inner PPO/SAC sub-agent bypasses Runner entirely.
     if isinstance(d.get("learning_rate_scheduler"), str):
         from skrl.resources.schedulers.torch import KLAdaptiveLR  # noqa: F401 (used by eval below)
         d["learning_rate_scheduler"] = eval(d["learning_rate_scheduler"])
@@ -95,8 +95,8 @@ def make_base_rl_cfg(
 
     # "rewards_shaper_scale" is a yaml convenience (same as skrl's own
     # Runner._process_cfg) for the real PPO_CFG/SAC_CFG field
-    # "rewards_shaper", a Callable — translate it here since con_agent/
-    # opt_agent bypass Runner entirely. 1.0 (or unset) is a no-op.
+    # "rewards_shaper", a Callable — translate it here since C2RL's inner
+    # PPO/SAC sub-agent bypasses Runner entirely. 1.0 (or unset) is a no-op.
     rewards_shaper_scale = raw_cfg.get("rewards_shaper_scale")
     # use_reward_norm: non-biasing running-std reward normalization (r/std, no
     # mean subtraction — preserves the optimal policy). Installed through the
