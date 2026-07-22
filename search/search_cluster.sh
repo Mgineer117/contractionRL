@@ -47,6 +47,9 @@
 #   --num-jobs N         independent sbatch jobs to submit (default: prompted)
 #   --gpus-per-job N     GPUs each job requests via --gres=gpu:N (default 1)
 #   --agents-per-gpu N   override the smoke-test packing result
+#   --max-agents-per-gpu N  hard ceiling on the packing result (default 16)
+#   --min-probe-mb N     reject a smoke-test peak below this as a failed run
+#                        (default 256; an idle GPU reads a few MB)
 #   --no-probe           skip the smoke test; requires --agents-per-gpu
 #   --time HH:MM:SS      per-job wall-time (default 24:00:00; self-resubmit makes
 #                        short limits fine, they just renew more often)
@@ -99,6 +102,11 @@ PARTITION=""; NUM_JOBS=""; GPUS_PER_JOB=1; AGENTS_PER_GPU=""
 WALLTIME="24:00:00"; ACCOUNT=""; QOS=""; CPUS_PER_GPU=8; MEM=""
 ACTIVATE=""; PER_RUN_TIMEOUT=24h; RUNS_PER_AGENT=0
 PROBE=1; YES=0; STOP_TAG=""; SAFETY="0.85"
+# Packing guard rails. MIN_PROBE_MB: a run using less than this obviously never
+# reached the GPU (an idle GPU reads a few MB) — reject rather than divide total
+# VRAM by ~0 and get a nonsense count. MAX_AGENTS_PER_GPU: hard ceiling so even a
+# legitimately tiny run can't ask for hundreds of processes on one GPU.
+MIN_PROBE_MB=256; MAX_AGENTS_PER_GPU=16
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -109,6 +117,8 @@ while [[ $# -gt 0 ]]; do
         --num-jobs) NUM_JOBS="$2"; shift 2 ;;
         --gpus-per-job) GPUS_PER_JOB="$2"; shift 2 ;;
         --agents-per-gpu) AGENTS_PER_GPU="$2"; shift 2 ;;
+        --max-agents-per-gpu) MAX_AGENTS_PER_GPU="$2"; shift 2 ;;
+        --min-probe-mb) MIN_PROBE_MB="$2"; shift 2 ;;
         --no-probe) PROBE=0; shift ;;
         --time) WALLTIME="$2"; shift 2 ;;
         --account) ACCOUNT="$2"; shift 2 ;;
@@ -308,15 +318,19 @@ done
 
 # ── Stage 3: smoke test → agents-per-GPU ──────────────────────────────────── #
 # Measure the REAL per-run footprint instead of guessing it. Run ONE trial under
-# srun on the chosen partition with a single dedicated GPU, so whole-GPU
-# `memory.used` IS this run's usage, sample its peak for a bit, then:
+# srun on the chosen partition with a single GPU, and sample the peak GPU memory
+# of THAT run's process subtree via `--query-compute-apps` — NOT a per-GPU
+# `memory.used` row, because nvidia-smi orders those by device index, not by
+# owner, so on a non-isolated multi-GPU node "row 0" can be an idle neighbour
+# (this is what produced the 1 MB → 20889 agents/GPU nonsense). Then:
 #
-#   agents_per_gpu = floor( total_MB × SAFETY / peak_MB )
+#   agents_per_gpu = min( MAX_AGENTS_PER_GPU, floor( total_MB × SAFETY / peak_MB ) )
 #
 # SAFETY leaves headroom for PyTorch's caching allocator + fragmentation, and for
-# SAC's replay buffer still growing past the sampling window. Probed once on the
-# first env as representative; override with --agents-per-gpu, or skip with
-# --no-probe (which then REQUIRES the override).
+# SAC's replay buffer still growing past the sampling window; a peak below
+# MIN_PROBE_MB means the run never reached the GPU (crash / wrong env) and is
+# rejected rather than trusted. Probed once on the first env as representative;
+# override with --agents-per-gpu, or skip with --no-probe (which REQUIRES it).
 if [[ -z "$AGENTS_PER_GPU" ]]; then
     if [[ "$PROBE" -ne 1 ]]; then
         _error "--no-probe requires --agents-per-gpu N."; exit 1
@@ -333,8 +347,9 @@ PY
     CLASSIC_FLAG=""; [[ "$PROBE_ENV" == classic-* ]] && CLASSIC_FLAG="--classic"
     PROBE_LOG="${ENV_LOGDIR[${ENVS[0]}]}/probe.log"
     # The probe body runs on the compute node: launch one training run in the
-    # background, poll nvidia-smi for ~120s recording the max used/total, kill the
-    # tree, and print a single MEM= line the launcher greps for.
+    # background, poll for ~120s recording the max GPU memory used by the run's
+    # OWN process subtree (pid-matched, so it can't read an idle neighbour GPU),
+    # kill the tree, and print a single MEM=peak/total line the launcher greps for.
     PROBE_OUT=$(srun --partition="$PARTITION" --gres=gpu:1 \
         --cpus-per-task="$CPUS_PER_GPU" --time=00:10:00 --job-name="crl-probe" \
         ${ACCOUNT:+--account="$ACCOUNT"} ${QOS:+--qos="$QOS"} \
@@ -347,39 +362,63 @@ PY
                 --num_envs "'"$NUM_ENVS"'" --skip_final_eval \
                 > "'"$PROBE_LOG"'" 2>&1 &
             child=$!
-            peak=0; total=0
+            # All pids in the training process tree — GPU memory is attributed to
+            # whichever pid opened the CUDA context, which may be a worker child.
+            subtree() { local p=$1 c; echo "$p"; for c in $(pgrep -P "$p" 2>/dev/null); do subtree "$c"; done; }
+            peak=0
+            total=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -dc "0-9")
             for _ in $(seq 1 40); do
                 kill -0 "$child" 2>/dev/null || break
-                read u t < <(nvidia-smi --query-gpu=memory.used,memory.total \
-                              --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d ",")
-                [[ -n "${u:-}" ]] && (( u > peak )) && peak=$u
-                [[ -n "${t:-}" ]] && total=$t
+                mine=" $(subtree "$child" | tr "\n" " ") "
+                used=0
+                while IFS="," read -r pid mem; do
+                    pid="${pid//[[:space:]]/}"; mem="${mem//[[:space:]]/}"
+                    [[ "$mem" =~ ^[0-9]+$ ]] || continue
+                    [[ "$mine" == *" $pid "* ]] && used=$(( used + mem ))
+                done < <(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null)
+                (( used > peak )) && peak=$used
                 sleep 3
             done
             kill -TERM -"$child" 2>/dev/null || kill -TERM "$child" 2>/dev/null || true
             sleep 2; kill -KILL "$child" 2>/dev/null || true
             echo "MEM=${peak}/${total}"
         ' 2>>"$PROBE_LOG") || true
-    MEM_LINE=$(grep -oE 'MEM=[0-9]+/[0-9]+' <<<"$PROBE_OUT" | tail -n1)
-    if [[ -z "$MEM_LINE" ]]; then
-        _error "Smoke test produced no MEM= reading. See $PROBE_LOG"
-        _info  "Re-run with --agents-per-gpu N to bypass the probe."
+    _probe_failed() {  # shared failure exit: show WHY, then how to proceed
+        _error "$1"
+        _info  "Likely causes: the env wasn't activated (pass --activate 'conda activate <env>'),"
+        _info  "the run crashed, or this site doesn't expose per-process GPU accounting."
+        _info  "Last lines of the probe log ($PROBE_LOG):"
+        tail -n 15 "$PROBE_LOG" 2>/dev/null | sed 's/^/      /' >&2 || true
+        _info  "Or bypass the probe entirely with --agents-per-gpu N."
         exit 1
-    fi
+    }
+    MEM_LINE=$(grep -oE 'MEM=[0-9]+/[0-9]+' <<<"$PROBE_OUT" | tail -n1)
+    [[ -z "$MEM_LINE" ]] && _probe_failed "Smoke test produced no MEM= reading."
     PEAK_MB=${MEM_LINE#MEM=}; PEAK_MB=${PEAK_MB%/*}
     TOTAL_MB=${MEM_LINE#*/}
-    if [[ -z "$PEAK_MB" || "$PEAK_MB" -le 0 ]]; then
-        _error "Smoke test measured 0 MB — the run may have crashed. See $PROBE_LOG"; exit 1
+    # A peak below MIN_PROBE_MB means the run never really allocated on the GPU (an
+    # idle GPU reads a few MB). Reject it — dividing total VRAM by ~0 is exactly
+    # what yielded the absurd 20889 agents/GPU before this guard existed.
+    if [[ -z "$PEAK_MB" || "$PEAK_MB" -lt "$MIN_PROBE_MB" ]]; then
+        _probe_failed "Smoke test peak was ${PEAK_MB:-?} MB (< ${MIN_PROBE_MB} MB) — the run never reached the GPU."
     fi
-    AGENTS_PER_GPU=$(python - "$PEAK_MB" "$TOTAL_MB" "$SAFETY" <<'PY'
+    if [[ -z "$TOTAL_MB" || "$TOTAL_MB" -le 0 ]]; then
+        _probe_failed "Smoke test could not read total GPU memory (got '${TOTAL_MB:-}')."
+    fi
+    UNCAPPED=$(python - "$PEAK_MB" "$TOTAL_MB" "$SAFETY" <<'PY'
 import sys, math
 peak, total, safety = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
 print(max(1, math.floor(total * safety / peak)))
 PY
 )
+    AGENTS_PER_GPU="$UNCAPPED"
+    if (( AGENTS_PER_GPU > MAX_AGENTS_PER_GPU )); then
+        _warn "Packing suggests ${UNCAPPED} agents/GPU from a ${PEAK_MB} MB run — capping at ${MAX_AGENTS_PER_GPU} (raise with --max-agents-per-gpu)."
+        AGENTS_PER_GPU="$MAX_AGENTS_PER_GPU"
+    fi
     _success "Peak ${C_BOLD}${PEAK_MB} MB${C_RESET} / ${TOTAL_MB} MB total → ${C_BOLD}${AGENTS_PER_GPU}${C_RESET} agent(s)/GPU (safety ${SAFETY})"
 fi
-[[ "$AGENTS_PER_GPU" -ge 1 ]] 2>/dev/null || { _error "agents-per-gpu must be ≥1 (got '$AGENTS_PER_GPU')."; exit 1; }
+[[ "$AGENTS_PER_GPU" =~ ^[0-9]+$ && "$AGENTS_PER_GPU" -ge 1 ]] || { _error "agents-per-gpu must be a positive integer (got '$AGENTS_PER_GPU')."; exit 1; }
 
 AGENTS_PER_JOB=$(( GPUS_PER_JOB * AGENTS_PER_GPU ))
 TOTAL_WORKERS=$(( NUM_JOBS * AGENTS_PER_JOB ))
