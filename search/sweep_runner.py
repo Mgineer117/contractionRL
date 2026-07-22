@@ -87,7 +87,10 @@ _TRAIN_PY = _ROOT / "scripts" / "skrl" / "train.py"
 # ── Infeasibility signals ─────────────────────────────────────────────────── #
 # Substrings that unambiguously mean "the SDP failed" regardless of counts.
 _HARD_MARKERS = (
-    "CVSTEM-LQR INFEASIBLE",       # cvstem_lqr.INFEASIBLE_MARKER (online abort)
+    # cvstem_lqr.INFEASIBLE_MARKER — the online abort, raised both by CV-STEM-LQR's
+    # control law and by C2RL's metric_source="online" reward metric
+    # (ncm_synthesis.OnlineCVSTEMMetric), which reuses the same marker and error type.
+    "CVSTEM-LQR INFEASIBLE",
     "CVSTEMInfeasibleError",       # same, as it appears in the traceback
     "produced 0 feasible metrics",
     "below min_feasibility_rate",

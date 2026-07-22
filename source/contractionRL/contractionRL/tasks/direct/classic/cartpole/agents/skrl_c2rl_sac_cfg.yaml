@@ -73,6 +73,15 @@ agent:
 
 # ── Contraction metric + Mahalanobis reward ────────────────────────────────── #
 cm:
+  # Metric source — how the ENV computes the Mahalanobis reward. "online":
+  # solve the CV-STEM SDP per env per step at the states the rollout visits
+  # (ncm_synthesis.OnlineCVSTEMMetric), so every M is a verified feasible
+  # metric and an infeasible state aborts the run. No Phase A, no CMG
+  # regression, no cm_data_path cache — but num_envs SDP solves per step
+  # (~12 ms each with MOSEK here), so this is a single-run configuration.
+  # "cmg" instead uses the Phase-A network (what c2rl_ppo does). Forced to
+  # "cmg" when cmg_method is "ccm" (that pipeline has no per-state SDP).
+  metric_source: online
   # Mahalanobis reward
   w_ub: 10.0  # Upper eigenvalue bound for the metric M(x)
   w_lb: 0.01  # Lower eigenvalue bound for the metric M(x)

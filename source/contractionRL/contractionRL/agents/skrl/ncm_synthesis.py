@@ -1167,3 +1167,128 @@ def train_cmg_ccm(
         # diagnostics on the same distribution (e.g. condition-number stats).
         "x": x_np,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# Online CV-STEM metric (no offline synthesis)
+# ─────────────────────────────────────────────────────────────────────────── #
+
+class OnlineCVSTEMMetric:
+    """Per-step CV-STEM SDP, shaped as a drop-in for a frozen CMG network.
+
+    Same call contract as ``BoundedCCM_Generator``: ``W, _ = metric(x)`` for a
+    batch ``x`` of raw states, plus a ``bounded`` attribute. That is the whole
+    interface the classic envs' ``set_ccm``/``get_rewards`` uses, so swapping
+    this in for the regressed network needs no env change and is identical for
+    the PPO and SAC base algorithms (both read the reward from the env).
+
+    Where the offline pipeline (``build_cm_dataset`` + ``regress_cmg``) solves
+    the SDP once per SAMPLED state and then approximates ``W`` everywhere by a
+    network fit, this solves it at exactly the states the rollout visits:
+
+      1. ``f, B = get_f_and_B(x)`` and the DRIFT Jacobian ``A = ∂f/∂x``
+         (batched, autograd, on device — control enters the LMI only through
+         the Riccati term, so the generalized Jacobian is deliberately not used
+         here; see ``solve_cm_metric``).
+      2. ``A``/``B`` to numpy — cvxpy is CPU-only, so this is a real sync point.
+      3. One ``_solve_cm_metric_with_backoff`` per env, in a Python loop.
+      4. Stack back to a ``(b, x_dim, x_dim)`` tensor on ``x``'s device.
+
+    So every deployed ``M = W⁻¹`` is a VERIFIED feasible metric rather than a
+    regression of one — at the cost of ``num_envs`` SDP solves per env-step
+    (~12 ms each with MOSEK on a 4-state system), which is why this is a
+    single-run research configuration and not a sweep one.
+
+    Infeasibility aborts the run (``CVSTEMInfeasibleError``, carrying
+    ``cvstem_lqr.INFEASIBLE_MARKER`` so ``search/sweep_runner.py`` records it as
+    a bad trial rather than a crash). Unlike CV-STEM-LQR there is no "zero
+    feedback" fallback available here — this metric defines a REWARD, and any
+    substitute ``W`` at that state would silently score an uncertified metric
+    as if it were certified.
+    """
+
+    # W comes back already satisfying w_lb·I ⪯ W ⪯ w_ub·I as an SDP constraint,
+    # so the env's bound_W has nothing left to clamp.
+    bounded = True
+
+    def __init__(
+        self,
+        get_f_and_B: Callable,
+        *,
+        x_dim: int,
+        lbd: float,
+        w_lb: float,
+        w_ub: float,
+        eps: float,
+        solver: str,
+        r_scaler: float,
+        max_lambda_reductions: int,
+        chi_weight: float | None = None,
+        nu_weight: float = 1.0,
+    ) -> None:
+        self._get_f_and_B = get_f_and_B
+        self._x_dim = x_dim
+        self._lbd = lbd
+        self._w_lb = w_lb
+        self._w_ub = w_ub
+        self._eps = eps
+        self._solver = solver
+        self._r_scaler = r_scaler
+        self._max_lambda_reductions = max_lambda_reductions
+        self._chi_weight = chi_weight
+        self._nu_weight = nu_weight
+        # Diagnostics — the offline path reports these once from its dataset;
+        # online they only exist as running counts (read by the trainer).
+        self.num_solves = 0
+        self.num_lambda_reduced = 0
+
+    def to(self, *args, **kwargs):  # noqa: D401 - torch-module-like no-op
+        """No parameters to move: the solve is CPU/cvxpy and the result is
+        returned on the input's device. Present so callers can treat this
+        exactly like the ``nn.Module`` CMG it replaces."""
+        return self
+
+    def eval(self):
+        return self
+
+    def parameters(self):
+        return iter(())
+
+    def __call__(self, x: torch.Tensor):
+        from .cvstem_lqr import INFEASIBLE_MARKER, CVSTEMInfeasibleError
+
+        device = x.device
+        x_req = x[:, : self._x_dim].detach().float().requires_grad_()
+        # get_rewards runs under no_grad; the Jacobian needs grad regardless.
+        with torch.enable_grad():
+            f, B, _ = self._get_f_and_B(x_req)
+            A = jacobian(f, x_req, create_graph=False)
+
+        A_np = A.detach().cpu().numpy()
+        B_np = B.detach().cpu().numpy()
+
+        W_out = np.empty((x_req.shape[0], self._x_dim, self._x_dim), dtype=np.float32)
+        for i in range(x_req.shape[0]):
+            W, _lbd_used, reductions = _solve_cm_metric_with_backoff(
+                A_np[i], B_np[i],
+                lbd=self._lbd, w_lb=self._w_lb, w_ub=self._w_ub, eps=self._eps,
+                solver=self._solver, r_scaler=self._r_scaler,
+                max_lambda_reductions=self._max_lambda_reductions,
+                chi_weight=self._chi_weight, nu_weight=self._nu_weight,
+            )
+            if W is None:
+                msg = (
+                    f"{INFEASIBLE_MARKER}: online C2RL metric has no feasible CV-STEM "
+                    f"solution at env {i}/{x_req.shape[0]}'s state, at lbd={self._lbd}, "
+                    f"cm_eps={self._eps}, w_lb={self._w_lb}, w_ub={self._w_ub}, "
+                    f"cvstem_r_scaler={self._r_scaler} "
+                    f"(max_lambda_reductions={self._max_lambda_reductions}). "
+                    "The Mahalanobis reward has no certified metric to fall back on."
+                )
+                print(msg, flush=True)
+                raise CVSTEMInfeasibleError(msg)
+            W_out[i] = W
+            self.num_solves += 1
+            self.num_lambda_reduced += int(reductions > 0)
+
+        return torch.as_tensor(W_out, device=device), None

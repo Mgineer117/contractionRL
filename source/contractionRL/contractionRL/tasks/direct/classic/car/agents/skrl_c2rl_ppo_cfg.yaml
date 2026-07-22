@@ -111,6 +111,11 @@ agent:
 
 # ── Contraction metric + Mahalanobis reward ────────────────────────────────── #
 cm:
+  # Metric source — how the ENV computes the Mahalanobis reward. "cmg": the
+  # frozen Phase-A network below (cmg_method selects how it is trained).
+  # "online" instead solves the CV-STEM SDP per env per step (what c2rl_sac
+  # does) — impractical here at this num_envs. See c2rl.py's module docstring.
+  metric_source: cmg
   # Mahalanobis reward
   w_ub: 10.0  # Upper eigenvalue bound for the metric M(x)
   w_lb: 0.01  # Lower eigenvalue bound for the metric M(x)

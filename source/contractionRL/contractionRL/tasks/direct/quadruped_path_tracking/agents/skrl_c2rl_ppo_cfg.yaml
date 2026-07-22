@@ -87,6 +87,11 @@ agent:
 
 # ── Contraction metric + Mahalanobis reward ────────────────────────────────── #
 cm:
+  # Metric source — the frozen Phase-A CMG network. "online" (per env per step
+  # CV-STEM SDP, see c2rl.py) is deliberately NOT used on the Isaac envs: their
+  # num_envs is in the thousands and f/B come from a learned NeuralDynamics,
+  # so a per-step solve per env is orders of magnitude too slow.
+  metric_source: cmg
   # Mahalanobis reward
   w_ub: 10.0  # Upper eigenvalue bound for the metric M(x)
   w_lb: 0.1   # Lower eigenvalue bound for the metric M(x)

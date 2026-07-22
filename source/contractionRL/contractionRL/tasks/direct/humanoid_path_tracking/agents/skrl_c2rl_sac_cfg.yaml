@@ -73,6 +73,19 @@ agent:
 
 # ── Contraction metric + Mahalanobis reward ────────────────────────────────── #
 cm:
+  # Metric source — how the ENV computes the Mahalanobis reward. "online":
+  # solve the CV-STEM SDP per env per step at the states the rollout visits
+  # (ncm_synthesis.OnlineCVSTEMMetric), so every M is a verified feasible
+  # metric and an infeasible state aborts the run — no Phase A, no CMG
+  # regression. c2rl_sac uses "online", c2rl_ppo uses "cmg"; forced to "cmg"
+  # when cmg_method is "ccm" (that pipeline has no per-state SDP).
+  #
+  # COST, on Isaac far more than on the classic envs: the solve is a serial
+  # per-env cvxpy loop (~7 ms/env/step measured on a 4-state classic env), so
+  # it scales linearly with scene.num_envs — which here is in the thousands —
+  # and each solve needs f/B/∂f/∂x from the learned NeuralDynamics. Drop
+  # num_envs hard for an online run, or set "cmg" to use the Phase-A network.
+  metric_source: online
   # Mahalanobis reward
   w_ub: 10.0  # Upper eigenvalue bound for the metric M(x)
   w_lb: 0.1   # Lower eigenvalue bound for the metric M(x)

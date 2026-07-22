@@ -7,13 +7,30 @@ against a Mahalanobis tracking reward
 
     ``-tracking_scaler·||e||²_M - control_scaler·||u - uref||²``,   e = x - xref
 
-where the metric ``M(x) = W(x)⁻¹`` always comes from a CMG network ``W(x)``
-synthesized OFFLINE, before Phase B, then FROZEN (``freeze_cmg``) for the
-whole RL run — Tsukamoto's Neural Contraction Metric recipe. There is no
-online per-state SDP path and no ``use_cmg`` switch: the CMG network is
-mandatory (``models["cmg"]``).
+where the metric ``M(x) = W(x)⁻¹`` comes from one of two sources, selected by
+``metric_source`` — this is the knob that decides HOW THE ENV COMPUTES THE
+MAHALANOBIS REWARD, since whichever source is chosen is injected into the env
+and called from its own ``get_rewards()``:
 
-``cmg_method`` (formerly ``cm_formulation``) selects HOW that network is
+  * **``"cmg"`` (default)** — a CMG network ``W(x)`` synthesized in Phase A,
+    before Phase B, then FROZEN (``freeze_cmg``) for the whole RL run:
+    Tsukamoto's Neural Contraction Metric recipe. ``cmg_method`` selects how it
+    is trained (below). The CMG network is mandatory (``models["cmg"]``); there
+    is no ``use_cmg`` switch.
+  * **``"online"``** — no Phase A at all. ``ncm_synthesis.OnlineCVSTEMMetric``
+    solves the CV-STEM SDP per env per step, at the states the rollout actually
+    visits, so every deployed ``M`` is a VERIFIED feasible metric rather than a
+    regression of one. It costs ``num_envs`` SDP solves per env-step (~12 ms
+    each with MOSEK on a 4-state system), which makes it a single-run research
+    configuration rather than a sweep one, and an infeasible state ABORTS the
+    run — a reward has no "open loop" fallback the way CV-STEM-LQR's control
+    law does.
+
+``cmg_method="ccm"`` forces ``metric_source="cmg"`` (with a printed note): that
+pipeline has no per-state SDP, so a frozen network is the only metric it can
+produce. The pair is therefore effectively three configurations, not four.
+
+``cmg_method`` (formerly ``cm_formulation``) selects HOW the CMG network is
 trained — the two are the only supported pipelines, both in ``ncm_synthesis.py``:
 
   * **``"cvstem"`` — CV-STEM regression.** Sample ``cmg_memory_size`` states,
@@ -41,9 +58,10 @@ supply) or, when ``dynamics_pretrain_data_path`` points to an offline
 warning if ``cmg_memory_size`` asks for more samples than are on disk).
 
 Phase B — the single-policy rollout loop — is the same regardless of
-``cmg_method`` (see ``C2RLSkrlTrainer``), since both hand off an identical
-frozen ``ccm_gen``. The reward is NOT overwritten anywhere on the agent side:
-``C2RLSkrlTrainer.train`` injects the frozen CMG into the env itself
+``cmg_method`` OR ``metric_source`` (see ``C2RLSkrlTrainer``): all three hand
+off one object with the same ``W, _ = metric(x)`` call contract, either a frozen
+``ccm_gen`` or an ``OnlineCVSTEMMetric``. The reward is NOT overwritten anywhere
+on the agent side: ``C2RLSkrlTrainer.train`` injects that object into the env
 (``_inject_ccm`` → the env's ``set_ccm``), and from then on the env's own
 ``get_rewards()`` returns the Mahalanobis reward natively. So the reward that
 reaches ``record_transition`` — and therefore PPO's GAE and SAC's replayed
@@ -63,10 +81,13 @@ shipped config.
 
 Learned dynamics (Isaac / ``use_empirical_dynamics=True``): a ``NeuralDynamics``
 model provides ``f``/``B``/``B_null`` and ``∂f/∂x``. It is pretrained once
-before Phase A, which is the only consumer — the SDP dataset (``"cvstem"``) or
-the C1/C2 gradient computation (``"ccm"``) both need ``f``/``B``/``∂f/∂x`` at
-synthesis time; Phase B never touches it again (the CMG is already frozen).
-Classic envs use their analytical ``get_f_and_B`` and skip this.
+before Phase A, which under ``metric_source="cmg"`` is the only consumer —
+the SDP dataset (``"cvstem"``) or the C1/C2 gradient computation (``"ccm"``)
+both need ``f``/``B``/``∂f/∂x`` at synthesis time; Phase B never touches it
+again (the CMG is already frozen). Under ``metric_source="online"`` it is the
+opposite: the dynamics are queried EVERY step, since each solve needs
+``A = ∂f/∂x`` and ``B`` at the current state. Classic envs use their analytical
+``get_f_and_B`` and skip the pretraining.
 """
 
 from __future__ import annotations
@@ -142,8 +163,15 @@ class C2RLPPOCfg(AgentCfg):
     # Deployed policy's discount factor — a single policy trained against the
     # Mahalanobis reward, so there is no con/opt duality here.
     discount_factor: float = 0.99
-    # ── Metric source: ALWAYS a frozen CMG network (models["cmg"]) — see
-    # module docstring. cmg_method selects how it's trained. ─────────────── #
+    # ── Metric source: WHERE the env's Mahalanobis reward gets M(x) ──────── #
+    # "cmg" (default): a CMG network synthesized in Phase A (cmg_method selects
+    # how) and frozen for the whole run. "online": no Phase A at all — solve the
+    # CV-STEM SDP per env per step at the visited states
+    # (ncm_synthesis.OnlineCVSTEMMetric), so every deployed M is a verified
+    # feasible metric instead of a regression of one, at the cost of num_envs
+    # SDP solves per step. cmg_method="ccm" FORCES "cmg" (there is no per-state
+    # SDP to solve online under the C1/C2 pipeline).
+    metric_source: str = "cmg"
     w_ub: float = 10.0
     w_lb: float = 0.1
     tracking_scaler: float = 1.0
@@ -303,8 +331,9 @@ class C2RLSACCfg(AgentCfg):
     caps_spatial_std: float = 0.05
     memory_size: int = -1
     discount_factor: float = 0.99
-    # ── Metric source: ALWAYS a frozen CMG network — cmg_method selects how it's
-    # trained (see C2RLPPOCfg / module docstring). ──────────────────────────── #
+    # ── Metric source — "cmg" frozen CMG network (cmg_method selects how it's
+    # trained) | "online" per-step CV-STEM SDP. See C2RLPPOCfg.metric_source. ── #
+    metric_source: str = "cmg"
     w_ub: float = 10.0
     w_lb: float = 0.1
     tracking_scaler: float = 1.0
@@ -452,6 +481,23 @@ class C2RLAgent(Agent):
                 "models.cmg.network.constrain_eigenvalues: true in the yaml, or "
                 "let ContractionRunner build it (it forces this)."
             )
+        self._metric_source = str(getattr(parsed_cfg, "metric_source", "cmg")).lower()
+        if self._metric_source not in ("cmg", "online"):
+            raise ValueError(
+                f"[C2RL] metric_source must be 'cmg' (frozen network from Phase A) or "
+                f"'online' (per-step CV-STEM SDP), got {parsed_cfg.metric_source!r}."
+            )
+        if self._metric_source == "online" and parsed_cfg.cmg_method == "ccm":
+            # Not an error: "ccm" simply has no per-state SDP to solve online (it
+            # trains the CMG by C1/C2 gradient descent), so the CMG network IS the
+            # only metric that pipeline can produce. Downgrade and say so, rather
+            # than making every ccm sweep restate a metric_source it cannot vary.
+            print(
+                "[C2RL] metric_source='online' is not available under cmg_method='ccm' "
+                "(no per-state SDP to solve) — falling back to metric_source='cmg'.",
+                flush=True,
+            )
+            self._metric_source = "cmg"
         if bool(getattr(parsed_cfg, "cm_wdot_trajectory", False)):
             if parsed_cfg.cmg_method != "cvstem":
                 raise ValueError(
@@ -713,6 +759,25 @@ class C2RLAgent(Agent):
         self.track_data("Loss / C2RL/cmg/cond_mean", cond_mean)
         self.track_data("Loss / C2RL/cmg/cond_q95", cond_q95)
 
+    def build_online_metric(self):
+        """The ``metric_source="online"`` stand-in for the frozen CMG network.
+
+        Replaces Phase A entirely: nothing is sampled, solved offline, cached or
+        regressed — the SDP is solved at the states the rollout actually visits,
+        inside the env's own reward (see ``OnlineCVSTEMMetric``). Returns the
+        object the trainer injects via ``set_ccm`` in place of the CMG.
+        """
+        from .ncm_synthesis import OnlineCVSTEMMetric
+        cfg = self._cfg
+        return OnlineCVSTEMMetric(
+            self._get_f_and_B,
+            x_dim=self._x_dim,
+            lbd=cfg.lbd, w_lb=cfg.w_lb, w_ub=cfg.w_ub, eps=cfg.cm_eps,
+            solver=cfg.cm_solver, r_scaler=cfg.cvstem_r_scaler,
+            max_lambda_reductions=cfg.max_lambda_reductions,
+            chi_weight=cfg.cm_chi_weight, nu_weight=cfg.cm_nu_weight,
+        )
+
     def synthesize_cmg(self, *, timesteps: int = 0) -> dict:
         """Offline CMG synthesis (Phase A, always runs before Phase B) —
         dispatches to one of two pipelines depending on ``cmg_method``:
@@ -941,7 +1006,7 @@ class C2RLSkrlTrainer(Trainer):
                 agent.track_data(key, float(v))
 
     @staticmethod
-    def _inject_ccm(env, agent) -> None:
+    def _inject_ccm(env, agent, metric=None) -> None:
         """Hand a frozen copy of the synthesized CMG to the env(s) so their own
         ``get_rewards()`` returns the Mahalanobis reward natively (see the
         module docstring — this is the ONLY reward path).
@@ -951,6 +1016,11 @@ class C2RLSkrlTrainer(Trainer):
         classic-vs-isaaclab parity bug this guard exists to prevent. A DEEPCOPY,
         not the agent's own module, so the env holds a stable frozen metric even
         if the agent's ``_ccm_gen`` were ever touched again.
+
+        ``metric`` overrides what is injected (``metric_source="online"`` passes
+        an ``OnlineCVSTEMMetric``). It is injected AS-IS: it is stateless apart
+        from counters, and deep-copying it would drag along whatever
+        ``get_f_and_B`` is bound to — the env itself, under analytical dynamics.
         """
         import copy
 
@@ -963,7 +1033,7 @@ class C2RLSkrlTrainer(Trainer):
             inner = inner.unwrapped
 
         device = agent.device
-        ccm = copy.deepcopy(agent._ccm_gen).to(device)
+        ccm = metric if metric is not None else copy.deepcopy(agent._ccm_gen).to(device)
         # A classic SyncVectorEnv exposes per-env instances via .envs; an Isaac
         # env is a single batched env that takes set_ccm directly.
         targets = list(getattr(inner, "envs", [])) or [inner]
@@ -1010,10 +1080,19 @@ class C2RLSkrlTrainer(Trainer):
         # (regress_cmg); "ccm" trains the CMG directly with C1/C2 losses
         # (train_cmg_ccm). Either way the CMG is frozen before Phase B reads its
         # static metric. synthesize_cmg logs feasibility/residual/loss/LR itself. ──
-        info = agent.synthesize_cmg(timesteps=timesteps)
-        print(f"[C2RL] Phase A ({agent._cfg.cmg_method}) — CMG synthesized "
-              f"(feasible {info['feasibility_rate']:.1%}, λ-reduced {info['lambda_reduced_rate']:.1%}, "
-              f"loss {info['regress_mse']:.4g}) and frozen.")
+        # metric_source="online" skips Phase A outright — there is nothing to
+        # synthesize or freeze, the SDP is solved per step inside the reward.
+        online_metric = None
+        if agent._metric_source == "online":
+            online_metric = agent.build_online_metric()
+            print("[C2RL] Phase A SKIPPED (metric_source=online) — the CV-STEM SDP is "
+                  f"solved per env per step at lbd={agent._cfg.lbd}, "
+                  f"solver={agent._cfg.cm_solver}; an infeasible state aborts the run.")
+        else:
+            info = agent.synthesize_cmg(timesteps=timesteps)
+            print(f"[C2RL] Phase A ({agent._cfg.cmg_method}) — CMG synthesized "
+                  f"(feasible {info['feasibility_rate']:.1%}, λ-reduced {info['lambda_reduced_rate']:.1%}, "
+                  f"loss {info['regress_mse']:.4g}) and frozen.")
 
         # ── Phase B: rollout + train the deployed policy against the Mahalanobis
         # reward computed from the frozen CMG. ─────────────────────────────
@@ -1021,7 +1100,7 @@ class C2RLSkrlTrainer(Trainer):
         rl_agent.enable_training_mode(True)
         rollout_steps = agent._cfg.rollouts
 
-        self._inject_ccm(env, agent)
+        self._inject_ccm(env, agent, metric=online_metric)
 
         observations, infos = env.reset()
         states = env.state() if hasattr(env, "state") else None
