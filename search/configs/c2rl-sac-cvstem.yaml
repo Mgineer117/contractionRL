@@ -79,3 +79,8 @@ parameters:
     value: 0.95
   cm.cmg_method:
     value: cvstem
+  # Phase-A CMG network, not the per-step SDP. Pinned explicitly rather than
+  # inherited: "online" solves num_envs SDPs per step, which is a single-run
+  # configuration, not something a sweep of this width can afford.
+  cm.metric_source:
+    value: cmg

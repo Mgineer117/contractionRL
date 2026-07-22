@@ -81,7 +81,7 @@ cm:
   # (~12 ms each with MOSEK here), so this is a single-run configuration.
   # "cmg" instead uses the Phase-A network (what c2rl_ppo does). Forced to
   # "cmg" when cmg_method is "ccm" (that pipeline has no per-state SDP).
-  metric_source: online
+  metric_source: cmg
   # Mahalanobis reward
   w_ub: 10.0  # Upper eigenvalue bound for the metric M(x)
   w_lb: 0.01  # Lower eigenvalue bound for the metric M(x). NOT 0.1: the CV-STEM SDP

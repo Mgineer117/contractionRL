@@ -85,7 +85,7 @@ cm:
   # it scales linearly with scene.num_envs — which here is in the thousands —
   # and each solve needs f/B/∂f/∂x from the learned NeuralDynamics. Drop
   # num_envs hard for an online run, or set "cmg" to use the Phase-A network.
-  metric_source: online
+  metric_source: cmg
   # Mahalanobis reward
   w_ub: 10.0  # Upper eigenvalue bound for the metric M(x)
   w_lb: 0.1   # Lower eigenvalue bound for the metric M(x)
