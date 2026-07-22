@@ -337,11 +337,15 @@ if [[ -z "$AGENTS_PER_GPU" ]]; then
     fi
     PROBE_ENV="${ENVS[0]}"
     _header "Smoke test  ${C_DIM}(${ALGORITHM} on ${PROBE_ENV}, 1 GPU, ~2 min)${C_RESET}"
-    NUM_ENVS=$(python - "$ALGORITHM" <<'PY'
+    # The config FILENAME stem (e.g. c2rl-ppo-cvstem) selects the search SPACE;
+    # the train.py --algorithm value is the yaml's `algorithm:` field (e.g.
+    # c2rl-ppo). build_sweep.py passes the latter, so the probe must too — the
+    # stem is not a registered cfg entry point (only cvstem-lqr happens to match).
+    read -r PROBE_ALGO NUM_ENVS < <(python - "$ALGORITHM" <<'PY'
 import sys, yaml, pathlib
 algo = sys.argv[1]
 cfg = yaml.safe_load((pathlib.Path("search/configs")/f"{algo}.yaml").read_text())
-print(int(cfg["num_envs"]))
+print(cfg["algorithm"], int(cfg["num_envs"]))
 PY
 )
     CLASSIC_FLAG=""; [[ "$PROBE_ENV" == classic-* ]] && CLASSIC_FLAG="--classic"
@@ -358,7 +362,7 @@ PY
             cd "'"$REPO_DIR"'"
             '"${ACTIVATE:+$ACTIVATE;}"'
             python scripts/skrl/train.py '"$CLASSIC_FLAG"' \
-                --task "'"$PROBE_ENV"'" --algorithm "'"$ALGORITHM"'" \
+                --task "'"$PROBE_ENV"'" --algorithm "'"$PROBE_ALGO"'" \
                 --num_envs "'"$NUM_ENVS"'" --skip_final_eval \
                 > "'"$PROBE_LOG"'" 2>&1 &
             child=$!
