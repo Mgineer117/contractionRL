@@ -21,6 +21,10 @@ classic (pure-NumPy, no-Isaac) environments alike.
 9. [Algorithm Reference](#algorithm-reference)
 10. [Config Files](#config-files)
 11. [Project Structure](#project-structure)
+12. [Testing](#testing)
+13. [Reproducing the Paper Results](#reproducing-the-paper-results)
+14. [Citing](#citing)
+15. [License](#license)
 
 ---
 
@@ -810,13 +814,18 @@ contractionRL/
 │   └── classic/{env}/cm_data*.npz    #   synthesized contraction-metric caches
 ├── logs/                             # RUN OUTPUT — checkpoints, tensorboard, eval json.
 │                                     #   Disposable: deleting it never forces a re-synthesis.
+├── tests/                            # Runs WITHOUT Isaac Sim (see "Testing")
+│   ├── test_configs.py               #   every yaml key is actually applied
+│   ├── test_contraction_metrics.py   #   the four Stability/* metrics' math
+│   ├── test_env_contract.py          #   the getattr-discovered env interface
+│   └── test_isaac_parity.py          #   classic <-> Isaac capability drift
 ├── scripts/
 │   ├── list_envs.py                  # List all envs without Isaac Sim
 │   ├── generate_ref_traj.py          # Manually generate reference trajectories
 │   └── skrl/
-│       ├── train.py                  # skrl training entry point (Isaac + --classic route);
-│       │                             #   ref-traj auto-generation lives here (_generate_ref_trajs)
-│       └── play.py                   # Evaluation + debug_vis (Isaac only)
+│       ├── train.py                  # skrl training entry point (Isaac + --classic route)
+│       ├── train_utils.py            #   shared W&B/patch/eval helpers for both routes
+│       └── play.py                   # Multi-model Stability evaluator (both routes)
 │
 └── source/contractionRL/contractionRL/
     ├── agents/skrl/
@@ -844,3 +853,79 @@ contractionRL/
         ├── manipulator_vel_tracking/ # Manipulator-VelTracking-v0 (obs 32, act  7)
         └── manipulator_path_tracking/# Manipulator-PathTracking-v0 (obs 49, act  7)
 ```
+
+---
+
+## Testing
+
+The test suite runs **without Isaac Sim** — the classic environments are pure
+NumPy/torch, and the Isaac-side contracts are verified statically (AST + config
+inspection) rather than by launching a simulator.
+
+```bash
+pip install pytest
+python -m pytest tests -q          # 157 tests, ~8 s
+```
+
+What each module guards:
+
+| File | Guards against |
+|---|---|
+| `tests/test_configs.py` | A yaml key that is **silently dropped** because it is not a field of the algorithm's `Cfg` dataclass — the run then trains a different algorithm than its config describes, without erroring. Also checks SAC↔squashed / PPO↔unbounded backbone pairing. |
+| `tests/test_contraction_metrics.py` | The streaming `auc` / `contraction_rate` / `overshoot` / `contraction_score` math, pinned against closed-form cases (a known exponential must report back its own λ). |
+| `tests/test_env_contract.py` | The duck-typed interface `ContractionRunner` discovers by `getattr`: control-affine `get_f_and_B` shapes, `Bᵀ·B_null ≈ 0`, `x_dot` (not `x_next`) from dynamics rollouts, the divergence guard under saturated actions, and that `set_ccm` actually switches the reward to the Mahalanobis form. |
+| `tests/test_isaac_parity.py` | Capability drift between the two env families — a member wired up on classic but missing on Isaac, mismatched `set_ccm` signatures, divergent reward forms, or an analytic controller left with no dynamics source on Isaac. |
+
+CI (`.github/workflows/ci.yml`) runs these on Python 3.10/3.11, plus one short
+end-to-end training run per algorithm on `classic-car-v0` — because a config key
+that stops being applied still imports and still passes unit tests.
+
+## Reproducing the Paper Results
+
+```bash
+# 1. Single run: one algorithm, one environment
+python scripts/skrl/train.py --classic --task classic-car-v0 --algorithm c2rl-ppo
+
+# 2. Multi-seed: every algorithm x every classic env, aggregated with 95% CIs
+./run_seeds.sh                      # see the script header for seed/env selection
+python scripts/aggregate_seeds.py   # -> mean +/- CI table across seeds
+
+# 3. Compare trained checkpoints head-to-head on the Stability metrics
+python scripts/skrl/play.py --classic --task classic-car-v0
+```
+
+Isaac Sim environments follow the same commands without `--classic`, but need
+reference trajectories first — see
+[Reference Trajectory Generation](#reference-trajectory-generation). The
+analytic controllers (`lqr`, `sdlqr`, `cvstem-lqr`) additionally need
+`--dynamics_checkpoint <dynamics.pt>` there, since Isaac exposes no analytical
+`get_f_and_B` and those algorithms train no dynamics model of their own.
+
+All algorithms report the same four contraction-stability metrics under
+`Stability/*` (normalized-error AUC, contraction rate λ, overshoot, contraction
+score), computed by the same code path — so numbers are directly comparable
+across algorithms and across both environment families. See
+[Algorithm Reference](#algorithm-reference).
+
+## Citing
+
+```bibtex
+@software{cho_contractionrl,
+  author  = {Cho, Minjae},
+  title   = {{contractionRL}: contraction-metric reinforcement learning on a unified skrl backend},
+  year    = {2026},
+  url     = {https://github.com/minjaecho/contractionRL},
+  license = {Apache-2.0}
+}
+```
+
+Machine-readable metadata is in [CITATION.cff](CITATION.cff).
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE). Portions derive from
+[Isaac Lab](https://github.com/isaac-sim/IsaacLab) (BSD-3-Clause), whose notices
+are retained in the affected files.
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md), which
+documents the invariants (silent-failure classes) this codebase is built around.

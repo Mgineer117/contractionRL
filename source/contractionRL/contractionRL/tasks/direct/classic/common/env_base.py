@@ -119,7 +119,6 @@ class BaseEnv(gym.Env):
         ...
 
     def _rollout_reference(self, xref_0: torch.Tensor, freqs, weights) -> tuple[torch.Tensor, torch.Tensor, int]:
-        n = xref_0.shape[0]
         xref_list = [xref_0]
         xref_wrapped_list = [xref_0]
         uref_list = []
@@ -144,10 +143,22 @@ class BaseEnv(gym.Env):
     def system_reset(self, env_ids: torch.Tensor):
         ...
 
-    def set_ccm(self, ccm_gen, w_lb, device):
+    def set_ccm(self, ccm_gen, w_lb, device, tracking_scaler=None, control_scaler=None):
+        """Inject the frozen CMG (and, optionally, the reward weights) for C2RL.
+
+        ``tracking_scaler``/``control_scaler`` default to None = keep whatever
+        the env config's ``q``/``r`` set. C2RL passes its own cfg values so the
+        ``cm.tracking_scaler``/``cm.control_scaler`` keys actually reach the
+        reward — they were declared on the agent cfg but read by nobody, which
+        made every sweep over them a no-op.
+        """
         self.ccm_gen = ccm_gen
         self.w_lb = w_lb
         self.ccm_device = device
+        if tracking_scaler is not None:
+            self.tracking_scaler = float(tracking_scaler)
+        if control_scaler is not None:
+            self.control_scaler = float(control_scaler)
 
     def set_eig_reshape(self, target_cond: float | None) -> None:
         """Reward-side ablation: reshape M's eigenvalue SPREAD to ``target_cond``

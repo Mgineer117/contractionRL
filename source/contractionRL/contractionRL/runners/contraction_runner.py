@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import copy
 import os
-import warnings
 
 import gymnasium as gym
 
@@ -43,6 +42,48 @@ from contractionRL.agents.skrl.rl_glue import filter_cfg_fields as _filter_cfg_f
 
 _SKRL_ALGOS = frozenset({"ppo", "sac", "td3", "ddpg", "amp", "ippo", "mappo"})
 _CONTRACTION_ALGOS = frozenset({"c3m", "lqr", "sdlqr", "cvstem-lqr", "c2rl-ppo", "c2rl-sac"})
+
+# Contraction algorithms that build and train NO dynamics network of their own:
+# they read f/B straight off ``get_f_and_B``. Classic envs answer that
+# analytically; Isaac envs have no closed form, so these need a PRETRAINED
+# NeuralDynamics injected into the env (see _resolve_dynamics_model).
+_ANALYTIC_CONTROLLERS = frozenset({"lqr", "sdlqr", "cvstem-lqr"})
+
+
+def _unwrap_env(env):
+    """Peel every wrapper layer down to the concrete env instance.
+
+    Follows ``.unwrapped`` then ``.env``, guarding against wrappers that return
+    themselves (and against cycles). Classic envs bottom out at the gymnasium
+    env; Isaac envs at the DirectRLEnv subclass under SkrlVecEnvWrapper.
+    """
+    seen = set()
+    while id(env) not in seen:
+        seen.add(id(env))
+        inner = getattr(env, "unwrapped", None) or getattr(env, "env", None)
+        if inner is None or inner is env:
+            break
+        env = inner
+    return env
+
+
+def _env_attrs(raw_env, *names, default=None):
+    """Read attributes off ``raw_env``, falling back to its first sub-env.
+
+    A gymnasium ``SyncVectorEnv`` holds N independent Python envs in ``.envs``
+    and forwards none of their attributes, so the values contraction agents need
+    (``x_dim``/``u_dim``/``angle_idx``/``get_f_and_B``/``get_rollout``) live one
+    level deeper there than they do on a batched Isaac env.
+    """
+    sub = next(iter(getattr(raw_env, "envs", []) or []), None)
+    sub = getattr(sub, "unwrapped", sub) if sub is not None else None
+    out = []
+    for name in names:
+        value = getattr(raw_env, name, None)
+        if value is None and sub is not None:
+            value = getattr(sub, name, None)
+        out.append(default if value is None else value)
+    return tuple(out)
 
 
 def _make_cmg_bounds_fn(cmg_model, w_lb: float):
@@ -223,6 +264,43 @@ def _build_critics(models_cfg: dict, block_name: str, base_algorithm: str, obs_s
 # Helper: translate custom YAML flags to skrl format
 # ────────────────────────────────────────────────────────────────────────── #
 
+def _resolve_dynamics_model(algo: str, agent_cfg: dict, is_classic: bool, device,
+                            explicit_model=None):
+    """Return the ``NeuralDynamics`` an analytic controller needs, or ``None``.
+
+    ``lqr``/``sdlqr``/``cvstem-lqr`` never train a dynamics model — they consume
+    ``get_f_and_B`` directly. On a classic env that is the exact analytical
+    dynamics and nothing is needed here. On an Isaac env there is no closed
+    form, so a NeuralDynamics pretrained by an earlier C3M/C2RL run
+    (``checkpoints/dynamics.pt``) must be loaded and injected into the env;
+    otherwise ``PathTrackingBase.get_f_and_B`` raises deep inside the rollout.
+    Raises up front, with the actual flag to pass, rather than letting that
+    happen.
+    """
+    # Popped, not read: it is a runner-level knob, not a field on any agent's
+    # Cfg dataclass, so leaving it in would trip filter_cfg_fields' warning.
+    path = str(agent_cfg.pop("dynamics_checkpoint", "") or "")
+    if explicit_model is not None:
+        return explicit_model
+    if path:
+        from contractionRL.agents.skrl.nn_modules import NeuralDynamics
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"dynamics_checkpoint '{path}' not found. It should point at a "
+                f"dynamics.pt written by a previous C3M/C2RL run "
+                f"(<log_dir>/checkpoints/dynamics.pt)."
+            )
+        return NeuralDynamics.load(path, device=str(device))
+    if not is_classic and algo in _ANALYTIC_CONTROLLERS:
+        raise ValueError(
+            f"'{algo}' has no dynamics model of its own and Isaac Sim envs expose no "
+            f"analytical get_f_and_B. Pass --dynamics_checkpoint <path-to-dynamics.pt> "
+            f"(written by a previous C3M or C2RL run as <log_dir>/checkpoints/dynamics.pt), "
+            f"or set agent.dynamics_checkpoint in the yaml."
+        )
+    return None
+
+
 def _prepare_skrl_cfg(cfg: dict, algo: str) -> tuple[dict, bool]:
     """Pop ContractionRL-specific keys and translate to skrl conventions."""
     cfg = copy.deepcopy(cfg)
@@ -358,24 +436,8 @@ class ContractionRunner:
         skrl_cfg["trainer"]["close_environment_at_exit"] = False
 
         # Unwrap to the deepest raw env to check for angle_idx
-        raw_env = env
-        seen = set()
-        while True:
-            rid = id(raw_env)
-            if rid in seen:
-                break
-            seen.add(rid)
-            inner = getattr(raw_env, "unwrapped", None) or getattr(raw_env, "env", None)
-            if inner is None or inner is raw_env:
-                break
-            raw_env = inner
-
-        angle_idx = list(getattr(raw_env, "angle_idx", []) or [])
-        if not angle_idx and hasattr(raw_env, "envs") and len(raw_env.envs) > 0:
-            first_env = raw_env.envs[0]
-            if hasattr(first_env, "unwrapped"):
-                first_env = first_env.unwrapped
-            angle_idx = list(getattr(first_env, "angle_idx", []) or [])
+        (angle_idx,) = _env_attrs(_unwrap_env(env), "angle_idx", default=[])
+        angle_idx = list(angle_idx or [])
 
         if skrl_cfg.get("agent", {}).get("observation_preprocessor") == "RunningStandardScaler" and angle_idx:
             raise ValueError(
@@ -402,8 +464,6 @@ class ContractionRunner:
     # ── contraction agents (C3M/LQR/SDLQR/C2RL) ───────────────────────── #
 
     def _setup_contraction(self, env, cfg, algo, task_id, num_envs, is_classic, dynamics_model=None):
-        from contractionRL.agents.skrl.models import CLActorModel, MetricModel
-
         skrl_env = _make_skrl_env(env, task_id, num_envs, is_classic)
         # Use the wrapped env's device for both classic and Isaac envs. The
         # classic env's own physics step is numpy/CPU-bound regardless (see
@@ -418,38 +478,23 @@ class ContractionRunner:
         act_space = skrl_env.action_space
         state_space = getattr(skrl_env, "state_space", None)
 
-        # Unwrap to the deepest raw env that exposes get_rollout / get_f_and_B.
-        # For classic envs this is the single gymnasium env; for Isaac envs it
-        # is the DirectRLEnv subclass buried under SkrlVecEnvWrapper + gym layers.
-        raw_env = env
-        seen = set()
-        while True:
-            rid = id(raw_env)
-            if rid in seen:
-                break
-            seen.add(rid)
-            inner = getattr(raw_env, "unwrapped", None) or getattr(raw_env, "env", None)
-            if inner is None or inner is raw_env:
-                break
-            raw_env = inner
-
-        # For Isaac Sim envs: inject the neural dynamics model so the env can
-        # provide get_f_and_B. Classic envs have analytical dynamics built-in.
-        if not is_classic and dynamics_model is not None:
-            if hasattr(raw_env, "set_dynamics_model"):
-                raw_env.set_dynamics_model(dynamics_model)
-
-        get_f_and_B = getattr(raw_env, "get_f_and_B", None)
-        get_rollout = getattr(raw_env, "get_rollout", None)
-        if get_f_and_B is None and hasattr(raw_env, "envs") and len(raw_env.envs) > 0:
-            first_env = raw_env.envs[0]
-            if hasattr(first_env, "unwrapped"):
-                first_env = first_env.unwrapped
-            get_f_and_B = getattr(first_env, "get_f_and_B", None)
-            get_rollout = getattr(first_env, "get_rollout", None)
+        # Deepest raw env — the one exposing get_rollout / get_f_and_B / x_dim.
+        raw_env = _unwrap_env(env)
 
         agent_cfg = copy.deepcopy(cfg.get("agent", {}))
         agent_cfg.pop("class", None)
+
+        # Isaac envs have no closed-form dynamics: lqr/sdlqr/cvstem-lqr (which
+        # train no dynamics model of their own) need a pretrained NeuralDynamics
+        # injected here, or get_f_and_B raises mid-rollout. No-op for classic
+        # envs and for C3M/C2RL, which own their dynamics model directly.
+        dynamics_model = _resolve_dynamics_model(
+            algo, agent_cfg, is_classic, skrl_env.device, dynamics_model
+        )
+        if dynamics_model is not None and hasattr(raw_env, "set_dynamics_model"):
+            raw_env.set_dynamics_model(dynamics_model)
+
+        get_f_and_B, get_rollout = _env_attrs(raw_env, "get_f_and_B", "get_rollout")
         trainer_cfg = copy.deepcopy(cfg.get("trainer", {}))
         trainer_cfg.pop("class", None)
         trainer_cfg.setdefault("close_environment_at_exit", False)
@@ -464,37 +509,36 @@ class ContractionRunner:
         cmg_cfg = copy.deepcopy(cfg.get("cmg", {}))
         empirical_dynamics_cfg = copy.deepcopy(cfg.get("empirical_dynamics", {}))
 
-        # Analytical dynamics (use_empirical_dynamics=False) needs the env's exact
-        # get_f_and_B, which only classic envs expose. Isaac envs must learn a
-        # NeuralDynamics (use_empirical_dynamics=True) — train.py forces this, so
-        # this guard only fires on a hand-rolled/standalone misconfiguration.
-        use_empirical_dynamics = agent_cfg.get(
-            "use_empirical_dynamics", empirical_dynamics_cfg.get("use_empirical_dynamics", False)
-        )
-        if not use_empirical_dynamics and not is_classic:
-            raise ValueError(
-                "Analytical dynamics (use_empirical_dynamics=False) is only valid for "
-                "classic envs that expose an analytical get_f_and_B. Isaac Sim envs have "
-                "no analytical dynamics — set use_empirical_dynamics=True (pass "
-                "--use_empirical_dynamics) and let the agent train NeuralDynamics online."
+        # use_empirical_dynamics only means anything to the algorithms that OWN a
+        # dynamics model (C3M/C2RL). lqr/sdlqr/cvstem-lqr read get_f_and_B
+        # directly, so the key is dropped here rather than reaching their cfg
+        # filter — which would warn "not applied to the algorithm" on every run
+        # (train.py sets it for every contraction algorithm).
+        if algo in _ANALYTIC_CONTROLLERS:
+            agent_cfg.pop("use_empirical_dynamics", None)
+        else:
+            # Analytical dynamics (use_empirical_dynamics=False) needs the env's exact
+            # get_f_and_B, which only classic envs expose. Isaac envs must learn a
+            # NeuralDynamics (use_empirical_dynamics=True) — train.py forces this, so
+            # this guard only fires on a hand-rolled/standalone misconfiguration.
+            use_empirical_dynamics = agent_cfg.get(
+                "use_empirical_dynamics", empirical_dynamics_cfg.get("use_empirical_dynamics", False)
             )
+            if not use_empirical_dynamics and not is_classic:
+                raise ValueError(
+                    "Analytical dynamics (use_empirical_dynamics=False) is only valid for "
+                    "classic envs that expose an analytical get_f_and_B. Isaac Sim envs have "
+                    "no analytical dynamics — set use_empirical_dynamics=True (pass "
+                    "--use_empirical_dynamics) and let the agent train NeuralDynamics online."
+                )
 
-        x_dim = getattr(raw_env, "x_dim", None)
-        u_dim = getattr(raw_env, "u_dim", None)
         # angle_idx: indices within an x-block that hold a raw (wrapping) angle.
         # Every network built below embeds these as (cos, sin) at its input —
         # see angle_utils.py / models.py — while the env/loss/error math keeps
         # using the RAW state. Defaults to [] (no angle dims) for envs that
         # don't declare it.
-        angle_idx = list(getattr(raw_env, "angle_idx", []) or [])
-        if x_dim is None and hasattr(raw_env, "envs") and len(raw_env.envs) > 0:
-            first_env = raw_env.envs[0]
-            if hasattr(first_env, "unwrapped"):
-                first_env = first_env.unwrapped
-            x_dim = getattr(first_env, "x_dim", None)
-            u_dim = getattr(first_env, "u_dim", None)
-            if not angle_idx:
-                angle_idx = list(getattr(first_env, "angle_idx", []) or [])
+        x_dim, u_dim, angle_idx = _env_attrs(raw_env, "x_dim", "u_dim", "angle_idx")
+        angle_idx = list(angle_idx or [])
 
         models_cfg = copy.deepcopy(cfg.get("models", {}))
         memory_cfg = copy.deepcopy(cfg.get("memory", {}))

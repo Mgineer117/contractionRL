@@ -5,9 +5,16 @@ C2RLAgent trains ONE real skrl ``PPO``/``SAC`` policy (``base_algorithm="PPO"``
 → a skrl ``PPO`` sub-agent, ``base_algorithm="SAC"`` → a skrl ``SAC`` sub-agent)
 against a Mahalanobis tracking reward
 
-    ``-tracking_scaler·||e||²_M - control_scaler·||u - uref||²``,   e = x - xref
+    ``tracking_scaler·(V_t - V_{t+1}) - control_scaler·||u||²``,   V = eᵀM(x)e
 
-where the metric ``M(x) = W(x)⁻¹`` comes from one of two sources, selected by
+where ``e = x - xref``. The tracking term is the per-step DECREASE of the
+Mahalanobis Lyapunov function ``V`` — a contraction signal, not a level
+penalty — computed identically by both env families (classic
+``env_base.get_rewards`` and Isaac ``PathTrackingBase._get_rewards``). The
+control term penalizes the raw action magnitude and is disabled
+(``control_scaler = 0``) in every shipped config.
+
+The metric ``M(x) = W(x)⁻¹`` comes from one of two sources, selected by
 ``metric_source`` — this is the knob that decides HOW THE ENV COMPUTES THE
 MAHALANOBIS REWARD, since whichever source is chosen is injected into the env
 and called from its own ``get_rewards()``:
@@ -92,6 +99,7 @@ opposite: the dynamics are queried EVERY step, since each solve needs
 
 from __future__ import annotations
 
+import copy
 import os
 import sys
 from dataclasses import dataclass, field
@@ -1041,7 +1049,13 @@ class C2RLSkrlTrainer(Trainer):
         for e in targets:
             e = e.unwrapped if hasattr(e, "unwrapped") else e
             if hasattr(e, "set_ccm"):
-                e.set_ccm(ccm, agent._cfg.w_lb, device)
+                e.set_ccm(
+                    ccm,
+                    agent._cfg.w_lb,
+                    device,
+                    tracking_scaler=agent._cfg.tracking_scaler,
+                    control_scaler=agent._cfg.control_scaler,
+                )
                 injected += 1
         if injected == 0:
             raise RuntimeError(
@@ -1110,6 +1124,34 @@ class C2RLSkrlTrainer(Trainer):
         flush_interval = max(1, timesteps // 100)
         next_flush = flush_interval
 
+        # ── Outer-agent checkpointing ──────────────────────────────────────
+        # The outer agent is stepped once per rollout CHUNK, so skrl's
+        # `(timestep + 1) % checkpoint_interval` gate in Agent.post_interaction
+        # can never line up (stride `rollout_steps` vs. interval 2000) — it
+        # would silently write no checkpoints at all. Drive them off the real
+        # step count instead. The best-model comparison also needs episode
+        # returns, and `record_transition` runs on the INNER rl_agent, so the
+        # outer agent's own tracking_data never holds them: mirror the inner
+        # agent's running mean across (captured per chunk, since
+        # write_tracking_data clears `_track_rewards`).
+        ckpt_interval = agent.checkpoint_interval if isinstance(agent.checkpoint_interval, int) else 0
+        next_ckpt = global_step + ckpt_interval if ckpt_interval > 0 else None
+        last_return: float | None = None
+
+        def _write_outer_checkpoint(step: int, *, force_best: bool = False) -> None:
+            improved = last_return is not None and last_return > agent.checkpoint_best_modules["reward"]
+            if improved or (force_best and not agent.checkpoint_best_modules["modules"]):
+                agent.checkpoint_best_modules.update({
+                    "timestep": step,
+                    "reward": last_return if last_return is not None else agent.checkpoint_best_modules["reward"],
+                    "saved": False,
+                    "modules": {
+                        k: copy.deepcopy(agent._get_internal_value(v))
+                        for k, v in agent.checkpoint_modules.items()
+                    },
+                })
+            agent.write_checkpoint(timestep=step, timesteps=timesteps)
+
         pbar = _tqdm.tqdm(total=timesteps, desc="C2RL training (Phase B)", file=sys.stdout)
         while global_step < timesteps:
             if agent._base_algorithm == "PPO":
@@ -1157,6 +1199,19 @@ class C2RLSkrlTrainer(Trainer):
             agent.post_interaction(timestep=global_step, timesteps=timesteps)
             if getattr(agent, "writer", None) is not None:
                 agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
+
+            if getattr(rl_agent, "_track_rewards", None):
+                last_return = float(np.mean(rl_agent._track_rewards))
+            if next_ckpt is not None and global_step >= next_ckpt:
+                _write_outer_checkpoint(global_step)
+                next_ckpt = global_step + ckpt_interval
+
+        # Final checkpoint — also guarantees a best_agent.pt exists for the
+        # post-training eval when no interval boundary was crossed cleanly.
+        if ckpt_interval > 0:
+            if getattr(rl_agent, "_track_rewards", None):
+                last_return = float(np.mean(rl_agent._track_rewards))
+            _write_outer_checkpoint(global_step, force_best=True)
 
         if getattr(rl_agent, "writer", None) is not None:
             rl_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)

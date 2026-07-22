@@ -180,16 +180,23 @@ class PathTrackingBase(DirectRLEnv):
         """Inject a NeuralDynamics model for get_f_and_B (required for Isaac envs)."""
         self._dynamics_model = model
 
-    def set_ccm(self, ccm_gen, w_lb, device) -> None:
+    def set_ccm(self, ccm_gen, w_lb, device, tracking_scaler=None, control_scaler=None) -> None:
         """Inject the frozen CMG for C2RL's Phase B Mahalanobis reward.
 
         Mirrors classic/common/env_base.py's BaseEnv.set_ccm exactly (same
         signature) so C2RLSkrlTrainer.train() can call it identically for
         both env families — see _get_rewards for the reward this enables.
+
+        The scalers default to None = keep the plain-reward weights set in
+        __init__ (1.0 / 0.0).
         """
         self.ccm_gen = ccm_gen
         self.w_lb = w_lb
         self.ccm_device = device
+        if tracking_scaler is not None:
+            self.tracking_scaler = float(tracking_scaler)
+        if control_scaler is not None:
+            self.control_scaler = float(control_scaler)
 
     def set_contraction_certificate(
         self,
@@ -359,8 +366,11 @@ class PathTrackingBase(DirectRLEnv):
         """
         if self._dynamics_model is None:
             raise RuntimeError(
-                "get_f_and_B requires a NeuralDynamics model. "
-                "Load one with --dynamics_checkpoint and pass it to ContractionRunner."
+                "get_f_and_B requires a NeuralDynamics model — Isaac Sim envs have no "
+                "analytical dynamics. C3M/C2RL build and pretrain one themselves; "
+                "lqr/sdlqr/cvstem-lqr need one injected via set_dynamics_model(), which "
+                "ContractionRunner does from --dynamics_checkpoint (a dynamics.pt saved "
+                "by a previous C3M/C2RL run)."
             )
         return self._dynamics_model.get_f_and_B(x)
 

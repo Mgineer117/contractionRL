@@ -110,7 +110,14 @@ cm:
   #              W = M⁻¹ congruence — it is what makes K above the certified gain.)
   #              Control is penalized via this Riccati term, not bounded over an
   #              action range — see ncm_synthesis.py module docstring.
-  cmg_method: cvstem
+  # ccm, NOT cvstem: the turtlebot is a DRIFTLESS unicycle (f(x) == 0 identically,
+  # measured max|f| = 0 over the sampled state space). CV-STEM imposes its LMI at
+  # the drift Jacobian A = df/dx, which is then also 0, so the program reduces to
+  # 2*lbd*W <= -eps*I with W >= 0 — infeasible at EVERY lambda, w_lb/w_ub and
+  # r_scaler (measured 0/32 across all of them). That is a structural property of
+  # CV-STEM on a driftless plant, not a tuning failure. The ccm pipeline trains the
+  # CMG through C1/C2 losses with no per-state SDP, so it has no such requirement.
+  cmg_method: ccm
   cvstem_r_scaler: 1.0  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only
   # On SDP infeasibility AT A GIVEN STATE, retry that state alone with λ
   # halved, up to this many times, before giving up on it and dropping it from

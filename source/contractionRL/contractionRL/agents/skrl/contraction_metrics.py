@@ -41,7 +41,6 @@ from __future__ import annotations
 import io
 import math
 import sys
-import warnings
 
 import numpy as np
 import torch
@@ -401,8 +400,6 @@ class StatManagerEnvWrapper:
                 err_vals = torch.where(init_flags.reshape(-1), fresh, err_vals)
         obs_x = obs[:, :pd].detach().cpu().numpy()
         obs_xref = obs[:, xd:xd + pd].detach().cpu().numpy()
-
-        N = self._num_envs_for_eval
 
         # For each env that is initializing, complete its old slot if any, and start a new one
         init_indices = torch.nonzero(init_flags, as_tuple=True)[0]

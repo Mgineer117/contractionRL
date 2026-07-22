@@ -72,7 +72,6 @@ from .math_utils import (
     spd_inverse,
     weighted_gradients,
 )
-from .nn_modules import NeuralDynamics
 from .rl_glue import filter_cfg_fields
 
 
@@ -237,7 +236,6 @@ class C3MAgent(Agent):
         self._device = device
         self._cfg = cfg
 
-        dev_str = str(device) if not isinstance(device, str) else device
 
         # ── Dynamics: analytical or learned online ──────────────────────── #
         if not cfg.use_empirical_dynamics:

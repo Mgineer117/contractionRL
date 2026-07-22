@@ -23,7 +23,7 @@ except ImportError:
 
 from .angle_utils import embed_angles, embedded_dim
 from .math_utils import rescale_residual
-from .nn_modules import CCM_Generator, BoundedCCM_Generator, CLActor, MLP, NeuralDynamics
+from .nn_modules import CCM_Generator, BoundedCCM_Generator, CLActor, MLP
 
 _MIN_LOG_STD = math.log(0.001)  # ≈ -6.908; matches CLActor annealing floor
 
@@ -246,6 +246,7 @@ class CLActorModel(GaussianMixin, Model):
         initial_log_std: float = 0.0,
         hidden_dim: list | None = None,
         activation: str = "tanh",
+        x_dim: int | None = None,
         angle_idx: list | None = None,
         **kwargs,
     ):
@@ -260,7 +261,12 @@ class CLActorModel(GaussianMixin, Model):
 
         obs_dim = int(self.observation_space.shape[0])
         u_dim = int(self.action_space.shape[0])
-        x_dim = (obs_dim - u_dim) // 2
+        # Declared explicitly (not swallowed by **kwargs): callers that know the
+        # layout — contraction_runner passes the env's own x_dim — must win over
+        # the dimension-parity guess, as they already do for every other
+        # backbone here.
+        if x_dim is None:
+            x_dim = (obs_dim - u_dim) // 2
 
         self.cl_actor = CLActor(
             x_dim=x_dim,
@@ -314,6 +320,7 @@ class MLPResidualActorModel(GaussianMixin, Model):
         initial_log_std: float = 0.0,
         hidden_dim: list | None = None,
         activation: str = "tanh",
+        x_dim: int | None = None,
         angle_idx: list | None = None,
         **kwargs,
     ):
@@ -335,7 +342,8 @@ class MLPResidualActorModel(GaussianMixin, Model):
                 f"layout [x, xref, uref]), got obs_dim={obs_dim}, act_dim={u_dim}."
             )
         self._u_dim = u_dim
-        self._x_dim = remainder // 2
+        # Explicit x_dim (from the env) wins over the parity guess — see CLActorModel.
+        self._x_dim = x_dim if x_dim is not None else remainder // 2
         self._angle_idx = angle_idx or []
 
         act_module = {"tanh": nn.Tanh(), "relu": nn.ReLU()}[activation.lower()] \

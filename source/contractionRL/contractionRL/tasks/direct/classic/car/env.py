@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import math
 import torch
-import numpy as np
 
 from ..common.env_base import BaseEnv
 

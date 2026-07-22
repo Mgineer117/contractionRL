@@ -137,6 +137,14 @@ ignore-words-list = "haa,slq,collapsable,buss,reacher,thirdparty"
 
 [tool.pytest.ini_options]
 
+testpaths = ["tests"]
+# tests/conftest.py puts source/, the task package and scripts/skrl on sys.path.
+addopts = "-q --strict-markers"
+filterwarnings = [
+    # Third-party noise (pygame/pkg_resources/protobuf) — not ours to fix.
+    "ignore::DeprecationWarning",
+]
+
 markers = [
     "isaacsim_ci: mark test to run in isaacsim ci",
 ]

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import numpy as np
 import torch
 
 from ..common.env_base import BaseEnv

@@ -146,7 +146,6 @@ def _gaussian_factory(observation_space, state_space, action_space, device,
     # "control" is the preferred spelling for the CLActor backbone;
     # "contraction" is kept as a backward-compatible alias.
     if backbone in ("control", "contraction"):
-        import gymnasium
         obs_dim = observation_space.shape[0]
         act_dim = action_space.shape[0]
         # CLActorModel requires obs layout [x, x_ref, u_ref]: obs_dim == 2*x_dim + u_dim
@@ -240,6 +239,7 @@ def _gaussian_factory(observation_space, state_space, action_space, device,
                 device=device,
                 hidden_dim=hidden_dim,
                 initial_log_std=initial_log_std,
+                x_dim=x_dim,
                 **kwargs,
             )
 

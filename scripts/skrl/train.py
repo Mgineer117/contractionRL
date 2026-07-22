@@ -50,6 +50,12 @@ parser.add_argument("--use_empirical_dynamics", "--use-empirical-dynamics",
                     action="store_true", default=False,
                     help="Use a learned NeuralDynamics model instead of the env's exact analytical get_f_and_B "
                          "(classic envs only). When NOT passed, C3M/C2RL use analytical dynamics.")
+parser.add_argument("--dynamics_checkpoint", "--dynamics-checkpoint", type=str, default=None,
+                    help="Path to a dynamics.pt written by a previous C3M/C2RL run "
+                         "(<log_dir>/checkpoints/dynamics.pt). REQUIRED for lqr/sdlqr/cvstem-lqr "
+                         "on Isaac Sim envs: those algorithms train no dynamics model of their own "
+                         "and Isaac envs expose no analytical get_f_and_B. Ignored by C3M/C2RL "
+                         "(they own their dynamics) and unnecessary for classic envs.")
 parser.add_argument("--caps_temporal_scale", "--caps-temporal-scale", type=float, default=None,
                     help="CAPS temporal action-smoothness weight on ||pi(s_t) - pi(s_t+1)||^2, added "
                          "to the POLICY LOSS (not the reward — the MDP/observation/dynamics are "
@@ -167,7 +173,12 @@ from datetime import datetime
 
 import gymnasium as gym
 import yaml
-from train_utils import _default_num_envs_classic, _inject_angle_idx, _generate_ref_trajs, _evaluate_classic_path_tracking, _evaluate_best_model, _resolve_caps_kwargs
+from train_utils import (
+    _default_num_envs_classic, _evaluate_best_model, _evaluate_classic_path_tracking,
+    _generate_ref_trajs, _inject_angle_idx, _resolve_caps_kwargs,
+    apply_agent_patches, apply_wandb_sweep_overrides, finish_wandb,
+    install_wandb_scalar_hook, normalize_agent_cfg,
+)
 
 algorithm = args_cli.algorithm.lower()
 # Bare "c2rl" (no -ppo/-sac suffix) defaults to the PPO variant, since it has
@@ -268,6 +279,8 @@ if _is_classic:
     # dynamics instead.
     if algorithm in _CONTRACTION_ALGOS:
         agent_cfg["agent"]["use_empirical_dynamics"] = args_cli.use_empirical_dynamics
+    if args_cli.dynamics_checkpoint:
+        agent_cfg["agent"]["dynamics_checkpoint"] = args_cli.dynamics_checkpoint
 
     _run_ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_dir = os.path.join("logs", "classic", algorithm, _run_ts)
@@ -278,9 +291,7 @@ if _is_classic:
 
     # W&B
     if not args_cli.no_wandb:
-        import skrl.utils.tensorboard as _skrl_tb
         import wandb as _wandb
-
         agent_cfg["agent"]["experiment"]["wandb"] = ("WANDB_SWEEP_ID" not in os.environ)
         _wkw = agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})
         _wkw["project"] = args_cli.wandb_project
@@ -298,197 +309,82 @@ if _is_classic:
         # default that matches the local log directory (logs/classic/<algo>/<ts>).
         _wkw["name"] = args_cli.wandb_run_name or _wkw.get("name") or f"classic_{algorithm}_{_run_ts}"
 
-        # If a sweep is running, init early to retrieve hyperparams and inject into agent_cfg
+        # A sweep must init EARLY: its sampled hyperparameters only exist on
+        # wandb.config once the run is live, and they have to reach agent_cfg
+        # before any model is built from it.
         if "WANDB_SWEEP_ID" in os.environ:
             if _wandb.run is None:
-                _wandb.init(
-                    project=_wkw["project"], name=_wkw.get("name"), sync_tensorboard=False,
-                    settings=_wkw["settings"],
-                )
-            for k, v in _wandb.config.items():
-                keys = k.split('.')
-                curr = agent_cfg
-                for key in keys[:-1]:
-                    if key not in curr:
-                        curr[key] = {}
-                    curr = curr[key]
-                # A sweep parameter whose value is itself a dict (wandb's
-                # nested-parameter form for jointly-sampled pairs, e.g.
-                # {w_lb, w_ub} — see search/configs/) must be merged into
-                # the existing sub-dict, not assigned — assigning would wipe
-                # out sibling keys already at that path (e.g. agent.class,
-                # agent.lbd) that this sweep parameter isn't sampling.
-                if isinstance(v, dict) and isinstance(curr.get(keys[-1]), dict):
-                    curr[keys[-1]].update(v)
-                else:
-                    curr[keys[-1]] = v
+                _wandb.init(project=_wkw["project"], name=_wkw.get("name"),
+                            sync_tensorboard=False, settings=_wkw.get("settings"))
+            apply_wandb_sweep_overrides(agent_cfg)
 
-        _orig_add_scalar = _skrl_tb.SummaryWriter.add_scalar
-        _scalar_metric_defined = [False]
-
-        def _wandb_add_scalar(self, *, tag: str, value: float, timestep: int) -> None:
-            _orig_add_scalar(self, tag=tag, value=value, timestep=timestep)
-            if _wandb.run is not None:
-                # Custom step metric instead of wandb's internal step counter —
-                # see the Isaac-route patch below for why (step-less media logs
-                # advance the counter and get later explicit-step scalars dropped).
-                if not _scalar_metric_defined[0]:
-                    _wandb.define_metric("global_step")
-                    _wandb.define_metric("*", step_metric="global_step")
-                    _scalar_metric_defined[0] = True
-                _wandb.log({tag: value, "global_step": timestep})
-
-        _skrl_tb.SummaryWriter.add_scalar = _wandb_add_scalar
+        install_wandb_scalar_hook()
     else:
         # --no_wandb: override the YAML default (wandb: true) so the skrl agent
         # does not call wandb.init() during agent.init().
         agent_cfg["agent"].setdefault("experiment", {})["wandb"] = False
 
-    if algorithm in _CONTRACTION_ALGOS:
-        # Contraction algorithms use ContractionRunner
-        _src_dir = os.path.join(_root, "source", "contractionRL")
-        if _src_dir not in sys.path:
-            sys.path.insert(0, _src_dir)
+    _src_dir = os.path.join(_root, "source", "contractionRL")
+    if _src_dir not in sys.path:
+        sys.path.insert(0, _src_dir)
+    _sys.path.append(_os.path.dirname(__file__))
 
+    from contractionRL.agents.skrl.contraction_metrics import StatManagerEnvWrapper
+    from train_utils import BatchedGymnasiumWrapper
+    from wandb_plot_wrapper import WandbPlotWrapper
+
+    _is_contraction = algorithm in _CONTRACTION_ALGOS
+    num_envs = args_cli.num_envs if args_cli.num_envs is not None else _default_num_envs_classic(algorithm)
+    device = getattr(args_cli, "device", "cuda:0")
+
+    raw_env = gym.make(args_cli.task, num_envs=num_envs, device=device)
+    if args_cli.eig_reshape is not None:
+        if not hasattr(raw_env.unwrapped, "set_eig_reshape"):
+            raise SystemExit("--eig_reshape requires a classic env_base env (got "
+                             f"{type(raw_env.unwrapped).__name__})")
+        raw_env.unwrapped.set_eig_reshape(args_cli.eig_reshape)
+        print(f"[train] eig_reshape ACTIVE: Mahalanobis reward's M reshaped to "
+              f"cond(M) = {args_cli.eig_reshape:g} every step")
+
+    # Wrapper order is load-bearing: StatManagerEnvWrapper must see the flat
+    # tensor observations BatchedGymnasiumWrapper produces, and WandbPlotWrapper
+    # sits outermost so it observes every step() regardless of caller.
+    env = WandbPlotWrapper(
+        StatManagerEnvWrapper(BatchedGymnasiumWrapper(raw_env)),
+        total_timesteps=agent_cfg["trainer"]["timesteps"],
+    )
+
+    _annealing = normalize_agent_cfg(agent_cfg, algorithm=algorithm)
+    # C2RL declares caps_* as real cfg fields and patches its own inner PPO/SAC
+    # sub-agent, so its keys must STAY in the dict (pop=False); skrl's Runner
+    # would reject them, so the standalone route strips them. See _resolve_caps_kwargs.
+    _caps = _resolve_caps_kwargs(agent_cfg, args_cli, pop=not _is_contraction)
+
+    if _is_contraction:
         from contractionRL.runners import ContractionRunner
-        
-        num_envs = args_cli.num_envs if args_cli.num_envs is not None else _default_num_envs_classic(algorithm)
-        device = getattr(args_cli, "device", "cuda:0")
-        
-        env = gym.make(args_cli.task, num_envs=num_envs, device=device)
-        if args_cli.eig_reshape is not None:
-            if not hasattr(env.unwrapped, "set_eig_reshape"):
-                raise SystemExit("--eig_reshape requires a classic env_base env (got "
-                                 f"{type(env.unwrapped).__name__})")
-            env.unwrapped.set_eig_reshape(args_cli.eig_reshape)
-            print(f"[train] eig_reshape ACTIVE: Mahalanobis reward's M reshaped to "
-                  f"cond(M) = {args_cli.eig_reshape:g} every step")
-        from train_utils import BatchedGymnasiumWrapper
-        env = BatchedGymnasiumWrapper(env)
-
-        from contractionRL.agents.skrl.contraction_metrics import StatManagerEnvWrapper
-        env = StatManagerEnvWrapper(env)
-
-        _sys.path.append(_os.path.dirname(__file__))
-        from wandb_plot_wrapper import WandbPlotWrapper
-        env = WandbPlotWrapper(env, total_timesteps=agent_cfg["trainer"]["timesteps"])
-
-        # C2RL applies the CAPS patch itself, off its own cfg fields — this just
-        # folds any --caps_* override back into the dict it will read.
-        _resolve_caps_kwargs(agent_cfg, args_cli, pop=False)
-
-        runner = ContractionRunner(env, agent_cfg, task_id=args_cli.task, num_envs=num_envs, is_classic=True)
-        # Best-checkpoint metric split (same rule as the Isaac route): c3m/cvstem-lqr
-        # pick best_agent.pt by contraction_score; lqr/sdlqr/c2rl by AUC. See
-        # best_metric_for. Without this, classic runs fell back to skrl's raw-reward
-        # default for "best".
-        from contractionRL.agents.skrl.agent_patches import (
-            patch_auc_checkpoint as _patch_auc_checkpoint,
-            best_metric_for as _best_metric_for,
-        )
-        _patch_auc_checkpoint(runner.agent, metric=_best_metric_for(algorithm))
-        if args_cli.checkpoint:
-            runner.load(args_cli.checkpoint)
-        runner.run()
-        env.close()
-
-        _evaluate_classic_path_tracking(task=args_cli.task, runner=runner, args_cli=args_cli, _is_classic=_is_classic)
-
-        if not args_cli.no_wandb and 'wandb' in sys.modules and sys.modules['wandb'].run is not None:
-            sys.modules['wandb'].finish()
-
+        runner = ContractionRunner(env, agent_cfg, task_id=args_cli.task,
+                                   num_envs=num_envs, is_classic=True)
     else:
-        # PPO / SAC use the built-in skrl Runner
-        from contractionRL.agents.skrl.runner import CLActorRunner as Runner, CONTROL_BACKBONES
+        # Standalone PPO/SAC build their models from agent_cfg alone (no env
+        # access), so angle_idx has to be injected into the model blocks for
+        # their networks to embed it continuously — see _inject_angle_idx.
+        # ContractionRunner reads it off the env itself and needs no injection.
+        from contractionRL.agents.skrl.runner import CLActorRunner
+        _inject_angle_idx(agent_cfg, list(getattr(raw_env.unwrapped, "angle_idx", []) or []))
+        runner = CLActorRunner(env, agent_cfg)
 
-        _a = agent_cfg["agent"]
-        _a.pop("use_state_norm", None)  # state norm disabled everywhere (see contraction_runner.py docstring)
-        _use_state = False
-        _use_value = _a.pop("use_value_norm", True)
+    # Contraction algorithms already namespace their own track_data() keys.
+    apply_agent_patches(runner.agent, algorithm=algorithm, annealing=_annealing,
+                        caps=_caps, namespace=not _is_contraction)
 
-        num_envs = args_cli.num_envs if args_cli.num_envs is not None else _default_num_envs_classic(algorithm)
-        device = getattr(args_cli, "device", "cuda:0")
-        
-        env = gym.make(args_cli.task, num_envs=num_envs, device=device)
-        
-        _isaac_env = env
-        from train_utils import BatchedGymnasiumWrapper
-        env = BatchedGymnasiumWrapper(env)
+    if args_cli.checkpoint:
+        runner.load(args_cli.checkpoint) if _is_contraction else runner.agent.load(args_cli.checkpoint)
+    runner.run()
+    env.close()
 
-        from contractionRL.agents.skrl.contraction_metrics import StatManagerEnvWrapper
-        env = StatManagerEnvWrapper(env)
-
-        _sys.path.append(_os.path.dirname(__file__))
-        from wandb_plot_wrapper import WandbPlotWrapper
-        env = WandbPlotWrapper(env, total_timesteps=agent_cfg["trainer"]["timesteps"])
-
-        # Standalone PPO/SAC build models purely from agent_cfg (no env access) —
-        # inject angle_idx (e.g. yaw at [2]) from the underlying classic env so
-        # every network embeds it continuously (see runner.py's _gaussian_factory
-        # / _deterministic_factory). No-op for envs with no wrapping angle.
-        _angle_idx = list(getattr(_isaac_env.unwrapped, "angle_idx", []) or [])
-        _inject_angle_idx(agent_cfg, _angle_idx)
-
-        if _use_state:
-            # [x, xref, uref] path-tracking layout (obs_dim = 2*x_dim + u_dim,
-            # same detection as runner.py's "mlp"/"mlp-squashed" backbones) needs
-            # the masked scaler — see c2rl.py's module docstring / preprocessors.py
-            # for why normalizing uref or angle_idx columns there is a
-            # correctness bug, not just a style choice. Flat (e.g. vel-tracking)
-            # layouts have no residual/angle-embedding structure, so the stock
-            # full-vector scaler is fine there.
-            _u_dim = int(env.action_space.shape[0])
-            _remainder = int(env.observation_space.shape[0]) - _u_dim
-            if _remainder > 0 and _remainder % 2 == 0:
-                from contractionRL.agents.skrl.preprocessors import PathTrackingObservationScaler
-                _a["state_preprocessor"] = PathTrackingObservationScaler
-                _a["state_preprocessor_kwargs"] = {
-                    "x_dim": _remainder // 2, "u_dim": _u_dim, "angle_idx": _angle_idx,
-                }
-            else:
-                _a["state_preprocessor"] = "RunningStandardScaler"
-                _a["state_preprocessor_kwargs"] = None
-        if _use_value and algorithm == "ppo":
-            _a["value_preprocessor"] = "RunningStandardScaler"
-            _a["value_preprocessor_kwargs"] = None
-        _a.pop("anneal_stddev", None)   # no longer a PPO_CFG field; handled below
-        _a.pop("anneal_log_std", None)  # legacy alias, superseded by backbone-driven annealing
-        _a.pop("std_dev_annealing", None)  # legacy on/off flag; now auto-derived from backbone below
-        _std_dev_annealing_kwargs = _a.pop("std_dev_annealing_kwargs", None)
-        _std_dev_annealing = (
-            agent_cfg.get("models", {}).get("policy", {}).get("backbone") in CONTROL_BACKBONES
-        )
-
-        # Read (and remove) the caps_* keys BEFORE Runner builds a PPO_CFG/SAC_CFG
-        # from this dict — see _resolve_caps_kwargs.
-        _caps = _resolve_caps_kwargs(agent_cfg, args_cli, pop=True)
-
-        runner = Runner(env, agent_cfg)
-        from contractionRL.agents.skrl.agent_patches import (
-            patch_algo_namespace as _patch_algo_namespace,
-            patch_caps_regularizer as _patch_caps_regularizer,
-            patch_kl_logging as _patch_kl_logging,
-            patch_ppo_std_annealing as _patch_ppo_std_annealing,
-            patch_sac_entropy_clamp as _patch_sac_entropy_clamp,
-            patch_auc_checkpoint as _patch_auc_checkpoint,
-        )
-        _patch_kl_logging(runner.agent)
-        _patch_sac_entropy_clamp(runner.agent)
-        _patch_ppo_std_annealing(runner.agent, _std_dev_annealing, _std_dev_annealing_kwargs)
-        _patch_caps_regularizer(runner.agent, **_caps)
-        _patch_algo_namespace(runner.agent, algorithm.upper())
-        # Standalone PPO/SAC pick best_agent.pt by AUC (learned RL policies never
-        # certify a contraction_score). See best_metric_for / the Isaac route.
-        _patch_auc_checkpoint(runner.agent, metric="auc")
-        if args_cli.checkpoint:
-            runner.agent.load(args_cli.checkpoint)
-        runner.run()
-        env.close()
-
-        _evaluate_classic_path_tracking(task=args_cli.task, runner=runner, args_cli=args_cli, _is_classic=_is_classic)
-
-        if not args_cli.no_wandb and 'wandb' in sys.modules and sys.modules['wandb'].run is not None:
-            sys.modules['wandb'].finish()
+    _evaluate_classic_path_tracking(task=args_cli.task, runner=runner, args_cli=args_cli,
+                                    _is_classic=_is_classic)
+    finish_wandb(args_cli)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -507,8 +403,6 @@ else:
             f"Install supported version using 'pip install skrl>={SKRL_VERSION}'"
         )
         sys.exit(1)
-
-    from contractionRL.agents.skrl.runner import CONTROL_BACKBONES
 
     if args_cli.ml_framework.startswith("torch"):
         from contractionRL.agents.skrl.runner import CLActorRunner as Runner
@@ -630,30 +524,11 @@ else:
             import glob as _glob
             import re as _re
             import threading as _threading
-            import skrl.utils.tensorboard as _skrl_tb
             import wandb as _wandb
 
             agent_cfg["agent"]["experiment"]["wandb"] = ("WANDB_SWEEP_ID" not in os.environ)
             agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})["sync_tensorboard"] = False
-            _orig_add_scalar = _skrl_tb.SummaryWriter.add_scalar
-            _scalar_metric_defined = [False]
-
-            def _wandb_add_scalar(self, *, tag: str, value: float, timestep: int) -> None:
-                _orig_add_scalar(self, tag=tag, value=value, timestep=timestep)
-                if _wandb.run is not None:
-                    # Log against a custom step metric instead of wandb's internal
-                    # step counter: any wandb.log() without step= (e.g. video/media
-                    # uploads) advances the internal counter, after which scalars
-                    # logged with an explicit smaller step= are silently dropped
-                    # ("steps must be monotonically increasing" warning). A step
-                    # *metric* has no monotonicity requirement.
-                    if not _scalar_metric_defined[0]:
-                        _wandb.define_metric("global_step")
-                        _wandb.define_metric("*", step_metric="global_step")
-                        _scalar_metric_defined[0] = True
-                    _wandb.log({tag: value, "global_step": timestep})
-
-            _skrl_tb.SummaryWriter.add_scalar = _wandb_add_scalar
+            install_wandb_scalar_hook()
 
             if args_cli.video:
                 _video_dir = os.path.join(log_dir, "videos", "train")
@@ -773,102 +648,39 @@ else:
         _angle_idx = list(getattr(_isaac_env.unwrapped, "angle_idx", []) or [])
         _inject_angle_idx(agent_cfg, _angle_idx)
 
-        _a = agent_cfg["agent"]
-        _alg = _a.get("class", "").lower()
-        _a.pop("use_state_norm", None)  # state norm disabled everywhere (see contraction_runner.py docstring)
-        _use_state = False
-        _use_value = _a.pop("use_value_norm", True)
-        if _use_state:
-            # [x, xref, uref] path-tracking layout needs the masked scaler (see
-            # c2rl.py's module docstring / preprocessors.py) — normalizing uref
-            # or angle_idx columns there is a correctness bug, not just a style
-            # choice. Flat (e.g. vel-tracking) layouts have no residual/angle-
-            # embedding structure, so the stock full-vector scaler is fine there.
-            _u_dim = int(env.action_space.shape[0])
-            _remainder = int(env.observation_space.shape[0]) - _u_dim
-            if _remainder > 0 and _remainder % 2 == 0:
-                from contractionRL.agents.skrl.preprocessors import PathTrackingObservationScaler
-                _obs_preproc_cls = PathTrackingObservationScaler
-                _obs_preproc_kwargs = {
-                    "x_dim": _remainder // 2, "u_dim": _u_dim, "angle_idx": _angle_idx,
-                }
-            else:
-                _obs_preproc_cls = "RunningStandardScaler"
-                _obs_preproc_kwargs = None
-            _a["observation_preprocessor"] = _obs_preproc_cls
-            _a["observation_preprocessor_kwargs"] = (
-                dict(_obs_preproc_kwargs) if _obs_preproc_kwargs is not None else None
-            )
-            if _alg == "ppo":
-                _a["state_preprocessor"] = _obs_preproc_cls
-                _a["state_preprocessor_kwargs"] = (
-                    dict(_obs_preproc_kwargs) if _obs_preproc_kwargs is not None else None
-                )
-        else:
-            for _k in ("state_preprocessor", "state_preprocessor_kwargs",
-                       "observation_preprocessor", "observation_preprocessor_kwargs"):
-                _a.pop(_k, None)
-        if _use_value and _alg == "ppo":
-            _a["value_preprocessor"] = "RunningStandardScaler"
-            _a["value_preprocessor_kwargs"] = None
-        else:
-            _a.pop("value_preprocessor", None)
-            _a.pop("value_preprocessor_kwargs", None)
-
-        _a.pop("anneal_stddev", None)   # no longer a PPO_CFG field; handled below
-        _a.pop("anneal_log_std", None)
-        _a.pop("std_dev_annealing", None)  # legacy on/off flag; now auto-derived from backbone below
-        _std_dev_annealing_kwargs = _a.pop("std_dev_annealing_kwargs", None)
-
-        # Auto-enable stddev annealing when policy uses the CLActor backbone
-        # ("control", with "contraction" kept as a backward-compatible alias)
-        _std_dev_annealing = (
-            agent_cfg.get("models", {}).get("policy", {}).get("backbone") in CONTROL_BACKBONES
-        )
+        _alg = agent_cfg["agent"].get("class", "").lower()
+        _is_contraction = _alg in _CONTRACTION_ALGOS
+        _annealing = normalize_agent_cfg(agent_cfg, algorithm=_alg)
 
         # C2RL reads the caps_* keys off its own cfg dataclass, so they must stay
         # in the dict there; skrl's Runner would reject them, so they are popped
         # on the standalone branch. See _resolve_caps_kwargs.
-        _caps = _resolve_caps_kwargs(agent_cfg, args_cli, pop=_alg not in _CONTRACTION_ALGOS)
+        _caps = _resolve_caps_kwargs(agent_cfg, args_cli, pop=not _is_contraction)
 
-        if _alg in _CONTRACTION_ALGOS:
+        if _is_contraction:
             from contractionRL.runners import ContractionRunner
             # Isaac envs have no closed-form dynamics, so they ALWAYS learn a
             # NeuralDynamics (pretrain + online). Forcing use_empirical_dynamics=True
             # here also makes the runner's guard reject any config that tries to
             # request analytical dynamics (use_empirical_dynamics=False) for Isaac.
             agent_cfg["agent"]["use_empirical_dynamics"] = True
+            # lqr/sdlqr/cvstem-lqr own no dynamics model — they need a pretrained
+            # one loaded from disk here (ContractionRunner raises with the flag
+            # to pass if it's missing). See --dynamics_checkpoint.
+            if args_cli.dynamics_checkpoint:
+                agent_cfg["agent"]["dynamics_checkpoint"] = args_cli.dynamics_checkpoint
             runner = ContractionRunner(env, agent_cfg, is_classic=False)
         else:
             runner = Runner(env, agent_cfg)
 
-        from contractionRL.agents.skrl.agent_patches import (
-            patch_algo_namespace as _patch_algo_namespace,
-            patch_caps_regularizer as _patch_caps_regularizer,
-            patch_kl_logging as _patch_kl_logging,
-            patch_ppo_std_annealing as _patch_ppo_std_annealing,
-            patch_sac_entropy_clamp as _patch_sac_entropy_clamp,
-            patch_auc_checkpoint as _patch_auc_checkpoint,
-            best_metric_for as _best_metric_for,
-        )
-        # No-ops for C2RL's outer agent (it has no .policy/.scheduler/.entropy_optimizer
-        # of its own) — C2RLAgent applies these directly to its inner PPO/SAC
-        # sub-agent internally (see c2rl.py), which is where they actually matter.
-        _patch_kl_logging(runner.agent)
-        _patch_sac_entropy_clamp(runner.agent)
-        _patch_ppo_std_annealing(runner.agent, _std_dev_annealing, _std_dev_annealing_kwargs)
-        _patch_caps_regularizer(runner.agent, **_caps)
-        if _alg not in _CONTRACTION_ALGOS:
-            # C3M/C2RL/LQR/SD-LQR already namespace their own track_data() keys
-            # ("Loss / C3M/...", "Loss / C2RL/...", etc.); this is standalone
-            # PPO/SAC's equivalent (see patch_algo_namespace).
-            _patch_algo_namespace(runner.agent, _alg.upper())
+        # Every patch no-ops on C2RL's outer agent (it owns no .policy/.scheduler/
+        # .entropy_optimizer) — C2RLAgent applies them to its inner PPO/SAC
+        # sub-agent itself, which is where they matter. Contraction algorithms
+        # already namespace their own track_data() keys, hence namespace=False.
+        apply_agent_patches(runner.agent, algorithm=_alg, annealing=_annealing,
+                            caps=_caps, namespace=not _is_contraction)
 
-        # Best-checkpoint metric split: c3m/cvstem-lqr pick by contraction_score,
-        # every other algorithm (ppo/sac/c2rl/lqr/sdlqr) by AUC. See best_metric_for.
-        _patch_auc_checkpoint(runner.agent, metric=_best_metric_for(_alg))
-
-        if _alg in _CONTRACTION_ALGOS and hasattr(runner.agent, "policy") and hasattr(runner.agent.policy, "cl_actor"):
+        if _is_contraction and hasattr(runner.agent, "policy") and hasattr(runner.agent.policy, "cl_actor"):
             _orig_post = runner.agent.post_interaction
 
             def _annealed_post(*, timestep: int, timesteps: int) -> None:
@@ -919,8 +731,7 @@ else:
 
         env.close()
         
-        if not args_cli.no_wandb and 'wandb' in sys.modules and sys.modules['wandb'].run is not None:
-            sys.modules['wandb'].finish()
+        finish_wandb(args_cli)
 
     if __name__ == "__main__":
         main()

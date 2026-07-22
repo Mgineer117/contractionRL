@@ -449,7 +449,6 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         t = self.episode_length_buf.float() * self.step_dt
         cmds = self._cmd.get(t)  # (N, 8): [vx_b, vy_b, vz, yaw, ...]
 
-        base_pos = self._robot.data.root_pos_w  # (N, 3)
         cmd_pos = self._robot.data.root_pos_w.clone()
         cmd_pos[:, 2] += 0.5  # Same height
         cur_pos = self._robot.data.root_pos_w.clone()

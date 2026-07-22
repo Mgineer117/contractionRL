@@ -96,6 +96,142 @@ def _resolve_caps_kwargs(agent_cfg: dict, args_cli, *, pop: bool) -> dict:
     return kwargs
 
 
+def install_wandb_scalar_hook() -> None:
+    """Mirror every skrl ``SummaryWriter.add_scalar`` into the active W&B run.
+
+    Logged against a CUSTOM step metric (``global_step``) rather than wandb's
+    internal step counter: any ``wandb.log()`` without ``step=`` (video/media
+    uploads, the PathTracking figures) advances that internal counter, after
+    which scalars logged with an explicit smaller ``step=`` are silently dropped
+    ("steps must be monotonically increasing"). A step *metric* has no
+    monotonicity requirement.
+
+    Process-wide and shared by both routes, which is also what lets C2RL's inner
+    PPO/SAC sub-agents reach the same run without ever calling ``wandb.init()``
+    themselves (see ``rl_glue.make_base_rl_cfg``).
+    """
+    import skrl.utils.tensorboard as _skrl_tb
+    import wandb
+
+    orig_add_scalar = _skrl_tb.SummaryWriter.add_scalar
+    defined = [False]
+
+    def _add_scalar(self, *, tag: str, value: float, timestep: int) -> None:
+        orig_add_scalar(self, tag=tag, value=value, timestep=timestep)
+        if wandb.run is None:
+            return
+        if not defined[0]:
+            wandb.define_metric("global_step")
+            wandb.define_metric("*", step_metric="global_step")
+            defined[0] = True
+        wandb.log({tag: value, "global_step": timestep})
+
+    _skrl_tb.SummaryWriter.add_scalar = _add_scalar
+
+
+def apply_wandb_sweep_overrides(agent_cfg: dict) -> None:
+    """Fold ``wandb.config`` (dotted keys) into ``agent_cfg`` for a sweep run.
+
+    A sweep parameter whose value is itself a dict (wandb's nested-parameter
+    form for jointly-sampled pairs, e.g. ``{w_lb, w_ub}`` — see
+    ``search/configs/``) is MERGED into the existing sub-dict rather than
+    assigned: assigning would wipe sibling keys already at that path
+    (``agent.class``, ``agent.lbd``, …) that the sweep isn't sampling.
+    """
+    import wandb
+
+    for dotted, value in wandb.config.items():
+        *parents, leaf = dotted.split(".")
+        node = agent_cfg
+        for key in parents:
+            node = node.setdefault(key, {})
+        if isinstance(value, dict) and isinstance(node.get(leaf), dict):
+            node[leaf].update(value)
+        else:
+            node[leaf] = value
+
+
+def finish_wandb(args_cli) -> None:
+    """Close the active W&B run, if this process started one."""
+    if getattr(args_cli, "no_wandb", False):
+        return
+    wandb = sys.modules.get("wandb")
+    if wandb is not None and wandb.run is not None:
+        wandb.finish()
+
+
+def normalize_agent_cfg(agent_cfg: dict, *, algorithm: str) -> dict:
+    """Strip this repo's non-skrl ``agent:`` keys and resolve the preprocessors.
+
+    Shared by both of train.py's routes so a yaml key means the same thing on
+    each. Returns the std-dev-annealing decision, which the caller passes to
+    ``agent_patches.patch_ppo_std_annealing`` AFTER the agent is built.
+
+    Observation/state normalization is disabled unconditionally: the Mahalanobis
+    reward and the CV-STEM metric are defined in RAW physical coordinates, and
+    per-dimension scaling would distort the tracking error ``e = x - xref`` (see
+    c2rl.py's module docstring). Value normalization stays available for PPO,
+    where it only rescales the critic target.
+    """
+    from contractionRL.agents.skrl.runner import CONTROL_BACKBONES
+
+    a = agent_cfg.setdefault("agent", {})
+    a.pop("use_state_norm", None)
+    use_value_norm = a.pop("use_value_norm", True)
+    for key in ("state_preprocessor", "state_preprocessor_kwargs",
+                "observation_preprocessor", "observation_preprocessor_kwargs"):
+        a.pop(key, None)
+
+    if use_value_norm and algorithm == "ppo":
+        a["value_preprocessor"] = "RunningStandardScaler"
+        a["value_preprocessor_kwargs"] = None
+    else:
+        a.pop("value_preprocessor", None)
+        a.pop("value_preprocessor_kwargs", None)
+
+    # Legacy annealing spellings — superseded by the backbone-driven decision
+    # below, but still present in older configs, and skrl's PPO_CFG/SAC_CFG
+    # would reject them as unknown fields.
+    for key in ("anneal_stddev", "anneal_log_std", "std_dev_annealing"):
+        a.pop(key, None)
+    return {
+        "std_dev_annealing": (
+            agent_cfg.get("models", {}).get("policy", {}).get("backbone") in CONTROL_BACKBONES
+        ),
+        "std_dev_annealing_kwargs": a.pop("std_dev_annealing_kwargs", None),
+    }
+
+
+def apply_agent_patches(agent, *, algorithm: str, annealing: dict, caps: dict,
+                        namespace: bool = True) -> None:
+    """Apply every post-construction patch an agent needs, in dependency order.
+
+    Each patch no-ops when the agent lacks the attribute it hooks, so this is
+    safe to call on any agent — including C2RL's outer agent, which owns no
+    ``.policy``/``.scheduler``/``.scaler`` and patches its inner PPO/SAC
+    sub-agent itself (see c2rl.py).
+
+    ``patch_auc_checkpoint`` goes LAST because it wraps ``post_interaction``,
+    and it must see (and therefore run after) the annealing wrapper installed by
+    ``patch_ppo_std_annealing``. ``namespace=False`` for the contraction
+    algorithms, which already namespace their own ``track_data`` keys.
+    """
+    from contractionRL.agents.skrl.agent_patches import (
+        best_metric_for, patch_algo_namespace, patch_auc_checkpoint,
+        patch_caps_regularizer, patch_kl_logging, patch_ppo_std_annealing,
+        patch_sac_entropy_clamp,
+    )
+
+    patch_kl_logging(agent)
+    patch_sac_entropy_clamp(agent)
+    patch_ppo_std_annealing(agent, annealing["std_dev_annealing"],
+                            annealing["std_dev_annealing_kwargs"])
+    patch_caps_regularizer(agent, **caps)
+    if namespace:
+        patch_algo_namespace(agent, algorithm.upper())
+    patch_auc_checkpoint(agent, metric=best_metric_for(algorithm))
+
+
 def _max_step_reward(robot: str, env_cfg) -> float:
     """Best-case per-step reward for a vel-tracking env's reward function.
 

@@ -182,4 +182,4 @@ empirical_dynamics:
 
 trainer:
   class: C2RLSkrlTrainer
-  timesteps: 30000   # Total number of environment steps to train for
+  timesteps: 20000   # Total number of environment steps to train for

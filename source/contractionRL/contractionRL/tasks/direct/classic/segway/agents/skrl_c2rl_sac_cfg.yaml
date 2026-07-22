@@ -84,7 +84,9 @@ cm:
   metric_source: online
   # Mahalanobis reward
   w_ub: 10.0  # Upper eigenvalue bound for the metric M(x)
-  w_lb: 0.1   # Lower eigenvalue bound for the metric M(x)
+  w_lb: 0.01  # Lower eigenvalue bound for the metric M(x). NOT 0.1: the CV-STEM SDP
+              # normalizes W and caps nu <= 1/w_lb, and at 0.1 that cap alone makes
+              # segway 0% feasible at every lambda (measured 0/32 -> 32/32 at 0.01).
   lbd: 0.1    # Contraction rate λ — used by cmg_method's synthesis loss (CM SDP LMI for
               # "cvstem", CMG Cu/C1 loss for "ccm")
   tracking_scaler: 1.0  # Q: tracking-error weight
@@ -111,7 +113,7 @@ cm:
   #              Control is penalized via this Riccati term, not bounded over an
   #              action range — see ncm_synthesis.py module docstring.
   cmg_method: cvstem
-  cvstem_r_scaler: 1.0  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only
+  cvstem_r_scaler: 0.01  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only
   # On SDP infeasibility AT A GIVEN STATE, retry that state alone with λ
   # halved, up to this many times, before giving up on it and dropping it from
   # the dataset — 0 disables this and reverts to dropping immediately. Warns
