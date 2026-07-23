@@ -77,9 +77,8 @@ agent:
   rewards_shaper_scale: 1.0
   use_state_norm: false  # OFF by default — see c2rl.py module docstring / rl_glue.make_base_rl_cfg
   use_value_norm: true   # Same, but for the value function's output (PPO only)
-  use_reward_norm: false  # Non-biasing running-std reward normalizer (r/std, no centering) — tames the
-                          # w_lb/w_ub-dependent Mahalanobis-reward scale/heavy-tail before GAE; see rl_glue.
-                          # Off to match the known-good 2026-07-15 run; re-enable only as an isolated A/B.
+  use_reward_norm: true  # Non-biasing running-std reward normalizer (r/std, no centering) — tames the
+                         # w_lb/w_ub-dependent Mahalanobis-reward scale/heavy-tail before GAE; see rl_glue.
 
   # ── CAPS action smoothness (Mysore et al. 2021) ─────────────────────────── #
   # Added to the POLICY LOSS, not the reward: pi's MEAN is penalized for
@@ -91,7 +90,7 @@ agent:
   # observation, which breaks the CLActor's obs_dim = 2*x_dim + u_dim layout).
   # Both 0.0 = off. Override per-run with --caps_temporal_scale /
   # --caps_spatial_scale / --caps_spatial_std. See patch_caps_regularizer.
-  caps_temporal_scale: 0.0   # weight on ||pi(s_t) - pi(s_t+1)||^2
+  caps_temporal_scale: 0.01  # weight on ||pi(s_t) - pi(s_t+1)||^2
   caps_spatial_scale: 0.0    # weight on ||pi(s) - pi(s_bar)||^2, s_bar ~ N(s, sigma^2)
   caps_spatial_std: 0.05     # sigma, in RAW observation units (see patch_caps_regularizer)
   discount_factor: 0.01  # deployed policy's discount factor (single policy — no con/opt duality)
