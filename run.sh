@@ -186,11 +186,16 @@ PARTITION=$(prompt_default "SLURM partition" "gpu")
 GPUS_PER_JOB=$(prompt_default "GPUs per job (--gres=gpu:N; seeds round-robin over them)" "1")
 GPU_TYPE=$(prompt_default "Pin GPU model (e.g. a100; blank = any on the partition)" "")
 WALLTIME=$(prompt_default "Wall-time HH:MM:SS" "24:00:00")
-CPUS_PER_GPU=$(prompt_default "CPUs per GPU" "8")
-MEM=$(prompt_default "Memory per job (e.g. 32G; blank = node default)" "")
-ACCOUNT=$(prompt_default "SLURM account (blank = none)" "")
-QOS=$(prompt_default "SLURM qos (blank = none)" "")
-ACTIVATE=$(prompt_default "Env-activation line to run inside the job (e.g. 'conda activate crl')" "")
+
+# ── Fixed site defaults for this project (no prompt) ──────────────────────── #
+# Memory scales with concurrency: 4 GB per run, and a job runs up to PARALLEL
+# runs at once. QoS left empty → the account/partition default is used.
+CPUS_PER_GPU=8
+ACCOUNT="huytran1-ic"
+QOS=""
+ACTIVATE="conda activate env_isaaclab"
+MEM="$(( 4 * PARALLEL ))G"
+_info "Fixed: account ${C_BOLD}$ACCOUNT${C_RESET} · env ${C_BOLD}$ACTIVATE${C_RESET} · ${C_BOLD}$CPUS_PER_GPU${C_RESET} CPU/GPU · mem ${C_BOLD}$MEM${C_RESET} (4G × $PARALLEL run(s))"
 
 CPUS_PER_TASK=$(( CPUS_PER_GPU * GPUS_PER_JOB ))
 GRES="gpu:${GPU_TYPE:+$GPU_TYPE:}$GPUS_PER_JOB"
