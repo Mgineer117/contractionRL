@@ -350,11 +350,13 @@ def run_isaac(args, simulation_app) -> list[dict]:
 
 # ── Reporting ────────────────────────────────────────────────────────────── #
 
-_METRIC_KEYS = ["auc_mean", "contraction_rate_mean", "overshoot_mean", "contraction_score_mean"]
+_METRIC_KEYS = ["auc_mean", "contraction_rate_mean", "running_lambda_mean",
+                "overshoot_mean", "contraction_score_mean"]
 # Short column labels so the table header lines up with the 16-wide value cells.
 _METRIC_LABELS = {
     "auc_mean": "auc",
     "contraction_rate_mean": "lambda",
+    "running_lambda_mean": "lambda_run",
     "overshoot_mean": "overshoot",
     "contraction_score_mean": "score",
 }

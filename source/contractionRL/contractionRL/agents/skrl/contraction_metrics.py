@@ -13,6 +13,14 @@ full ``(num_envs, T)`` error tensor:
                              ``lambda = -ln(e_T / e_0) / (T·dt)`` (clamped ≥ 0).
                              Logged both as ``contraction_rate`` and the
                              user-facing alias ``lambda``.
+  * ``running_lambda``     — per-STEP contraction rate averaged over one
+                             episode: ``mean_t max(0, ln(C_t/C_{t+1})/dt)`` on
+                             the normalized cost ``C = e/e(0)``, i.e. the rate
+                             satisfying ``C_{t+1} = e^{-lambda·dt}·C_t`` at every
+                             step where the cost actually decreased and 0 where
+                             it did not.  Only emitted by
+                             :class:`StatManagerEnvWrapper` (it needs the full
+                             per-step curve, not just the endpoints).
   * ``overshoot``          — peak normalized error ``e_max / e(0)`` (≥ 1 in
                              theory; a pure overshoot factor).
   * ``contraction_score``  — ``lambda / overshoot`` (higher = fast contraction
@@ -174,6 +182,8 @@ class StatManagerEnvWrapper:
         self._recent_auc_ci95: float = 0.0
         self._recent_lambda_mean: float = 0.0
         self._recent_lambda_ci95: float = 0.0
+        self._recent_running_lambda_mean: float = 0.0
+        self._recent_running_lambda_ci95: float = 0.0
         self._recent_C: float = 1e2
         self._recent_score_mean: float = 0.0
         self._recent_score_ci95: float = 0.0
@@ -320,6 +330,34 @@ class StatManagerEnvWrapper:
         lambda_vec = torch.clamp(min_lambdas, min=0.0, max=10.0)
         score_vec = lambda_vec / torch.clamp(best_C, min=1e-6)
 
+        # 5. Running-mean lambda — the per-STEP contraction rate, averaged over
+        #    the episode.  Where the normalized cost actually decreases, the
+        #    rate that makes the one-step contraction condition
+        #        C(s_{t+1}) = e^{-lambda·dt}·C(s_t)
+        #    hold with equality is  lambda_t = ln(C_t / C_{t+1}) / dt;  where it
+        #    does NOT decrease that expression is ≤ 0 and the step contributes 0
+        #    (no contraction observed on that step, not a negative rate).  So
+        #    the clamp below IS the "did a decrement happen?" test.
+        #
+        #    Unlike `lambda_vec` above — an endpoint/envelope quantity dominated
+        #    by the worst curve — this one is a per-step average, so a policy
+        #    that contracts steadily and one that plunges once then coasts are
+        #    distinguishable.
+        step_dt = dt_array.clamp(min=1e-8)
+        step_lambda = ((torch.log(errs[:, :-1]) - torch.log(errs[:, 1:])) / step_dt).clamp(min=0.0)
+        # Only average over the steps this slot REALLY recorded: an episode that
+        # terminated early was padded with its final error out to the horizon
+        # (see _record), and those flat padded steps carry lambda == 0 — counting
+        # them would scale every short episode's mean down by its own length.
+        lengths = self._tracking_steps.clamp(max=self._max_ep_len).reshape(-1, 1)
+        k = torch.arange(self._max_ep_len - 1, device=self._device()).reshape(1, -1)
+        valid = (k < (lengths - 1)).float()
+        counts = valid.sum(dim=1)
+        running_lambda_vec = (step_lambda * valid).sum(dim=1) / counts.clamp(min=1.0)
+        # A slot with < 2 recorded samples has no transition to measure.
+        running_lambda_vec = torch.where(
+            counts > 0, running_lambda_vec, torch.zeros_like(running_lambda_vec))
+
         auc_m, auc_ci = mean_confidence_interval(auc_vec.detach().cpu().numpy(), 0.95)
         self._recent_auc_mean = float(auc_m)
         self._recent_auc_ci95 = float(auc_ci)
@@ -327,6 +365,10 @@ class StatManagerEnvWrapper:
         lambda_m, lambda_ci = mean_confidence_interval(lambda_vec.detach().cpu().numpy(), 0.95)
         self._recent_lambda_mean = float(lambda_m)
         self._recent_lambda_ci95 = float(lambda_ci)
+
+        run_m, run_ci = mean_confidence_interval(running_lambda_vec.detach().cpu().numpy(), 0.95)
+        self._recent_running_lambda_mean = float(run_m)
+        self._recent_running_lambda_ci95 = float(run_ci)
 
         score_m, score_ci = mean_confidence_interval(score_vec.detach().cpu().numpy(), 0.95)
         self._recent_score_mean = float(score_m)
@@ -633,6 +675,8 @@ class StatManagerEnvWrapper:
             "auc_ci95": self._recent_auc_ci95,
             "contraction_rate_mean": self._recent_lambda_mean,
             "contraction_rate_ci95": self._recent_lambda_ci95,
+            "running_lambda_mean": self._recent_running_lambda_mean,
+            "running_lambda_ci95": self._recent_running_lambda_ci95,
             "overshoot_mean": self._recent_C,
             "overshoot_ci95": 0.0,
             "contraction_score_mean": self._recent_score_mean,
