@@ -170,10 +170,14 @@ else
 fi
 
 # ── Partition discovery (best-effort; raw sinfo always shown) ─────────────── #
+# sinfo's own field-width syntax (%-20P) isn't portable — some sites print it
+# literally — so ask for pipe-delimited columns and let `column -t` align them.
 _header "Partition / GPU discovery"
-printf '\n  %-20s %-12s %-10s %s\n' "PARTITION" "AVAIL" "TIMELIMIT" "GRES" >&2
-_rule
-sinfo -h -o "  %-20P %-12a %-10l %G" 2>/dev/null | sed 's/*//' >&2 || _warn "sinfo unavailable."
+echo "" >&2
+{
+    printf 'PARTITION|AVAIL|TIMELIMIT|GRES\n'
+    sinfo -h -o "%P|%a|%l|%G" 2>/dev/null | sed 's/\*//' | sort -u
+} | column -t -s '|' 2>/dev/null | sed 's/^/  /' >&2 || _warn "sinfo unavailable."
 _rule
 PARTITION=$(prompt_default "SLURM partition" "gpu")
 [[ -z "$PARTITION" ]] && { _error "No partition chosen."; exit 1; }
