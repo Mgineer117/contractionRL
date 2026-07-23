@@ -18,7 +18,12 @@ full ``(num_envs, T)`` error tensor:
                              the normalized cost ``C = e/e(0)``, i.e. the rate
                              satisfying ``C_{t+1} = e^{-lambda·dt}·C_t`` at every
                              step where the cost actually decreased and 0 where
-                             it did not.  Only emitted by
+                             it did not.  Steps spent in OVERSHOOT
+                             (``max(C_t, C_{t+1}) > 1``) also count as 0 — the
+                             descent back from a self-inflicted excursion is not
+                             credited as contraction — but they remain in the
+                             denominator, so overshoot dilutes the mean.
+                             Only emitted by
                              :class:`StatManagerEnvWrapper` (it needs the full
                              per-step curve, not just the endpoints).
   * ``overshoot``          — peak normalized error ``e_max / e(0)`` (≥ 1 in
@@ -343,8 +348,19 @@ class StatManagerEnvWrapper:
         #    by the worst curve — this one is a per-step average, so a policy
         #    that contracts steadily and one that plunges once then coasts are
         #    distinguishable.
+        #
+        #    Steps taken while the cost is OVERSHOOTING — i.e. anywhere on the
+        #    step the normalized cost sits above its initial value C = 1 — are
+        #    credited 0 as well, even if the cost is falling there: recovering
+        #    from an excursion the policy itself caused is not contraction, and
+        #    without this a policy that blows the error up and then dives back
+        #    would score a *higher* running lambda than one that never
+        #    overshot (the recovery leg has a large ln(C_t/C_{t+1})).  Those
+        #    steps stay in the denominator, so overshoot dilutes the mean.
         step_dt = dt_array.clamp(min=1e-8)
         step_lambda = ((torch.log(errs[:, :-1]) - torch.log(errs[:, 1:])) / step_dt).clamp(min=0.0)
+        no_overshoot = (torch.maximum(errs[:, :-1], errs[:, 1:]) <= 1.0).float()
+        step_lambda = step_lambda * no_overshoot
         # Only average over the steps this slot REALLY recorded: an episode that
         # terminated early was padded with its final error out to the horizon
         # (see _record), and those flat padded steps carry lambda == 0 — counting
