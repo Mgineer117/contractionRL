@@ -46,6 +46,12 @@
 #   --partition NAME     SLURM partition (default: recommended by discovery)
 #   --num-jobs N         independent sbatch jobs to submit (default: prompted)
 #   --gpus-per-job N     GPUs each job requests via --gres=gpu:N (default 1)
+#   --gpu-type NAME      pin the GPU MODEL: --gres=gpu:NAME:N (e.g. a100). Use it
+#                        on heterogeneous partitions to keep jobs off GPUs your
+#                        torch build has no kernels for (e.g. V100 / CC 7.0 under
+#                        a CUDA-13 build). Applies to the smoke test too.
+#   --constraint FEAT    --constraint=FEAT for sbatch/srun, if the site defines
+#                        node features instead of typed gres
 #   --agents-per-gpu N   override the smoke-test packing result
 #   --max-agents-per-gpu N  hard ceiling on the packing result (default 16)
 #   --min-probe-mb N     reject a smoke-test peak below this as a failed run
@@ -102,6 +108,13 @@ PARTITION=""; NUM_JOBS=""; GPUS_PER_JOB=1; AGENTS_PER_GPU=""
 WALLTIME="24:00:00"; ACCOUNT=""; QOS=""; CPUS_PER_GPU=8; MEM=""
 ACTIVATE=""; PER_RUN_TIMEOUT=24h; RUNS_PER_AGENT=0
 PROBE=1; YES=0; STOP_TAG=""; SAFETY="0.85"
+# GPU selection. On a heterogeneous partition (scavenger is), a bare
+# --gres=gpu:N can land a job on ANY model — including a V100 (compute
+# capability 7.0), which a CUDA-13 torch build has no kernels for: every CUDA op
+# then dies with cudaErrorNoKernelImageForDevice at the first tensor op, before
+# wandb logs anything, so the trial shows up as an empty "crashed" run. Pinning
+# the type (or a node feature) keeps jobs on GPUs the install actually supports.
+GPU_TYPE=""; CONSTRAINT=""
 # Packing guard rails. MIN_PROBE_MB: a run using less than this obviously never
 # reached the GPU (an idle GPU reads a few MB) — reject rather than divide total
 # VRAM by ~0 and get a nonsense count. MAX_AGENTS_PER_GPU: hard ceiling so even a
@@ -116,6 +129,8 @@ while [[ $# -gt 0 ]]; do
         --partition) PARTITION="$2"; shift 2 ;;
         --num-jobs) NUM_JOBS="$2"; shift 2 ;;
         --gpus-per-job) GPUS_PER_JOB="$2"; shift 2 ;;
+        --gpu-type) GPU_TYPE="$2"; shift 2 ;;
+        --constraint) CONSTRAINT="$2"; shift 2 ;;
         --agents-per-gpu) AGENTS_PER_GPU="$2"; shift 2 ;;
         --max-agents-per-gpu) MAX_AGENTS_PER_GPU="$2"; shift 2 ;;
         --min-probe-mb) MIN_PROBE_MB="$2"; shift 2 ;;
@@ -199,10 +214,16 @@ _success "Env(s): ${C_BOLD}${ENVS[*]}${C_RESET}"
 # free GPUs: walk `scontrol show nodes -o` (one node per line), and for nodes in
 # an allocatable state (IDLE/MIXED) subtract GresUsed=gpu:… from Gres=gpu:…,
 # crediting the difference to each of the node's Partitions.
-declare -A PART_FREE PART_TOTAL PART_PENDING
+declare -A PART_FREE PART_TOTAL PART_PENDING PART_TYPES
 
 _gres_gpu_count() {  # extract the trailing integer of a gpu:[type:]N token
     grep -oE 'gpu:[^,]*' <<<"$1" | grep -oE '[0-9]+' | tail -n1
+}
+# Model name out of a typed gres token: "gpu:a100:4" -> "a100" ("" when untyped,
+# e.g. a bare "gpu:4"). Surfaced per partition so a heterogeneous queue is
+# VISIBLE at selection time rather than discovered by a job dying on the wrong model.
+_gres_gpu_type() {
+    grep -oE 'gpu:[A-Za-z][A-Za-z0-9_.-]*:' <<<"$1" | head -n1 | cut -d: -f2
 }
 
 _header "Partition / GPU discovery"
@@ -217,10 +238,15 @@ _header "Partition / GPU discovery"
         total=$(_gres_gpu_count "$gres"); used=$(_gres_gpu_count "$gused")
         [[ -z "$total" ]] && continue; [[ -z "$used" ]] && used=0
         free=$(( total - used )); (( free < 0 )) && free=0
+        gtype=$(_gres_gpu_type "$gres")
         IFS=',' read -ra plist <<<"$parts"
         for p in "${plist[@]}"; do
             PART_TOTAL[$p]=$(( ${PART_TOTAL[$p]:-0} + total ))
             PART_FREE[$p]=$(( ${PART_FREE[$p]:-0} + free ))
+            # accumulate DISTINCT models so a mixed partition shows "a100,v100"
+            if [[ -n "$gtype" && " ${PART_TYPES[$p]:-} " != *" $gtype "* ]]; then
+                PART_TYPES[$p]="${PART_TYPES[$p]:-}${PART_TYPES[$p]:+ }$gtype"
+            fi
         done
     done < <(scontrol show nodes -o 2>/dev/null)
 } || _warn "Could not parse 'scontrol show nodes' — showing raw sinfo only."
@@ -231,12 +257,12 @@ while IFS='|' read -r p _; do
     PART_PENDING[$p]=$(( ${PART_PENDING[$p]:-0} + 1 ))
 done < <(squeue -h -t PD -o "%P" 2>/dev/null | sed 's/*//')
 
-printf '\n  %-18s %8s %8s %10s\n' "PARTITION" "FREE-GPU" "TOT-GPU" "PENDING" >&2
+printf '\n  %-18s %8s %8s %10s  %s\n' "PARTITION" "FREE-GPU" "TOT-GPU" "PENDING" "GPU TYPES" >&2
 _rule
 RECOMMENDED=""; BEST_FREE=-1
 for p in "${!PART_TOTAL[@]}"; do
     f=${PART_FREE[$p]:-0}; t=${PART_TOTAL[$p]:-0}; q=${PART_PENDING[$p]:-0}
-    printf '  %-18s %8s %8s %10s\n' "$p" "$f" "$t" "$q" >&2
+    printf '  %-18s %8s %8s %10s  %s\n' "$p" "$f" "$t" "$q" "${PART_TYPES[$p]:-untyped}" >&2
     # recommend the partition with the most free GPUs, tie-broken by least queue.
     if (( f > BEST_FREE )) || { (( f == BEST_FREE )) && [[ -n "$RECOMMENDED" ]] && (( q < ${PART_PENDING[$RECOMMENDED]:-0} )); }; then
         BEST_FREE=$f; RECOMMENDED=$p
@@ -259,6 +285,25 @@ if [[ -z "$PARTITION" ]]; then
 fi
 [[ -z "$PARTITION" ]] && { _error "No partition chosen."; exit 1; }
 _success "Partition: ${C_BOLD}$PARTITION${C_RESET}"
+
+# ── GPU model ─────────────────────────────────────────────────────────────── #
+# A bare --gres=gpu:N on a MIXED partition is a silent trial-killer: land on a
+# model the torch build has no kernels for (V100 = CC 7.0 under a CUDA-13 build)
+# and every CUDA op raises cudaErrorNoKernelImageForDevice at the first tensor
+# op — before wandb logs anything, so the run is recorded as an empty "crashed".
+# Offer the pin whenever the chosen partition exposes more than one model.
+_avail_types="${PART_TYPES[$PARTITION]:-}"
+if [[ -z "$GPU_TYPE" && -n "$_avail_types" && "$_avail_types" == *" "* ]]; then
+    _warn "Partition '$PARTITION' is heterogeneous: ${C_BOLD}${_avail_types}${C_RESET}"
+    _info "A bare --gres can land on any of them; an unsupported model crashes every trial before it logs."
+    if [[ "$YES" -ne 1 ]]; then
+        printf '%s' "  ${C_MAGENTA}?${C_RESET} ${C_BOLD}Pin a GPU type?${C_RESET} ${C_DIM}[blank = any]${C_RESET}: " >&2
+        read -r GPU_TYPE
+    fi
+fi
+# What both the smoke test and the generated jobs ask SLURM for.
+gres_spec() { printf 'gpu:%s%s' "${GPU_TYPE:+$GPU_TYPE:}" "$1"; }
+_success "GPU request: ${C_BOLD}--gres=$(gres_spec "$GPUS_PER_JOB")${C_RESET}${CONSTRAINT:+  --constraint=$CONSTRAINT}"
 
 # ── num-jobs / gpus-per-job ───────────────────────────────────────────────── #
 if [[ -z "$NUM_JOBS" ]]; then
@@ -354,8 +399,11 @@ PY
     # background, poll for ~120s recording the max GPU memory used by the run's
     # OWN process subtree (pid-matched, so it can't read an idle neighbour GPU),
     # kill the tree, and print a single MEM=peak/total line the launcher greps for.
-    PROBE_OUT=$(srun --partition="$PARTITION" --gres=gpu:1 \
+    # Same gres/constraint as the real jobs: probing on a different GPU model
+    # would size agents-per-GPU against memory the jobs never actually get.
+    PROBE_OUT=$(srun --partition="$PARTITION" --gres="$(gres_spec 1)" \
         --cpus-per-task="$CPUS_PER_GPU" --time=00:10:00 --job-name="crl-probe" \
+        ${CONSTRAINT:+--constraint="$CONSTRAINT"} \
         ${ACCOUNT:+--account="$ACCOUNT"} ${QOS:+--qos="$QOS"} \
         bash -c '
             set -uo pipefail
@@ -433,7 +481,8 @@ _kv "Algorithm"      "$ALGORITHM"
 _kv "Env(s)"         "${ENVS[*]}"
 _kv "Partition"      "$PARTITION"
 _kv "Jobs / env"     "$NUM_JOBS"
-_kv "GPUs / job"     "$GPUS_PER_JOB"
+_kv "GPUs / job"     "$GPUS_PER_JOB  (--gres=$(gres_spec "$GPUS_PER_JOB"))"
+[[ -n "$CONSTRAINT" ]] && _kv "Constraint" "$CONSTRAINT"
 _kv "Agents / GPU"   "$AGENTS_PER_GPU"
 _kv "Agents / job"   "$AGENTS_PER_JOB"
 _kv "Workers / env"  "$TOTAL_WORKERS"
@@ -469,7 +518,8 @@ for ENV in "${!ENV_SWEEP[@]}"; do
         echo "#!/bin/bash"
         echo "#SBATCH --job-name=$JOBNAME"
         echo "#SBATCH --partition=$PARTITION"
-        echo "#SBATCH --gres=gpu:$GPUS_PER_JOB"
+        echo "#SBATCH --gres=$(gres_spec "$GPUS_PER_JOB")"
+        [[ -n "$CONSTRAINT" ]] && echo "#SBATCH --constraint=$CONSTRAINT"
         echo "#SBATCH --cpus-per-task=$CPUS_PER_TASK"
         echo "#SBATCH --time=$WALLTIME"
         # B: → deliver USR1 to the batch shell (not the job steps); @180 → 3 min
