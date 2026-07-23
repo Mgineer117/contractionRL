@@ -269,6 +269,14 @@ if _is_classic:
         agent_cfg["trainer"]["timesteps"] = args_cli.num_timesteps
     if args_cli.lr is not None:
         agent_cfg["agent"]["learning_rate"] = args_cli.lr
+    # Discount override — the Isaac branch below honors --ppo_discount /
+    # --sac_discount, this one silently ignored them, so a classic gamma sweep
+    # trained every run at the yaml's own discount_factor. Both flags write the
+    # same key; the PPO one wins if (nonsensically) both are given.
+    _discount = args_cli.sac_discount if args_cli.sac_discount is not None else None
+    _discount = args_cli.ppo_discount if args_cli.ppo_discount is not None else _discount
+    if _discount is not None:
+        agent_cfg["agent"]["discount_factor"] = _discount
     # Classic contraction envs use the env's exact analytical get_f_and_B by
     # default (use_empirical_dynamics=False); pass --use_empirical_dynamics to
     # learn a NeuralDynamics instead. Classic envs only (Isaac forces empirical).

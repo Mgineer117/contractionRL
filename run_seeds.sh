@@ -28,7 +28,8 @@
 #   --env NAME           car|cartpole|segway|turtlebot|quadrotor, an Isaac Lab
 #                        task id, or 'all' for every classic env
 #   --seeds SPEC         a count (e.g. 5 → seeds 0..4) or an explicit list
-#   --gpu N              pin every run to this GPU (default: round-robin)
+#   --gpu SPEC           GPU index, a comma/space list of indices to round-robin
+#                        over (e.g. "0,2,3"), or 'all' (default: all detected)
 #   --num-timesteps N    override the cfg's training length
 #   --parallel N         runs executed concurrently (default 1 = sequential)
 #   --tag NAME           run tag / output basename (default: seeds_<timestamp>)
@@ -179,8 +180,10 @@ fi
 
 # ── GPU ─────────────────────────────────────────────────────────────────── #
 # CUDA_VISIBLE_DEVICES=<index> for a nonexistent index silently hides the only
-# real GPU from PyTorch, so the index is validated against what nvidia-smi
-# actually reports rather than trusted.
+# real GPU from PyTorch, so every index is validated against what nvidia-smi
+# actually reports rather than trusted. GPU_ARG may be a single index, a
+# comma/space list to round-robin over, empty, or 'all' — all normalize to the
+# GPU_POOL array the launch loop cycles through.
 NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 if [[ "$NUM_GPUS" -lt 1 ]]; then
     _error "nvidia-smi reports 0 GPUs — aborting."
@@ -191,12 +194,18 @@ if [[ -z "$GPU_ARG" ]]; then
     GPU_CHOICE=$(prompt_choice "Select GPU to pin these runs to (or 'all' to round-robin):" "${GPU_NAMES[@]}" "all")
     [[ "$GPU_CHOICE" != "all" ]] && GPU_ARG="${GPU_CHOICE%%:*}"
 fi
-if [[ -n "$GPU_ARG" ]]; then
-    if ! [[ "$GPU_ARG" =~ ^[0-9]+$ ]] || [[ "$GPU_ARG" -ge "$NUM_GPUS" ]]; then
-        _error "--gpu $GPU_ARG is out of range — nvidia-smi reports $NUM_GPUS GPU(s) (0-$((NUM_GPUS - 1)))."
-        exit 1
-    fi
+if [[ -z "$GPU_ARG" || "$GPU_ARG" == "all" ]]; then
+    mapfile -t GPU_POOL < <(seq 0 $((NUM_GPUS - 1)))
+else
+    IFS=', ' read -r -a GPU_POOL <<< "$GPU_ARG"
+    for g in "${GPU_POOL[@]}"; do
+        if ! [[ "$g" =~ ^[0-9]+$ ]] || [[ "$g" -ge "$NUM_GPUS" ]]; then
+            _error "--gpu index '$g' is out of range — nvidia-smi reports $NUM_GPUS GPU(s) (0-$((NUM_GPUS - 1)))."
+            exit 1
+        fi
+    done
 fi
+NUM_POOL="${#GPU_POOL[@]}"
 
 TAG="${TAG:-seeds_$(date '+%Y%m%d_%H%M%S')}"
 TOTAL=$(( ${#ENVS[@]} * ${#ALGOS[@]} * ${#SEEDS[@]} ))
@@ -208,7 +217,7 @@ if [[ "$DETACHED" -ne 1 ]]; then
     _kv "Algorithms"     "${ALGOS[*]}"
     _kv "Env(s)"         "${ENVS[*]}"
     _kv "Seeds"          "${SEEDS[*]}"
-    _kv "GPU"            "${GPU_ARG:-all detected (round-robin)}"
+    _kv "GPU pool"       "${GPU_POOL[*]}$([[ "$NUM_POOL" -gt 1 ]] && echo " (round-robin)")"
     _kv "Concurrency"    "$PARALLEL"
     _kv "Total runs"     "$TOTAL"
     _kv "Output CSV"     "results/$TAG.csv"
@@ -239,7 +248,7 @@ if [[ "$DETACHED" -ne 1 ]]; then
         --seeds "$(IFS=,; echo "${SEEDS[*]}")" \
         --parallel "$PARALLEL" --tag "$TAG" \
         ${NUM_TIMESTEPS:+--num-timesteps "$NUM_TIMESTEPS"} \
-        ${GPU_ARG:+--gpu "$GPU_ARG"} \
+        --gpu "$(IFS=,; echo "${GPU_POOL[*]}")" \
         ${EXTRA:+--extra "$EXTRA"} \
         --detached > "$NOHUP_LOG" 2>&1 &
     disown
@@ -269,7 +278,7 @@ for ENV in "${ENVS[@]}"; do
 
     for ALGO in "${ALGOS[@]}"; do
         for SEED in "${SEEDS[@]}"; do
-            GPU="${GPU_ARG:-$((gpu_i % NUM_GPUS))}"
+            GPU="${GPU_POOL[$((gpu_i % NUM_POOL))]}"
             gpu_i=$((gpu_i + 1))
             RUN_LOG="$LOG_DIR/${ENV}_${ALGO}_seed${SEED}.log"
 
