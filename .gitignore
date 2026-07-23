@@ -82,7 +82,7 @@ nohup.out
 # size: the current set is ~800 MB (a single dynamics_data.npz is 154 MB), far
 # past what belongs in git. The small tracked npz under visualization/cache/ is
 # a deliberate exception and stays versioned.
-/data/
+# /data/
 
 # Per-launch generated W&B sweep yamls (search.sh writes one per sweep, into
 # search/logs/). The searched space itself is versioned in search/configs/.
