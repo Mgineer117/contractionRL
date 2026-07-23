@@ -97,36 +97,59 @@ parser.add_argument("--export_io_descriptors", action="store_true", default=Fals
 parser.add_argument("--ml_framework", type=str, default="torch", choices=["torch", "jax"])
 parser.add_argument("--ray-proc-id", "-rid", type=int, default=None)
 parser.add_argument("--debug_vis", action="store_true", default=False)
-# SAC HP overrides
-parser.add_argument("--sac_lr", "--sac-lr", type=float, default=None)
-parser.add_argument("--sac_batch_size", "--sac-batch-size", type=int, default=None)
-parser.add_argument("--sac_discount", "--sac-discount", type=float, default=None)
-parser.add_argument("--sac_polyak", "--sac-polyak", type=float, default=None)
-parser.add_argument("--sac_gradient_steps", "--sac-gradient-steps", type=int, default=None)
-parser.add_argument("--sac_entropy", "--sac-entropy", type=float, default=None)
-parser.add_argument("--sac_memory_size", "--sac-memory-size", type=int, default=None)
-# PPO HP overrides
-parser.add_argument("--ppo_lr", "--ppo-lr", type=float, default=None)
-parser.add_argument("--ppo_rollouts", "--ppo-rollouts", type=int, default=None)
-parser.add_argument("--ppo_learning_epochs", "--ppo-learning-epochs", type=int, default=None)
-parser.add_argument("--ppo_mini_batches", "--ppo-mini-batches", type=int, default=None)
-parser.add_argument("--ppo_discount", "--ppo-discount", type=float, default=None)
-parser.add_argument("--ppo_lambda", "--ppo-lambda", type=float, default=None)
-parser.add_argument("--ppo_ratio_clip", "--ppo-ratio-clip", type=float, default=None)
-parser.add_argument("--ppo_entropy_scale", "--ppo-entropy-scale", type=float, default=None)
-parser.add_argument("--ppo_kl_threshold", "--ppo-kl-threshold", type=float, default=None)
-parser.add_argument("--ppo_use_state_norm", "--ppo-use-state-norm", type=str, default=None)
-parser.add_argument("--ppo_use_value_norm", "--ppo-use-value-norm", type=str, default=None)
+# ── Agent-config overrides — flag name == YAML key under `agent:` ─────────── #
+# Each dest is spelled EXACTLY like the key it writes in agents/skrl_*_cfg.yaml,
+# so `--discount_factor 0.1` does what editing `discount_factor: 0.1` would.
+# Applied to agent_cfg["agent"] in BOTH the classic and Isaac branches via
+# _apply_agent_overrides (previously only the Isaac branch honored them, so a
+# classic run silently ignored everything but --learning_rate/--discount_factor).
+# The older --ppo_*/--sac_*/--lr/--epochs spellings are kept as aliases on the
+# same arguments, so existing commands and --extra strings keep working.
+_ov = parser.add_argument_group("agent config overrides (flag == YAML key)")
+# Shared by PPO and SAC.
+_ov.add_argument("--learning_rate", "--learning-rate", "--lr", "--ppo_lr", "--ppo-lr",
+                 "--sac_lr", "--sac-lr", type=float, default=None)
+_ov.add_argument("--discount_factor", "--discount-factor", "--ppo_discount", "--ppo-discount",
+                 "--sac_discount", "--sac-discount", type=float, default=None)
+# PPO.
+_ov.add_argument("--rollouts", "--ppo_rollouts", "--ppo-rollouts", type=int, default=None)
+_ov.add_argument("--learning_epochs", "--learning-epochs", "--epochs",
+                 "--ppo_learning_epochs", "--ppo-learning-epochs", type=int, default=None)
+_ov.add_argument("--mini_batches", "--mini-batches", "--ppo_mini_batches", "--ppo-mini-batches",
+                 type=int, default=None)
+# skrl PPO's GAE key is `lambda`; the yaml also carries `gae_lambda` — set both.
+_ov.add_argument("--gae_lambda", "--gae-lambda", "--lambda", "--ppo_lambda", "--ppo-lambda",
+                 type=float, default=None)
+_ov.add_argument("--ratio_clip", "--ratio-clip", "--ppo_ratio_clip", "--ppo-ratio-clip",
+                 type=float, default=None)
+_ov.add_argument("--entropy_loss_scale", "--entropy-loss-scale",
+                 "--ppo_entropy_scale", "--ppo-entropy-scale", type=float, default=None)
+_ov.add_argument("--kl_threshold", "--kl-threshold", "--ppo_kl_threshold", "--ppo-kl-threshold",
+                 type=float, default=None)
+_ov.add_argument("--value_loss_scale", "--value-loss-scale", type=float, default=None)
+_ov.add_argument("--grad_norm_clip", "--grad-norm-clip", type=float, default=None)
+_ov.add_argument("--use_state_norm", "--use-state-norm", "--ppo_use_state_norm",
+                 "--ppo-use-state-norm", type=str, default=None)
+_ov.add_argument("--use_value_norm", "--use-value-norm", "--ppo_use_value_norm",
+                 "--ppo-use-value-norm", type=str, default=None)
+# SAC.
+_ov.add_argument("--batch_size", "--batch-size", "--sac_batch_size", "--sac-batch-size",
+                 type=int, default=None)
+_ov.add_argument("--polyak", "--sac_polyak", "--sac-polyak", type=float, default=None)
+_ov.add_argument("--gradient_steps", "--gradient-steps", "--sac_gradient_steps",
+                 "--sac-gradient-steps", type=int, default=None)
+_ov.add_argument("--initial_entropy_value", "--initial-entropy-value", "--sac_entropy",
+                 "--sac-entropy", type=float, default=None)
+# Under the `memory:` block, not `agent:`.
+_ov.add_argument("--memory_size", "--memory-size", "--sac_memory_size", "--sac-memory-size",
+                 type=int, default=None)
+# Model-structure overrides (manipulate the `models:` block, not `agent:`).
 parser.add_argument("--ppo_activations", "--ppo-activations", type=str, default=None)
 parser.add_argument("--ppo_network_arch", "--ppo-network-arch", type=str, default=None)
 
 # Classic-specific
 parser.add_argument("--cfg", type=str, default=None,
                     help="Path to a custom YAML config (classic only).")
-parser.add_argument("--lr", type=float, default=None,
-                    help="Learning rate override (classic only).")
-parser.add_argument("--epochs", type=int, default=None,
-                    help="Training epochs override (classic only).")
 
 # Reference trajectory generation (auto-triggered after vel-tracking training)
 parser.add_argument("--ref_num_trajs", type=int, default=1000,
@@ -201,6 +224,37 @@ _DEFAULT_NUM_ENVS_PPO_CLASSIC = 1024
 
 
 
+def _apply_agent_overrides(agent_cfg, args):
+    """Write every set agent-config override into agent_cfg, by YAML key name.
+
+    Shared by the classic and Isaac branches so a flag behaves identically on
+    both (before, only the Isaac branch applied most of them). Each flag's dest
+    is the YAML key it targets; ``None`` means "not passed, leave the config's
+    value". ``lambda``/``gae_lambda`` and ``memory_size`` are the only keys whose
+    destination differs from a plain ``agent[<dest>]`` write.
+    """
+    a = agent_cfg["agent"]
+    simple = (
+        "learning_rate", "discount_factor", "rollouts", "learning_epochs",
+        "mini_batches", "ratio_clip", "entropy_loss_scale", "kl_threshold",
+        "value_loss_scale", "grad_norm_clip", "batch_size", "polyak",
+        "gradient_steps", "initial_entropy_value",
+    )
+    for key in simple:
+        val = getattr(args, key, None)
+        if val is not None:
+            a[key] = val
+    if args.gae_lambda is not None:
+        a["lambda"] = args.gae_lambda      # skrl PPO's GAE key
+        a["gae_lambda"] = args.gae_lambda  # yaml's own spelling
+    for key in ("use_state_norm", "use_value_norm"):
+        val = getattr(args, key, None)
+        if val is not None:
+            a[key] = (str(val).lower() == "true")
+    if args.memory_size is not None:
+        agent_cfg["memory"]["memory_size"] = args.memory_size
+
+
 seed = args_cli.seed if args_cli.seed is not None else random.randint(0, 10000)
 
 logger = logging.getLogger(__name__)
@@ -267,16 +321,10 @@ if _is_classic:
 
     if args_cli.num_timesteps is not None:
         agent_cfg["trainer"]["timesteps"] = args_cli.num_timesteps
-    if args_cli.lr is not None:
-        agent_cfg["agent"]["learning_rate"] = args_cli.lr
-    # Discount override — the Isaac branch below honors --ppo_discount /
-    # --sac_discount, this one silently ignored them, so a classic gamma sweep
-    # trained every run at the yaml's own discount_factor. Both flags write the
-    # same key; the PPO one wins if (nonsensically) both are given.
-    _discount = args_cli.sac_discount if args_cli.sac_discount is not None else None
-    _discount = args_cli.ppo_discount if args_cli.ppo_discount is not None else _discount
-    if _discount is not None:
-        agent_cfg["agent"]["discount_factor"] = _discount
+    # All agent-config overrides (--learning_rate, --discount_factor, --rollouts,
+    # …) — the classic branch used to apply only a couple of these, silently
+    # dropping the rest, so a classic gamma sweep trained at the yaml's own value.
+    _apply_agent_overrides(agent_cfg, args_cli)
     # Classic contraction envs use the env's exact analytical get_f_and_B by
     # default (use_empirical_dynamics=False); pass --use_empirical_dynamics to
     # learn a NeuralDynamics instead. Classic envs only (Isaac forces empirical).
@@ -464,28 +512,8 @@ else:
             agent_cfg["trainer"]["timesteps"] = args_cli.num_timesteps
         agent_cfg["trainer"]["close_environment_at_exit"] = False
 
-        # HP overrides
-        a = agent_cfg["agent"]
-        if args_cli.sac_lr is not None:             a["learning_rate"]          = args_cli.sac_lr
-        if args_cli.sac_batch_size is not None:      a["batch_size"]             = args_cli.sac_batch_size
-        if args_cli.sac_discount is not None:        a["discount_factor"]        = args_cli.sac_discount
-        if args_cli.sac_polyak is not None:          a["polyak"]                 = args_cli.sac_polyak
-        if args_cli.sac_gradient_steps is not None:  a["gradient_steps"]         = args_cli.sac_gradient_steps
-        if args_cli.sac_entropy is not None:         a["initial_entropy_value"]  = args_cli.sac_entropy
-        if args_cli.sac_memory_size is not None:     agent_cfg["memory"]["memory_size"] = args_cli.sac_memory_size
-        if args_cli.ppo_lr is not None:              a["learning_rate"]    = args_cli.ppo_lr
-        if args_cli.ppo_rollouts is not None:        a["rollouts"]         = args_cli.ppo_rollouts
-        if args_cli.ppo_learning_epochs is not None: a["learning_epochs"]  = args_cli.ppo_learning_epochs
-        if args_cli.ppo_mini_batches is not None:    a["mini_batches"]     = args_cli.ppo_mini_batches
-        if args_cli.ppo_discount is not None:        a["discount_factor"]  = args_cli.ppo_discount
-        if args_cli.ppo_lambda is not None:          
-            a["lambda"] = args_cli.ppo_lambda
-            a["gae_lambda"] = args_cli.ppo_lambda
-        if args_cli.ppo_ratio_clip is not None:      a["ratio_clip"]       = args_cli.ppo_ratio_clip
-        if args_cli.ppo_entropy_scale is not None:   a["entropy_loss_scale"] = args_cli.ppo_entropy_scale
-        if args_cli.ppo_kl_threshold is not None:    a["kl_threshold"]     = args_cli.ppo_kl_threshold
-        if args_cli.ppo_use_state_norm is not None:  a["use_state_norm"]   = (args_cli.ppo_use_state_norm.lower() == 'true')
-        if args_cli.ppo_use_value_norm is not None:  a["use_value_norm"]   = (args_cli.ppo_use_value_norm.lower() == 'true')
+        # Agent-config overrides (flag name == YAML key); see _apply_agent_overrides.
+        _apply_agent_overrides(agent_cfg, args_cli)
 
         if args_cli.ppo_activations is not None:
             models_cfg = agent_cfg.get("models", {})
