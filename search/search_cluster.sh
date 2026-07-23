@@ -56,6 +56,12 @@
 #   --exclude-gpu-type T resolve every node carrying gres type T to a nodelist and
 #                        --exclude it. This is how you say "any GPU EXCEPT V100",
 #                        which --gres cannot express (it takes ONE type only).
+#                        Repeatable. NOTE: by default this is done automatically —
+#                        every model too old for the installed torch is detected
+#                        and excluded, so all the SUPPORTED models stay usable.
+#   --min-cc X.Y         compute-capability floor (default: read from the local
+#                        torch's get_arch_list, else 7.5)
+#   --no-auto-exclude    don't auto-exclude old GPU models
 #   --exclude NODELIST   --exclude=NODELIST passed through verbatim
 #   --agents-per-gpu N   override the smoke-test packing result
 #   --max-agents-per-gpu N  hard ceiling on the packing result (default 16)
@@ -119,7 +125,11 @@ PROBE=1; YES=0; STOP_TAG=""; SAFETY="0.85"
 # then dies with cudaErrorNoKernelImageForDevice at the first tensor op, before
 # wandb logs anything, so the trial shows up as an empty "crashed" run. Pinning
 # the type (or a node feature) keeps jobs on GPUs the install actually supports.
-GPU_TYPE=""; CONSTRAINT=""; EXCLUDE=""; EXCLUDE_GPU_TYPE=""
+GPU_TYPE=""; CONSTRAINT=""; EXCLUDE=""; EXCLUDE_GPU_TYPES=""
+# AUTO_EXCLUDE: keep every GPU model the installed torch has kernels for and drop
+# only the too-old ones, instead of forfeiting the partition to a single pinned
+# model. MIN_CC (compute capability ×10) is auto-detected from torch when empty.
+AUTO_EXCLUDE=1; MIN_CC=""
 # Packing guard rails. MIN_PROBE_MB: a run using less than this obviously never
 # reached the GPU (an idle GPU reads a few MB) — reject rather than divide total
 # VRAM by ~0 and get a nonsense count. MAX_AGENTS_PER_GPU: hard ceiling so even a
@@ -137,7 +147,10 @@ while [[ $# -gt 0 ]]; do
         --gpu-type) GPU_TYPE="$2"; shift 2 ;;
         --constraint) CONSTRAINT="$2"; shift 2 ;;
         --exclude) EXCLUDE="$2"; shift 2 ;;
-        --exclude-gpu-type) EXCLUDE_GPU_TYPE="$2"; shift 2 ;;
+        # repeatable; auto-exclusion appends to the same list
+        --exclude-gpu-type) EXCLUDE_GPU_TYPES+="${EXCLUDE_GPU_TYPES:+ }$2"; shift 2 ;;
+        --min-cc) MIN_CC="$(awk -v v="$2" 'BEGIN{printf "%d", v*10 + 0.5}')"; shift 2 ;;
+        --no-auto-exclude) AUTO_EXCLUDE=0; shift ;;
         --agents-per-gpu) AGENTS_PER_GPU="$2"; shift 2 ;;
         --max-agents-per-gpu) MAX_AGENTS_PER_GPU="$2"; shift 2 ;;
         --min-probe-mb) MIN_PROBE_MB="$2"; shift 2 ;;
@@ -221,7 +234,12 @@ _success "Env(s): ${C_BOLD}${ENVS[*]}${C_RESET}"
 # free GPUs: walk `scontrol show nodes -o` (one node per line), and for nodes in
 # an allocatable state (IDLE/MIXED) subtract GresUsed=gpu:… from Gres=gpu:…,
 # crediting the difference to each of the node's Partitions.
-declare -A PART_FREE PART_TOTAL PART_PENDING PART_TYPES
+# PART_TYPES  — models on allocatable (idle/mix) nodes, for the "what's free now"
+#               table. PART_TYPES_ALL — models on EVERY node regardless of state,
+#               which is what the old-GPU auto-exclusion must key off: a V100 that
+#               is merely alloc/down right now would otherwise go unclassified and
+#               happily take a job the moment it frees up.
+declare -A PART_FREE PART_TOTAL PART_PENDING PART_TYPES PART_TYPES_ALL
 
 _gres_gpu_count() {  # extract the trailing integer of a gpu:[type:]N token
     grep -oE 'gpu:[^,]*' <<<"$1" | grep -oE '[0-9]+' | tail -n1
@@ -237,11 +255,21 @@ _header "Partition / GPU discovery"
 {
     while IFS= read -r line; do
         state=$(grep -oE 'State=[^ ]+' <<<"$line" | cut -d= -f2 | tr 'A-Z' 'a-z')
-        [[ "$state" =~ idle|mix ]] || continue
         gres=$(grep -oE 'Gres=[^ ]+' <<<"$line" | cut -d= -f2-)
         gused=$(grep -oE 'GresUsed=[^ ]+' <<<"$line" | cut -d= -f2-)
         parts=$(grep -oE 'Partitions=[^ ]+' <<<"$line" | cut -d= -f2-)
         [[ "$gres" == *gpu:* ]] || continue
+        # Record the model for EVERY state first — auto-exclusion needs the full
+        # inventory, not just what happens to be free at this instant.
+        _t_all=$(_gres_gpu_type "$gres")
+        if [[ -n "$_t_all" ]]; then
+            IFS=',' read -ra _pall <<<"$parts"
+            for p in "${_pall[@]}"; do
+                [[ " ${PART_TYPES_ALL[$p]:-} " != *" $_t_all "* ]] && \
+                    PART_TYPES_ALL[$p]="${PART_TYPES_ALL[$p]:-}${PART_TYPES_ALL[$p]:+ }$_t_all"
+            done
+        fi
+        [[ "$state" =~ idle|mix ]] || continue
         total=$(_gres_gpu_count "$gres"); used=$(_gres_gpu_count "$gused")
         [[ -z "$total" ]] && continue; [[ -z "$used" ]] && used=0
         free=$(( total - used )); (( free < 0 )) && free=0
@@ -298,18 +326,73 @@ _success "Partition: ${C_BOLD}$PARTITION${C_RESET}"
 # model the torch build has no kernels for (V100 = CC 7.0 under a CUDA-13 build)
 # and every CUDA op raises cudaErrorNoKernelImageForDevice at the first tensor
 # op — before wandb logs anything, so the run is recorded as an empty "crashed".
-# Offer the pin whenever the chosen partition exposes more than one model.
+# Rather than making the user pin ONE model (which forfeits every other GPU in a
+# mixed partition), keep EVERY model the local torch has kernels for and exclude
+# only the too-old ones. That is strictly better on a queue like scavenger: the
+# job can land on whichever supported GPU frees up first.
 _avail_types="${PART_TYPES[$PARTITION]:-}"
-if [[ -z "$GPU_TYPE" && -n "$_avail_types" && "$_avail_types" == *" "* ]]; then
-    _warn "Partition '$PARTITION' is heterogeneous: ${C_BOLD}${_avail_types}${C_RESET}"
-    _info "A bare --gres can land on any of them; an unsupported model crashes every trial before it logs."
-    _info "--gres takes ONE type. To allow several, leave this blank and use"
-    _info "  --exclude-gpu-type V100   (any GPU except that model), or --constraint 'A|B'."
-    if [[ "$YES" -ne 1 ]]; then
-        printf '%s' "  ${C_MAGENTA}?${C_RESET} ${C_BOLD}Pin ONE GPU type?${C_RESET} ${C_DIM}[blank = any]${C_RESET}: " >&2
-        read -r GPU_TYPE
-        GPU_TYPE="${GPU_TYPE//[[:space:]]/ }"; GPU_TYPE="${GPU_TYPE#"${GPU_TYPE%%[![:space:]]*}"}"
-        GPU_TYPE="${GPU_TYPE%"${GPU_TYPE##*[![:space:]]}"}"
+
+# Compute capability by gres model name, ×10 so bash can compare them as ints.
+# Extend this table when the cluster gains a model it doesn't know about.
+declare -A GPU_CC=(
+    [K80]=37   [P100]=60  [P40]=61   [GTX1080]=61 [TitanXp]=61
+    [V100]=70  [TitanV]=70
+    [T4]=75    [QuadroRTX6000]=75 [QuadroRTX8000]=75 [RTX6000]=75 [RTX2080Ti]=75
+    [A100]=80  [A30]=80
+    [A40]=86   [A6000]=86 [A5000]=86 [A4000]=86 [RTX3090]=86
+    [L4]=89    [L40]=89   [L40S]=89  [RTX4090]=89
+    [H100]=90  [H200]=90  [GH200]=90
+    [B200]=100 [B100]=100
+)
+
+# The floor: the lowest arch the INSTALLED torch was built for. Asking torch
+# itself (get_arch_list -> sm_75/sm_90/...) beats hardcoding, because the answer
+# changes with the wheel's CUDA build — a cu130 wheel has no sm_70, a cu126 one
+# does. Best-effort: if torch isn't importable on the login node, fall back to
+# --min-cc (default 7.5, i.e. exclude Volta and older).
+if [[ -z "$MIN_CC" ]]; then
+    MIN_CC=$(python - <<'PY' 2>/dev/null
+try:
+    import torch
+    ccs = []
+    for a in torch.cuda.get_arch_list():
+        d = a.split("_")[-1]
+        if d.isdigit():
+            ccs.append(int(d[:-1]) * 10 + int(d[-1]))
+    print(min(ccs) if ccs else "")
+except Exception:
+    print("")
+PY
+)
+fi
+if [[ -z "$MIN_CC" ]]; then
+    MIN_CC=75
+    _info "torch not importable here — assuming min compute capability 7.5 (override with --min-cc)."
+else
+    _info "Installed torch supports compute capability ≥ ${C_BOLD}$((MIN_CC/10)).$((MIN_CC%10))${C_RESET}"
+fi
+
+# Classify the partition's models, and auto-exclude every one below the floor.
+# Keyed off PART_TYPES_ALL (every node state), not the free-now list.
+_all_types="${PART_TYPES_ALL[$PARTITION]:-$_avail_types}"
+if [[ "$AUTO_EXCLUDE" -eq 1 && -n "$_all_types" ]]; then
+    _keep=""; _drop=""; _unknown=""
+    for _t in $_all_types; do
+        _cc="${GPU_CC[$_t]:-}"
+        if [[ -z "$_cc" ]]; then _unknown+="${_unknown:+ }$_t"; _keep+="${_keep:+ }$_t"
+        elif (( _cc < MIN_CC )); then _drop+="${_drop:+ }$_t"
+        else _keep+="${_keep:+ }$_t"; fi
+    done
+    [[ -n "$_unknown" ]] && _warn "Unknown GPU model(s): $_unknown — keeping them (add to GPU_CC, or use --exclude-gpu-type)."
+    if [[ -n "$_drop" ]]; then
+        _warn "Too old for this torch build: ${C_BOLD}${_drop}${C_RESET} — excluding those nodes."
+        _success "Will use: ${C_BOLD}${_keep:-<none>}${C_RESET}"
+        for _t in $_drop; do
+            EXCLUDE_GPU_TYPES+="${EXCLUDE_GPU_TYPES:+ }$_t"
+        done
+        [[ -z "$_keep" ]] && { _error "No supported GPU model left in '$PARTITION'."; exit 1; }
+    else
+        _success "All GPU models in '$PARTITION' are supported: ${C_BOLD}${_all_types}${C_RESET}"
     fi
 fi
 # A gres type is a single token. Catching a multi-token answer here matters:
@@ -327,21 +410,26 @@ if [[ -n "$GPU_TYPE" && -n "$_avail_types" && " $_avail_types " != *" $GPU_TYPE 
     _warn "'$GPU_TYPE' is not among partition '$PARTITION' types ($_avail_types) — gres names are case-sensitive."
 fi
 
-# --exclude-gpu-type: resolve the model to the nodes carrying it. Scans ALL nodes
-# (not just idle/mix like the discovery walk) so a currently-busy bad node is
-# still excluded when it frees up.
-if [[ -n "$EXCLUDE_GPU_TYPE" ]]; then
+# Resolve every excluded model to the nodes carrying it. ONE pass over the node
+# list for all types. Scans ALL nodes (not just idle/mix like the discovery walk)
+# so a currently-busy bad node is still excluded when it later frees up.
+if [[ -n "$EXCLUDE_GPU_TYPES" ]]; then
     _ex_nodes=""
     while IFS= read -r line; do
         _nn=$(grep -oE 'NodeName=[^ ]+' <<<"$line" | cut -d= -f2)
         _gr=$(grep -oE 'Gres=[^ ]+' <<<"$line" | cut -d= -f2-)
-        [[ -n "$_nn" && "$_gr" == *"gpu:$EXCLUDE_GPU_TYPE:"* ]] && _ex_nodes+="${_ex_nodes:+,}$_nn"
+        [[ -z "$_nn" ]] && continue
+        for _t in $EXCLUDE_GPU_TYPES; do
+            if [[ "$_gr" == *"gpu:$_t:"* ]]; then
+                _ex_nodes+="${_ex_nodes:+,}$_nn"; break
+            fi
+        done
     done < <(scontrol show nodes -o 2>/dev/null)
     if [[ -z "$_ex_nodes" ]]; then
-        _warn "No nodes found with gres type '$EXCLUDE_GPU_TYPE' (case-sensitive) — nothing excluded."
+        _warn "No nodes found for gres type(s) '$EXCLUDE_GPU_TYPES' (case-sensitive) — nothing excluded."
     else
         EXCLUDE="${EXCLUDE:+$EXCLUDE,}$_ex_nodes"
-        _success "Excluding $EXCLUDE_GPU_TYPE nodes: ${C_BOLD}$_ex_nodes${C_RESET}"
+        _success "Excluding $EXCLUDE_GPU_TYPES nodes: ${C_BOLD}$_ex_nodes${C_RESET}"
     fi
 fi
 
