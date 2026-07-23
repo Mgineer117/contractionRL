@@ -51,7 +51,12 @@
 #                        torch build has no kernels for (e.g. V100 / CC 7.0 under
 #                        a CUDA-13 build). Applies to the smoke test too.
 #   --constraint FEAT    --constraint=FEAT for sbatch/srun, if the site defines
-#                        node features instead of typed gres
+#                        node features instead of typed gres. Unlike --gres this
+#                        DOES support OR: --constraint 'H100|L40S'
+#   --exclude-gpu-type T resolve every node carrying gres type T to a nodelist and
+#                        --exclude it. This is how you say "any GPU EXCEPT V100",
+#                        which --gres cannot express (it takes ONE type only).
+#   --exclude NODELIST   --exclude=NODELIST passed through verbatim
 #   --agents-per-gpu N   override the smoke-test packing result
 #   --max-agents-per-gpu N  hard ceiling on the packing result (default 16)
 #   --min-probe-mb N     reject a smoke-test peak below this as a failed run
@@ -114,7 +119,7 @@ PROBE=1; YES=0; STOP_TAG=""; SAFETY="0.85"
 # then dies with cudaErrorNoKernelImageForDevice at the first tensor op, before
 # wandb logs anything, so the trial shows up as an empty "crashed" run. Pinning
 # the type (or a node feature) keeps jobs on GPUs the install actually supports.
-GPU_TYPE=""; CONSTRAINT=""
+GPU_TYPE=""; CONSTRAINT=""; EXCLUDE=""; EXCLUDE_GPU_TYPE=""
 # Packing guard rails. MIN_PROBE_MB: a run using less than this obviously never
 # reached the GPU (an idle GPU reads a few MB) — reject rather than divide total
 # VRAM by ~0 and get a nonsense count. MAX_AGENTS_PER_GPU: hard ceiling so even a
@@ -131,6 +136,8 @@ while [[ $# -gt 0 ]]; do
         --gpus-per-job) GPUS_PER_JOB="$2"; shift 2 ;;
         --gpu-type) GPU_TYPE="$2"; shift 2 ;;
         --constraint) CONSTRAINT="$2"; shift 2 ;;
+        --exclude) EXCLUDE="$2"; shift 2 ;;
+        --exclude-gpu-type) EXCLUDE_GPU_TYPE="$2"; shift 2 ;;
         --agents-per-gpu) AGENTS_PER_GPU="$2"; shift 2 ;;
         --max-agents-per-gpu) MAX_AGENTS_PER_GPU="$2"; shift 2 ;;
         --min-probe-mb) MIN_PROBE_MB="$2"; shift 2 ;;
@@ -296,14 +303,51 @@ _avail_types="${PART_TYPES[$PARTITION]:-}"
 if [[ -z "$GPU_TYPE" && -n "$_avail_types" && "$_avail_types" == *" "* ]]; then
     _warn "Partition '$PARTITION' is heterogeneous: ${C_BOLD}${_avail_types}${C_RESET}"
     _info "A bare --gres can land on any of them; an unsupported model crashes every trial before it logs."
+    _info "--gres takes ONE type. To allow several, leave this blank and use"
+    _info "  --exclude-gpu-type V100   (any GPU except that model), or --constraint 'A|B'."
     if [[ "$YES" -ne 1 ]]; then
-        printf '%s' "  ${C_MAGENTA}?${C_RESET} ${C_BOLD}Pin a GPU type?${C_RESET} ${C_DIM}[blank = any]${C_RESET}: " >&2
+        printf '%s' "  ${C_MAGENTA}?${C_RESET} ${C_BOLD}Pin ONE GPU type?${C_RESET} ${C_DIM}[blank = any]${C_RESET}: " >&2
         read -r GPU_TYPE
+        GPU_TYPE="${GPU_TYPE//[[:space:]]/ }"; GPU_TYPE="${GPU_TYPE#"${GPU_TYPE%%[![:space:]]*}"}"
+        GPU_TYPE="${GPU_TYPE%"${GPU_TYPE##*[![:space:]]}"}"
     fi
 fi
+# A gres type is a single token. Catching a multi-token answer here matters:
+# "gpu:A B C:1" is not an OR — sbatch would split it on whitespace and silently
+# request only the first, or reject the directive outright.
+if [[ -n "$GPU_TYPE" && ! "$GPU_TYPE" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    _error "--gpu-type must be ONE gres type name (got: '$GPU_TYPE')."
+    _info "SLURM's --gres cannot OR types. To allow several models instead:"
+    _info "  • --exclude-gpu-type V100        keep every model EXCEPT that one"
+    _info "  • --constraint 'H100|L40S'       if the site defines node FEATURES (sinfo -N -o '%N %f')"
+    _info "  • or submit one batch per type"
+    exit 1
+fi
+if [[ -n "$GPU_TYPE" && -n "$_avail_types" && " $_avail_types " != *" $GPU_TYPE "* ]]; then
+    _warn "'$GPU_TYPE' is not among partition '$PARTITION' types ($_avail_types) — gres names are case-sensitive."
+fi
+
+# --exclude-gpu-type: resolve the model to the nodes carrying it. Scans ALL nodes
+# (not just idle/mix like the discovery walk) so a currently-busy bad node is
+# still excluded when it frees up.
+if [[ -n "$EXCLUDE_GPU_TYPE" ]]; then
+    _ex_nodes=""
+    while IFS= read -r line; do
+        _nn=$(grep -oE 'NodeName=[^ ]+' <<<"$line" | cut -d= -f2)
+        _gr=$(grep -oE 'Gres=[^ ]+' <<<"$line" | cut -d= -f2-)
+        [[ -n "$_nn" && "$_gr" == *"gpu:$EXCLUDE_GPU_TYPE:"* ]] && _ex_nodes+="${_ex_nodes:+,}$_nn"
+    done < <(scontrol show nodes -o 2>/dev/null)
+    if [[ -z "$_ex_nodes" ]]; then
+        _warn "No nodes found with gres type '$EXCLUDE_GPU_TYPE' (case-sensitive) — nothing excluded."
+    else
+        EXCLUDE="${EXCLUDE:+$EXCLUDE,}$_ex_nodes"
+        _success "Excluding $EXCLUDE_GPU_TYPE nodes: ${C_BOLD}$_ex_nodes${C_RESET}"
+    fi
+fi
+
 # What both the smoke test and the generated jobs ask SLURM for.
 gres_spec() { printf 'gpu:%s%s' "${GPU_TYPE:+$GPU_TYPE:}" "$1"; }
-_success "GPU request: ${C_BOLD}--gres=$(gres_spec "$GPUS_PER_JOB")${C_RESET}${CONSTRAINT:+  --constraint=$CONSTRAINT}"
+_success "GPU request: ${C_BOLD}--gres=$(gres_spec "$GPUS_PER_JOB")${C_RESET}${CONSTRAINT:+  --constraint=$CONSTRAINT}${EXCLUDE:+  --exclude=$EXCLUDE}"
 
 # ── num-jobs / gpus-per-job ───────────────────────────────────────────────── #
 if [[ -z "$NUM_JOBS" ]]; then
@@ -403,7 +447,7 @@ PY
     # would size agents-per-GPU against memory the jobs never actually get.
     PROBE_OUT=$(srun --partition="$PARTITION" --gres="$(gres_spec 1)" \
         --cpus-per-task="$CPUS_PER_GPU" --time=00:10:00 --job-name="crl-probe" \
-        ${CONSTRAINT:+--constraint="$CONSTRAINT"} \
+        ${CONSTRAINT:+--constraint="$CONSTRAINT"} ${EXCLUDE:+--exclude="$EXCLUDE"} \
         ${ACCOUNT:+--account="$ACCOUNT"} ${QOS:+--qos="$QOS"} \
         bash -c '
             set -uo pipefail
@@ -483,6 +527,7 @@ _kv "Partition"      "$PARTITION"
 _kv "Jobs / env"     "$NUM_JOBS"
 _kv "GPUs / job"     "$GPUS_PER_JOB  (--gres=$(gres_spec "$GPUS_PER_JOB"))"
 [[ -n "$CONSTRAINT" ]] && _kv "Constraint" "$CONSTRAINT"
+[[ -n "$EXCLUDE" ]]    && _kv "Excluded nodes" "$EXCLUDE"
 _kv "Agents / GPU"   "$AGENTS_PER_GPU"
 _kv "Agents / job"   "$AGENTS_PER_JOB"
 _kv "Workers / env"  "$TOTAL_WORKERS"
@@ -520,6 +565,7 @@ for ENV in "${!ENV_SWEEP[@]}"; do
         echo "#SBATCH --partition=$PARTITION"
         echo "#SBATCH --gres=$(gres_spec "$GPUS_PER_JOB")"
         [[ -n "$CONSTRAINT" ]] && echo "#SBATCH --constraint=$CONSTRAINT"
+        [[ -n "$EXCLUDE" ]]    && echo "#SBATCH --exclude=$EXCLUDE"
         echo "#SBATCH --cpus-per-task=$CPUS_PER_TASK"
         echo "#SBATCH --time=$WALLTIME"
         # B: → deliver USR1 to the batch shell (not the job steps); @180 → 3 min
