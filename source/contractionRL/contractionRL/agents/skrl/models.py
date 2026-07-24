@@ -21,7 +21,10 @@ try:
 except ImportError:
     raise ImportError("skrl is required. Install it or use the local developer copy.")
 
-from .angle_utils import embed_angles, embedded_dim
+from .angle_utils import (
+    embed_angles, embedded_dim,
+    pair_feature_dim, pair_features,
+)
 from .math_utils import rescale_residual
 from .nn_modules import CCM_Generator, BoundedCCM_Generator, CLActor, MLP
 
@@ -55,6 +58,7 @@ class CLDeterministicActorModel(DeterministicMixin, Model):
         activation: str = "tanh",
         x_dim: int | None = None,
         angle_idx: list | None = None,
+        pos_dim: int = 0,
         **kwargs,
     ):
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
@@ -72,6 +76,7 @@ class CLDeterministicActorModel(DeterministicMixin, Model):
             hidden_dim=hidden_dim or [128, 128],
             activation=activation,
             angle_idx=angle_idx or [],
+            pos_dim=pos_dim,
         )
 
         self.to(self.device)
@@ -117,6 +122,7 @@ class SquashedCLDeterministicActorModel(DeterministicMixin, Model):
         activation: str = "tanh",
         x_dim: int | None = None,
         angle_idx: list | None = None,
+        pos_dim: int = 0,
         **kwargs,
     ):
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
@@ -134,6 +140,7 @@ class SquashedCLDeterministicActorModel(DeterministicMixin, Model):
             hidden_dim=hidden_dim or [128, 128],
             activation=activation,
             angle_idx=angle_idx or [],
+            pos_dim=pos_dim,
         )
 
         # DeterministicMixin.__init__ already computed _d_min_actions/_d_max_actions
@@ -162,6 +169,7 @@ class MetricModel(Model):
         activation: str = "tanh",
         x_dim: int | None = None,
         angle_idx: list | None = None,
+        pos_dim: int = 0,
         **kwargs,
     ):
         super().__init__(
@@ -191,6 +199,7 @@ class MetricModel(Model):
                 w_ub=w_ub,
                 device=str(device) if not isinstance(device, str) else device,
                 angle_idx=angle_idx,
+                pos_dim=pos_dim,
             )
         else:
             self.ccm_gen = CCM_Generator(
@@ -200,6 +209,7 @@ class MetricModel(Model):
                 mode=mode,
                 device=str(device) if not isinstance(device, str) else device,
                 angle_idx=angle_idx,
+                pos_dim=pos_dim,
             )
 
     def compute(self, inputs: dict, role: str = "cmg"):
@@ -248,6 +258,7 @@ class CLActorModel(GaussianMixin, Model):
         activation: str = "tanh",
         x_dim: int | None = None,
         angle_idx: list | None = None,
+        pos_dim: int = 0,
         **kwargs,
     ):
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
@@ -275,6 +286,7 @@ class CLActorModel(GaussianMixin, Model):
             hidden_dim=hidden_dim or [128, 128],
             activation=activation,
             angle_idx=angle_idx or [],
+            pos_dim=pos_dim,
         )
         self.log_std_parameter = self.cl_actor.logstd
 
@@ -322,6 +334,7 @@ class MLPResidualActorModel(GaussianMixin, Model):
         activation: str = "tanh",
         x_dim: int | None = None,
         angle_idx: list | None = None,
+        pos_dim: int = 0,
         **kwargs,
     ):
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
@@ -345,11 +358,12 @@ class MLPResidualActorModel(GaussianMixin, Model):
         # Explicit x_dim (from the env) wins over the parity guess — see CLActorModel.
         self._x_dim = x_dim if x_dim is not None else remainder // 2
         self._angle_idx = angle_idx or []
+        self._pos_dim = int(pos_dim or 0)
 
         act_module = {"tanh": nn.Tanh(), "relu": nn.ReLU()}[activation.lower()] \
             if isinstance(activation, str) else activation
         # net sees the x/xref blocks CONTINUOUSLY embedded + the raw uref tail.
-        net_in_dim = 2 * embedded_dim(self._x_dim, self._angle_idx) + u_dim
+        net_in_dim = pair_feature_dim(self._x_dim, self._pos_dim, self._angle_idx) + u_dim
         self.net = MLP(net_in_dim, list(hidden_dim or [128, 128]), u_dim, activation=act_module)
 
         self.log_std_parameter = nn.Parameter(torch.full((u_dim,), float(initial_log_std)))
@@ -362,7 +376,7 @@ class MLPResidualActorModel(GaussianMixin, Model):
         xref = obs[:, self._x_dim : 2 * self._x_dim]
         uref = obs[:, -self._u_dim:]  # last u_dim entries of [x, xref, uref]
         net_in = torch.cat(
-            [embed_angles(x, self._angle_idx), embed_angles(xref, self._angle_idx), uref], dim=-1
+            [pair_features(x, xref, self._pos_dim, self._angle_idx), uref], dim=-1
         )
         mean = uref + self.net(net_in)
         return mean, {"log_std": self.log_std_parameter}
@@ -602,6 +616,7 @@ class SquashedMLPActorModel(_TanhSquashMixin, GaussianMixin, Model):
         activation: str = "relu",
         x_dim: int | None = _X_DIM_UNSET,
         angle_idx: list | None = None,
+        pos_dim: int = 0,
         **kwargs,
     ):
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
@@ -639,11 +654,14 @@ class SquashedMLPActorModel(_TanhSquashMixin, GaussianMixin, Model):
         # angle_idx only makes sense (and is only ever passed) when the layout
         # has a known x/xref split; vel-tracking's flat obs has none.
         self._angle_idx = (angle_idx or []) if is_path_tracking else []
+        # Same gate as angle_idx: only the [x, xref, uref] layout has a
+        # position block to quotient out; a flat obs leaves pos_dim at 0.
+        self._pos_dim = int(pos_dim or 0) if is_path_tracking else 0
 
         act_module = {"tanh": nn.Tanh(), "relu": nn.ReLU()}[activation.lower()] \
             if isinstance(activation, str) else activation
         net_in_dim = (
-            2 * embedded_dim(self._x_dim, self._angle_idx) + self._u_dim
+            pair_feature_dim(self._x_dim, self._pos_dim, self._angle_idx) + self._u_dim
             if is_path_tracking else obs_dim
         )
         self.net = MLP(net_in_dim, list(hidden_dim or [256, 256]), output_dim=None, activation=act_module)
@@ -664,7 +682,7 @@ class SquashedMLPActorModel(_TanhSquashMixin, GaussianMixin, Model):
             xref = obs[:, self._x_dim : 2 * self._x_dim]
             uref = obs[:, -self._u_dim:]
             net_in = torch.cat(
-                [embed_angles(x, self._angle_idx), embed_angles(xref, self._angle_idx), uref], dim=-1
+                [pair_features(x, xref, self._pos_dim, self._angle_idx), uref], dim=-1
             )
         else:
             net_in = obs
@@ -726,6 +744,7 @@ class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
         activation: str = "tanh",
         x_dim: int | None = None,
         angle_idx: list | None = None,
+        pos_dim: int = 0,
         **kwargs,
     ):
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
@@ -748,6 +767,7 @@ class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
             u_dim=u_dim,
             anneal_stddev=False,  # see class docstring — SAC learns log_std via gradients
             angle_idx=angle_idx or [],
+            pos_dim=pos_dim,
             hidden_dim=hidden_dim or [128, 128],
             activation=activation,
         )
@@ -800,6 +820,7 @@ class EmbeddedDeterministicModel(DeterministicMixin, Model):
         activation: str = "tanh",
         x_dim: int | None = _X_DIM_UNSET,
         angle_idx: list | None = None,
+        pos_dim: int = 0,
         use_actions: bool = False,
         **kwargs,
     ):
@@ -830,13 +851,16 @@ class EmbeddedDeterministicModel(DeterministicMixin, Model):
         self._x_dim = x_dim if is_path_tracking else None
         self._u_dim = act_dim if is_path_tracking else None
         self._angle_idx = (angle_idx or []) if is_path_tracking else []
+        # Same gate as angle_idx: only the [x, xref, uref] layout has a
+        # position block to quotient out; a flat obs leaves pos_dim at 0.
+        self._pos_dim = int(pos_dim or 0) if is_path_tracking else 0
         self._use_actions = use_actions
 
         act_module = {"tanh": nn.Tanh(), "relu": nn.ReLU()}[activation.lower()] \
             if isinstance(activation, str) else activation
 
         obs_in_dim = (
-            2 * embedded_dim(self._x_dim, self._angle_idx) + self._u_dim
+            pair_feature_dim(self._x_dim, self._pos_dim, self._angle_idx) + self._u_dim
             if is_path_tracking else obs_dim
         )
         net_in_dim = obs_in_dim + (act_dim if use_actions else 0)
@@ -851,7 +875,7 @@ class EmbeddedDeterministicModel(DeterministicMixin, Model):
         xref = obs[:, self._x_dim : 2 * self._x_dim]
         uref = obs[:, -self._u_dim:]
         return torch.cat(
-            [embed_angles(x, self._angle_idx), embed_angles(xref, self._angle_idx), uref], dim=-1
+            [pair_features(x, xref, self._pos_dim, self._angle_idx), uref], dim=-1
         )
 
     def compute(self, inputs: dict, role: str = "value"):

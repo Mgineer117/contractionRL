@@ -41,8 +41,29 @@ def _run_metadata(args_cli, task: str) -> dict:
 
 
 
-def _inject_angle_idx(agent_cfg: dict, angle_idx: list) -> None:
-    """Inject ``angle_idx`` into every model sub-block of agent_cfg["models"].
+def _resolve_pos_dim_for_env(raw_env) -> int:
+    """``_resolve_pos_dim`` for the STANDALONE PPO/SAC path, which has no
+    ContractionRunner to ask. Delegates to the same verified check so both
+    routes make the same call for the same env (never one quotiented and one
+    not, which would make PPO and C2RL-PPO architecturally incomparable).
+    """
+    from contractionRL.runners.contraction_runner import (
+        _env_attrs, _resolve_pos_dim, _unwrap_env)
+    env = _unwrap_env(raw_env)
+    # _env_attrs, not getattr: a classic SyncVectorEnv forwards none of its
+    # sub-envs' attributes, so x_dim/angle_idx live one level deeper there (a
+    # plain getattr silently returned None and disabled the quotient for the
+    # standalone PPO/SAC route while ContractionRunner had it on -- which would
+    # have made the PPO baseline and C2RL-PPO architecturally incomparable,
+    # exactly the mismatch this function exists to prevent).
+    x_dim, angle_idx = _env_attrs(env, "x_dim", "angle_idx")
+    if x_dim is None:
+        (x_dim,) = _env_attrs(env, "num_dim_x")
+    return _resolve_pos_dim(env, x_dim, list(angle_idx or []))
+
+
+def _inject_angle_idx(agent_cfg: dict, angle_idx: list, pos_dim: int = 0) -> None:
+    """Inject ``angle_idx``/``pos_dim`` into every model sub-block of agent_cfg["models"].
 
     Only the STANDALONE PPO/SAC path needs this: those models are built by
     _gaussian_factory/_deterministic_factory (runner.py) purely from each
@@ -51,12 +72,20 @@ def _inject_angle_idx(agent_cfg: dict, angle_idx: list) -> None:
     angle_idx directly off the env in _setup_contraction — so this is a no-op
     for that path. A no-op (angle_idx=[]) here is also harmless: every
     consumer treats an empty angle_idx as "nothing to embed".
+
+    ``pos_dim`` is the width of the leading TRANSLATION-invariant state block
+    (see angle_utils' translation quotient). It travels with ``angle_idx``
+    because every consumer needs both to size and build its input; 0 keeps the
+    previous absolute-observation behaviour.
     """
-    if not angle_idx:
+    if not angle_idx and not pos_dim:
         return
     for block in agent_cfg.get("models", {}).values():
         if isinstance(block, dict):
-            block.setdefault("angle_idx", angle_idx)
+            if angle_idx:
+                block.setdefault("angle_idx", angle_idx)
+            if pos_dim:
+                block.setdefault("pos_dim", int(pos_dim))
 
 
 

@@ -245,6 +245,7 @@ def _gaussian_factory(observation_space, state_space, action_space, device,
 
     from skrl.utils.model_instantiators.torch import gaussian_model
     kwargs.pop("angle_idx", None)
+    kwargs.pop("pos_dim", None)
     return gaussian_model(
         observation_space=observation_space,
         state_space=state_space,
