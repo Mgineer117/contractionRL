@@ -84,7 +84,7 @@ agent:
   std_dev_annealing_kwargs:
     schedule: exponential
     final_log_std: -4.6
-    power: 5.0
+    power: 2.0
   experiment:
     directory: "humanoid_path_tracking"
     experiment_name: ""
