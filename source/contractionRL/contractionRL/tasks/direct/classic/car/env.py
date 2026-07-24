@@ -17,18 +17,32 @@ from ..common.env_base import BaseEnv
 ANGLE_IDX = [2]
 
 v_l, v_h = 1.0, 2.0
+# The reference START position is randomized over the whole POS_SPREAD box, not
+# pinned near the origin. Why: f(x) = [v cos(theta), v sin(theta), 0, 0] and B are
+# independent of (p_x, p_y), so the tracking problem is exactly translation
+# invariant — but the policy backbone's gain nets (CLActor's w1/w2 read the
+# ABSOLUTE [x, xref] pair; only the feedback error e = wrap_diff(x - xref) is
+# relative) have no such structure and must learn it from data. With a +-2.0
+# start box the reference spends the episode drifting out to ~22 m while tracking
+# error has already decayed, so every large-error training sample sits within a
+# few metres of the origin and the learned gains do not generalize down the path
+# (measured: translating a whole (x0, xref) pair by 3 m — a symmetry of the
+# dynamics — changed the eval failure rate from 4% to 30%). Spreading the start
+# position decorrelates |xref| from "how much error is left".
+POS_SPREAD = 20.0
 # Position bound must comfortably contain the reference rollout: xref's velocity is
 # fixed at 1.5 (see XREF_INIT below — sample_reference_controls never drives the
 # acceleration control) and heading only gets steered by omega, so over the full
 # time_bound the reference can travel up to ~v*time_bound in a single direction if
 # heading holds roughly constant. Without enough margin here, _rollout_reference's
 # torch.clamp(next_x_wrapped, X_MIN, X_MAX) silently clips the reference position mid
-# -trajectory, which corrupts tracking-error/reward at the boundary. 30.0 covers the
-# worst case (1.5 * 15.0 = 22.5) plus the +-2.0 initial spread with margin to spare.
-X_MIN = [-30.0, -30.0, -math.pi, v_l]
-X_MAX = [30.0, 30.0, math.pi, v_h]
-XREF_INIT_MIN = [-2.0, -2.0, -1.0, 1.5]
-XREF_INIT_MAX = [2.0, 2.0, 1.0, 1.5]
+# -trajectory, which corrupts tracking-error/reward at the boundary. So the bound is
+# POS_SPREAD (worst-case start) + 1.5 * 15.0 = 22.5 (worst-case travel) + margin.
+POS_BOUND = POS_SPREAD + 1.5 * 15.0 + 2.5
+X_MIN = [-POS_BOUND, -POS_BOUND, -math.pi, v_l]
+X_MAX = [POS_BOUND, POS_BOUND, math.pi, v_h]
+XREF_INIT_MIN = [-POS_SPREAD, -POS_SPREAD, -1.0, 1.5]
+XREF_INIT_MAX = [POS_SPREAD, POS_SPREAD, 1.0, 1.5]
 XE_INIT_MIN = [-1.0, -1.0, -1.0, -1.0]
 XE_INIT_MAX = [1.0, 1.0, 1.0, 1.0]
 lim = 1.0
