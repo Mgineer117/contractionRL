@@ -192,6 +192,17 @@ class StatManagerEnvWrapper:
         self._recent_C: float = 1e2
         self._recent_score_mean: float = 0.0
         self._recent_score_ci95: float = 0.0
+
+        # Mahalanobis-error twins of the above (Stability_maha/* — C2RL only).
+        self._recent_maha_auc_mean: float = 1e2
+        self._recent_maha_auc_ci95: float = 0.0
+        self._recent_maha_lambda_mean: float = 0.0
+        self._recent_maha_lambda_ci95: float = 0.0
+        self._recent_maha_running_lambda_mean: float = 0.0
+        self._recent_maha_running_lambda_ci95: float = 0.0
+        self._recent_maha_C: float = 1e2
+        self._recent_maha_score_mean: float = 0.0
+        self._recent_maha_score_ci95: float = 0.0
         # Bumped each time a full eval buffer is reduced to metrics — lets
         # callers (e.g. C3M's eval loop) detect that a rollout actually
         # produced FRESH numbers instead of silently re-reading stale ones.
@@ -208,6 +219,15 @@ class StatManagerEnvWrapper:
         self._traj_x_buf = None
         self._traj_xref_buf = None
         self._recent_trajs = ({}, {}, {})
+
+        # Parallel Mahalanobis normalized-error curve (C2RL only — filled from
+        # info["maha_tracking_error"] when the env supplies it). Reuses the SAME
+        # slot/step bookkeeping as the Euclidean buffer above; only the raw value
+        # and its e(0) anchor differ. Empty for envs that emit no maha error.
+        self._eval_buffer_maha = None
+        self._e0_maha = None
+        self._maha_seen = False
+        self._recent_maha_err: dict = {}
 
         # Action volatility (see _track_action_volatility). Lazily allocated on
         # the first step, from the action tensor's own shape/device — the action
@@ -267,6 +287,8 @@ class StatManagerEnvWrapper:
         dev = self._device()
 
         self._eval_buffer = torch.zeros((N, T), dtype=torch.float32, device=dev)
+        self._eval_buffer_maha = torch.zeros((N, T), dtype=torch.float32, device=dev)
+        self._e0_maha = torch.zeros(N, dtype=torch.float32, device=dev)
         self._time_buffer = torch.zeros((N, T), dtype=torch.float32, device=dev)
         self._tracking_env_ids = torch.full((N,), -1, dtype=torch.long, device=dev)
         self._tracking_steps = torch.zeros(N, dtype=torch.long, device=dev)
@@ -297,13 +319,21 @@ class StatManagerEnvWrapper:
             pass
         return None
 
-    def _compute_batched_metrics(self):
-        N = self._num_envs_for_eval
-        # Clamp once: a stored error of exactly 0 would otherwise produce
-        # 0 * inf = NaN in the C search below (exp(lambda*t) overflows to inf
-        # in float32 once lambda*t ≳ 88) and -inf in the log for lambda.
-        errs = torch.clamp(self._eval_buffer, min=1e-8)
+    def _metric_set(self, errs: torch.Tensor, rate_divisor: float = 1.0) -> dict[str, float]:
+        """Reduce a NORMALIZED per-slot error buffer (rows already ÷ e(0)) to the
+        stability metric summary. Shared by the Euclidean ``_eval_buffer`` and
+        the Mahalanobis ``_eval_buffer_maha`` — the time base (``_time_buffer``)
+        and per-slot lengths (``_tracking_steps``) are common to both, only the
+        error rows differ. Returns python floats keyed
+        ``{auc,lambda,running_lambda,score}_{mean,ci95}`` + shared ``C``.
 
+        ``rate_divisor`` is the exponent order of the contraction envelope the
+        buffer decays under: 1 for the Euclidean ‖e‖/‖e₀‖ (envelope e^{-λt}), 2
+        for the SQUARED Mahalanobis Lyapunov V/V₀ (envelope e^{-2λt}, since the
+        CCM certificate is V̇ ≤ -2λV). The raw curve's decay rate is divided by
+        it so the reported λ is the true contraction rate in both cases —
+        comparable to each other and to the synthesis `lbd`. Overshoot ``C`` and
+        AUC are left as measured on the curve itself (no divisor)."""
         # 1. AUC per env (trapezoid over the true per-slot time base)
         dt_array = self._time_buffer[:, 1:] - self._time_buffer[:, :-1]
         auc_vec = torch.sum(dt_array * 0.5 * (errs[:, :-1] + errs[:, 1:]), dim=1)
@@ -332,7 +362,9 @@ class StatManagerEnvWrapper:
 
         lambda_vals = (torch.log(best_C) - torch.log(x_pos)) / t_pos
         min_lambdas = torch.min(lambda_vals, dim=1).values
-        lambda_vec = torch.clamp(min_lambdas, min=0.0, max=10.0)
+        # /rate_divisor: the curve decays as e^{-(order·λ)t}, so its measured
+        # rate is order·λ — undo it to report the true λ (see the docstring).
+        lambda_vec = torch.clamp(min_lambdas / rate_divisor, min=0.0, max=10.0)
         score_vec = lambda_vec / torch.clamp(best_C, min=1e-6)
 
         # 5. Running-mean lambda — the per-STEP contraction rate, averaged over
@@ -358,7 +390,7 @@ class StatManagerEnvWrapper:
         #    overshot (the recovery leg has a large ln(C_t/C_{t+1})).  Those
         #    steps stay in the denominator, so overshoot dilutes the mean.
         step_dt = dt_array.clamp(min=1e-8)
-        step_lambda = ((torch.log(errs[:, :-1]) - torch.log(errs[:, 1:])) / step_dt).clamp(min=0.0)
+        step_lambda = ((torch.log(errs[:, :-1]) - torch.log(errs[:, 1:])) / (step_dt * rate_divisor)).clamp(min=0.0)
         no_overshoot = (torch.maximum(errs[:, :-1], errs[:, 1:]) <= 1.0).float()
         step_lambda = step_lambda * no_overshoot
         # Only average over the steps this slot REALLY recorded: an episode that
@@ -375,22 +407,49 @@ class StatManagerEnvWrapper:
             counts > 0, running_lambda_vec, torch.zeros_like(running_lambda_vec))
 
         auc_m, auc_ci = mean_confidence_interval(auc_vec.detach().cpu().numpy(), 0.95)
-        self._recent_auc_mean = float(auc_m)
-        self._recent_auc_ci95 = float(auc_ci)
-
         lambda_m, lambda_ci = mean_confidence_interval(lambda_vec.detach().cpu().numpy(), 0.95)
-        self._recent_lambda_mean = float(lambda_m)
-        self._recent_lambda_ci95 = float(lambda_ci)
-
         run_m, run_ci = mean_confidence_interval(running_lambda_vec.detach().cpu().numpy(), 0.95)
-        self._recent_running_lambda_mean = float(run_m)
-        self._recent_running_lambda_ci95 = float(run_ci)
-
         score_m, score_ci = mean_confidence_interval(score_vec.detach().cpu().numpy(), 0.95)
-        self._recent_score_mean = float(score_m)
-        self._recent_score_ci95 = float(score_ci)
+        return {
+            "auc_mean": float(auc_m), "auc_ci95": float(auc_ci),
+            "lambda_mean": float(lambda_m), "lambda_ci95": float(lambda_ci),
+            "running_lambda_mean": float(run_m), "running_lambda_ci95": float(run_ci),
+            "score_mean": float(score_m), "score_ci95": float(score_ci),
+            "C": float(best_C.item()),
+        }
 
-        self._recent_C = best_C.item()
+    def _compute_batched_metrics(self):
+        N = self._num_envs_for_eval
+        # Clamp once: a stored error of exactly 0 would otherwise produce
+        # 0 * inf = NaN in the C search (exp(lambda*t) overflows to inf in
+        # float32 once lambda*t ≳ 88) and -inf in the log for lambda.
+        m = self._metric_set(torch.clamp(self._eval_buffer, min=1e-8))
+        self._recent_auc_mean = m["auc_mean"]
+        self._recent_auc_ci95 = m["auc_ci95"]
+        self._recent_lambda_mean = m["lambda_mean"]
+        self._recent_lambda_ci95 = m["lambda_ci95"]
+        self._recent_running_lambda_mean = m["running_lambda_mean"]
+        self._recent_running_lambda_ci95 = m["running_lambda_ci95"]
+        self._recent_score_mean = m["score_mean"]
+        self._recent_score_ci95 = m["score_ci95"]
+        self._recent_C = m["C"]
+
+        # Same reduction on the SQUARED Mahalanobis Lyapunov V(t)/V(0) =
+        # ‖e(t)‖²_M/‖e(0)‖²_M — the quantity the CCM certificate contracts
+        # (V̇ ≤ -2λV), hence rate_divisor=2 so the reported λ is the true rate.
+        # Only when the env supplied it.
+        if self._maha_seen:
+            mm = self._metric_set(torch.clamp(self._eval_buffer_maha, min=1e-8), rate_divisor=2.0)
+            self._recent_maha_auc_mean = mm["auc_mean"]
+            self._recent_maha_auc_ci95 = mm["auc_ci95"]
+            self._recent_maha_lambda_mean = mm["lambda_mean"]
+            self._recent_maha_lambda_ci95 = mm["lambda_ci95"]
+            self._recent_maha_running_lambda_mean = mm["running_lambda_mean"]
+            self._recent_maha_running_lambda_ci95 = mm["running_lambda_ci95"]
+            self._recent_maha_score_mean = mm["score_mean"]
+            self._recent_maha_score_ci95 = mm["score_ci95"]
+            self._recent_maha_C = mm["C"]
+
         self._compute_count += 1
 
         # Save trajectories + per-slot normalized error curves (consumed by
@@ -398,12 +457,16 @@ class StatManagerEnvWrapper:
         # can legitimately own two slots in one buffer round (early termination
         # + re-init), so env-id keys would silently collide.
         err_rows = self._eval_buffer.detach().cpu()
-        res_x, res_xref, res_err = {}, {}, {}
+        maha_rows = self._eval_buffer_maha.detach().cpu()
+        res_x, res_xref, res_err, res_maha = {}, {}, {}, {}
         for j in range(N):
             res_x[j] = self._traj_x_buf[j]
             res_xref[j] = self._traj_xref_buf[j]
             res_err[j] = err_rows[j].tolist()
+            if self._maha_seen:
+                res_maha[j] = maha_rows[j].tolist()
         self._recent_trajs = (res_x, res_xref, res_err)
+        self._recent_maha_err = res_maha
 
     def _record(self, obs: torch.Tensor, info: dict | None = None) -> None:
         if not self._ensure_stats():
@@ -456,6 +519,22 @@ class StatManagerEnvWrapper:
                 fresh = torch.sqrt(torch.clamp(
                     init_err_sq.reshape(-1).to(err_vals), min=0.0))
                 err_vals = torch.where(init_flags.reshape(-1), fresh, err_vals)
+
+        # Mahalanobis error √(eᵀM(x)e) — same construction as err_vals above but
+        # metric-weighted. None when the env emits no maha error (non-C2RL runs),
+        # in which case the parallel buffer stays empty and no curve is plotted.
+        maha_err_vals = None
+        if isinstance(info, dict) and "maha_tracking_error" in info:
+            maha_err_vals = torch.sqrt(torch.clamp(
+                info["maha_tracking_error"].reshape(-1).to(self._device()), min=0.0)).detach()
+            if init_flags.any():
+                init_maha_sq = self._first_attr("init_maha_error")
+                if isinstance(init_maha_sq, torch.Tensor):
+                    fresh_m = torch.sqrt(torch.clamp(
+                        init_maha_sq.reshape(-1).to(maha_err_vals), min=0.0))
+                    maha_err_vals = torch.where(init_flags.reshape(-1), fresh_m, maha_err_vals)
+            self._maha_seen = True
+
         obs_x = obs[:, :pd].detach().cpu().numpy()
         obs_xref = obs[:, xd:xd + pd].detach().cpu().numpy()
 
@@ -477,6 +556,8 @@ class StatManagerEnvWrapper:
                     if step < self._max_ep_len:
                         last_val = self._eval_buffer[old_slot, step-1] if step > 0 else 1.0
                         self._eval_buffer[old_slot, step:] = last_val
+                        last_maha = self._eval_buffer_maha[old_slot, step-1] if step > 0 else 1.0
+                        self._eval_buffer_maha[old_slot, step:] = last_maha
                         time_steps_pad = torch.arange(step, self._max_ep_len, device=self._device(), dtype=torch.float32)
                         self._time_buffer[old_slot, step:] = time_steps_pad * self._dt
 
@@ -500,12 +581,21 @@ class StatManagerEnvWrapper:
             
             if step == 0:
                 self._e0[slot] = err_vals[env_id].clamp(min=1e-8)
-            
+                if maha_err_vals is not None:
+                    self._e0_maha[slot] = maha_err_vals[env_id].clamp(min=1e-8)
+
             if step < self._max_ep_len:
                 val = err_vals[env_id] / self._e0[slot]
                 self._eval_buffer[slot, step] = val
+                if maha_err_vals is not None:
+                    # SQUARED normalized Mahalanobis error V(t)/V(0) =
+                    # ‖e(t)‖²_M/‖e(0)‖²_M — the Lyapunov the CCM certificate is
+                    # written on (V̇ ≤ -2λV ⇒ V(t) ≤ V(0)e^{-2λt}). The extra 2
+                    # in the exponent is undone in _metric_set(rate_divisor=2)
+                    # so the reported λ matches the synthesis rate `lbd`.
+                    self._eval_buffer_maha[slot, step] = (maha_err_vals[env_id] / self._e0_maha[slot]) ** 2
                 self._time_buffer[slot, step] = step * self._dt
-                
+
                 self._traj_x_buf[slot].append(obs_x[env_id])
                 self._traj_xref_buf[slot].append(obs_xref[env_id])
             
@@ -672,6 +762,12 @@ class StatManagerEnvWrapper:
                 if "log" not in info or not isinstance(info["log"], dict):
                     info["log"] = {}
                 info["log"].update(stability_log_dict(self.stability_summary(), self._device()))
+                # C2RL: the same metrics on the Mahalanobis error, under
+                # Stability_maha/*. Empty dict (no keys) for non-maha envs.
+                maha_summary = self.stability_maha_summary()
+                if maha_summary:
+                    info["log"].update(
+                        stability_log_dict(maha_summary, self._device(), tab="Stability_maha"))
 
         return obs, reward, terminated, truncated, info
 
@@ -700,8 +796,36 @@ class StatManagerEnvWrapper:
             **volatility,
         }
 
+    def stability_maha_summary(self) -> dict[str, float]:
+        """Same metric shape as :meth:`stability_summary`, but computed on the
+        SQUARED Mahalanobis Lyapunov V(t)/V(0) = ‖e(t)‖²_M/‖e(0)‖²_M (λ extracted
+        against its e^{-2λt} envelope, so it is the true contraction rate). Empty
+        until an env has supplied a maha error AND a buffer round has completed —
+        so the keys are ABSENT (not sentinels) for non-C2RL runs, same rule as
+        the action volatility metrics."""
+        if not self._initialized or not self._maha_seen:
+            return {}
+        return {
+            "auc_mean": self._recent_maha_auc_mean,
+            "auc_ci95": self._recent_maha_auc_ci95,
+            "contraction_rate_mean": self._recent_maha_lambda_mean,
+            "contraction_rate_ci95": self._recent_maha_lambda_ci95,
+            "running_lambda_mean": self._recent_maha_running_lambda_mean,
+            "running_lambda_ci95": self._recent_maha_running_lambda_ci95,
+            "overshoot_mean": self._recent_maha_C,
+            "overshoot_ci95": 0.0,
+            "contraction_score_mean": self._recent_maha_score_mean,
+            "contraction_score_ci95": self._recent_maha_score_ci95,
+        }
+
     def trajectories(self):
         return self._recent_trajs
+
+    def maha_trajectories(self):
+        """Per-slot squared Mahalanobis normalized-error curves
+        (V(t)/V(0) = ‖e(t)‖²_M/‖e(0)‖²_M), keyed by buffer slot. Empty dict for
+        envs that emit no maha error."""
+        return self._recent_maha_err
 
     def all_finished(self) -> bool:
         # We can just return False or True depending on usage.
@@ -829,6 +953,7 @@ def log_tracking_plots(
     prefix: str = "train",
     step: int | None = None,
     title: str | None = None,
+    traj_maha_error: dict | None = None,
 ) -> None:
     """Push ``{prefix}/normalized_error`` and ``{prefix}/path_tracking`` to wandb.
 
@@ -857,33 +982,52 @@ def log_tracking_plots(
             payload["global_step"] = step
         wandb.log(payload)
 
-    # ── Normalized error curve(s) ─────────────────────────────────────────── #
+    # All curves for a given wandb key go into ONE figure laid out as a grid of
+    # subplots — PER_SUBPLOT envs per subplot, ceil(n / PER_SUBPLOT) subplots —
+    # so every eval env is logged (not a random handful) while each panel stays
+    # readable. The grid is sized to the number of envs actually passed in, so
+    # normalized_error / normalized_maha_error / path_tracking share the same
+    # env set and ordering (the caller supplies a single consistent key list).
     _trapz = getattr(np, "trapezoid", None) or np.trapz
-    fig_err, ax_err = plt.subplots(figsize=(6, 4))
-    err_plotted = False
-    for i, errs in traj_error.items():
-        if not errs:
-            continue
-        errs_arr = np.asarray(errs, dtype=np.float64)
-        e0 = max(float(errs_arr[0]), 1e-8)
-        norm = errs_arr / e0
-        auc = float(_trapz(norm, dx=float(dt)))
-        ax_err.plot(norm, label=f"Env {i} (AUC: {auc:.2f})")
-        err_plotted = True
-    if err_plotted:
-        ax_err.set_title(f"{label} Normalized Error")
-        ax_err.set_xlabel("Step")
-        ax_err.set_ylabel("Normalized Error")
-        ax_err.legend(fontsize="small")
-        ax_err.grid(True, alpha=0.3)
-        _push(fig_err, "normalized_error")
-    else:
-        plt.close(fig_err)
+    PER_SUBPLOT = 5
 
-    # ── Position trajectory vs reference ──────────────────────────────────── #
-    fig = plt.figure(figsize=(6, 5))
-    ax = None
-    pos_plotted = False
+    def _grid_dims(n_sub: int) -> tuple[int, int]:
+        ncols = int(math.ceil(math.sqrt(n_sub)))
+        nrows = int(math.ceil(n_sub / ncols))
+        return nrows, ncols
+
+    def _plot_error_grid(traj: dict, key: str, plot_title: str, ylabel: str) -> None:
+        items = [(i, np.asarray(errs, dtype=np.float64))
+                 for i, errs in traj.items() if errs is not None and len(errs) > 0]
+        if not items:
+            return
+        n_sub = int(math.ceil(len(items) / PER_SUBPLOT))
+        nrows, ncols = _grid_dims(n_sub)
+        fig, axes = plt.subplots(nrows, ncols, figsize=(5.5 * ncols, 3.8 * nrows), squeeze=False)
+        flat = axes.flatten()
+        for s in range(n_sub):
+            ax = flat[s]
+            for i, errs_arr in items[s * PER_SUBPLOT:(s + 1) * PER_SUBPLOT]:
+                e0 = max(float(errs_arr[0]), 1e-8)
+                norm = errs_arr / e0
+                auc = float(_trapz(norm, dx=float(dt)))
+                ax.plot(norm, label=f"Env {i} (AUC: {auc:.2f})")
+            ax.set_xlabel("Step"); ax.set_ylabel(ylabel)
+            ax.legend(fontsize="x-small"); ax.grid(True, alpha=0.3)
+        for s in range(n_sub, len(flat)):
+            flat[s].axis("off")
+        fig.suptitle(f"{label} {plot_title}")
+        fig.tight_layout()
+        _push(fig, key)
+
+    # ── Normalized error / squared-Mahalanobis error curve grids ──────────── #
+    _plot_error_grid(traj_error, "normalized_error", "Normalized Error", "Normalized Error")
+    if traj_maha_error:
+        _plot_error_grid(traj_maha_error, "normalized_maha_error",
+                         "Normalized Mahalanobis Error (squared, V/V₀)", "V(t)/V(0)")
+
+    # ── Position trajectory vs reference grid ─────────────────────────────── #
+    pos_items = []
     for i in traj_x:
         xs = traj_x.get(i) or []
         refs = traj_xref.get(i) or []
@@ -894,26 +1038,34 @@ def log_tracking_plots(
         d = min(tx.shape[-1], txref.shape[-1])
         if d < 1:
             continue
-        if ax is None:
-            ax = fig.add_subplot(111, projection="3d") if d >= 3 else fig.add_subplot(111)
-        t = np.arange(len(tx))
-        if d == 1:
-            ax.scatter(t, tx[:, 0], c=t, cmap="viridis", s=10, label=f"x (env {i})")
-            ax.plot(t, txref[:, 0], "--", color="red", label=f"x_ref (env {i})")
-            ax.set_xlabel("Step"); ax.set_ylabel("Position")
-        elif d == 2:
-            ax.scatter(tx[:, 0], tx[:, 1], c=t, cmap="viridis", s=10, label=f"x (env {i})")
-            ax.plot(txref[:, 0], txref[:, 1], "--", color="red", label=f"x_ref (env {i})")
-            ax.set_xlabel("X"); ax.set_ylabel("Y")
-        else:
-            ax.scatter(tx[:, 0], tx[:, 1], tx[:, 2], c=t, cmap="viridis", s=10, label=f"x (env {i})")
-            ax.plot(txref[:, 0], txref[:, 1], txref[:, 2], "--", color="red", label=f"x_ref (env {i})")
-            ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
-        pos_plotted = True
-    if pos_plotted:
-        ax.set_title(f"{label} Path Tracking")
-        ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize="small")
-        ax.grid(True, alpha=0.3)
+        pos_items.append((i, tx, txref, d))
+    if pos_items:
+        d0 = pos_items[0][3]  # env family is homogeneous — set projection once
+        n_sub = int(math.ceil(len(pos_items) / PER_SUBPLOT))
+        nrows, ncols = _grid_dims(n_sub)
+        subplot_kw = {"projection": "3d"} if d0 >= 3 else {}
+        fig, axes = plt.subplots(nrows, ncols, figsize=(5.5 * ncols, 4.5 * nrows),
+                                 squeeze=False, subplot_kw=subplot_kw)
+        flat = axes.flatten()
+        for s in range(n_sub):
+            ax = flat[s]
+            for i, tx, txref, _d in pos_items[s * PER_SUBPLOT:(s + 1) * PER_SUBPLOT]:
+                t = np.arange(len(tx))
+                if d0 == 1:
+                    ax.scatter(t, tx[:, 0], c=t, cmap="viridis", s=8, label=f"x (env {i})")
+                    ax.plot(t, txref[:, 0], "--", label=f"x_ref (env {i})")
+                    ax.set_xlabel("Step"); ax.set_ylabel("Position")
+                elif d0 == 2:
+                    ax.scatter(tx[:, 0], tx[:, 1], c=t, cmap="viridis", s=8, label=f"x (env {i})")
+                    ax.plot(txref[:, 0], txref[:, 1], "--", label=f"x_ref (env {i})")
+                    ax.set_xlabel("X"); ax.set_ylabel("Y")
+                else:
+                    ax.scatter(tx[:, 0], tx[:, 1], tx[:, 2], c=t, cmap="viridis", s=8, label=f"x (env {i})")
+                    ax.plot(txref[:, 0], txref[:, 1], txref[:, 2], "--", label=f"x_ref (env {i})")
+                    ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
+            ax.legend(fontsize="x-small"); ax.grid(True, alpha=0.3)
+        for s in range(n_sub, len(flat)):
+            flat[s].axis("off")
+        fig.suptitle(f"{label} Path Tracking")
+        fig.tight_layout()
         _push(fig, "path_tracking")
-    else:
-        plt.close(fig)

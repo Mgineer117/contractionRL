@@ -217,21 +217,35 @@ class BaseEnv(gym.Env):
 
                 V = torch.bmm(torch.bmm(err_t.transpose(1, 2), M), err_t).squeeze(-1).squeeze(-1)
                 next_V = torch.bmm(torch.bmm(next_err_t.transpose(1, 2), next_M), next_err_t).squeeze(-1).squeeze(-1)
-                
+
                 reward = self.tracking_scaler * (V - next_V) - self.control_scaler * control_effort
+                # Mahalanobis tracking error V = eᵀM(x)e (squared, like
+                # "tracking_error" above) — the metric-weighted analog of the
+                # plain Euclidean error, so StatManagerEnvWrapper can plot a
+                # "normalized_maha_error" curve alongside "normalized_error".
+                maha_tracking_error = next_V
         else:
             reward = -self.tracking_scaler * tracking_error - self.control_scaler * control_effort
+            maha_tracking_error = None
 
         infos = {
             "tracking_error": tracking_error,
             "control_effort": control_effort,
         }
+        if maha_tracking_error is not None:
+            infos["maha_tracking_error"] = maha_tracking_error
         return reward, infos
 
     def reset(self, seed=None, options=None):
         env_ids = torch.arange(self.num_envs, device=self.device)
         self.reset_idx(env_ids)
-        return self.construct_state(self.x_t), {"x": self.x_t.clone(), "tracking_error": self.init_tracking_error.clone()}
+        info = {"x": self.x_t.clone(), "tracking_error": self.init_tracking_error.clone()}
+        # Anchor the maha error curve's e(0) at reset, same as tracking_error
+        # above — without this the StatManager records the step-0 slot with no
+        # maha value and its e0_maha stays 0 (later ÷0). Only present for C2RL.
+        if getattr(self, "ccm_gen", None) is not None and hasattr(self, "init_maha_error"):
+            info["maha_tracking_error"] = self.init_maha_error.clone()
+        return self.construct_state(self.x_t), info
 
     def reset_idx(self, env_ids: torch.Tensor):
         if len(env_ids) == 0:
@@ -246,15 +260,25 @@ class BaseEnv(gym.Env):
         self.x_t[env_ids] = x_0
         
         self.init_tracking_error[env_ids] = torch.norm(x_0 - self.xref[env_ids, 0], p=2, dim=-1) ** 2
-        
+
         if getattr(self, "ccm_gen", None) is not None:
             if not hasattr(self, "M"):
                 self.M = torch.zeros(self.num_envs, self.num_dim_x, self.num_dim_x, device=self.device)
+            if not hasattr(self, "init_maha_error"):
+                self.init_maha_error = torch.zeros(self.num_envs, device=self.device)
             from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
             with torch.no_grad():
                 W_raw, _ = self.ccm_gen(x_0)
                 W = bound_W(W_raw, self.w_lb, self.num_dim_x, getattr(self.ccm_gen, "bounded", False))
-                self.M[env_ids] = spd_inverse(W)
+                M0 = spd_inverse(W)
+                self.M[env_ids] = M0
+                # Squared Mahalanobis error e0ᵀM(x0)e0 for e0/e(0) normalization
+                # of the maha error curve — mirrors init_tracking_error above,
+                # but angle-wrapped since M-weighting an unwrapped angle error
+                # would be meaningless.
+                e0 = self.wrap_angles(x_0 - self.xref[env_ids, 0]).unsqueeze(-1)
+                self.init_maha_error[env_ids] = torch.bmm(
+                    torch.bmm(e0.transpose(1, 2), M0), e0).squeeze(-1).squeeze(-1)
 
     def step(self, u: torch.Tensor):
         if not isinstance(u, torch.Tensor):
@@ -294,6 +318,12 @@ class BaseEnv(gym.Env):
             "control_effort": infos["control_effort"],
             "relative_tracking_error": infos["tracking_error"] / torch.clamp(self.init_tracking_error, min=1e-8),
         }
+        # Forward the Mahalanobis error (C2RL only) so StatManagerEnvWrapper's
+        # _record can fill the maha buffer every step — not just at reset. Without
+        # this the maha curve/Stability_maha metrics stay pinned at their step-0
+        # value (flat) because get_rewards' infos are rebuilt into this dict here.
+        if "maha_tracking_error" in infos:
+            info_dict["maha_tracking_error"] = infos["maha_tracking_error"]
         
         if dones.any():
             done_idx = dones.nonzero(as_tuple=False).squeeze(-1)

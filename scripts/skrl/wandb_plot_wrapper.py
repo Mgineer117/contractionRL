@@ -142,13 +142,26 @@ class WandbPlotWrapper:
         if not traj_err:
             return
         # trajectories() is keyed by BUFFER SLOT (up to num_envs_for_eval,
-        # e.g. 64) — plot only a handful of curves so the legend stays
-        # readable, matching the previous "3 random envs" behavior.
-        keys = list(traj_err.keys())
-        plot_keys = np.random.choice(keys, min(3, len(keys)), replace=False)
+        # e.g. 64). Log ALL slots that actually recorded an episode — the plotter
+        # lays them out as ceil(n/5) subplots, 5 curves each. Unused slots still
+        # carry a full-length all-zero error row in traj_err but an EMPTY traj_x
+        # list, so they are filtered here (gating on non-empty traj_x) — that
+        # both drops flat placeholder lines and keeps every figure
+        # (normalized_error / normalized_maha_error / path_tracking) on the SAME
+        # env set and ordering.
+        plot_keys = sorted(k for k in traj_err if traj_x.get(k))
+        if not plot_keys:
+            return
         traj_x = {k: traj_x.get(k, []) for k in plot_keys}
         traj_xref = {k: traj_xref.get(k, []) for k in plot_keys}
         traj_err = {k: traj_err[k] for k in plot_keys}
+
+        # C2RL only: the metric-weighted analog of normalized_error. Empty (→ no
+        # extra figure) for envs that emit no Mahalanobis error (see
+        # StatManagerEnvWrapper.maha_trajectories).
+        maha_fn = getattr(self.env, "maha_trajectories", None)
+        traj_maha = maha_fn() if callable(maha_fn) else {}
+        traj_maha = {k: traj_maha[k] for k in plot_keys if k in traj_maha}
 
         # For classic envs, self.env.unwrapped is the SyncVectorEnv itself —
         # `dt` lives on its per-env `.envs[i]`, not on the vector env — so the
@@ -162,4 +175,5 @@ class WandbPlotWrapper:
         log_tracking_plots(
             traj_x, traj_xref, traj_err,
             dt=float(dt), prefix="train", step=self._total_steps, title="Train",
+            traj_maha_error=traj_maha,
         )
