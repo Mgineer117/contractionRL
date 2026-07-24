@@ -2,13 +2,12 @@ label: c2rl (rl=ppo, cm=cvstem)
 algorithm: c2rl-ppo
 num_envs: 1024
 
-# Exhaustive grid, not bayes. The remaining axes are few and mostly categorical
-# (reward normalization on/off, CAPS coefficients), and the earlier bayes runs
-# had already collapsed the PPO trust-region knobs — so what is left is a
-# question of coverage, not of surrogate-guided exploration. Every parameter
-# below must therefore be a discrete `values:` list; build_sweep.py rejects a
-# `distribution:` under method: grid (W&B would silently drop it).
-method: grid
+# Bayes, not grid. The PPO trust-region / GAE knobs are re-opened below (see the
+# parameters block), and their cross product with the CM feasibility axes is far
+# too large to enumerate — surrogate-guided search is the point. Under bayes a
+# parameter may be either a discrete `values:` list OR a continuous
+# `distribution:` (the latter is what a plain grid could not express).
+method: bayes
 
 metric:
   # AUC, not reward. Large parts of the CV-STEM {w_lb, w_ub} x lbd x r_scaler
@@ -28,15 +27,32 @@ runner:
   wrapper: true
   bad_value: 100.0
 
-# NOTE — the PPO trust-region block (rollouts, gae_lambda, ratio_clip,
-# std_dev_annealing_kwargs.schedule, learning_rate_scheduler_kwargs.kl_threshold)
-# and models.policy.backbone are NO LONGER SWEPT: that search concluded and its
-# result is pinned in the per-env yaml (rollouts 4, gae_lambda 0.99, ratio_clip
-# 0.3, exponential annealing, kl_threshold 0.02, backbone control). Re-add them
-# here only to re-open that question.
+# The PPO trust-region / GAE block is SWEPT again below (re-opened from the
+# per-env pin: rollouts 4, gae_lambda 0.99, ratio_clip 0.3, kl_threshold 0.02).
+# models.policy.backbone stays pinned at `control` — the CLActor u = uref +
+# feedback(x-xref) form is load-bearing for C2RL's Mahalanobis reward, not a
+# free tuning axis, so it is deliberately NOT re-opened here.
 parameters:
+  # agent.discount_factor:
+  #   values: [0.1, 0.3, 0.5, 0.7, 0.9, 0.99]
   agent.discount_factor:
-    values: [0.1, 0.3, 0.5, 0.7, 0.9, 0.99, 0.999]
+    value: 0.01 # [0.1, 0.3, 0.5, 0.7, 0.9, 0.99]
+  # ── PPO / GAE knobs (re-opened) ──────────────────────────────────────── #
+  # GAE bias/variance trade-off. Same ladder as the standalone ppo.yaml, plus
+  # 0.99 (the current per-env pin) so bayes can confirm or move off it.
+  agent.gae_lambda:
+    values: [0.9, 0.95, 0.975, 0.99, 1.0]
+  # PPO trust-region clip on the probability ratio.
+  agent.ratio_clip:
+    values: [0.1, 0.2, 0.3]
+  # KLAdaptiveLR early-stop / LR-adaptation target on the policy update.
+  agent.learning_rate_scheduler_kwargs.kl_threshold:
+    values: [0.008, 0.016, 0.032]
+  # Gradient passes over each rollout batch, and how finely it is split.
+  agent.learning_epochs:
+    values: [2, 5, 10]
+  agent.mini_batches:
+    values: [4, 8, 16]
   # Non-biasing running-std reward normalizer (r/std, no centering). The
   # Mahalanobis reward's scale swings with w_lb/w_ub across the state box, and
   # PPO's advantage normalization only partly absorbs that — see rl_glue.
@@ -52,7 +68,7 @@ parameters:
   # error, and the classic envs are analytically modeled and noise-free. So
   # caps_spatial_scale is pinned at 0.0 — patch_caps_regularizer then skips
   # that forward pass entirely, and caps_spatial_std below is inert. Re-open it
-  # by giving it a values list. 0.0 stays in the temporal ladder so the grid
+  # by giving it a values list. 0.0 stays in the temporal ladder so the search
   # always contains the regularizer-free control condition (at which the patch
   # no-ops completely — no hooks, no extra memory tensors).
   # See agent_patches.patch_caps_regularizer.
