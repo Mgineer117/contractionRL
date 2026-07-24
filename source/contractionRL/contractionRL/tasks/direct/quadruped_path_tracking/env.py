@@ -56,6 +56,24 @@ class QuadrupedPathTrackingEnv(PathTrackingBase):
     def _apply_action(self) -> None:
         self._robot.set_joint_position_target(self._joint_targets, joint_ids=self._joint_ids)
 
+    @property
+    def state_names(self) -> tuple[str, ...]:
+        """Matches _get_physical_state's concatenation order exactly.
+
+        xy_rel and yaw are the only WORLD-frame quantities; projected gravity,
+        the joint states and both root velocities are body frame, hence already
+        yaw invariant -- which is what makes the full SE(2) quotient valid here.
+        """
+        n_j = len(self._joint_ids)
+        return (
+            ("pos_x", "pos_y", "yaw")
+            + tuple(f"proj_grav_{a}" for a in "xyz")
+            + tuple(f"joint_pos_{i}" for i in range(n_j))
+            + ("vel_x_b", "vel_y_b", "vel_z_b")
+            + ("ang_vel_x_b", "ang_vel_y_b", "ang_vel_z_b")
+            + tuple(f"joint_vel_{i}" for i in range(n_j))
+        )
+
     def _get_physical_state(self) -> torch.Tensor:
         xy_rel = self._robot.data.root_pos_w[:, :2] - self.scene.env_origins[:, :2]
         _, _, yaw = euler_xyz_from_quat(self._robot.data.root_quat_w)

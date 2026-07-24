@@ -41,14 +41,14 @@ def _run_metadata(args_cli, task: str) -> dict:
 
 
 
-def _resolve_pos_dim_for_env(raw_env) -> int:
-    """``_resolve_pos_dim`` for the STANDALONE PPO/SAC path, which has no
+def _resolve_symmetry_for_env(raw_env) -> int:
+    """``_resolve_symmetry`` for the STANDALONE PPO/SAC path, which has no
     ContractionRunner to ask. Delegates to the same verified check so both
     routes make the same call for the same env (never one quotiented and one
     not, which would make PPO and C2RL-PPO architecturally incomparable).
     """
     from contractionRL.runners.contraction_runner import (
-        _env_attrs, _resolve_pos_dim, _unwrap_env)
+        _env_attrs, _resolve_symmetry, _unwrap_env)
     env = _unwrap_env(raw_env)
     # _env_attrs, not getattr: a classic SyncVectorEnv forwards none of its
     # sub-envs' attributes, so x_dim/angle_idx live one level deeper there (a
@@ -59,10 +59,10 @@ def _resolve_pos_dim_for_env(raw_env) -> int:
     x_dim, angle_idx = _env_attrs(env, "x_dim", "angle_idx")
     if x_dim is None:
         (x_dim,) = _env_attrs(env, "num_dim_x")
-    return _resolve_pos_dim(env, x_dim, list(angle_idx or []))
+    return _resolve_symmetry(env, x_dim, list(angle_idx or []))
 
 
-def _inject_angle_idx(agent_cfg: dict, angle_idx: list, pos_dim: int = 0) -> None:
+def _inject_angle_idx(agent_cfg: dict, angle_idx: list, sym=None) -> None:
     """Inject ``angle_idx``/``pos_dim`` into every model sub-block of agent_cfg["models"].
 
     Only the STANDALONE PPO/SAC path needs this: those models are built by
@@ -78,14 +78,14 @@ def _inject_angle_idx(agent_cfg: dict, angle_idx: list, pos_dim: int = 0) -> Non
     because every consumer needs both to size and build its input; 0 keeps the
     previous absolute-observation behaviour.
     """
-    if not angle_idx and not pos_dim:
+    if not angle_idx and sym is None:
         return
     for block in agent_cfg.get("models", {}).values():
         if isinstance(block, dict):
             if angle_idx:
                 block.setdefault("angle_idx", angle_idx)
-            if pos_dim:
-                block.setdefault("pos_dim", int(pos_dim))
+            if sym is not None:
+                block.setdefault("sym", sym)
 
 
 

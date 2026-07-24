@@ -36,8 +36,25 @@ class BaseEnv(gym.Env):
 
         self.num_dim_x = env_config["num_dim_x"]
         self.num_dim_control = env_config["num_dim_control"]
-        self.pos_dimension = env_config["pos_dimension"]
-        self.angle_idx = env_config.get("angle_idx", [])
+        # state_names is the single source of truth for the state layout: one
+        # name per dim (see agents/skrl/state_symmetry.py for the vocabulary).
+        # angle_idx (which dims wrap) and pos_dimension (which dims are pure
+        # translation directions) are DERIVED from it, so they can no longer
+        # disagree with each other or with the physics. The explicit keys are
+        # still honoured for any env that has not been renamed yet.
+        self.state_names = tuple(env_config.get("state_names") or ())
+        if self.state_names:
+            if len(self.state_names) != self.num_dim_x:
+                raise ValueError(
+                    f"state_names has {len(self.state_names)} entries but "
+                    f"num_dim_x={self.num_dim_x}: {self.state_names}")
+            from contractionRL.agents.skrl.state_symmetry import StateSymmetry
+            sym = StateSymmetry.from_names(self.state_names)
+            self.angle_idx = list(sym.angle_idx)
+            self.pos_dimension = sym.pos_dimension
+        else:
+            self.pos_dimension = env_config["pos_dimension"]
+            self.angle_idx = env_config.get("angle_idx", [])
 
         self.time_bound = env_config["time_bound"]
         self.dt = env_config["dt"]

@@ -49,6 +49,23 @@ class ManipulatorPathTrackingEnv(PathTrackingBase):
     def _apply_action(self) -> None:
         self._robot.set_joint_position_target(self._joint_targets, joint_ids=self._arm_ids)
 
+    @property
+    def state_names(self) -> tuple[str, ...]:
+        """Matches _get_physical_state's order. Deliberately uses ee_* rather
+        than pos_*: the arm base is FIXED, so the end-effector position is a
+        function of joint_pos, not a free translation direction -- naming it
+        pos_x/pos_y would wrongly invite the quotient to drop it. No base yaw
+        either, so this env gets no symmetry reduction (mode="none").
+        """
+        n_a = len(self._arm_ids)
+        return (
+            tuple(f"joint_pos_{i}" for i in range(n_a))
+            + tuple(f"joint_vel_{i}" for i in range(n_a))
+            + ("ee_pos_x", "ee_pos_y", "ee_pos_z")
+            + ("ee_lin_vel_x", "ee_lin_vel_y", "ee_lin_vel_z")
+            + ("ee_yaw_vel",)
+        )
+
     def _get_physical_state(self) -> torch.Tensor:
         ee_pos = self._robot.data.body_pos_w[:, self._ee_id[0], :] - self.scene.env_origins
         ee_lin_vel = self._robot.data.body_lin_vel_w[:, self._ee_id[0], :]

@@ -114,46 +114,86 @@ def _make_cmg_bounds_fn(cmg_model, w_lb: float):
     return _bounds_fn
 
 
-def _resolve_pos_dim(raw_env, x_dim, angle_idx) -> int:
-    """How many leading state dims may be quotiented out as pure TRANSLATION
-    directions — 0 to disable the quotient entirely.
+def _resolve_symmetry(raw_env, x_dim, angle_idx):
+    """Which symmetry of the tracking problem the networks may quotient out.
 
-    The env declares a candidate (``pos_dimension``), but a declaration is not a
-    proof, so the candidate is CHECKED against the env's own dynamics: perturb
-    those dims and require f and B to be bit-identical. This keeps the feature
-    universal without a per-env whitelist — an env with position-dependent
-    terrain/drag, or a mis-declared ``pos_dimension``, silently fails the check
-    and keeps the previous absolute-observation behaviour.
+    Two stages, and BOTH must pass:
 
-    Requires an analytical ``get_f_and_B`` plus an ``X_MIN``/``X_MAX`` box to
-    sample from, so Isaac Sim envs (no analytical dynamics) return 0 for now.
+    1. The env's ``state_names`` say what each state dim IS (see
+       agents/skrl/state_symmetry.py). Names alone decide the candidate: a
+       pos_x/pos_y pair plus a yaw and otherwise only recognised yaw-invariant
+       dims -> SE(2); any pos_* dim -> translation; nothing -> none. An
+       UNRECOGNISED name fails closed to translation rather than being assumed
+       invariant.
+    2. The candidate is CHECKED against the env's own dynamics -- translation
+       needs f, B invariant; SE(2) needs them EQUIVARIANT (f(R.x) = R f(x)).
+       A declaration is not a proof, and this is what catches e.g. the
+       quadrotor, whose roll/pitch are world referenced so a yaw rotation mixes
+       them: it is silently demoted to translation instead of mis-modelled.
+
+    Envs with no analytical ``get_f_and_B`` (Isaac Sim) cannot be checked, so
+    they keep the name-derived candidate but are capped at translation -- the
+    conservative choice, since an unverifiable SE(2) claim would corrupt every
+    network input if wrong.
+
+    Returns a StateSymmetry (mode "none" disables everything) or None.
     """
-    if not x_dim:
-        return 0
-    (pos_dim,) = _env_attrs(raw_env, "pos_dimension", default=0)
-    pos_dim = int(pos_dim or 0)
-    if pos_dim <= 0 or pos_dim >= x_dim:
-        return 0
-    if angle_idx and min(int(i) for i in angle_idx) < pos_dim:
-        print(f"[ContractionRunner] pos_dimension={pos_dim} overlaps angle_idx="
-              f"{list(angle_idx)} — translation quotient DISABLED (check the env).")
-        return 0
+    from contractionRL.agents.skrl.state_symmetry import StateSymmetry
+
+    (names,) = _env_attrs(raw_env, "state_names", default=())
+    names = tuple(names or ())
+    if not names or (x_dim and len(names) != int(x_dim)):
+        if names:
+            print(f"[ContractionRunner] state_names has {len(names)} entries but "
+                  f"x_dim={x_dim} — symmetry quotient DISABLED.")
+        return None
+
+    sym = StateSymmetry.from_names(names)
+    if sym.mode == "none":
+        return None
+
     get_f_and_B, x_min, x_max = _env_attrs(raw_env, "get_f_and_B", "X_MIN", "X_MAX")
     if get_f_and_B is None or x_min is None or x_max is None:
-        return 0
-    from contractionRL.agents.skrl.angle_utils import is_translation_invariant
-    if not is_translation_invariant(get_f_and_B, x_min, x_max, pos_dim):
-        print(f"[ContractionRunner] f/B are NOT invariant to the leading {pos_dim} "
-              "state dims — translation quotient DISABLED (absolute positions kept).")
-        return 0
-    print(f"[ContractionRunner] translation quotient ON: dropping the leading "
-          f"{pos_dim} absolute position dims from every network input "
-          f"(f/B invariance verified against the env).")
-    return pos_dim
+        # Isaac Sim: no closed-form dynamics to test against, so the schema is
+        # the only evidence. from_names() already refused SE(2) unless EVERY dim
+        # is a recognised yaw-invariant name, which for the quadruped/humanoid is
+        # a real argument (projected_gravity_b, root_lin_vel_b, root_ang_vel_b and
+        # the joint states are body frame, hence yaw invariant by construction).
+        # Accepted, but announced as UNVERIFIED so a wrong frame suffix on some
+        # future env is discoverable from the log rather than silent.
+        print(f"[ContractionRunner] symmetry quotient: {sym.describe()}  "
+              f"[UNVERIFIED — no analytical f/B; trusting state_names. A "
+              f"world-frame dim misnamed as body-frame (_b) would break this.]")
+        return sym
+
+    if not sym.verify_translation(get_f_and_B, x_min, x_max):
+        print("[ContractionRunner] f/B DO depend on the declared position dims — "
+              "symmetry quotient DISABLED (check state_names).")
+        return None
+    if sym.mode == "se2" and not sym.verify_rotation(get_f_and_B, x_min, x_max):
+        sym = sym.demote_to_translation()
+        print("[ContractionRunner] f/B are translation invariant but NOT yaw "
+              "equivariant — demoted to 'translation'.")
+    print(f"[ContractionRunner] symmetry quotient: {sym.describe()}")
+    return sym
+
+
+def _cmg_symmetry(sym):
+    """The symmetry the CMG's W(x) may use — never SE(2).
+
+    A metric is a TENSOR, not a scalar: under a symmetry g it must transform as
+    W(g.x) = dg W(x) dg^T, so W cannot simply be fed yaw-free features the way an
+    invariant control output can. Making W yaw-equivariant needs an explicit
+    conjugation (build W in the canonical frame, rotate it back), which also
+    changes C3M's Wdot / LMI terms — a separate change. Until then W keeps the
+    translation quotient, which IS a genuine invariance for it (f and B do not
+    depend on position at all, so neither should the metric).
+    """
+    return None if sym is None else sym.demote_to_translation()
 
 
 def _build_c3m_models(models_cfg: dict, agent_cfg: dict, obs_space, act_space, device,
-                       x_dim, u_dim, angle_idx: list, pos_dim: int = 0,
+                       x_dim, u_dim, angle_idx: list, sym=None,
                        policy_key: str = "policy") -> dict:
     """Build the policy/cmg/(optional) dynamics models for a C3M-style offline
     synthesis phase — used by ``_setup_c3m`` (pure C3M, ``policy_key="policy"``).
@@ -220,7 +260,7 @@ def _build_c3m_models(models_cfg: dict, agent_cfg: dict, obs_space, act_space, d
     policy_kwargs.pop("network", None)
     policy_kwargs.pop("backbone", None)
     policy_kwargs.pop("angle_idx", None)  # angle_idx below is the single source of truth
-    policy_kwargs.pop("pos_dim", None)    # ditto: the env is the source of truth
+    policy_kwargs.pop("sym", None)    # ditto: the env is the source of truth
 
     constrain_eigenvalues = models_cfg.get("cmg", {}).get("network", [{}])[0].get("constrain_eigenvalues", False)
     w_lb = agent_cfg.get("w_lb", 0.1)
@@ -228,8 +268,8 @@ def _build_c3m_models(models_cfg: dict, agent_cfg: dict, obs_space, act_space, d
 
     from contractionRL.agents.skrl.models import MetricModel
     models = {
-        "policy": policy_cls(obs_space, act_space, device, hidden_dim=hd_policy, activation=act_policy, x_dim=x_dim, angle_idx=angle_idx, pos_dim=pos_dim, **policy_kwargs),
-        "cmg": MetricModel(obs_space, act_space, device, hidden_dim=hd_cmg, activation=act_cmg, x_dim=x_dim, angle_idx=angle_idx, pos_dim=pos_dim, constrain_eigenvalues=constrain_eigenvalues, w_lb=w_lb, w_ub=w_ub),
+        "policy": policy_cls(obs_space, act_space, device, hidden_dim=hd_policy, activation=act_policy, x_dim=x_dim, angle_idx=angle_idx, sym=sym, **policy_kwargs),
+        "cmg": MetricModel(obs_space, act_space, device, hidden_dim=hd_cmg, activation=act_cmg, x_dim=x_dim, angle_idx=angle_idx, sym=_cmg_symmetry(sym), constrain_eigenvalues=constrain_eigenvalues, w_lb=w_lb, w_ub=w_ub),
     }
 
     # Only build a NeuralDynamics when learning dynamics (use_empirical_dynamics
@@ -240,13 +280,13 @@ def _build_c3m_models(models_cfg: dict, agent_cfg: dict, obs_space, act_space, d
         dyn_net = models_cfg["dynamics"].get("network", [{}])[0]
         dyn_hd = dyn_net.get("layers", [256, 256])
         dyn_act = dyn_net.get("activations", "relu")
-        models["dynamics"] = NeuralDynamics(x_dim, u_dim, hidden_dim=dyn_hd, activation=dyn_act, device=device, angle_idx=angle_idx, pos_dim=pos_dim)
+        models["dynamics"] = NeuralDynamics(x_dim, u_dim, hidden_dim=dyn_hd, activation=dyn_act, device=device, angle_idx=angle_idx, sym=_cmg_symmetry(sym))
 
     return models
 
 
 def _build_gaussian_policy(models_cfg: dict, block_name: str, obs_space, state_space, act_space,
-                           device, x_dim, angle_idx: list, agent_class: str, pos_dim: int = 0):
+                           device, x_dim, angle_idx: list, agent_class: str, sym=None):
     """Build a deployed policy — same backbone dispatch PPO/SAC path-tracking
     configs use (control -> CLActorModel, mlp -> MLPResidualActorModel, both
     u = uref + feedback). Used by ``_setup_c2rl``. ``agent_class`` lets
@@ -262,7 +302,7 @@ def _build_gaussian_policy(models_cfg: dict, block_name: str, obs_space, state_s
     spec.setdefault("min_log_std", -4.605)
     spec.setdefault("max_log_std", 2.0)
     spec.setdefault("angle_idx", angle_idx)
-    spec.setdefault("pos_dim", pos_dim)
+    spec.setdefault("sym", sym)
     # x_dim is already known from the env — pass it explicitly so backbones
     # like mlp-squashed, which see both path-tracking and vel-tracking
     # layouts, don't have to guess the [x, xref, uref] split from obs_dim/
@@ -273,7 +313,7 @@ def _build_gaussian_policy(models_cfg: dict, block_name: str, obs_space, state_s
 
 
 def _build_critics(models_cfg: dict, block_name: str, base_algorithm: str, obs_space, act_space,
-                   device, x_dim, angle_idx: list, key_prefix: str = "", pos_dim: int = 0) -> dict:
+                   device, x_dim, angle_idx: list, key_prefix: str = "", sym=None) -> dict:
     """Build the value/critic model(s) for one policy — a single V(obs) model
     for PPO, or the twin-Q + target architecture (critic_1/2 + targets) for
     SAC. Used by ``_setup_c2rl`` (``key_prefix=""``, a single deployed policy).
@@ -287,13 +327,13 @@ def _build_critics(models_cfg: dict, block_name: str, base_algorithm: str, obs_s
     if base_algorithm == "PPO":
         return {f"{key_prefix}value": EmbeddedDeterministicModel(
             obs_space, act_space, device, hidden_dim=hd, activation=act,
-            x_dim=x_dim, angle_idx=angle_idx, pos_dim=pos_dim, use_actions=False,
+            x_dim=x_dim, angle_idx=angle_idx, sym=sym, use_actions=False,
         )}
     elif base_algorithm == "SAC":
         return {
             f"{key_prefix}{k}": EmbeddedDeterministicModel(
                 obs_space, act_space, device, hidden_dim=hd, activation=act,
-                x_dim=x_dim, angle_idx=angle_idx, pos_dim=pos_dim, use_actions=True,
+                x_dim=x_dim, angle_idx=angle_idx, sym=sym, use_actions=True,
             )
             for k in ("critic_1", "critic_2", "target_critic_1", "target_critic_2")
         }
@@ -580,7 +620,7 @@ class ContractionRunner:
         # don't declare it.
         x_dim, u_dim, angle_idx = _env_attrs(raw_env, "x_dim", "u_dim", "angle_idx")
         angle_idx = list(angle_idx or [])
-        pos_dim = _resolve_pos_dim(raw_env, x_dim, angle_idx)
+        sym = _resolve_symmetry(raw_env, x_dim, angle_idx)
 
         models_cfg = copy.deepcopy(cfg.get("models", {}))
         memory_cfg = copy.deepcopy(cfg.get("memory", {}))
@@ -597,13 +637,13 @@ class ContractionRunner:
         if algo in ("c3m",):
             self._setup_c3m(skrl_env, device, obs_space, state_space, act_space,
                             agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B, x_dim, u_dim,
-                            angle_idx=angle_idx, pos_dim=pos_dim, raw_cfg_snapshot=raw_cfg_snapshot)
+                            angle_idx=angle_idx, sym=sym, raw_cfg_snapshot=raw_cfg_snapshot)
         elif algo in ("lqr", "sdlqr"):
             # LQR/SD-LQR build no networks (get_f_and_B is either analytical or
             # an externally-loaded NeuralDynamics whose angle_idx was already
             # baked in when IT was trained) — nothing here to embed.
             self._setup_sdlqr(skrl_env, device, obs_space, state_space, act_space,
-                              agent_cfg, trainer_cfg, models_cfg, get_f_and_B, lqr=(algo == "lqr"), x_dim=x_dim, u_dim=u_dim, angle_idx=angle_idx, pos_dim=pos_dim,
+                              agent_cfg, trainer_cfg, models_cfg, get_f_and_B, lqr=(algo == "lqr"), x_dim=x_dim, u_dim=u_dim, angle_idx=angle_idx, sym=sym,
                               raw_cfg_snapshot=raw_cfg_snapshot)
         elif algo in ("cvstem-lqr",):
             # CV-STEM-LQR reads the same `cm:`/`cmg:` blocks C2RL does (contraction
@@ -612,7 +652,7 @@ class ContractionRunner:
             # solves the SDP per step and needs no network.
             self._setup_cvstem_lqr(skrl_env, device, obs_space, state_space, act_space,
                                    agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B,
-                                   x_dim=x_dim, u_dim=u_dim, angle_idx=angle_idx, pos_dim=pos_dim,
+                                   x_dim=x_dim, u_dim=u_dim, angle_idx=angle_idx, sym=sym,
                                    raw_cfg_snapshot=raw_cfg_snapshot,
                                    cm_cfg=cm_cfg, cmg_cfg=cmg_cfg)
         elif algo in ("c2rl-ppo", "c2rl-sac"):
@@ -621,17 +661,17 @@ class ContractionRunner:
             # C2RLAgent's base_algorithm constructor kwarg.
             self._setup_c2rl(skrl_env, device, obs_space, state_space, act_space,
                              agent_cfg, trainer_cfg, models_cfg, memory_cfg, get_rollout, get_f_and_B, x_dim, u_dim,
-                             base_algorithm=("PPO" if algo == "c2rl-ppo" else "SAC"), angle_idx=angle_idx, pos_dim=pos_dim,
+                             base_algorithm=("PPO" if algo == "c2rl-ppo" else "SAC"), angle_idx=angle_idx, sym=sym,
                              raw_cfg_snapshot=raw_cfg_snapshot,
                              cm_cfg=cm_cfg, cmg_cfg=cmg_cfg, empirical_dynamics_cfg=empirical_dynamics_cfg)
 
     def _setup_c3m(self, env, device, obs_space, state_space, act_space,
                    agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None,
-                   angle_idx=None, pos_dim: int = 0, raw_cfg_snapshot=None):
+                   angle_idx=None, sym=None, raw_cfg_snapshot=None):
         angle_idx = list(angle_idx or [])
         from contractionRL.agents.skrl.c3m import C3MAgent, C3MCfg, C3MSkrlTrainer, C3MTrainerCfg
 
-        models = _build_c3m_models(models_cfg, agent_cfg, obs_space, act_space, device, x_dim, u_dim, angle_idx, pos_dim)
+        models = _build_c3m_models(models_cfg, agent_cfg, obs_space, act_space, device, x_dim, u_dim, angle_idx, sym)
         w_lb = agent_cfg.get("w_lb", 0.1)
         w_ub = agent_cfg.get("w_ub", 10.0)
 
@@ -670,7 +710,7 @@ class ContractionRunner:
             )
 
     def _setup_sdlqr(self, env, device, obs_space, state_space, act_space,
-                     agent_cfg, trainer_cfg, models_cfg, get_f_and_B, lqr: bool = False, x_dim=None, u_dim=None, angle_idx=None, pos_dim: int = 0,
+                     agent_cfg, trainer_cfg, models_cfg, get_f_and_B, lqr: bool = False, x_dim=None, u_dim=None, angle_idx=None, sym=None,
                      raw_cfg_snapshot=None):
         from contractionRL.agents.skrl.sdlqr import SDLQRAgent, LQRAgent, SDLQRCfg, LQRCfg
         from skrl.trainers.torch import SequentialTrainer
@@ -717,7 +757,7 @@ class ContractionRunner:
 
     def _setup_cvstem_lqr(self, env, device, obs_space, state_space, act_space,
                           agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B,
-                          x_dim=None, u_dim=None, angle_idx=None, pos_dim: int = 0, raw_cfg_snapshot=None,
+                          x_dim=None, u_dim=None, angle_idx=None, sym=None, raw_cfg_snapshot=None,
                           cm_cfg=None, cmg_cfg=None):
         """Build a CVSTEMLQRAgent — Tsukamoto's CV-STEM contraction controller.
 
@@ -747,7 +787,7 @@ class ContractionRunner:
             cmg_act = cmg_net[0].get("activations", "tanh") if cmg_net else "tanh"
             models["cmg"] = MetricModel(
                 obs_space, act_space, device, hidden_dim=cmg_hd, activation=cmg_act,
-                x_dim=x_dim, angle_idx=angle_idx, pos_dim=pos_dim, constrain_eigenvalues=True,
+                x_dim=x_dim, angle_idx=angle_idx, sym=_cmg_symmetry(sym), constrain_eigenvalues=True,
                 w_lb=w_lb, w_ub=w_ub,
             )
 
@@ -795,7 +835,7 @@ class ContractionRunner:
 
     def _setup_c2rl(self, env, device, obs_space, state_space, act_space,
                     agent_cfg, trainer_cfg, models_cfg, memory_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None,
-                    base_algorithm: str = "PPO", angle_idx=None, pos_dim: int = 0, raw_cfg_snapshot=None,
+                    base_algorithm: str = "PPO", angle_idx=None, sym=None, raw_cfg_snapshot=None,
                     cm_cfg=None, cmg_cfg=None, empirical_dynamics_cfg=None):
         """Build a single-policy C2RLAgent. Always builds a CMG network
         (MetricModel), synthesized offline before Phase B and then frozen
@@ -853,7 +893,7 @@ class ContractionRunner:
         cmg_act = cmg_net[0].get("activations", "tanh") if cmg_net else "tanh"
         cmg_model = MetricModel(
             obs_space, act_space, device, hidden_dim=cmg_hd, activation=cmg_act,
-            x_dim=x_dim, angle_idx=angle_idx, pos_dim=pos_dim, constrain_eigenvalues=True, w_lb=w_lb, w_ub=w_ub,
+            x_dim=x_dim, angle_idx=angle_idx, sym=_cmg_symmetry(sym), constrain_eigenvalues=True, w_lb=w_lb, w_ub=w_ub,
         )
         models["cmg"] = cmg_model
 
@@ -865,16 +905,16 @@ class ContractionRunner:
             dyn_net = models_cfg["dynamics"].get("network", [{}])[0]
             dyn_hd = dyn_net.get("layers", [256, 256])
             dyn_act = dyn_net.get("activations", "relu")
-            models["dynamics"] = NeuralDynamics(x_dim, u_dim, hidden_dim=dyn_hd, activation=dyn_act, device=device, angle_idx=angle_idx, pos_dim=pos_dim)
+            models["dynamics"] = NeuralDynamics(x_dim, u_dim, hidden_dim=dyn_hd, activation=dyn_act, device=device, angle_idx=angle_idx, sym=_cmg_symmetry(sym))
 
         # Phase B deployed policy + critic — control/mlp backbone dispatch, same
         # as C3M's. Value (PPO) / twin-Q + targets (SAC) see the SAME
         # angle-bearing x/xref blocks as the policy and embed them identically.
         models["policy"] = _build_gaussian_policy(models_cfg, "policy", obs_space, state_space, act_space,
                                                   device, x_dim, angle_idx, agent_class=f"C2RL-{base_algorithm}",
-                                                  pos_dim=pos_dim)
+                                                  sym=sym)
         models.update(_build_critics(models_cfg, "critic", base_algorithm, obs_space, act_space,
-                                     device, x_dim, angle_idx, key_prefix="", pos_dim=pos_dim))
+                                     device, x_dim, angle_idx, key_prefix="", sym=sym))
 
         # Pass the RAW agent_cfg dict (not a pre-parsed C2RLPPOCfg/C2RLSACCfg) —
         # C2RLAgent keeps the full dict in self._raw_cfg, which make_base_rl_cfg()

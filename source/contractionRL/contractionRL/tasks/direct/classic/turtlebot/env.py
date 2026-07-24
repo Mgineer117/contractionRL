@@ -11,7 +11,10 @@ from ..common.env_base import BaseEnv
 k1, k2, k3 = 1.0, 1.0, 1.0
 
 # Denote angle indices to handle smooth transition
-ANGLE_IDX = [2]
+STATE_NAMES = ("pos_x", "pos_y", "yaw")
+# angle_idx / pos_dimension are DERIVED from STATE_NAMES by BaseEnv (see
+# agents/skrl/state_symmetry.py) -- the names are the single source of truth for
+# which dims wrap, which translate, and which co-rotate under a yaw rotation.
 
 # X bounds
 X_MIN = [-10.0, -10.0, 0]
@@ -43,12 +46,11 @@ ENV_CONFIG = {
     "xe_init_max": XE_INIT_MAX,
     "xe_min": XE_MIN,
     "xe_max": XE_MAX,
-    "angle_idx": ANGLE_IDX,
+    "state_names": STATE_NAMES,
     "uref_min": UREF_MIN,
     "uref_max": UREF_MAX,
     "num_dim_x": 3,
     "num_dim_control": 2,
-    "pos_dimension": 2,
     "dt": 0.05,
     "time_bound": 30.0,
     "q": 1.0,

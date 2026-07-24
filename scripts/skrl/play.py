@@ -203,7 +203,7 @@ def run_classic(args) -> list[dict]:
     from contractionRL.agents.skrl.runner import CLActorRunner
     from contractionRL.agents.skrl.contraction_metrics import StatManagerEnvWrapper
     from train_utils import (BatchedGymnasiumWrapper, _default_num_envs_classic,
-                             _inject_angle_idx, _resolve_pos_dim_for_env)
+                             _inject_angle_idx, _resolve_symmetry_for_env)
 
     def _load_agent_cfg(algorithm: str) -> dict:
         entry_key = f"skrl_{algorithm.replace('-', '_')}_cfg_entry_point"
@@ -267,7 +267,7 @@ def run_classic(args) -> list[dict]:
                            "std_dev_annealing_kwargs"):
                     _a.pop(_k, None)
                 _angle_idx = list(getattr(env.unwrapped, "angle_idx", []) or [])
-                _inject_angle_idx(agent_cfg, _angle_idx, _resolve_pos_dim_for_env(env))
+                _inject_angle_idx(agent_cfg, _angle_idx, _resolve_symmetry_for_env(env))
                 runner = CLActorRunner(env, agent_cfg)
 
             print(f"  loading checkpoint …")

@@ -64,6 +64,33 @@ class PathTrackingBase(DirectRLEnv):
     """
     angle_idx: "Sequence[int]" = ()
 
+    # One name per PHYSICAL state dim (see agents/skrl/state_symmetry.py for the
+    # vocabulary). Declaring names rather than raw indices is what lets the
+    # networks quotient out the symmetry of the tracking problem: which dims are
+    # pure translation directions, which is the planar heading, and which co-
+    # rotate under a yaw rotation. Crucially the FRAME suffix matters --
+    # root_lin_vel_b / root_ang_vel_b / projected_gravity_b are BODY frame and so
+    # already yaw invariant, whereas a world-frame velocity would have to be
+    # co-rotated with the position pair. Left empty -> angle_idx below is used as
+    # before and no quotient is applied.
+    #
+    # Subclasses whose width depends on the robot (joint count) should override
+    # the ``state_names`` PROPERTY instead of this attribute.
+    _state_names: "Sequence[str]" = ()
+
+    @property
+    def state_names(self) -> tuple[str, ...]:
+        return tuple(self._state_names)
+
+    @property
+    def pos_dimension(self) -> int:
+        """Number of pure translation directions, derived from state_names."""
+        names = self.state_names
+        if not names:
+            return 0
+        from contractionRL.agents.skrl.state_symmetry import StateSymmetry
+        return StateSymmetry.from_names(names).pos_dimension
+
     # ── Divergence guard ────────────────────────────────────────────────── #
     # An initially unstable policy (random init, or C2RL's policy early on)
     # can drive the sim to a non-finite / exploded physical state. Rather than

@@ -8,7 +8,10 @@ import torch
 from ..common.env_base import BaseEnv
 
 # Denote angle indices to handle smooth transition
-ANGLE_IDX = [1]
+STATE_NAMES = ("pos_x", "pitch", "vel_x_b", "pitch_rate")
+# angle_idx / pos_dimension are DERIVED from STATE_NAMES by BaseEnv (see
+# agents/skrl/state_symmetry.py) -- the names are the single source of truth for
+# which dims wrap, which translate, and which co-rotate under a yaw rotation.
 
 # X bounds
 X_MIN = [-5.0, -math.pi / 3, -1.0, -math.pi]
@@ -40,12 +43,11 @@ ENV_CONFIG = {
     "xe_init_max": XE_INIT_MAX,
     "xe_min": XE_MIN,
     "xe_max": XE_MAX,
-    "angle_idx": ANGLE_IDX,
+    "state_names": STATE_NAMES,
     "uref_min": UREF_MIN,
     "uref_max": UREF_MAX,
     "num_dim_x": 4,
     "num_dim_control": 1,
-    "pos_dimension": 1,
     "dt": 0.03,
     "time_bound": 15.0,
     "q": 1.0,

@@ -15,8 +15,8 @@ dims of that difference must be wrapped to the shortest-angle representative
 in (-pi, pi] before it is used in a norm/reward/metric/matmul — otherwise a
 raw wraparound (e.g. a U-turn) spikes the difference by ~2*pi.
 
-``pos_dim`` and the ``*_features``/``*_feature_dim`` helpers are the third
-piece: the TRANSLATION QUOTIENT. Every env in this repo declares a leading
+The SYMMETRY QUOTIENT is the third piece, and it lives in
+``state_symmetry.py`` (which builds on the two functions here). Every env in this repo declares a leading
 block of ``pos_dimension`` state dims that ``f`` and ``B`` provably do not
 depend on (verified numerically for car/turtlebot/segway/quadrotor: perturbing
 those dims changes f and B by exactly 0). The tracking problem is therefore
@@ -85,104 +85,3 @@ def wrap_diff(diff: torch.Tensor, angle_idx: Sequence[int]) -> torch.Tensor:
     mask[list(int(i) for i in angle_idx)] = True
     wrapped = torch.remainder(diff + math.pi, 2 * math.pi) - math.pi
     return torch.where(mask, wrapped, diff)
-
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# Translation quotient — see the module docstring.
-# ─────────────────────────────────────────────────────────────────────────── #
-
-def _shifted_angle_idx(angle_idx: Sequence[int], pos_dim: int) -> list[int]:
-    """Re-index ``angle_idx`` into a block whose leading ``pos_dim`` dims were
-    dropped. Angles are never inside the position block (a position is not an
-    angle in any env here), which the assertion makes explicit rather than
-    letting a mis-declared ``pos_dimension`` silently corrupt the embedding.
-    """
-    idx = sorted(set(int(i) for i in angle_idx))
-    if pos_dim and idx and idx[0] < pos_dim:
-        raise ValueError(
-            f"angle_idx={idx} overlaps the position block (pos_dim={pos_dim}): a "
-            "translation-invariant dim cannot also be an angle. Check the env's "
-            "pos_dimension/angle_idx declaration."
-        )
-    return [i - pos_dim for i in idx]
-
-
-def state_feature_dim(dim: int, pos_dim: int, angle_idx: Sequence[int]) -> int:
-    """Input width of a network that sees ONE state block (e.g. W(x), f/B nets)."""
-    return embedded_dim(dim - pos_dim, _shifted_angle_idx(angle_idx, pos_dim))
-
-
-def state_features(x: torch.Tensor, pos_dim: int, angle_idx: Sequence[int]) -> torch.Tensor:
-    """Network input for a single state block: drop the translation directions,
-    then angle-embed what is left.
-
-    Dropping (rather than zeroing) the position columns is what makes the
-    invariance exact: for W(x) and for f/B the position dims are pure symmetry
-    directions, so d/d(pos) is identically 0 by construction instead of being a
-    small nonzero number the optimiser has to push down.
-    """
-    if not pos_dim:
-        return embed_angles(x, angle_idx)
-    return embed_angles(x[..., pos_dim:], _shifted_angle_idx(angle_idx, pos_dim))
-
-
-def pair_feature_dim(x_dim: int, pos_dim: int, angle_idx: Sequence[int]) -> int:
-    """Input width of a network that sees the ``(x, xref)`` PAIR.
-
-    ``pos_dim`` relative-position dims (shared by both blocks) + the two
-    position-stripped, angle-embedded blocks. At ``pos_dim=0`` this is exactly
-    the previous ``2 * embedded_dim(x_dim, angle_idx)``.
-    """
-    return pos_dim + 2 * state_feature_dim(x_dim, pos_dim, angle_idx)
-
-
-def pair_features(
-    x: torch.Tensor, xref: torch.Tensor, pos_dim: int, angle_idx: Sequence[int]
-) -> torch.Tensor:
-    """Network input for an ``(x, xref)`` pair, quotiented by translation.
-
-    Layout: ``[x_pos - xref_pos, features(x), features(xref)]``. This is a
-    COMPLETE invariant of the translation action — nothing is lost, because the
-    dynamics and the tracking reward are themselves translation invariant, so
-    the map is a bijection onto the reduced state space.
-    """
-    if not pos_dim:
-        return torch.cat([embed_angles(x, angle_idx), embed_angles(xref, angle_idx)], dim=-1)
-    return torch.cat(
-        [
-            x[..., :pos_dim] - xref[..., :pos_dim],
-            state_features(x, pos_dim, angle_idx),
-            state_features(xref, pos_dim, angle_idx),
-        ],
-        dim=-1,
-    )
-
-
-def is_translation_invariant(
-    get_f_and_B, x_min: torch.Tensor, x_max: torch.Tensor, pos_dim: int,
-    *, samples: int = 256, offset: float = 10.0, atol: float = 1e-5,
-) -> bool:
-    """Ask the ENV whether translating its leading ``pos_dim`` dims leaves f and
-    B unchanged, instead of maintaining a per-env whitelist.
-
-    This is what makes the quotient universal and safe: a new env (or one whose
-    ``pos_dimension`` is mis-declared, or one with position-dependent terrain /
-    drag / obstacle terms) fails the check and transparently falls back to the
-    absolute-observation behaviour. Returns False on any error, since "could not
-    prove the symmetry" must never be treated as "the symmetry holds".
-    """
-    if not pos_dim:
-        return False
-    try:
-        x_min = x_min.flatten().float()
-        x_max = x_max.flatten().float()
-        x = x_min + torch.rand(samples, x_min.numel(), device=x_min.device) * (x_max - x_min)
-        shifted = x.clone()
-        shifted[:, :pos_dim] += (torch.rand(samples, pos_dim, device=x.device) * 2 - 1) * offset
-        f1, B1, _ = get_f_and_B(x)
-        f2, B2, _ = get_f_and_B(shifted)
-        return bool(
-            torch.allclose(f1, f2, atol=atol) and torch.allclose(B1, B2, atol=atol)
-        )
-    except Exception:
-        return False

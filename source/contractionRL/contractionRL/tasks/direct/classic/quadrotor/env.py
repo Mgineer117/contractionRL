@@ -7,7 +7,14 @@ import torch
 
 from ..common.env_base import BaseEnv
 
-ANGLE_IDX = [7, 8, 9]
+STATE_NAMES = (
+    "pos_x", "pos_y", "pos_z",
+    "vel_x_w", "vel_y_w", "vel_z_w",
+    "thrust", "roll", "pitch", "yaw",
+)
+# angle_idx / pos_dimension are DERIVED from STATE_NAMES by BaseEnv (see
+# agents/skrl/state_symmetry.py) -- the names are the single source of truth for
+# which dims wrap, which translate, and which co-rotate under a yaw rotation.
 
 G = 9.81
 
@@ -41,9 +48,9 @@ ENV_CONFIG = {
     "xref_init_min": XREF_INIT_MIN, "xref_init_max": XREF_INIT_MAX,
     "xe_init_min": XE_INIT_MIN, "xe_init_max": XE_INIT_MAX,
     "xe_min": XE_MIN, "xe_max": XE_MAX,
-    "angle_idx": ANGLE_IDX,
+    "state_names": STATE_NAMES,
     "uref_min": UREF_MIN, "uref_max": UREF_MAX,
-    "num_dim_x": 10, "num_dim_control": 4, "pos_dimension": 3,
+    "num_dim_x": 10, "num_dim_control": 4,
     "dt": 0.025, "time_bound": 10.0,
     "q": 1.0, "r": 0.0,
 }

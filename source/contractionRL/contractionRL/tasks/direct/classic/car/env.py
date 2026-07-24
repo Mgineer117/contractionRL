@@ -14,7 +14,10 @@ import torch
 
 from ..common.env_base import BaseEnv
 
-ANGLE_IDX = [2]
+STATE_NAMES = ("pos_x", "pos_y", "yaw", "vel")
+# angle_idx / pos_dimension are DERIVED from STATE_NAMES by BaseEnv (see
+# agents/skrl/state_symmetry.py) -- the names are the single source of truth for
+# which dims wrap, which translate, and which co-rotate under a yaw rotation.
 
 v_l, v_h = 1.0, 2.0
 # The reference START position is randomized over the whole POS_SPREAD box, not
@@ -56,9 +59,9 @@ ENV_CONFIG = {
     "xref_init_min": XREF_INIT_MIN, "xref_init_max": XREF_INIT_MAX,
     "xe_init_min": XE_INIT_MIN, "xe_init_max": XE_INIT_MAX,
     "xe_min": XE_MIN, "xe_max": XE_MAX,
-    "angle_idx": ANGLE_IDX,
+    "state_names": STATE_NAMES,
     "uref_min": UREF_MIN, "uref_max": UREF_MAX,
-    "num_dim_x": 4, "num_dim_control": 2, "pos_dimension": 2,
+    "num_dim_x": 4, "num_dim_control": 2,
     "dt": 0.03, "time_bound": 15.0,
     "q": 1.0, "r": 0.0,
 }

@@ -198,7 +198,7 @@ import gymnasium as gym
 import yaml
 from train_utils import (
     _default_num_envs_classic, _evaluate_best_model, _evaluate_classic_path_tracking,
-    _generate_ref_trajs, _inject_angle_idx, _resolve_caps_kwargs, _resolve_pos_dim_for_env,
+    _generate_ref_trajs, _inject_angle_idx, _resolve_caps_kwargs, _resolve_symmetry_for_env,
     apply_agent_patches, apply_wandb_sweep_overrides, finish_wandb,
     install_wandb_scalar_hook, normalize_agent_cfg,
 )
@@ -427,7 +427,7 @@ if _is_classic:
         # ContractionRunner reads it off the env itself and needs no injection.
         from contractionRL.agents.skrl.runner import CLActorRunner
         _inject_angle_idx(agent_cfg, list(getattr(raw_env.unwrapped, "angle_idx", []) or []),
-                          _resolve_pos_dim_for_env(raw_env))
+                          _resolve_symmetry_for_env(raw_env))
         runner = CLActorRunner(env, agent_cfg)
 
     # Contraction algorithms already namespace their own track_data() keys.
@@ -683,7 +683,7 @@ else:
         # (C3M/LQR/SDLQR/C2RL) reads it directly off the env and needs no
         # injection. _isaac_env is the pre-SkrlVecEnvWrapper raw env saved above.
         _angle_idx = list(getattr(_isaac_env.unwrapped, "angle_idx", []) or [])
-        _inject_angle_idx(agent_cfg, _angle_idx, _resolve_pos_dim_for_env(_isaac_env))
+        _inject_angle_idx(agent_cfg, _angle_idx, _resolve_symmetry_for_env(_isaac_env))
 
         _alg = agent_cfg["agent"].get("class", "").lower()
         _is_contraction = _alg in _CONTRACTION_ALGOS
