@@ -1,15 +1,12 @@
 """Generic post-construction patches for skrl PPO/SAC agent instances.
 
-Shared between the standalone PPO/SAC path (scripts/skrl/train.py, which
-patches ``runner.agent`` directly) and C2RL (c2rl.py, which patches its inner
-PPO/SAC sub-agent — C2RL's own outer agent has no ``.policy``/``.scheduler``/
-etc. attributes for these to find). Each patch inspects the given agent for the
-attributes it needs and no-ops if they're absent, so it's safe to call
-unconditionally on any agent.
+Used by train.py (patches ``runner.agent``) and c2rl.py (patches its inner
+PPO/SAC sub-agent; C2RL's outer agent has no ``.policy``/``.scheduler``). Each
+patch no-ops if the agent lacks what it needs, so calling any of them on any
+agent is safe.
 
-Every call site patches BEFORE ``agent.init()``, which is where skrl allocates
-the memory tensors and the trainer, in turn, only calls at ``train()`` time.
-``patch_caps_regularizer`` relies on that ordering.
+INVARIANT: every call site patches BEFORE ``agent.init()`` (where skrl
+allocates memory tensors). ``patch_caps_regularizer`` relies on it.
 """
 
 from __future__ import annotations
@@ -20,15 +17,13 @@ import torch
 
 
 def patch_kl_logging(agent) -> None:
-    """Log per-epoch approximate KL divergence to 'Policy / KL divergence'.
+    """Log per-epoch approximate KL to 'Policy / KL divergence'.
 
-    skrl's PPO computes KL every epoch to drive KLAdaptiveLR but never records
-    it, so early-stop events (kl_threshold) are invisible in tensorboard/wandb
-    even though they silently truncate — and thus deflate — the averaged
-    Loss/Policy loss, Loss/Value loss, Loss/Entropy loss for that update
-    (skrl divides by the full learning_epochs*mini_batches regardless of how
-    many minibatches actually ran before the break). No-ops for agents without
-    a KLAdaptiveLR scheduler (SAC, PPO with scheduler=null).
+    skrl's PPO computes KL to drive KLAdaptiveLR but never records it, so
+    kl_threshold early stops are invisible — even though they deflate that
+    update's averaged losses (skrl divides by the full
+    learning_epochs*mini_batches regardless of where it broke). No-op without a
+    KLAdaptiveLR scheduler.
     """
     import skrl.resources.schedulers.torch as _sched
 
@@ -46,18 +41,83 @@ def patch_kl_logging(agent) -> None:
     scheduler.step = _step
 
 
+def patch_ppo_diagnostics(agent, *, disable_advantage_norm: bool = False) -> None:
+    """Phase-0 collapse diagnostics. Swaps skrl's module-level ``compute_gae``
+    for an instrumented copy of the SAME math (loop verbatim from skrl 1.4),
+    logging per update::
+
+        Diagnostics / raw advantage mean/std — pre-normalization GAE. Near-zero
+            std means skrl's (adv - mean)/(std + 1e-8) manufactures a
+            full-scale confident gradient out of noise — the mechanism behind
+            "near-optimal policy -> destabilizing update".
+        Diagnostics / critic explained variance — 1 - Var(returns-values)/
+            Var(returns). Near 0 = critic has no predictive content yet; the
+            first update where it jumps off 0 is the collapse candidate.
+
+    ``disable_advantage_norm=True`` (Ablation C) also skips the normalization.
+
+    SCOPE: ``compute_gae`` is a bare module-level name with no per-instance
+    hook, so this patches it GLOBALLY — fine while only one PPO agent runs per
+    process, true of every entrypoint here. Idempotent; no-op for SAC.
+    """
+    # PPO.__init__ (already run, see module docstring) sets self.value; SAC has
+    # critic_1/critic_2 instead. self._tensors_names would be the better check
+    # but isn't set until agent.init(), which runs AFTER this.
+    if not hasattr(agent, "value"):
+        return
+    import skrl.agents.torch.ppo.ppo as _ppo_mod
+
+    if getattr(_ppo_mod, "_c2rl_diagnostics_patched", False):
+        return
+    _ppo_mod._c2rl_diagnostics_patched = True
+
+    def _instrumented_compute_gae(
+        *,
+        rewards,
+        terminated,
+        truncated,
+        values,
+        last_values,
+        discount_factor: float = 0.99,
+        lambda_coefficient: float = 0.95,
+        time_limit_bootstrap: bool = False,
+    ):
+        advantage = 0
+        advantages = torch.zeros_like(rewards)
+        not_done = ((terminated | truncated) if time_limit_bootstrap else terminated).logical_not()
+        memory_size = rewards.shape[0]
+        for i in reversed(range(memory_size)):
+            next_values = values[i + 1] if i < memory_size - 1 else last_values
+            advantage = (
+                rewards[i] - values[i]
+                + discount_factor * not_done[i] * (next_values + lambda_coefficient * advantage)
+            )
+            advantages[i] = advantage
+        returns = advantages + values
+
+        agent.track_data("Diagnostics / raw advantage mean", advantages.mean().item())
+        agent.track_data("Diagnostics / raw advantage std", advantages.std().item())
+        returns_var = returns.var()
+        if returns_var > 1e-12:
+            ev = 1.0 - (returns - values).var() / returns_var
+            agent.track_data("Diagnostics / critic explained variance", ev.item())
+
+        if disable_advantage_norm:
+            return returns, advantages
+        return returns, (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    _ppo_mod.compute_gae = _instrumented_compute_gae
+
+
 def patch_sac_entropy_clamp(agent, min_log_alpha: float = -5.0, max_log_alpha: float = 2.0) -> None:
     """Clamp log_entropy_coefficient in-place after every entropy optimizer step.
 
-    skrl's SAC applies grad_norm_clip to the policy and critic optimizers but
-    NOT to entropy_optimizer, and _entropy_coefficient = exp(log_entropy_coefficient)
-    is exponentiated with no bound. A noisy/undertrained critic can push this
-    single scalar's gradient large, and exponentiation turns even a moderate
-    excursion into a runaway entropy coefficient that then dominates both the
-    critic target and the policy loss — a textbook SAC divergence mechanism.
-    Bounds exp(log_alpha) to roughly [0.0067, 7.39], mirroring the clip_log_std
-    bounds skrl already applies to GaussianMixin policies elsewhere. No-op for
-    agents without learn_entropy (PPO, SAC with learn_entropy=False).
+    skrl's SAC applies grad_norm_clip to the policy/critic optimizers but NOT to
+    entropy_optimizer, and alpha = exp(log_alpha) is unbounded. A noisy critic
+    can push this one scalar's gradient large, and exp() turns a moderate
+    excursion into a runaway alpha that dominates both the critic target and the
+    policy loss — a textbook SAC divergence. Bounds alpha to ~[0.0067, 7.39],
+    mirroring skrl's own clip_log_std. No-op without learn_entropy.
     """
     entropy_optimizer = getattr(agent, "entropy_optimizer", None)
     log_alpha = getattr(agent, "log_entropy_coefficient", None)
@@ -78,22 +138,15 @@ def patch_sac_entropy_clamp(agent, min_log_alpha: float = -5.0, max_log_alpha: f
 def patch_ppo_std_annealing(agent, std_dev_annealing: bool, kwargs: dict | None = None) -> None:
     """Adds manual standard deviation annealing to SKRL's PPO policy.
 
-    If `std_dev_annealing` is True, this disables the entropy loss entirely
-    (setting entropy_loss_scale to 0.0) and anneals the policy's
-    log_std_parameter from its initial value down to `final_log_std` over the
-    total training timesteps, following the chosen schedule.
+    When on: disables the entropy loss (entropy_loss_scale=0.0) and anneals
+    log_std_parameter from its initial value to `final_log_std` over training.
 
-    `std_dev_annealing` is not a yaml flag: callers auto-derive it. train.py's
-    standalone PPO/SAC route still derives it from whether the policy's
-    backbone is one of ``runner.CONTROL_BACKBONES`` (``"control"``/
-    ``"contraction"``). c2rl.py instead derives it from
-    ``self._base_algorithm == "PPO"`` — i.e. always on for PPO regardless of
-    backbone, and always off for SAC (which learns log_std via its own
-    automatic entropy tuning; see ``SquashedCLActorModel``'s docstring in
-    models.py). Either way, this function freezes ``log_std_parameter``
-    (``requires_grad=False``) itself and no-ops if the policy has no such
-    attribute (e.g. a state-dependent log_std head, as in
-    ``mlp-squashed``). Only the schedule itself is yaml-configurable::
+    `std_dev_annealing` is not a yaml flag — callers derive it. train.py: from
+    whether the backbone is in ``runner.CONTROL_BACKBONES``. c2rl.py: from
+    ``base_algorithm == "PPO"``, i.e. always on for PPO, always off for SAC
+    (which tunes log_std via automatic entropy tuning). Freezes
+    log_std_parameter here; no-ops for a state-dependent log_std head
+    (``mlp-squashed``). Only the schedule is yaml-configurable::
 
         agent:
           std_dev_annealing_kwargs:
@@ -132,7 +185,12 @@ def patch_ppo_std_annealing(agent, std_dev_annealing: bool, kwargs: dict | None 
     # Disable gradients on log_std_parameter because we update it manually
     agent.policy.log_std_parameter.requires_grad_(False)
 
-    initial_log_std = agent.policy.log_std_parameter.mean().item()
+    # Captured lazily on the FIRST post_interaction, not here: this patch runs
+    # at __init__, before C2RL's Phase A + pretraining. Capturing eagerly froze
+    # "initial" at the yaml's initial_log_std, so a post-pretrain override
+    # (residual_pretrain_init_log_std) got silently reverted on the next
+    # post_interaction. Lazy = "initial" means what Phase B actually starts at.
+    initial_log_std = None
 
     def _ratio(p: float) -> float:
         if schedule == "exponential":
@@ -144,6 +202,9 @@ def patch_ppo_std_annealing(agent, std_dev_annealing: bool, kwargs: dict | None 
     _orig_post = agent.post_interaction
 
     def _annealed_post(*, timestep: int, timesteps: int) -> None:
+        nonlocal initial_log_std
+        if initial_log_std is None:
+            initial_log_std = agent.policy.log_std_parameter.mean().item()
         progress = min(1.0, max(0.0, timestep / max(1, timesteps)))
         current_log_std = initial_log_std + _ratio(progress) * (final_log_std - initial_log_std)
         agent.policy.log_std_parameter.data.fill_(current_log_std)
@@ -154,16 +215,13 @@ def patch_ppo_std_annealing(agent, std_dev_annealing: bool, kwargs: dict | None 
 
 def _resolve_x_dim(policy) -> int | None:
     """Length of the leading ``x`` block of a ``[x, xref, uref]`` observation,
-    or ``None`` for a policy over a flat observation with no such split.
+    or ``None`` for a flat observation with no such split.
 
-    Every path-tracking backbone knows this number, but they spell it
-    differently and none of the spellings is universal: the residual/squashed
-    MLPs store it as ``_x_dim`` (``None`` when they were built for a
-    vel-tracking layout), while ``CLActorModel``/``SquashedCLActorModel`` keep
-    it only on the ``cl_actor`` submodule they delegate to. Missing that last
-    case silently returned ``None`` for exactly the two backbones whose control
-    law makes the x-only restriction load-bearing — see
-    ``patch_caps_regularizer``'s note on uref pass-through.
+    Every backbone knows this number but spells it differently: residual/
+    squashed MLPs use ``_x_dim``; CLActorModel/SquashedCLActorModel keep it only
+    on their ``cl_actor`` submodule. Missing that last case silently returned
+    None for exactly the two backbones where the x-only restriction is
+    load-bearing (see patch_caps_regularizer on uref pass-through).
     """
     for owner, attr in ((policy, "x_dim"), (policy, "_x_dim"),
                         (getattr(policy, "cl_actor", None), "x_dim")):
@@ -183,101 +241,64 @@ def patch_caps_regularizer(
 ) -> None:
     """Add CAPS action-smoothness regularization to the POLICY LOSS.
 
-    CAPS (Mysore et al. 2021, *Regularizing Action Policies for Smooth
-    Control*) penalizes two distinct kinds of non-smoothness in the policy MEAN
-    (never the sampled action — exploration noise is not what we want to
-    suppress, and its gradient would fight std annealing / SAC entropy tuning)::
+    CAPS (Mysore et al. 2021) penalizes two kinds of non-smoothness in the
+    policy MEAN — never the sampled action, whose noise we don't want to
+    suppress and whose gradient would fight std annealing / entropy tuning::
 
-        L_T = temporal_scale * || pi(s_t)  - pi(s_{t+1}) ||^2   (chatter in time)
-        L_S = spatial_scale  * || pi(s)    - pi(s_bar)   ||^2,  s_bar ~ N(s, sigma^2)
-                                                               (high state gain)
+        L_T = temporal_scale * || pi(s_t) - pi(s_{t+1}) ||^2   (chatter in time)
+        L_S = spatial_scale  * || pi(s)   - pi(s_bar)   ||^2   (high state gain)
+                                        s_bar ~ N(s, spatial_std^2)
 
-    Why a LOSS term rather than a reward term. A ``-||u_t - u_{t-1}||^2`` reward
-    makes the return depend on u_{t-1}, which is not in the observation — that
-    is a different (partially observed) MDP, and the critic can only model the
-    extra term as noise. Putting u_{t-1} INTO the observation is also not free
-    here: it changes obs_dim and so trips the ``obs_dim == 2*x_dim + u_dim``
-    layout assertion the CLActor backbones rely on (see runner.py). And the
-    spatial term is not expressible as a reward at all — the environment has no
-    handle on pi to evaluate it at a second, perturbed state. As a policy-loss
-    term CAPS touches none of that: same MDP, same observation, same dynamics,
-    so the offline CV-STEM synthesis and the contraction certificate it produces
-    remain valid.
+    LOSS, not reward. A ``-||u_t - u_{t-1}||^2`` reward makes the return depend
+    on u_{t-1}, which isn't observed — a different, partially observed MDP the
+    critic can only model as noise. Adding u_{t-1} to the obs changes obs_dim
+    and trips the ``obs_dim == 2*x_dim + u_dim`` assertion the CLActor backbones
+    rely on. And L_S isn't expressible as a reward at all: the env has no handle
+    on pi to evaluate at a second state. As a policy-loss term CAPS keeps the
+    MDP/obs/dynamics identical, so the offline CV-STEM certificate stays valid.
 
-    WHERE THE STATES COME FROM — the agent's OWN memory, so CAPS inherits each
-    algorithm's data distribution instead of imposing a third one: for SAC the
-    persistent replay buffer its critic is trained on, for PPO the rollout
-    memory, whose ``memory_size`` is ``rollouts`` — exactly the on-policy batch
-    the policy gradient uses and nothing older.
+    STATES come from the agent's OWN memory, so CAPS inherits each algorithm's
+    data distribution rather than imposing a third: SAC's replay buffer, PPO's
+    rollout memory (exactly the on-policy batch, nothing older).
 
-    The (s_t, s_t+1) pairing needs a ``next_observations`` column, which SAC
-    allocates itself (its target computation needs it) but PPO never does. This
-    patch allocates it unconditionally: ``create_tensor`` is idempotent for a
-    matching name/size/dtype, and since every call site patches BEFORE
-    ``agent.init()`` (see the module docstring) the memory is still empty either
-    way, so there is no per-algorithm branch to get wrong. It is then filled
-    through the SAME ``add_samples`` call the agent already makes — injected via
-    a wrapper rather than a second call, so the memory index still advances
-    exactly once per transition (and for SAC the injected value is simply the
-    one the agent was passing anyway).
+    The (s_t, s_t+1) pairing needs a ``next_observations`` column that SAC
+    allocates but PPO doesn't. Allocated unconditionally here: create_tensor is
+    idempotent and the memory is still empty (see module docstring on ordering),
+    so there's no per-algorithm branch to get wrong. Filled by wrapping the
+    agent's existing ``add_samples`` — a second call would advance memory_index
+    twice and desync the columns. Read via ``sample_by_index``, never by
+    extending ``_tensors_names``: both agents unpack ``memory.sample()`` into a
+    fixed-arity tuple, so one extra name would raise.
 
-    The pairing is read with a separate ``sample_by_index``, never by extending
-    ``_tensors_names``: both agents unpack ``memory.sample(...)`` into a
-    fixed-arity tuple, and one extra name there would raise.
+    AUTORESET: a pair straddling an episode boundary isn't a real (s_t, s_t+1),
+    and smoothness across a reset is a discontinuity the policy can't control.
+    ``caps_valid`` drops both the ``terminated | truncated`` step (in-place
+    autoreset, what both families here do) AND the step after a done (what a
+    next-step-autoreset env would flag), so it's correct under either convention
+    without detecting which is live. Costs <=2 transitions/episode (<1% here).
 
-    AUTORESET. A transition whose ``next_observations`` straddles an episode
-    boundary is not a real (s_t, s_{t+1}) pair, and asking the policy to be
-    smooth across a reset is asking it to be smooth across a discontinuity it
-    cannot control. Both env families here reset IN PLACE at the terminating
-    step (classic ``env_base.step`` calls ``reset_idx`` and returns the
-    post-reset observation, keeping the true final one in
-    ``info["final_observation"]``; Isaac Lab does the same), so the bogus pair
-    is the one flagged ``terminated | truncated``. The stored ``caps_valid``
-    mask ALSO drops the step immediately after a done, which is what a
-    next-step-autoreset env would flag instead — so the mask is correct under
-    either convention without having to detect which is in play. The cost is at
-    most two transitions per episode (<1% at the ~300-step episodes here);
-    splicing ``info["final_observation"]`` back in would recover them, but for
-    SAC that would mean rewriting the ``next_observations`` its critic target
-    bootstraps from, which is not this patch's business.
+    INJECTION POINT: both agents route every policy backward through
+    ``scaler.scale(loss).backward()`` right after the update's one grad-enabled
+    ``policy.act(role="policy")``. Arming on that act and consuming on the next
+    scale puts the CAPS gradient in the same backward as the policy loss, hence
+    INSIDE grad_norm_clip — a separate ``.backward()`` would escape it. SAC's
+    critic scale precedes the act and its entropy scale follows the consume, so
+    neither is hit. PPO's kl_threshold break leaves the flag armed and it is
+    consumed by the next update's policy scale — still never a critic/entropy one.
 
-    Where the loss is injected. Both skrl PPO and SAC route every policy
-    backward through ``self.scaler.scale(<loss>).backward()``, immediately after
-    the one grad-enabled ``policy.act(..., role="policy")`` of that update. This
-    arms on that act() and consumes on the next scale(), so the CAPS gradient
-    lands in the same backward as the policy loss — and therefore INSIDE the
-    subsequent ``grad_norm_clip``, which a separate ``.backward()`` before
-    ``optimizer.step()`` would have escaped. SAC's critic-loss scale() call
-    precedes the policy act() and its entropy-loss call follows the consume, so
-    neither is affected. PPO's ``kl_threshold`` early stop breaks out between
-    the act() and the scale(), leaving the flag armed; the next scale() to run
-    is the next update's policy scale, so the invariant that survives is the one
-    that matters — at most one CAPS term per policy backward, never on a critic
-    or entropy one.
+    SPATIAL PERTURBATION covers only the leading ``x`` block when the policy
+    exposes an x_dim (else the whole obs). For control backbones
+    ``u = uref + feedback(x - xref)``, so perturbing uref shifts the output by
+    exactly that amount — irreducible feedforward pass-through that would floor
+    L_S and push the policy to suppress its own uref term.
 
-    Which observation dimensions get perturbed (spatial term). For the
-    ``control``/``control-squashed`` backbones the observation is
-    ``[x, xref, uref]`` and the control law is ``u = uref + feedback(x - xref)``,
-    so perturbing ``uref`` shifts the output by exactly that perturbation. That
-    is pure feedforward pass-through, structurally required and NOT reducible by
-    the network — penalizing it would put an irreducible floor on L_S and push
-    the policy to suppress its own uref term. Only the leading ``x`` block is
-    perturbed when the policy exposes an ``x_dim``; otherwise (a flat
-    observation with no such split, e.g. velocity tracking) the whole
-    observation is. ``_resolve_x_dim`` covers every backbone's spelling of it.
+    ``spatial_std`` is in RAW obs units (perturbation added pre-preprocessor),
+    so enabling use_state_norm would shrink what the policy actually sees.
+    Inert today (state norm off everywhere), but note a single scalar sigma
+    under-regularizes any dimension with a much wider range than the rest.
 
-    ``spatial_std`` is in RAW observation units: the perturbation is added to
-    the stored observation and the preprocessor is applied afterwards, so
-    turning ``use_state_norm`` on would shrink the perturbation the policy
-    actually sees by that dimension's running std rather than leaving sigma in
-    normalized units. Inert today (state normalization is off in every config
-    and train.py force-disables it), but the scale is per-dimension either way —
-    a state component with a much wider range than the rest is effectively
-    under-regularized at a single scalar sigma.
-
-    No-op unless at least one scale is positive, and no-op for agents without
-    ``policy``/``scaler``/``memory`` (C2RL's outer agent — it patches its inner
-    PPO/SAC sub-agent directly, see c2rl.py).
+    No-op unless a scale is positive, or without policy/scaler/memory (C2RL's
+    outer agent — it patches its inner sub-agent directly).
     """
     temporal_scale = float(temporal_scale)
     spatial_scale = float(spatial_scale)
@@ -302,11 +323,10 @@ def patch_caps_regularizer(
     _orig_act = policy.act
 
     # ── make the (s_t, s_t+1) pairing readable from the agent's own memory ──
-    # create_tensor is idempotent for a matching name/size/dtype, so this is a
-    # no-op for whichever columns the agent allocates for itself in init().
-    # next_states returns False (nothing allocated) when state_space is None,
-    # which is the norm here; sample_by_index then yields None for that name and
-    # the policy gets states=None, exactly as it does during a normal update.
+    # Idempotent, so a no-op for columns the agent allocates itself in init().
+    # next_states allocates nothing when state_space is None (the norm here);
+    # sample_by_index then yields None and the policy gets states=None, exactly
+    # as in a normal update.
     memory.create_tensor(name="next_observations", size=agent.observation_space, dtype=torch.float32)
     memory.create_tensor(name="next_states", size=agent.state_space, dtype=torch.float32)
     memory.create_tensor(name="caps_valid", size=1, dtype=torch.bool)
@@ -316,9 +336,6 @@ def patch_caps_regularizer(
     _prev_done = torch.zeros((memory.num_envs, 1), dtype=torch.bool, device=device)
     _pending: dict = {}
 
-    # Injected into the agent's existing add_samples call rather than added by a
-    # second one: add_samples advances memory_index itself, so calling it twice
-    # per transition would desynchronize our columns from the agent's.
     _orig_add_samples = memory.add_samples
 
     def _add_samples(**tensors):
@@ -348,9 +365,8 @@ def patch_caps_regularizer(
     agent.record_transition = _record
 
     # ── the CAPS loss itself ────────────────────────────────────────────────
-    # _orig_act, not policy.act: the arming wrapper installed below must not see
-    # these forwards, and calling the pre-patch method is what keeps it from
-    # doing so — there is no re-entrancy to guard against.
+    # _orig_act, not policy.act: the arming wrapper below must not see these
+    # forwards, and calling the pre-patch method is what keeps it from doing so.
     def _policy_mean(obs, states):
         inputs = {"observations": obs_pre(obs, train=False),
                   "states": states if states is None else state_pre(states, train=False)}
@@ -373,10 +389,9 @@ def patch_caps_regularizer(
 
         if temporal_scale > 0.0 and bool(valid.any()):
             next_mean = _policy_mean(next_obs, next_states)
-            # Masked mean over surviving pairs, not sum/N — otherwise the
-            # effective coefficient would silently shrink with the episode-
-            # boundary fraction (and swing with termination rate as the
-            # policy improves).
+            # Masked MEAN over surviving pairs, not sum/N — else the effective
+            # coefficient silently shrinks with the episode-boundary fraction,
+            # swinging with the termination rate as the policy improves.
             sq = ((mean - next_mean) ** 2).sum(dim=-1, keepdim=True)
             l_t = (sq * valid).sum() / valid.sum().clamp(min=1)
             agent.track_data("Loss / CAPS temporal", l_t.item())
@@ -420,25 +435,16 @@ def patch_caps_regularizer(
 
 
 def patch_algo_namespace(agent, algo_name: str) -> None:
-    """Namespace this agent's own track_data() keys under ``algo_name``.
+    """Rewrite track_data keys "{cat} / {name}" -> "{cat} / {algo_name}/{name}".
 
-    C3M/C2RL already log their internals as "{tab} / {ALGO}/{metric}" (e.g.
-    "Loss / C3M/dynamics/mse", see c3m.py/c2rl.py) so runs from different
-    algorithms don't collide on the same wandb Loss/Policy/Learning panels.
-    Standalone PPO/SAC never got the same treatment — skrl's own track_data
-    calls (ppo.py/sac.py: "Loss / Policy loss", "Q-network / Q1 (max)", ...)
-    and ours (patch_kl_logging's "Policy / KL divergence") land un-namespaced.
-    This rewrites "{category} / {name}" -> "{category} / {algo_name}/{name}"
-    for every track_data() call, matching that convention.
+    C3M/C2RL already namespace their internals this way so runs from different
+    algorithms don't collide on the same wandb panels; standalone PPO/SAC never
+    did, leaving skrl's own keys ("Loss / Policy loss", ...) un-namespaced.
 
-    "Reward / Total reward (mean/max/min)" is deliberately left untouched:
-    skrl's base Agent writes that EXACT key straight into tracking_data
-    (base.py, bypassing track_data()) to pick the best_agent.pt checkpoint,
-    and patch_auc_checkpoint below injects into that same key via
-    track_data() to redirect the checkpoint metric to contraction_score/AUC —
-    renaming it here would silently break both. Stability/*, Episode/*,
-    Info/* (also written directly into tracking_data, not through
-    track_data()) are unaffected regardless.
+    "Reward / *" is deliberately exempt: skrl's base Agent writes that EXACT key
+    straight into tracking_data (bypassing track_data) to pick best_agent.pt,
+    and patch_auc_checkpoint injects into it — renaming would silently break
+    both. Stability/*, Episode/*, Info/* also bypass track_data, so unaffected.
     """
     orig_track_data = agent.track_data
 
@@ -455,15 +461,10 @@ def patch_algo_namespace(agent, algo_name: str) -> None:
 def best_metric_for(algorithm: str) -> str:
     """Which stability metric an algorithm's best_agent.pt should track.
 
-    The two hard per-step contraction controllers that certify a metric
-    directly — ``c3m`` and ``cvstem-lqr`` — pick their best checkpoint by
-    ``contraction_score`` (λ/overshoot; higher is better). Every learned RL
-    policy (``ppo``/``sac``/``c2rl-ppo``/``c2rl-sac``) and the remaining
-    analytical baselines (``lqr``/``sdlqr``) pick by AUC (lower is better).
-
-    Accepts either the hyphen (Isaac ``_alg``: ``"cvstem-lqr"``/``"c2rl-ppo"``)
-    or underscore (classic ``algorithm``: ``"cvstem_lqr"``/``"c2rl_ppo"``)
-    spelling — both normalize to hyphens before the set check.
+    c3m/cvstem-lqr — the two controllers that certify a metric directly — use
+    ``contraction_score`` (λ/overshoot, higher better). Everything else (learned
+    policies, lqr/sdlqr) uses AUC (lower better). Accepts either the hyphen or
+    underscore spelling of the algorithm name.
     """
     norm = str(algorithm).lower().replace("_", "-")
     return "contraction_score" if norm in ("c3m", "cvstem-lqr") else "auc"
@@ -472,30 +473,23 @@ def best_metric_for(algorithm: str) -> str:
 def patch_auc_checkpoint(agent, metric: str = "auc") -> None:
     """Override agent.post_interaction to pick best_agent.pt by ``metric``.
 
-    skrl natively saves best_agent.pt by tracking the highest
-    'Reward / Total reward (mean)'. This redirects that checkpoint rule to a
-    stability metric by injecting into the SAME key (see patch_algo_namespace's
-    docstring for why 'Reward / Total reward (mean)' is the injection target —
-    base skrl reads exactly that key in post_interaction to choose the best).
+    skrl saves best_agent.pt by the highest 'Reward / Total reward (mean)'.
+    This redirects that rule by injecting a stability metric into the SAME key
+    (base skrl reads exactly that key in post_interaction).
 
-    ``metric="contraction_score"`` (c3m/cvstem-lqr): use
-    ``Stability/contraction_score_mean`` — higher is better, so it plugs into
-    skrl's "maximize reward" rule with no sign flip. ``metric="auc"``
-    (everything else): use ``-Stability/auc_mean`` (or ``-Episode/auc`` for
-    velocity-tracking envs) — lower AUC = better, hence the flip. If the chosen
-    metric isn't logged in a given step, the base reward is left untouched (the
-    c3m↔cvstem vs. AUC split is explicit — no cross-fallback). See
-    ``best_metric_for`` for the algorithm→metric mapping callers use.
+    "contraction_score": ``Stability/contraction_score_mean``, higher better, so
+    no sign flip. "auc": ``-Stability/auc_mean`` (or ``-Episode/auc`` for
+    vel-tracking), flipped since lower is better. If the chosen metric isn't
+    logged this step the base reward is left alone — no cross-fallback between
+    the two. See ``best_metric_for`` for the algorithm→metric mapping.
     """
     _orig_post = getattr(agent, "post_interaction", None)
     if _orig_post is None:
         return
 
     def _metric_post(*, timestep: int, timesteps: int) -> None:
-        # Stability/contraction_score and Stability/auc are logged with a
-        # "_mean" suffix (see contraction_metrics.py's track_stability_summary);
-        # Episode/auc (velocity-tracking envs) has no such suffix — it's a
-        # single value from a different, unrelated logging path.
+        # Stability/* carries a "_mean" suffix; Episode/auc (vel-tracking) does
+        # not — it comes from a different logging path.
         if metric == "contraction_score":
             score_list = agent.tracking_data.get("Stability/contraction_score_mean")
             if score_list:

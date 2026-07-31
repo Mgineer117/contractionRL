@@ -25,7 +25,8 @@ agent:
   metric_source: online
   # R = r_scaler·I, used in BOTH the metric SDP's Riccati term AND the deployed
   # gain K = R⁻¹BᵀM — a single knob so K stays the CERTIFIED CV-STEM gain.
-  r_scaler: 1.0
+  # Tuned 2026-07-29 alongside cm.lbd below — see that comment.
+  r_scaler: 0.5657
   experiment:
     directory: "quadrotor_cvstem_lqr"
     experiment_name: ""
@@ -39,9 +40,25 @@ agent:
 # ── Contraction metric SDP (both metric sources) ───────────────────────────── #
 cm:
   w_ub: 10.0    # Upper eigenvalue bound for W (M ≥ 1/w_ub)
-  w_lb: 0.1     # Lower eigenvalue bound for W (M ≤ 1/w_lb)
+  # lbd/w_lb/cm_eps/r_scaler tuned 2026-07-29 via the REAL wandb sweep infra
+  # THIS yaml drives (search/search_cluster.sh --algorithm cvstem-lqr --env
+  # quadrotor -> search/configs/cvstem-lqr.yaml): online per-step SDP solve,
+  # full 400-step/64-env rollout, aborts on the FIRST infeasible state
+  # anywhere, metric = Stability/auc_mean (minimize). An earlier LOCAL
+  # heuristic pass (checking only 200 STATIC reference-sampled states, not a
+  # real closed-loop rollout) had picked lbd=0.1/r_scaler=5.0/w_lb=0.1 --
+  # feasible there, but the real sweep showed it is a WEAK point: AUC=9.72 at
+  # full 64-env scale vs. the sweep's best of AUC=1.79. The full-rollout
+  # abort-on-infeasible test is dramatically stricter than any static-sample
+  # check: most of the search grid (lbd>1.0, or w_ub<10) was 100% infeasible
+  # across dozens of trials. Best of 15 feasible trials (of ~95 total):
+  #   AUC=1.79  r_scaler=0.5657  lbd=0.5  w_lb=0.01  w_ub=10  cm_eps=1.0
+  # cm_eps=1.0 was the LOOSEST value in the grid ([0.001,0.01,0.1,1]) -- every
+  # top feasible trial used it (one exception at 0.1), so the true optimum may
+  # sit even looser than what this grid covered.
+  w_lb: 0.01    # Lower eigenvalue bound for W (M ≤ 1/w_lb)
   lbd: 0.5      # Contraction rate λ
-  cm_eps: 0.01  # Strict-definiteness margin on the contraction LMI
+  cm_eps: 1.0   # Strict-definiteness margin on the contraction LMI — see tuning note above
   cm_solver: MOSEK  # SCS (no license) | CLARABEL | MOSEK (tightest/fastest; see README)
   max_lambda_reductions: 5  # per-state λ-backoff budget on SDP infeasibility
   # ── metric_source=pretrained only ──

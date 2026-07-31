@@ -27,22 +27,18 @@ Policy          a deterministic callable obs(1, 2*x_dim+u_dim) -> u(1, u_dim).
 Normalized error (the quantity every plot shows):
     r(t) = sqrt( e_tᵀ M(x_t) e_t / e_0ᵀ M(x_0) e_0 ),   e_t = wrap(x_t - xref_t)
 
-Scope — u_dim <= 2 only (car/turtlebot: 2, cartpole/segway: 1). This is a
-deliberate restriction, not a limitation to work around: for one or two
-control inputs the FULL control space is directly plottable, so the error
-landscape is shown COMPLETE with no projection and no information loss:
+Scope — u_dim <= 2 only (car/turtlebot 2, cartpole/segway 1). A deliberate
+restriction, not a limitation to work around: at one or two inputs the FULL
+control space is plottable, so the landscape is COMPLETE, with no projection and
+no information loss (u_dim 1 -> a t x u surface; u_dim 2 -> a u0 x u1 surface
+animated over t).
 
-  * u_dim == 1 -> a t x u surface (see ``compute_landscape_1d``).
-  * u_dim == 2 -> a u0 x u1 surface per timestep, animated over t (see
-    ``compute_landscape_2d``).
-
-Any dimension-reducing projection onto a scalar axis (an earlier design here)
-is strictly worse and provably so: no continuous injection R^m -> R^1 exists
-for m >= 2, so a bijection like digit-interleaving is necessarily
-discontinuous and destroys exactly the neighborhood structure a plot's shape
-depends on. For m > 2 the principled reduction is a LINEAR projection onto
-span(B^T(2Me + w)) — the single direction the contraction rate depends on to
-first order — but for m <= 2 no reduction is needed at all, so none is used.
+Projecting down to a scalar axis (an earlier design) is provably worse: no
+continuous injection R^m -> R^1 exists for m >= 2, so a bijection like
+digit-interleaving is necessarily discontinuous and destroys exactly the
+neighborhood structure the plot's shape depends on. For m > 2 the principled
+reduction is a LINEAR projection onto span(B^T(2Me + w)), the one direction the
+contraction rate depends on to first order — but at m <= 2 none is needed.
 """
 
 from __future__ import annotations
@@ -62,9 +58,8 @@ _SRC = os.path.join(_REPO_ROOT, "source", "contractionRL")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-import gymnasium as gym  # noqa: E402
-
 import contractionRL.tasks.direct.classic  # noqa: F401,E402  registers classic-*-v0
+import gymnasium as gym  # noqa: E402
 from contractionRL.agents.skrl.angle_utils import wrap_diff  # noqa: E402
 from contractionRL.agents.skrl.math_utils import (  # noqa: E402
     b_jacobian,
@@ -872,30 +867,24 @@ def trunk_states(env, scen: Scenario, mode: str = "cvstem_lqr", *, env_name: str
                  ) -> tuple[torch.Tensor, torch.Tensor]:
     """The state/control sequence the error geometry is built along ("the trunk").
 
-    The trunk fixes WHERE the landscape is sampled; the swept candidate grid at
-    each trunk state is a throwaway branch that never feeds back into it. The
-    mode is a real modelling choice, because the trunk decides which region of
-    state space you end up looking at:
+    The trunk fixes WHERE the landscape is sampled; the candidate grid swept at
+    each trunk state is a throwaway branch that never feeds back. A real
+    modelling choice, since the trunk decides which region you end up looking at:
 
-      * ``uref`` — zero feedback, u = u_ref. The only mode that is fully
-        algorithm- AND metric-independent, so all metrics are guaranteed to be
-        compared at identical states. Its cost, and the reason it is not the
-        default, is that the error grows unchecked, so the trunk wanders into a
-        badly-tracked region that no working controller would visit.
-      * ``greedy`` — at each step apply the grid control minimising the
-        ``horizon``-step-ahead normalized error, i.e. the best a controller
-        confined to this grid could possibly do under ``metric``. This is
-        metric-DEPENDENT: one designated metric must drive the trunk for all
-        panels (see error_geometry.py --trunk-metric), otherwise the panels sit
-        on different trajectories and their differences are no longer
-        attributable to the metric alone.
+      * ``uref`` — zero feedback. The only fully algorithm- AND
+        metric-independent mode, so all metrics are compared at identical states.
+        Not the default because the error grows unchecked into a badly-tracked
+        region no working controller would visit.
+      * ``greedy`` — the grid control minimising the ``horizon``-step-ahead
+        normalized error, i.e. the best a grid-confined controller could do under
+        ``metric``. Metric-DEPENDENT, so ONE designated metric must drive the
+        trunk for all panels (error_geometry.py --trunk-metric) or the panels sit
+        on different trajectories and differences stop being attributable to it.
       * ``cvstem_lqr`` (default) / ``lqr`` / ``sd_lqr`` — follow that analytical
-        controller. Metric-independent (a fixed control law), so all panels
-        still share states, and the trunk stays in the well-tracked region a
-        real controller occupies. ``cvstem_lqr`` costs one SDP solve per step.
+        controller. Metric-independent, so panels still share states, and the
+        trunk stays where a real controller goes. cvstem_lqr costs one SDP/step.
 
-    Returns (x (T, x_dim), u (T-1, u_dim)) where u[k] is the control applied at
-    x[k] to reach x[k+1].
+    Returns (x (T, x_dim), u (T-1, u_dim)); u[k] takes x[k] to x[k+1].
     """
     if mode not in TRUNK_MODES:
         raise ValueError(f"Unknown trunk mode {mode!r}; choose from {TRUNK_MODES}")

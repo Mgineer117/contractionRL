@@ -10,15 +10,14 @@ stay recessive, text wears ink colors rather than series colors.
 
 from __future__ import annotations
 
-import numpy as np
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
 import matplotlib.patheffects as pe  # noqa: E402
-from matplotlib.colors import LinearSegmentedColormap, LogNorm  # noqa: E402
+import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib.colors import LogNorm  # noqa: E402
 from mpl_toolkits.mplot3d import Axes3D  # noqa: E402,F401  registers projection="3d"
-
 from viz_common import SERIES_COLORS  # noqa: E402
 
 # Every figure is saved as .svg (vector — see error_geometry.py/policy_overlay.py's

@@ -70,7 +70,6 @@ from __future__ import annotations
 
 from skrl.utils.runner.torch import Runner
 
-
 # Backbone → action-distribution family. Unbounded backbones sample from a raw
 # Normal (valid only for PPO-family trust-region methods); squashed backbones
 # tanh-bound the action + correct log_prob (valid only for SAC-family off-policy
@@ -148,10 +147,24 @@ def _gaussian_factory(observation_space, state_space, action_space, device,
     if backbone in ("control", "contraction"):
         obs_dim = observation_space.shape[0]
         act_dim = action_space.shape[0]
+        # CLActorModel requires obs layout [x, x_ref, u_ref, preview?]: obs_dim
+        # == 2*x_dim + u_dim + preview_dim, preview_dim >= 0.
+        remainder = obs_dim - act_dim
+        if x_dim is not None:
+            # x_dim is already known (the common case — contraction_runner
+            # passes the env's own x_dim), so there is no guess to validate:
+            # just check the true invariant. Unlike the x_dim-unknown branch
+            # below, remainder need NOT be even — an odd-width preview tail
+            # (e.g. an odd-u_dim env like cartpole with an odd point count)
+            # is perfectly valid and was wrongly rejected here before.
+            if remainder < 2 * x_dim:
+                raise ValueError(
+                    f"backbone: contraction requires obs_dim >= 2*x_dim + u_dim, but got "
+                    f"obs_dim={obs_dim}, x_dim={x_dim}, act_dim={act_dim}."
+                )
         # CLActorModel requires obs layout [x, x_ref, u_ref]: obs_dim == 2*x_dim + u_dim
         # and x_dim must be an integer
-        remainder = obs_dim - act_dim
-        if remainder <= 0 or remainder % 2 != 0:
+        elif remainder <= 0 or remainder % 2 != 0:
             raise ValueError(
                 f"backbone: contraction requires obs_dim = 2*x_dim + u_dim, but got "
                 f"obs_dim={obs_dim}, act_dim={act_dim} (remainder={remainder} is not even). "

@@ -54,11 +54,11 @@ import time
 
 import numpy as np
 import torch
-
 from viz_common import (
     CLASSIC_ENVS,
     METRIC_KINDS,
     OUTPUT_DIR,
+    TRUNK_MODES,
     compute_landscape_1d,
     compute_landscape_2d,
     control_grid,
@@ -70,7 +70,6 @@ from viz_common import (
     make_metric,
     make_policy,
     rollout,
-    TRUNK_MODES,
     trunk_states,
 )
 

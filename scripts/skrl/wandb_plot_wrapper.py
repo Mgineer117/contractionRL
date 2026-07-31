@@ -1,5 +1,7 @@
 import sys
+
 import numpy as np
+
 
 class WandbPlotWrapper:
     """
@@ -70,8 +72,8 @@ class WandbPlotWrapper:
         if "log" in info and "_log" in info and not lifted:
             mask = info["_log"]  # bool array (num_envs,)
             if isinstance(mask, np.ndarray) and mask.any():
-                from contractionRL.tasks.direct.common.eval_metrics import mean_confidence_interval
                 import torch
+                from contractionRL.tasks.direct.common.eval_metrics import mean_confidence_interval
                 raw_log = info["log"]
                 # raw_log is a dict whose leaf values are numpy arrays and whose
                 # sub-keys starting with "_" are masks — skip those.
@@ -110,8 +112,8 @@ class WandbPlotWrapper:
                             logs_list.setdefault(k, []).append(float(v))
 
                 if logs_list:
-                    from contractionRL.tasks.direct.common.eval_metrics import mean_confidence_interval
                     import torch
+                    from contractionRL.tasks.direct.common.eval_metrics import mean_confidence_interval
                     info["log"] = {}
                     for k, v_list in logs_list.items():
                         v_m, v_ci = mean_confidence_interval(np.array(v_list))

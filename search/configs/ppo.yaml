@@ -4,6 +4,12 @@ algorithm: ppo
 # train.py's _default_num_envs_classic.
 num_envs: 1024
 
+# DECREMENT Euclidean reward (‖e_prev‖²-‖e_next‖², M = I) rather than the
+# default per-step -‖e‖² level cost — see env_base.get_rewards' reward_euclidean
+# branch. Static flag, not a swept parameter (see build_sweep.py's extra_flags
+# comment for why a store_true flag can't go in `parameters:`).
+extra_flags: ["--reward_euclidean"]
+
 metric:
   name: "Reward / Total reward (mean)"
   goal: maximize
@@ -17,6 +23,15 @@ parameters:
     values: [0.1, 0.2, 0.3]
   agent.entropy_loss_scale:
     values: [0.0, 0.001, 0.01]
-  agent.models.policy.backbone:
+  models.policy.backbone:
     # mlp (plain MLP, u = MLP(obs)) | control (CLActor, u = uref + feedback(x-xref))
     values: [mlp, control]
+  # Same ladder as c3m.yaml's agent.actor_architecture, but applied to BOTH the
+  # actor and critic nets (train.py's network_architecture handling) — c3m has
+  # no critic, so this keeps the two searches on comparable network capacity.
+  network_architecture:
+    values:
+      - [64, 64]
+      - [128, 128]
+      - [512, 512]
+      - [128, 128, 128, 128]

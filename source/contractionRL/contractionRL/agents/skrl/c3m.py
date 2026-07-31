@@ -51,18 +51,17 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from tqdm import tqdm
 import tqdm as _tqdm
-from torch import matmul, transpose
-
 from skrl.agents.torch.base import Agent, AgentCfg
 from skrl.trainers.torch.base import Trainer, TrainerCfg
+from torch import matmul, transpose
+from tqdm import tqdm
 
 from .math_utils import (
     b_jacobian,
@@ -73,7 +72,6 @@ from .math_utils import (
     weighted_gradients,
 )
 from .rl_glue import filter_cfg_fields
-
 
 # ─────────────────────────────────────────────────────────────────────────── #
 # Configuration
@@ -225,7 +223,7 @@ class C3MAgent(Agent):
 
         obs_dim = int(observation_space.shape[0])
         u_dim_inferred = int(action_space.shape[0])
-        
+
         if u_dim is None:
             u_dim = u_dim_inferred
         if x_dim is None:
@@ -249,10 +247,10 @@ class C3MAgent(Agent):
             self._neural_dynamics = None
             self._dynamics_optimizer = None
         else:
-            self._neural_dynamics = models.get("dynamics", None)
+            self._neural_dynamics = models.get("dynamics")
             if self._neural_dynamics is None:
                 raise ValueError("C3M requires 'dynamics' model in models dictionary when use_empirical_dynamics=True")
-                
+
             self._get_f_and_B = self._neural_dynamics.get_f_and_B
             self._dynamics_optimizer = torch.optim.Adam(
                 self._neural_dynamics.parameters(), lr=cfg.dynamics_lr
@@ -448,7 +446,7 @@ class C3MAgent(Agent):
             C2_inner = DbW - 2 * sym_DbDxW
             C2 = matmul(matmul(transpose(Bbot, 1, 2), C2_inner), Bbot)
             c2_loss = c2_loss + (C2 ** 2).reshape(batch_size, -1).sum(1).mean()
-            
+
         Cu_reg = Cu + cfg.eps * I
         C1_reg = C1 + cfg.eps * torch.eye(C1.shape[-1], device=device)
 
@@ -513,7 +511,7 @@ class C3MAgent(Agent):
         iters = max(1, n // batch_size)
         total_pd = total_c1 = total_c2 = total_os = total_loss = 0.0
 
-        pbar = tqdm(range(iters), desc=f"Epoch C3M Update", leave=False)
+        pbar = tqdm(range(iters), desc="Epoch C3M Update", leave=False)
         for b in pbar:
             idx = indices[b * batch_size : (b + 1) * batch_size]
 
@@ -558,18 +556,18 @@ class C3MAgent(Agent):
         x     = torch.as_tensor(data["x"], dtype=torch.float32, device=dev)
         u     = torch.as_tensor(data["u"], dtype=torch.float32, device=dev)
         x_dot = torch.as_tensor(data["x_dot"], dtype=torch.float32, device=dev)
-        
+
         pred = self._neural_dynamics.predict_x_dot(x, u)
         loss = F.mse_loss(pred, x_dot)
-        
+
         self._dynamics_optimizer.zero_grad()
         loss.backward()
-        
+
         # Prevent NaNs from massive MSE losses by checking gradients and clipping
         if all(torch.isfinite(p.grad).all() for p in self._neural_dynamics.parameters() if p.grad is not None):
             torch.nn.utils.clip_grad_norm_(self._neural_dynamics.parameters(), 1.0)
             self._dynamics_optimizer.step()
-            
+
         return loss.item()
     def save_dynamics(self, path: str) -> None:
         """Save NeuralDynamics checkpoint for SDLQR/LQR/C2RL to load."""
@@ -605,7 +603,7 @@ class C3MSkrlTrainer(Trainer):
         # ever logged to W&B.
         agent.write_interval = eval_interval
         agent.init(trainer_cfg=self.cfg)
-        
+
         from .contraction_metrics import log_raw_config
         log_raw_config(getattr(self, "_wandb_raw_cfg", None))
         agent.enable_training_mode(True)

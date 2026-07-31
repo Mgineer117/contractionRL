@@ -6,8 +6,9 @@
 from __future__ import annotations
 
 import math
-import torch
 from collections.abc import Sequence
+
+import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation

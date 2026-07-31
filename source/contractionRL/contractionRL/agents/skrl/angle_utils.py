@@ -38,7 +38,7 @@ site that is not passed a ``pos_dim`` keeps the previous semantics.
 from __future__ import annotations
 
 import math
-from typing import Sequence
+from collections.abc import Sequence
 
 import torch
 

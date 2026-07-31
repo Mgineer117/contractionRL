@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from abc import abstractmethod
 import math
+from abc import abstractmethod
+
+import gymnasium as gym
 import numpy as np
 import torch
-import gymnasium as gym
 
 from contractionRL.tasks.direct.common.state_guard import carry_forward_nonfinite
+
 
 class BaseEnv(gym.Env):
     def __init__(self, env_config: dict, num_envs: int = 1, device: str = "cpu"):
@@ -95,7 +97,48 @@ class BaseEnv(gym.Env):
         self.init_tracking_error = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self.episode_reward = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
 
+        # Reference preview (the POMDP fix that makes a high discount_factor
+        # valid): a window of FUTURE uref rows appended to the observation.
+        # uref is the reference feedforward, so xref_t (already in the obs) plus
+        # the future uref sequence is a COMPLETE statistic for the future
+        # reference — the whole trajectory is a deterministic rollout of them.
+        # Off (byte-identical to the historic [x, xref, uref] layout) unless
+        # configure_preview() is called — from the training entry point with the
+        # run's discount_factor, or here if the env config pins both.
+        self.preview_offsets: list[int] = []
+        self._preview_offsets_t: torch.Tensor | None = None
+        # Off by default (byte-identical to the uref-only preview above) unless
+        # configure_preview(..., include_xref=True) is passed explicitly — see
+        # construct_state / set_preview_offsets.
+        self._preview_include_xref: bool = False
+        # On by default (byte-identical to the historic uref-only preview) —
+        # configure_preview(..., include_uref=False) drops the future-uref
+        # block from the preview tail entirely, testing whether xref alone
+        # (from which uref is in principle recoverable by differencing
+        # consecutive preview points) is enough. Needs include_xref=True or
+        # the preview tail would carry nothing at all.
+        self._preview_include_uref: bool = True
+
+        # Privileged, critic-ONLY state channel (asymmetric actor-critic) —
+        # skrl already threads a separate `states`/`state_space` alongside
+        # `observations`/`observation_space` to both policy.act() and
+        # value.act() (see skrl.envs.wrappers.torch.base.Wrapper.state_space /
+        # GymnasiumWrapper.state(), and skrl.agents.torch.ppo.PPO.act()); it
+        # was simply never populated here. `configure_value_state` (see below)
+        # sets this up so the CRITIC can see a richer future-xref trajectory
+        # than whatever preview the ACTOR's observation happens to carry —
+        # decoupled, not doubled: the actor is unaffected either way. None
+        # (default) leaves `state()` returning None and `state_space` unset,
+        # exactly as before this existed.
+        self._value_state_offsets_t: torch.Tensor | None = None
+        self.state_space = None
+
         self.reset()
+
+        _pp = int(env_config.get("preview_points", 0) or 0)
+        _g = env_config.get("discount_factor")
+        if _pp > 0 and _g is not None:
+            self.configure_preview(_pp, float(_g))
 
     @staticmethod
     def _build_cfg(env_config: dict, *, sample_mode: str = "uniform", time_bound: float | None = None, dt: float | None = None) -> dict:
@@ -125,10 +168,10 @@ class BaseEnv(gym.Env):
         n = len(env_ids)
         rand_xref = torch.rand(n, self.num_dim_x, device=self.device, dtype=torch.float32)
         xref_0 = self.XREF_INIT_MIN + rand_xref * (self.XREF_INIT_MAX - self.XREF_INIT_MIN)
-        
+
         rand_xe = torch.rand(n, self.num_dim_x, device=self.device, dtype=torch.float32)
         xe_0 = self.XE_INIT_MIN + rand_xe * (self.XE_INIT_MAX - self.XE_INIT_MIN)
-        
+
         return xref_0, xe_0, xref_0 + xe_0
 
     @abstractmethod
@@ -139,28 +182,30 @@ class BaseEnv(gym.Env):
         xref_list = [xref_0]
         xref_wrapped_list = [xref_0]
         uref_list = []
-        
+
         for i, _t in enumerate(self.t):
             uref_t = self.sample_reference_controls(freqs, weights, _t, {"xref_0": xref_0})
             xref_prev = xref_list[-1]
             f_x, B_x, _ = self.get_f_and_B(xref_prev)
             x_dot = f_x + torch.bmm(B_x, uref_t.unsqueeze(-1)).squeeze(-1)
             next_x = xref_prev + self.dt * x_dot
-            
+
             next_x_wrapped = self.wrap_angles(next_x)
             next_x_wrapped = torch.clamp(next_x_wrapped, self.X_MIN, self.X_MAX)
-            
+
             xref_list.append(next_x_wrapped)
             xref_wrapped_list.append(next_x_wrapped)
             uref_list.append(uref_t)
-            
+
         return torch.stack(xref_wrapped_list[:-1], dim=1), torch.stack(uref_list, dim=1), i + 1
 
     @abstractmethod
     def system_reset(self, env_ids: torch.Tensor):
         ...
 
-    def set_ccm(self, ccm_gen, w_lb, device, tracking_scaler=None, control_scaler=None):
+    def set_ccm(self, ccm_gen, w_lb, device, tracking_scaler=None, control_scaler=None,
+                reward_euclidean=False, reward_level=False,
+                residual_anchor_scale=0.0, cvstem_r_scaler=1.0):
         """Inject the frozen CMG (and, optionally, the reward weights) for C2RL.
 
         ``tracking_scaler``/``control_scaler`` default to None = keep whatever
@@ -172,6 +217,19 @@ class BaseEnv(gym.Env):
         self.ccm_gen = ccm_gen
         self.w_lb = w_lb
         self.ccm_device = device
+        # When True, get_rewards uses the raw Euclidean error decrement (M = I)
+        # instead of the Mahalanobis one — the AUC-aligned reward for residual RL
+        # over the CV-STEM-LQR baseline (the CMG is still kept, for that baseline).
+        self.reward_euclidean = bool(reward_euclidean)
+        # LEVEL vs DECREMENT euclidean reward (only when reward_euclidean). Level
+        # (r = -‖e‖) is the tightest AUC alignment; see get_rewards.
+        self.reward_level = bool(reward_level)
+        # Residual TRUST anchor: penalize ‖u - u_base‖² (u_base = the CV-STEM-LQR
+        # action from this same frozen CMG), so PPO deviates from the certified
+        # analytic base only when it strictly helps tracking — the base already
+        # beats CV-STEM-LQR, and the unanchored residual DEGRADES it. See get_rewards.
+        self.residual_anchor_scale = float(residual_anchor_scale)
+        self.cvstem_r = float(cvstem_r_scaler)
         if tracking_scaler is not None:
             self.tracking_scaler = float(tracking_scaler)
         if control_scaler is not None:
@@ -208,14 +266,38 @@ class BaseEnv(gym.Env):
         t_idx = self.time_steps[env_ids]
         xref_prev = self.xref[env_ids, torch.clamp(t_idx - 1, min=0)]
         xref_curr = self.xref[env_ids, torch.clamp(t_idx, max=self.max_episode_len - 1)]
-        
+
         error = self.wrap_angles(x - xref_prev)
         next_error = self.wrap_angles(next_x - xref_curr)
-        
+
         tracking_error = torch.norm(next_error, p=2, dim=-1) ** 2
         control_effort = torch.norm(u, p=2, dim=-1) ** 2
 
-        if getattr(self, "ccm_gen", None) is not None:
+        if getattr(self, "reward_euclidean", False):
+            # AUC-aligned reward paired with the CV-STEM-LQR residual baseline
+            # (cvstem_residual_base): the contraction certificate lives in the
+            # analytic baseline, so the learned residual is free to minimize the
+            # TRUE tracking error the eval AUC measures — not the frozen-CMG
+            # Mahalanobis proxy the baseline already ~minimizes (which let PPO
+            # only drift it, 1.06 -> 1.19). See nn_modules.CVSTEMLQRBase.
+            if getattr(self, "reward_level", False):
+                # LEVEL form: r = -‖e‖. AUC = ∫‖e‖/‖e0‖ dt, so the discounted sum
+                # of -‖e‖ IS (minus) the error integral — the tightest possible
+                # alignment. The DECREMENT form below telescopes to the ENDPOINT
+                # error e0²-eT², which a dawdle-then-settle policy games while
+                # keeping AUC high (measured plateau at 0.96). Linear norm (not
+                # squared) matches AUC's ‖e‖ weighting exactly.
+                err_norm = torch.norm(next_error, p=2, dim=-1)
+                reward = -self.tracking_scaler * err_norm \
+                    - self.control_scaler * control_effort
+            else:
+                # DECREMENT form: raw Euclidean error decrement ‖e_prev‖²-‖e_next‖²
+                # (M = I) — same telescoping shape as the Mahalanobis reward.
+                prev_sq = torch.norm(error, p=2, dim=-1) ** 2
+                reward = self.tracking_scaler * (prev_sq - tracking_error) \
+                    - self.control_scaler * control_effort
+            maha_tracking_error = None
+        elif getattr(self, "ccm_gen", None) is not None:
             from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
             with torch.no_grad():
                 if not hasattr(self, "M"):
@@ -235,7 +317,19 @@ class BaseEnv(gym.Env):
                 V = torch.bmm(torch.bmm(err_t.transpose(1, 2), M), err_t).squeeze(-1).squeeze(-1)
                 next_V = torch.bmm(torch.bmm(next_err_t.transpose(1, 2), next_M), next_err_t).squeeze(-1).squeeze(-1)
 
-                reward = self.tracking_scaler * (V - next_V) - self.control_scaler * control_effort
+                if getattr(self, "reward_level", False):
+                    # LEVEL form: R(t) = -‖e(t+1)‖²_M. Same rationale as the
+                    # euclidean reward_level branch above — the DECREMENT form
+                    # V - next_V telescopes to the endpoint error V_0 - V_T
+                    # (policy-independent up to that constant only at γ=1;
+                    # at γ<1 it still vanishes almost everywhere near the
+                    # optimum, starving PPO's advantage of signal exactly
+                    # where this policy lives — see project memory on the
+                    # single-update collapse). The level form's per-step
+                    # signal never vanishes.
+                    reward = -self.tracking_scaler * next_V - self.control_scaler * control_effort
+                else:
+                    reward = self.tracking_scaler * (V - next_V) - self.control_scaler * control_effort
                 # Mahalanobis tracking error V = eᵀM(x)e (squared, like
                 # "tracking_error" above) — the metric-weighted analog of the
                 # plain Euclidean error, so StatManagerEnvWrapper can plot a
@@ -244,6 +338,38 @@ class BaseEnv(gym.Env):
         else:
             reward = -self.tracking_scaler * tracking_error - self.control_scaler * control_effort
             maha_tracking_error = None
+
+        # Residual TRUST anchor (residual RL over CV-STEM-LQR): penalize the
+        # applied action's deviation from the analytic base action u_base =
+        # uref - (1/r)Bᵀ W⁻¹ (x - xref) built from this env's frozen CMG. The base
+        # already beats CV-STEM-LQR; the unanchored residual DEGRADES it (PPO games
+        # the decrement reward), so this keeps the policy at the base unless a
+        # deviation strictly helps tracking. See set_ccm / CVSTEMLQRBase.
+        if getattr(self, "residual_anchor_scale", 0.0) > 0 and getattr(self, "ccm_gen", None) is not None:
+            from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
+            with torch.no_grad():
+                r = self.cvstem_r + 1e-5
+                uref_curr = self.uref[env_ids, torch.clamp(t_idx, max=self.max_episode_len - 1)]
+                _f, B, _ = self.get_f_and_B(x)
+                Wb = bound_W(self.ccm_gen(x)[0], self.w_lb, self.num_dim_x,
+                             getattr(self.ccm_gen, "bounded", False))
+                Kb = (1.0 / r) * torch.bmm(B.transpose(1, 2).to(torch.float32), spd_inverse(Wb))
+                e_b = self.wrap_angles(x - xref_curr).unsqueeze(-1)
+                u_base = uref_curr - torch.bmm(Kb, e_b).squeeze(-1)
+                # ``u`` reaching get_rewards has ALREADY been clamped to
+                # [U_MIN, U_MAX] by step(), so u_base must be too or the two
+                # sides of this penalty live in different spaces. It is not a
+                # small discrepancy: at cvstem_r_scaler=0.01 the analytic gain
+                # is ‖K‖₂ ≈ 53, putting ~86% of u_base's components outside the
+                # box (measured on the cached car CM dataset). Unclamped, the
+                # anchor charges a large, IRREDUCIBLE penalty no matter what the
+                # policy does, and the only gradient it supplies pushes the
+                # action hard against the saturation boundary — the opposite of
+                # the intended "stay near the certified base unless deviating
+                # strictly helps" trust region. Clamping makes both sides the
+                # control the plant actually applies.
+                u_base = torch.clamp(u_base, self.U_MIN, self.U_MAX)
+            reward = reward - self.residual_anchor_scale * torch.norm(u - u_base, p=2, dim=-1) ** 2
 
         infos = {
             "tracking_error": tracking_error,
@@ -267,15 +393,15 @@ class BaseEnv(gym.Env):
     def reset_idx(self, env_ids: torch.Tensor):
         if len(env_ids) == 0:
             return
-            
+
         self.time_steps[env_ids] = 0
         self.episode_reward[env_ids] = 0.0
-        
+
         x_0, xref_arr, uref_arr, _ = self.system_reset(env_ids)
         self.xref[env_ids] = torch.clamp(xref_arr, self.X_MIN, self.X_MAX)
         self.uref[env_ids] = uref_arr
         self.x_t[env_ids] = x_0
-        
+
         self.init_tracking_error[env_ids] = torch.norm(x_0 - self.xref[env_ids, 0], p=2, dim=-1) ** 2
 
         if getattr(self, "ccm_gen", None) is not None:
@@ -303,32 +429,32 @@ class BaseEnv(gym.Env):
         u = torch.nan_to_num(u)
         u = torch.clamp(u, self.U_MIN, self.U_MAX)
         self.time_steps += 1
-        
+
         f_x, B_x, _ = self.get_f_and_B(self.x_t)
         x_dot = f_x + torch.bmm(B_x, u.unsqueeze(-1)).squeeze(-1)
         next_x = self.x_t + self.dt * x_dot
-        
+
         next_x = carry_forward_nonfinite(next_x, self.x_t)
-        
+
         pos_min = self.X_MIN[:self.pos_dimension]
         pos_max = self.X_MAX[:self.pos_dimension]
         out_of_bounds = (next_x[:, :self.pos_dimension] < pos_min) | (next_x[:, :self.pos_dimension] > pos_max)
         invalid_mask = out_of_bounds.any(dim=-1)
         next_x[invalid_mask, :self.pos_dimension] = self.x_t[invalid_mask, :self.pos_dimension]
-        
+
         next_x_wrapped = self.wrap_angles(next_x)
         next_x_wrapped = torch.clamp(next_x_wrapped, self.X_MIN, self.X_MAX)
-        
+
         reward, infos = self.get_rewards(self.x_t, u, next_x_wrapped, torch.arange(self.num_envs, device=self.device))
         self.episode_reward += reward
 
         self.x_t = next_x_wrapped
         state = self.construct_state(self.x_t)
-        
+
         termination = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         truncation = self.time_steps >= self.episode_len
         dones = termination | truncation
-        
+
         info_dict = {
             "x": self.x_t.clone(),
             "tracking_error": infos["tracking_error"],
@@ -341,7 +467,7 @@ class BaseEnv(gym.Env):
         # value (flat) because get_rewards' infos are rebuilt into this dict here.
         if "maha_tracking_error" in infos:
             info_dict["maha_tracking_error"] = infos["maha_tracking_error"]
-        
+
         if dones.any():
             done_idx = dones.nonzero(as_tuple=False).squeeze(-1)
 
@@ -355,11 +481,11 @@ class BaseEnv(gym.Env):
 
             info_dict["final_observation"] = state[done_idx].clone()
             info_dict["_final_observation"] = dones.clone()
-            
+
             self.reset_idx(done_idx)
             # Reconstruct state after reset for done envs (IsaacLab standard)
             state = self.construct_state(self.x_t)
-            
+
         return state, reward, termination, truncation, info_dict
 
     def get_f_and_B(self, x: torch.Tensor):
@@ -367,7 +493,7 @@ class BaseEnv(gym.Env):
             with torch.no_grad():
                 f_x, B_x, Bbot_x = self.learned_dynamics_model(self.wrap_angles(x))
             return f_x, B_x, Bbot_x
-        
+
         return self._f_logic(x), self._B_logic(x), self._B_null_logic(x)
 
     def get_rollout(self, buffer_size: int, mode: str, num_control_per_state: int | None = None):
@@ -394,11 +520,11 @@ class BaseEnv(gym.Env):
         else:
             x = self.X_MIN + torch.rand(batch_size, self.num_dim_x, device=self.device) * (self.X_MAX - self.X_MIN)
             u = self.UREF_MIN + torch.rand(batch_size, self.num_dim_control, device=self.device) * (self.UREF_MAX - self.UREF_MIN)
-        
+
         x = x.repeat(n_control_per_x, 1)
         u_list = [u[torch.randperm(batch_size)] for _ in range(n_control_per_x)]
         u = torch.cat(u_list, dim=0)
-        
+
         f, B, _ = self.get_f_and_B(x)
         x_dot = f + torch.bmm(B, u.unsqueeze(-1)).squeeze(-1)
         # "x_dot", not "x_next": every consumer of a "dynamics" rollout
@@ -417,12 +543,180 @@ class BaseEnv(gym.Env):
             x_copy[:, idx] = (x_copy[:, idx] + math.pi) % (2 * math.pi) - math.pi
         return x_copy
 
+    def _preview_offsets(self, num_points: int, gamma: float) -> list[int]:
+        """Geometrically-spaced future-step offsets spanning the effective horizon.
+
+        The window EXTENT is the discount's effective horizon ``H = 1/(1-gamma)``
+        (in steps) — how far the value function actually looks — clamped to the
+        episode. Within ``[1, H]`` it places ``num_points`` unique offsets on a
+        GEOMETRIC ladder: near-term references (where the error is being crushed
+        now) get dense coverage, the far horizon a few anchors, matching how the
+        discount weights them. At a low gamma ``H`` collapses to ~1, so preview
+        is ~just the next uref — exactly when look-ahead is not needed anyway.
+        """
+        if not num_points or gamma is None or not (0.0 < gamma < 1.0):
+            return []
+        H = min(self.max_episode_len - 1, max(1, int(round(1.0 / (1.0 - gamma)))))
+        if num_points >= H:
+            return list(range(1, H + 1))
+        geom = torch.logspace(0.0, math.log10(float(H)), num_points)
+        offs = sorted({int(round(v)) for v in geom.tolist() if 1 <= round(v) <= H})
+        return offs
+
+    def set_preview_offsets(self, offsets: Sequence[int], include_xref: bool = False,
+                            include_uref: bool = True) -> None:
+        """Set the preview window to an EXPLICIT list of step offsets and widen
+        the observation space to match. Used to make a fresh eval env mirror the
+        training env's exact layout (copy its ``preview_offsets``).
+
+        ``include_xref=False`` (default) reproduces the historic uref-only
+        preview EXACTLY. ``include_xref=True`` additionally appends, for each
+        offset, the future reference position RELATIVE TO THE CURRENT STATE
+        (``wrap_angles(xref_future - x)`` — see ``construct_state``): a
+        translation-invariant "where is the path heading from here" signal,
+        one ``x_dim``-wide block per offset, ordered nearest-offset-first like
+        the uref block it follows. NOT full SE(2)-invariant (no rotation into
+        the current heading frame) — a deliberate simplification.
+
+        ``include_uref=False`` drops the future-uref block from the preview
+        tail entirely (the tail becomes xref-only) — needs ``include_xref=True``
+        or the preview would carry nothing. Default True reproduces the
+        historic layout exactly.
+        """
+        self.preview_offsets = [int(o) for o in offsets]
+        self._preview_include_xref = bool(include_xref) and bool(self.preview_offsets)
+        self._preview_include_uref = bool(include_uref) and bool(self.preview_offsets)
+        if not self.preview_offsets:
+            self._preview_offsets_t = None
+            self.observation_space = gym.spaces.Box(
+                low=self.STATE_MIN.cpu().numpy(), high=self.STATE_MAX.cpu().numpy(),
+                dtype=np.float32)
+            return
+        self._preview_offsets_t = torch.tensor(
+            self.preview_offsets, device=self.device, dtype=torch.long)
+        p = len(self.preview_offsets)
+        lo, hi = self.STATE_MIN, self.STATE_MAX
+        if self._preview_include_uref:
+            lo = torch.cat([lo] + [self.UREF_MIN] * p)
+            hi = torch.cat([hi] + [self.UREF_MAX] * p)
+        if self._preview_include_xref:
+            # Symmetric superset bound for a relative-position difference —
+            # X_MIN/X_MAX are x_dim-wide (STATE_MIN/MAX are the FULL [x,xref,
+            # uref] base width; using those here would over-widen by (u_dim +
+            # x_dim) per point instead of x_dim).
+            rel_lo = self.X_MIN - self.X_MAX
+            rel_hi = self.X_MAX - self.X_MIN
+            lo = torch.cat([lo] + [rel_lo] * p)
+            hi = torch.cat([hi] + [rel_hi] * p)
+        self.observation_space = gym.spaces.Box(
+            low=lo.cpu().numpy(), high=hi.cpu().numpy(), dtype=np.float32)
+
+    def _full_trajectory_offsets(self) -> list[int]:
+        """EVERY future step offset from the current time to episode end
+        (dense, not the geometric ladder — see ``_preview_offsets``). Meant to
+        pair with a sequence gate encoder (``film_gate_encoder in ("gru",
+        "attn")``): rather than hand-picking a small window sized off the
+        discount's effective horizon, hand the encoder the WHOLE remaining
+        reference and let it learn what to attend to / how much to forget.
+        Cost warning: construct_state recomputes this EVERY step, so the
+        gate encoder's forward pass is O(max_episode_len) per step instead of
+        O(num_preview) — an O(max_episode_len^2) cost per episode overall.
+        Intended for GPU (cluster) runs, not the CPU-only local sweeps."""
+        return list(range(1, self.max_episode_len))
+
+    def configure_preview(self, num_points: int, gamma: float, include_xref: bool = False,
+                          full_trajectory: bool = False, include_uref: bool = True) -> None:
+        """Enable/resize reference preview and widen the observation space to
+        match. Must be called BEFORE the agent/memory are built off
+        ``observation_space``. Idempotent; ``num_points<=0`` disables preview.
+        ``include_xref`` — see ``set_preview_offsets`` — defaults to False,
+        reproducing the historic uref-only preview exactly. ``full_trajectory``
+        (see ``_full_trajectory_offsets``) replaces the geometric ``num_points``/
+        ``gamma`` ladder with every future offset up to episode end; ``gamma``
+        is unused in that case (kept in the signature so callers don't branch).
+        ``include_uref=False`` drops the future-uref block, testing an
+        xref-only preview (needs ``include_xref=True`` or there is nothing
+        left in the tail)."""
+        offsets = self._full_trajectory_offsets() if full_trajectory else self._preview_offsets(int(num_points), gamma)
+        self.set_preview_offsets(offsets, include_xref=include_xref, include_uref=include_uref)
+        if self.preview_offsets:
+            if self._preview_include_uref and self._preview_include_xref:
+                _what = "future-uref + relative-future-xref"
+            elif self._preview_include_xref:
+                _what = "relative-future-xref (uref EXCLUDED)"
+            else:
+                _what = "future-uref"
+            print(f"[BaseEnv] reference preview: {len(self.preview_offsets)} {_what} "
+                  f"points at step offsets {self.preview_offsets} (gamma={gamma}) -> "
+                  f"obs_dim {self.observation_space.shape[0]}")
+
+    def configure_value_state(self, num_points: int, gamma: float = 0.99,
+                              full_trajectory: bool = False) -> None:
+        """Enable the PRIVILEGED critic-only state channel: ``[x, future-xref
+        relative to x]`` at ``num_points`` offsets (or every remaining step if
+        ``full_trajectory``), completely independent of whatever preview the
+        ACTOR's own observation carries (see the ``_value_state_offsets_t``
+        docstring in ``__init__``). Must be called BEFORE the agent/memory are
+        built off ``state_space``, mirroring ``configure_preview``. Idempotent;
+        ``num_points<=0`` (and not full_trajectory) disables it (``state()``
+        then returns ``None``, ``state_space`` stays ``None``)."""
+        offsets = self._full_trajectory_offsets() if full_trajectory else self._preview_offsets(int(num_points), gamma)
+        if not offsets:
+            self._value_state_offsets_t = None
+            self.state_space = None
+            return
+        self._value_state_offsets_t = torch.tensor(offsets, device=self.device, dtype=torch.long)
+        p = len(offsets)
+        # Same symmetric superset bound construct_state uses for its own
+        # relative-xref preview block (see set_preview_offsets).
+        rel_lo = self.X_MIN - self.X_MAX
+        rel_hi = self.X_MAX - self.X_MIN
+        lo = torch.cat([self.X_MIN] + [rel_lo] * p)
+        hi = torch.cat([self.X_MAX] + [rel_hi] * p)
+        self.state_space = gym.spaces.Box(low=lo.cpu().numpy(), high=hi.cpu().numpy(), dtype=np.float32)
+        print(f"[BaseEnv] privileged critic state: {p} relative-future-xref points "
+              f"at step offsets {offsets} (gamma={gamma}) -> state_dim {self.state_space.shape[0]}")
+
+    def state(self) -> torch.Tensor | None:
+        """The privileged critic-only state ``[x, future-xref relative to x]``
+        — see ``configure_value_state``. ``None`` when not configured (skrl's
+        ``GymnasiumWrapper.state()`` catches the resulting exception from
+        indexing a ``None`` offsets tensor and returns ``None`` itself, but we
+        short-circuit explicitly here for clarity)."""
+        if self._value_state_offsets_t is None:
+            return None
+        idx = torch.clamp(self.time_steps, max=self.max_episode_len - 1)
+        env_idx = torch.arange(self.num_envs, device=self.device)
+        pidx = torch.clamp(idx.unsqueeze(-1) + self._value_state_offsets_t.unsqueeze(0),
+                           max=self.max_episode_len - 1)                    # (N, P)
+        xref_fut = self.xref[env_idx.unsqueeze(-1), pidx]                   # (N, P, x_dim)
+        p = xref_fut.shape[1]
+        raw_rel = (xref_fut - self.x_t.unsqueeze(1)).reshape(self.num_envs * p, -1)
+        xref_rel = self.wrap_angles(raw_rel).reshape(self.num_envs, p, -1)  # relative to CURRENT x
+        return torch.cat([self.x_t, xref_rel.reshape(self.num_envs, -1)], dim=-1)
+
     def construct_state(self, x: torch.Tensor):
         idx = torch.clamp(self.time_steps, max=self.max_episode_len - 1)
         env_idx = torch.arange(self.num_envs, device=self.device)
         xref = self.xref[env_idx, idx]
         uref = self.uref[env_idx, idx]
-        return torch.cat([x, xref, uref], dim=-1)
+        base = torch.cat([x, xref, uref], dim=-1)
+        if self._preview_offsets_t is None:
+            return base
+        # Future uref rows, clamped at the episode end (hold the last feedforward).
+        pidx = torch.clamp(idx.unsqueeze(-1) + self._preview_offsets_t.unsqueeze(0),
+                           max=self.max_episode_len - 1)                    # (N, P)
+        tail = [base]
+        if self._preview_include_uref:
+            uref_prev = self.uref[env_idx.unsqueeze(-1), pidx]              # (N, P, u_dim)
+            tail.append(uref_prev.reshape(self.num_envs, -1))
+        if self._preview_include_xref:
+            p = self._preview_offsets_t.shape[0]
+            xref_prev = self.xref[env_idx.unsqueeze(-1), pidx]              # (N, P, x_dim)
+            raw_rel = (xref_prev - x.unsqueeze(1)).reshape(self.num_envs * p, -1)
+            xref_rel = self.wrap_angles(raw_rel).reshape(self.num_envs, p, -1)  # relative to CURRENT x
+            tail.append(xref_rel.reshape(self.num_envs, -1))
+        return torch.cat(tail, dim=-1)
 
     @staticmethod
     def _zeros(shape, x):

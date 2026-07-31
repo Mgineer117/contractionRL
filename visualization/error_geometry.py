@@ -1,83 +1,69 @@
 """Feature 1 — the complete control-space error geometry, one panel per metric.
 
-Produces one geometry per contraction-metric source, side by side, all evaluated
-over the exact same states so the only thing that differs between them is the
-metric. Each is defined by THE OBJECTIVE ITS CMG MINIMIZES — trained here from
-the config, NOT loaded from whichever checkpoint happens to be on disk, so each
-panel means exactly what its name says:
+One geometry per contraction-metric source, side by side, all over the SAME
+states so the metric is the only difference. Each is defined by THE OBJECTIVE
+ITS CMG MINIMIZES, trained here from the config rather than loaded from whatever
+checkpoint is on disk, so each panel means what its name says:
 
-  * ccm               — CMG trained to minimize the C1/C2 contraction losses
-                        (ncm_synthesis.train_cmg_ccm; no SDP, no regression).
-  * cvstem_pretrained — CMG trained to minimize MSE regression loss onto CV-STEM
-                        SDP solutions (build_cm_dataset + regress_cmg; the
-                        Tsukamoto NCM = cvstem_lqr's "pretrained").
-  * cvstem_online     — no CMG at all: the CV-STEM SDP re-solved at every state.
-  * random            — CONTROL BASELINE: ccm's architecture, config and
-                        w_lb/w_ub bounds, with no training whatsoever.
+  * ccm               — CMG trained on the C1/C2 contraction losses
+                        (train_cmg_ccm; no SDP, no regression).
+  * cvstem_pretrained — CMG trained by MSE regression onto CV-STEM SDP solutions
+                        (build_cm_dataset + regress_cmg; the Tsukamoto NCM).
+  * cvstem_online     — no CMG: the SDP re-solved at every state.
+  * random            — CONTROL BASELINE: ccm's architecture/config/bounds,
+                        untrained.
 
-So ccm vs cvstem_pretrained is a clean comparison of the two SYNTHESIS
-FORMULATIONS (C1/C2 gradient descent vs SDP + regression) on identical networks;
-cvstem_online vs cvstem_pretrained IS the regression error of that fit; and both
-vs random is what their objective actually bought. That last one matters because
-a random CMG is still a bounded SPD field, so its landscape is NOT featureless —
-whatever structure it shows is structure the architecture and bounds give you for
-free, and only the excess over it is creditable to the objective.
+So ccm vs cvstem_pretrained compares the two SYNTHESIS FORMULATIONS on identical
+networks; cvstem_online vs cvstem_pretrained IS that fit's regression error; and
+both vs random is what the objective bought. Random matters because a random CMG
+is still a bounded SPD field, so its landscape is NOT featureless — only the
+excess over it is creditable to the objective.
 
---metric-ckpt overrides ccm with a stored CMG. Use it knowingly: c3m.pt's CMG is
-trained JOINTLY with its controller on pd_loss + c1_loss + c2_loss (+ os_loss),
-so it is co-adapted to that controller and is NOT a pure C1/C2 metric.
+--metric-ckpt overrides ccm with a stored CMG. Use knowingly: c3m.pt's CMG is
+trained JOINTLY with its controller on pd+c1+c2(+os) loss, so it is co-adapted
+and NOT a pure C1/C2 metric.
 
-The trunk (--trunk, ``viz_common.trunk_states``) is the trajectory those states
-are sampled along, and it accepts a COMMA-SEPARATED LIST — one output file per
-trunk (default: uref,cvstem_lqr,greedy). Within each file it is ALWAYS one trunk
-shared by every panel, so the panels differ only by their conditioning metric:
+TRUNK (--trunk, ``viz_common.trunk_states``) is the trajectory the states are
+sampled along. Accepts a comma-separated list, one output file per trunk
+(default uref,cvstem_lqr,greedy); within a file all panels share one trunk.
 
   * ``cvstem_lqr`` (default) / ``lqr`` / ``sd_lqr`` — follow that analytical
-    controller. Metric-independent (a fixed control law), so the panels stay
-    comparable, and the trunk stays in the well-tracked region a real controller
-    occupies — which is why one of these is the default rather than ``uref``.
-    The trade: the landscape is conditioned on where THAT controller went.
-  * ``uref`` — zero feedback: env dynamics and scenario only, no policy and no
-    metric. The only fully algorithm- AND metric-independent choice, at the cost
-    of a trunk whose error grows unchecked into a region no working controller
-    would visit (car: |e| 0.819 → 2.741 vs 0.065 under cvstem_lqr).
-  * ``greedy`` — the best control on the grid under --trunk-metric. This one is
-    metric-DEPENDENT, so a single designated metric drives the trunk for every
-    panel; letting each panel follow its own metric would put them on different
-    trajectories and their differences would no longer be attributable to the
-    metric alone.
+    controller. Metric-independent, and stays in the well-tracked region a real
+    controller occupies. Trade: conditioned on where THAT controller went.
+  * ``uref`` — zero feedback. The only fully algorithm- AND metric-independent
+    choice, at the cost of unchecked error growth into a region no working
+    controller visits (car: |e| 0.819 -> 2.741, vs 0.065 under cvstem_lqr).
+  * ``greedy`` — best grid control under --trunk-metric. Metric-DEPENDENT, so
+    ONE designated metric drives the trunk for every panel; letting each follow
+    its own would put them on different trajectories and the differences would
+    no longer be attributable to the metric.
 
-At each such state, EVERY control in the actuator box is HELD for --lookahead H
-steps and the resulting error measured:
+At each state EVERY control in the actuator box is HELD for --lookahead H steps::
 
     error(u, k) = sqrt( e'^T M(x') e' / e0^T M(x0) e0 ),  e' = wrap(x' - xref_{k+H})
 
-Restricted to u_dim <= 2, where the whole control space is plotted directly and
-nothing is projected away:
+Restricted to u_dim <= 2, where the whole control space plots directly with
+nothing projected away:
 
-  * u_dim == 1 (cartpole, segway) -> static t x u x error surface per metric (.svg)
-  * u_dim == 2 (car, turtlebot)   -> MP4: u0 x u1 x error surface per metric per
-                                    timestep, titled with its timestep; each frame
-                                    also keeps the previous --history geometries as
-                                    translucent shells (alpha ramping toward the
-                                    present), so the motion is visible in a frame.
+  * u_dim == 1 (cartpole, segway) -> static t x u x error surface (.svg)
+  * u_dim == 2 (car, turtlebot)   -> MP4, one u0 x u1 surface per timestep, each
+    frame keeping the previous --history geometries as translucent shells so the
+    motion is visible within a single frame.
 
-The normalized-error axis retunes EVERY FRAME over exactly the shells on screen,
-so their per-timestep change fills the plot. All panels in a frame share one
-norm, so the three metrics stay comparable within that frame; colour/height are
-not comparable across frames — read motion from the shells. --error-range pins
-the axis instead when cross-run comparability matters more.
+The error axis retunes EVERY FRAME over exactly the shells on screen. All panels
+in a frame share one norm (so metrics are comparable within a frame); colour and
+height are NOT comparable across frames — read motion from the shells.
+--error-range pins the axis when cross-run comparability matters more.
 
-Why H > 1 by default: the error-minimizing control over a lookahead of H steps
-satisfies ||u*|| ~ ||e||/(H*dt). At H=1 (dt=0.03) that is ~33*||e||, far outside
-the actuator box for any realistic error, so the control has no time to act and
-EVERY slice is a monotone wall with no interior optimum. Raising H brings ||u*||
-inside the box and the basin becomes visible — without reintroducing any
-dependence on a controller. This matters most here precisely BECAUSE the states
-are open-loop: their error grows rather than decays, so it never falls into the
-regime where a 1-step landscape would have shown structure on its own.
+WHY H > 1 BY DEFAULT: the error-minimizing control over H steps satisfies
+||u*|| ~ ||e||/(H*dt). At H=1 (dt=0.03) that is ~33*||e||, far outside the
+actuator box, so the control has no time to act and every slice is a monotone
+wall with no interior optimum. Raising H brings ||u*|| inside the box without
+reintroducing any controller dependence. It matters most here precisely because
+the states are open-loop: their error grows rather than decays, so it never
+reaches the regime where a 1-step landscape would show structure by itself.
 
-Classic envs only. Standalone: nothing in the training code depends on this.
+Classic envs only. Standalone: no training code depends on this.
 
 Examples:
     python visualization/error_geometry.py --env car   # all metrics x 3 trunks
@@ -93,11 +79,11 @@ import os
 import time
 
 import numpy as np
-
 from viz_common import (
     CLASSIC_ENVS,
     METRIC_KINDS,
     OUTPUT_DIR,
+    TRUNK_MODES,
     compute_landscape_1d,
     compute_landscape_2d,
     control_grid,
@@ -108,7 +94,6 @@ from viz_common import (
     make_env,
     make_metric,
     normalized_error,
-    TRUNK_MODES,
     trunk_states,
     wrap_diff,
 )

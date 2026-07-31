@@ -6,13 +6,13 @@
 import gymnasium as gym
 import numpy as np
 
-from isaaclab_assets.robots.cartpole import CARTPOLE_CFG
-
 from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sim import SimulationCfg, PhysxCfg
+from isaaclab.sim import PhysxCfg, SimulationCfg
 from isaaclab.utils import configclass
+
+from isaaclab_assets.robots.cartpole import CARTPOLE_CFG
 
 
 @configclass

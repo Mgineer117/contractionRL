@@ -56,16 +56,17 @@ sim_app = app_launcher.app
 # Everything below runs inside the Isaac Sim context
 # ------------------------------------------------------------------ #
 
+import contractionRL.tasks  # noqa: F401 — registers all envs
+import gymnasium as gym
 import numpy as np
 import torch
-import gymnasium as gym
 from skrl.utils.runner.torch import Runner
 
 from isaaclab.envs import DirectRLEnvCfg
-from isaaclab_rl.skrl import SkrlVecEnvWrapper
-from isaaclab_tasks.utils.hydra import hydra_task_config
 
-import contractionRL.tasks  # noqa: F401 — registers all envs
+from isaaclab_rl.skrl import SkrlVecEnvWrapper
+
+from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # Map from robot name to the physical-state extractor method name
 _STATE_METHOD = "get_physical_state"

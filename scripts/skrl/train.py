@@ -127,6 +127,99 @@ _ov.add_argument("--entropy_loss_scale", "--entropy-loss-scale",
 _ov.add_argument("--kl_threshold", "--kl-threshold", "--ppo_kl_threshold", "--ppo-kl-threshold",
                  type=float, default=None)
 _ov.add_argument("--value_loss_scale", "--value-loss-scale", type=float, default=None)
+# C2RL only: actor = CV-STEM-LQR analytic baseline + learned residual (see
+# c2rl.C2RLPPOCfg.cvstem_residual_base / nn_modules.CVSTEMLQRBase).
+_ov.add_argument("--cvstem_residual_base", "--cvstem-residual-base",
+                 dest="cvstem_residual_base", action="store_true", default=None)
+# C2RL only: make the residual a pure anticipatory feedforward head of the
+# reference preview (see c2rl.C2RLPPOCfg.residual_feedforward). Needs --num_preview>0.
+_ov.add_argument("--residual_feedforward", "--residual-feedforward",
+                 dest="residual_feedforward", action="store_true", default=None)
+# C2RL only: π-network architecture — bilinear | feedforward | decoupled |
+# latent_bias | film (see c2rl.C2RLPPOCfg.residual_variant). Structured variants
+# need --num_preview>0.
+_ov.add_argument("--residual_variant", "--residual-variant",
+                 dest="residual_variant", type=str, default=None,
+                 choices=["bilinear", "feedforward", "decoupled", "latent_bias", "film"])
+# C2RL only: contraction-pretrain π before PPO (Cu≺0 vs the frozen CMG, NOT
+# cvstem-lqr) so u = uref + π starts stabilizing — see C2RLPPOCfg.
+_ov.add_argument("--residual_contraction_pretrain", "--residual-contraction-pretrain",
+                 dest="residual_contraction_pretrain", action="store_true", default=None)
+_ov.add_argument("--residual_pretrain_epochs", "--residual-pretrain-epochs",
+                 dest="residual_pretrain_epochs", type=int, default=None)
+_ov.add_argument("--residual_pretrain_batch", "--residual-pretrain-batch",
+                 dest="residual_pretrain_batch", type=int, default=None)
+# C2RL only: pretrain OBJECTIVE — "contraction" (default, Cu⮠ SDP violation vs
+# frozen CMG) or "cvstemlqr" (supervised MSE regression of u=uref+π onto the
+# analytic CV-STEM-LQR control law; base is NOT attached, deployed law stays
+# u=uref+π). See C2RLPPOCfg.residual_pretrain_method.
+_ov.add_argument("--residual_pretrain_method", "--residual-pretrain-method",
+                 dest="residual_pretrain_method", type=str, default=None,
+                 choices=["contraction", "cvstemlqr"])
+# C2RL only: clamp the "cvstemlqr" pretrain TARGET to the actuator box env_base.step
+# actually applies (2*UREF). Unclamped, the r=0.01 CV-STEM-LQR law is ~2.7x outside
+# that box on most samples, which pretrains the policy straight into saturation —
+# see C2RLPPOCfg.residual_pretrain_clamp_target.
+_ov.add_argument("--residual_pretrain_clamp_target", "--residual-pretrain-clamp-target",
+                 dest="residual_pretrain_clamp_target", action="store_true", default=None)
+# C2RL 'film' variant only: independently pick what γ1/γ2 gate on — "preview"
+# (default), "xref" (current reference point only), "uref" (current reference
+# control). See nn_modules.FiLMResidual / models.CLActorModel.
+_ov.add_argument("--film_gate1_source", "--film-gate1-source",
+                 dest="film_gate1_source", type=str, default=None,
+                 choices=["preview", "xref_preview", "xref", "uref"])
+_ov.add_argument("--film_gate2_source", "--film-gate2-source",
+                 dest="film_gate2_source", type=str, default=None,
+                 choices=["preview", "xref_preview", "xref", "uref"])
+# C2RL 'film' variant only: how a "preview"-sourced gate encodes its P-point
+# window — "mlp" (default, flattens P points, ORIGINAL behavior) or
+# "gru"/"attn" (nn_modules.PreviewSequenceEncoder — treats it as a sequence).
+_ov.add_argument("--film_gate_encoder", "--film-gate-encoder",
+                 dest="film_gate_encoder", type=str, default=None,
+                 choices=["mlp", "gru", "attn"])
+# C2RL only: after the trained eval, ALSO evaluate with the residual bypassed
+# (= pure CV-STEM-LQR base) on the IDENTICAL frozen CMG — a controlled base-vs-
+# residual comparison free of CMG-regression nondeterminism. See models.CLActorModel.
+parser.add_argument("--eval_base_too", "--eval-base-too",
+                    dest="eval_base_too", action="store_true", default=False)
+# AUC-aligned Euclidean-decrement reward (see c2rl.C2RLPPOCfg.reward_euclidean).
+# Works for standalone PPO/SAC too (applied straight to the env — see the
+# `not _is_contraction` block right after raw_env is built) as well as C2RL.
+_ov.add_argument("--reward_euclidean", "--reward-euclidean",
+                 dest="reward_euclidean", action="store_true", default=None)
+_ov.add_argument("--reward_level", "--reward-level",
+                 dest="reward_level", action="store_true", default=None)
+# C2RL only: warm-start the residual to the online per-state CV-STEM-LQR controller.
+_ov.add_argument("--cvstem_residual_distill", "--cvstem-residual-distill",
+                 dest="cvstem_residual_distill", action="store_true", default=None)
+_ov.add_argument("--residual_frozen", "--residual-frozen",
+                 dest="residual_frozen", action="store_true", default=None)
+_ov.add_argument("--residual_anchor_scale", "--residual-anchor-scale",
+                 dest="residual_anchor_scale", type=float, default=None)
+# Hard-control-bound CV-STEM-LQR base — DISABLED 2026-07-30 (measured worse
+# than the post-hoc actuator filter, itself removed 2026-07-30 — never set by
+# any config; see c2rl.C2RLPPOCfg's commented hard_control_bound docstring).
+# _ov.add_argument("--hard_control_bound", "--hard-control-bound",
+#                  dest="hard_control_bound", action="store_true", default=None)
+# _ov.add_argument("--hard_control_u_bound", "--hard-control-u-bound",
+#                  dest="hard_control_u_bound", type=float, default=None)
+# _ov.add_argument("--hard_control_rho", "--hard-control-rho",
+#                  dest="hard_control_rho", type=float, default=None)
+# _ov.add_argument("--hard_control_lbd", "--hard-control-lbd",
+#                  dest="hard_control_lbd", type=float, default=None)
+# Phase-0 single-update-collapse diagnostics/ablations — see
+# C2RLPPOCfg.residual_pretrain_init_log_std / pretrain_critic_steps /
+# disable_advantage_norm docstrings.
+_ov.add_argument("--residual_pretrain_init_log_std", "--residual-pretrain-init-log-std",
+                 dest="residual_pretrain_init_log_std", type=float, default=None)
+_ov.add_argument("--pretrain_critic_steps", "--pretrain-critic-steps",
+                 dest="pretrain_critic_steps", type=int, default=None)
+_ov.add_argument("--pretrain_critic_epochs", "--pretrain-critic-epochs",
+                 dest="pretrain_critic_epochs", type=int, default=None)
+_ov.add_argument("--pretrain_critic_lr", "--pretrain-critic-lr",
+                 dest="pretrain_critic_lr", type=float, default=None)
+_ov.add_argument("--disable_advantage_norm", "--disable-advantage-norm",
+                 dest="disable_advantage_norm", action="store_true", default=None)
 _ov.add_argument("--grad_norm_clip", "--grad-norm-clip", type=float, default=None)
 _ov.add_argument("--use_state_norm", "--use-state-norm", "--ppo_use_state_norm",
                  "--ppo-use-state-norm", type=str, default=None)
@@ -147,9 +240,110 @@ _ov.add_argument("--memory_size", "--memory-size", "--sac_memory_size", "--sac-m
 parser.add_argument("--ppo_activations", "--ppo-activations", type=str, default=None)
 parser.add_argument("--ppo_network_arch", "--ppo-network-arch", type=str, default=None)
 
+# Reference preview (POMDP fix that makes a high discount_factor valid): append
+# NUM_PREVIEW future-uref points to the observation, spaced geometrically over
+# the discount's effective horizon 1/(1-discount_factor). 0 = off (historic
+# [x, xref, uref] layout). Applies to path-tracking layouts (classic + isaaclab).
+parser.add_argument("--num_preview", "--num-preview", "--preview_points",
+                    "--preview-points", type=int, default=0,
+                    help="Future-uref preview points appended to the obs (0 = off). "
+                         "Window extent = effective horizon 1/(1-discount_factor).")
+# Additionally append, at each of the SAME preview offsets, the future
+# reference position RELATIVE TO THE CURRENT STATE (xref_future - x, angle-
+# wrapped) — see env_base.BaseEnv.construct_state / set_preview_offsets.
+# Classic only. Off by default (byte-identical to the uref-only preview).
+parser.add_argument("--preview_include_xref", "--preview-include-xref",
+                    action="store_true", default=False,
+                    help="Widen the preview tail to also carry relative future-xref "
+                         "points (needs --num_preview>0).")
+# Drop the future-uref block from the preview tail entirely (xref-only
+# preview) — tests whether xref alone (uref is in principle recoverable by
+# differencing consecutive preview points) is enough. Needs
+# --preview_include_xref or the preview tail carries nothing. Default False
+# reproduces the historic uref-in-preview layout exactly.
+parser.add_argument("--preview_no_uref", "--preview-no-uref",
+                    action="store_true", default=False,
+                    help="Drop future-uref points from the preview tail (needs "
+                         "--preview_include_xref, else the preview is empty).")
+# Replace the geometric num_preview/gamma ladder with EVERY future step up to
+# episode end (env_base.BaseEnv._full_trajectory_offsets) — meant for a
+# sequence gate encoder (--film_gate_encoder gru/attn), which can learn its
+# own attention/forgetting over the whole remaining trajectory instead of a
+# hand-picked window. num_preview/discount_factor are ignored for sizing the
+# window when this is set. Cost: O(max_episode_len) per step instead of
+# O(num_preview) — GPU-only in practice, not for the CPU-only local sweeps.
+parser.add_argument("--preview_full_trajectory", "--preview-full-trajectory",
+                    action="store_true", default=False,
+                    help="Preview = every future step to episode end, not a "
+                         "num_preview/gamma-sized window. Pairs with "
+                         "--film_gate_encoder gru/attn.")
+
+# Asymmetric (privileged) critic: give the CRITIC ONLY a future-xref
+# trajectory via skrl's separate states/state_space channel — see
+# env_base.BaseEnv.configure_value_state / models.TrajectoryAwareValueModel —
+# completely independent of whatever preview the ACTOR's own observation
+# carries. Unset (default None) leaves the critic on the historic
+# EmbeddedDeterministicModel(observations) path exactly as before.
+parser.add_argument("--critic_encoder", "--critic-encoder", type=str, default=None,
+                    choices=["mlp", "gru", "attn"],
+                    help="Give the critic a privileged future-xref trajectory via a "
+                         "separate state channel, encoded by this model (mlp/gru/attn). "
+                         "Unset = historic critic (sees only the actor's own preview).")
+parser.add_argument("--critic_num_points", "--critic-num-points", type=int, default=7,
+                    help="Number of future-xref offsets in the critic's privileged "
+                         "state (ignored if --critic_full_trajectory).")
+parser.add_argument("--critic_full_trajectory", "--critic-full-trajectory",
+                    action="store_true", default=False,
+                    help="Critic's privileged state = every future step to episode "
+                         "end, not a --critic_num_points/gamma window.")
+parser.add_argument("--critic_combine", "--critic-combine", type=str, default="concat",
+                    choices=["concat", "bilinear", "film"],
+                    help="How the critic combines phi(x) and psi(traj): 'concat' "
+                         "(default, joint MLP over both embeddings) or 'bilinear' "
+                         "(true UVFA-style factorization: w^T(phi*psi) + linear terms, "
+                         "phi/psi never jointly fed to a net — see models."
+                         "TrajectoryAwareValueModel). Ignored unless --critic_encoder is set.")
+# Width of phi(x) / psi(traj). For 'bilinear' this bounds the RANK of the
+# state x goal interaction the critic can represent, so it is the key UVFA
+# hyperparameter (Schaul et al. 2015); 'concat' is far less sensitive to it.
+# O6: parameterize the critic as V(s) = f_theta(s) + ||e||^2_M, with the second
+# term computed analytically from the frozen CMG instead of learned. The
+# decrement reward's telescoping identity is V_shaped = (1-gamma)V_orig - Phi(s),
+# so the O(1) potential the shaping removes from the REWARD reappears in the
+# critic's target; adding it back in closed form leaves f_theta only the O(dt)
+# part. Pair with --use_value_norm false (the term is in real value units).
+parser.add_argument("--critic_analytic_potential", "--critic-analytic-potential",
+                    dest="critic_analytic_potential", action="store_true", default=False,
+                    help="Critic V(s) = f_theta(s) + ||e||^2_M using the frozen CMG "
+                         "(see models._AnalyticPotentialMixin). Use with use_value_norm=false.")
+parser.add_argument("--critic_embed_dim", "--critic-embed-dim", type=int, default=64,
+                    help="Embedding width for the privileged critic's phi/psi "
+                         "(default 64). Bounds the bilinear form's rank.")
+
+# UVFA-style generalization test: ALSO evaluate the trained policy on a FIXED
+# bank of reference-trajectory shapes drawn from a generator seeded
+# independently of training (see env.CarEnv.set_held_out_mode) — guaranteed
+# never encountered during training, unlike the normal post-training eval's
+# i.i.d.-random trajectories (a different draw from the SAME distribution).
+# None (default) = skip this second eval pass entirely.
+parser.add_argument("--eval_held_out_seed", "--eval-held-out-seed", type=int, default=None,
+                    help="Generator seed for a FIXED, held-out bank of reference-"
+                         "trajectory shapes (must differ from --seed). None = skip "
+                         "this extra generalization eval.")
+parser.add_argument("--eval_held_out_trajectories", "--eval-held-out-trajectories",
+                    type=int, default=64,
+                    help="Size of the fixed held-out reference-trajectory bank.")
+
 # Classic-specific
 parser.add_argument("--cfg", type=str, default=None,
                     help="Path to a custom YAML config (classic only).")
+# The Isaac branch gets --device from AppLauncher; the classic branch has no
+# AppLauncher, so register it here (gated to avoid a conflicting option string
+# with AppLauncher's --device). Default None -> cuda:0 if available else cpu.
+if _is_classic:
+    parser.add_argument("--device", type=str, default=None,
+                        help="Torch device for classic runs (default: cuda:0 if "
+                             "available, else cpu).")
 
 # Reference trajectory generation (auto-triggered after vel-tracking training)
 parser.add_argument("--ref_num_trajs", type=int, default=1000,
@@ -183,7 +377,7 @@ if not _is_classic:
     sys.argv = [sys.argv[0]] + hydra_args
     app_launcher = AppLauncher(args_cli)
     simulation_app = app_launcher.app
-    
+
     # Suppress noisy mesh/hydra warnings from Isaac Sim assets
     import carb
     carb.settings.get_settings().set("/log/logger/channelFilter", "-omni.hydra")
@@ -197,10 +391,18 @@ from datetime import datetime
 import gymnasium as gym
 import yaml
 from train_utils import (
-    _default_num_envs_classic, _evaluate_best_model, _evaluate_classic_path_tracking,
-    _generate_ref_trajs, _inject_angle_idx, _resolve_caps_kwargs, _resolve_symmetry_for_env,
-    apply_agent_patches, apply_wandb_sweep_overrides, finish_wandb,
-    install_wandb_scalar_hook, normalize_agent_cfg,
+    _default_num_envs_classic,
+    _evaluate_best_model,
+    _evaluate_classic_path_tracking,
+    _generate_ref_trajs,
+    _inject_angle_idx,
+    _resolve_caps_kwargs,
+    _resolve_symmetry_for_env,
+    apply_agent_patches,
+    apply_wandb_sweep_overrides,
+    finish_wandb,
+    install_wandb_scalar_hook,
+    normalize_agent_cfg,
 )
 
 algorithm = args_cli.algorithm.lower()
@@ -253,6 +455,66 @@ def _apply_agent_overrides(agent_cfg, args):
             a[key] = (str(val).lower() == "true")
     if args.memory_size is not None:
         agent_cfg["memory"]["memory_size"] = args.memory_size
+    if getattr(args, "cvstem_residual_base", None):
+        a["cvstem_residual_base"] = True
+    if getattr(args, "residual_feedforward", None):
+        a["residual_feedforward"] = True
+    if getattr(args, "residual_variant", None):
+        a["residual_variant"] = args.residual_variant
+    if getattr(args, "residual_contraction_pretrain", None):
+        a["residual_contraction_pretrain"] = True
+    if getattr(args, "residual_pretrain_epochs", None) is not None:
+        a["residual_pretrain_epochs"] = args.residual_pretrain_epochs
+    if getattr(args, "residual_pretrain_batch", None) is not None:
+        a["residual_pretrain_batch"] = args.residual_pretrain_batch
+    if getattr(args, "residual_pretrain_method", None):
+        a["residual_pretrain_method"] = args.residual_pretrain_method
+    if getattr(args, "residual_pretrain_clamp_target", None):
+        a["residual_pretrain_clamp_target"] = True
+    # FiLM gate sources are MODEL kwargs (models.policy.*), not agent-config keys —
+    # contraction_runner passes models.policy's dict through verbatim as
+    # CLActorModel kwargs (see models.CLActorModel.__init__).
+    _policy_block = agent_cfg.get("models", {}).get("policy")
+    if isinstance(_policy_block, dict):
+        if getattr(args, "film_gate1_source", None):
+            _policy_block["film_gate1_source"] = args.film_gate1_source
+        if getattr(args, "film_gate2_source", None):
+            _policy_block["film_gate2_source"] = args.film_gate2_source
+        if getattr(args, "film_gate_encoder", None):
+            _policy_block["film_gate_encoder"] = args.film_gate_encoder
+        if getattr(args, "preview_include_xref", False):
+            _policy_block["preview_includes_xref"] = True
+        if getattr(args, "preview_no_uref", False):
+            _policy_block["preview_includes_uref"] = False
+    if getattr(args, "reward_euclidean", None):
+        a["reward_euclidean"] = True
+    if getattr(args, "reward_level", None):
+        a["reward_level"] = True
+    if getattr(args, "cvstem_residual_distill", None):
+        a["cvstem_residual_distill"] = True
+    if getattr(args, "residual_frozen", None):
+        a["residual_frozen"] = True
+    if getattr(args, "residual_anchor_scale", None) is not None:
+        a["residual_anchor_scale"] = args.residual_anchor_scale
+    # Hard-control-bound overrides DISABLED 2026-07-30 (flags commented out above).
+    # if getattr(args, "hard_control_bound", None):
+    #     a["hard_control_bound"] = True
+    # if getattr(args, "hard_control_u_bound", None) is not None:
+    #     a["hard_control_u_bound"] = args.hard_control_u_bound
+    # if getattr(args, "hard_control_rho", None) is not None:
+    #     a["hard_control_rho"] = args.hard_control_rho
+    # if getattr(args, "hard_control_lbd", None) is not None:
+    #     a["hard_control_lbd"] = args.hard_control_lbd
+    if getattr(args, "residual_pretrain_init_log_std", None) is not None:
+        a["residual_pretrain_init_log_std"] = args.residual_pretrain_init_log_std
+    if getattr(args, "pretrain_critic_steps", None) is not None:
+        a["pretrain_critic_steps"] = args.pretrain_critic_steps
+    if getattr(args, "pretrain_critic_epochs", None) is not None:
+        a["pretrain_critic_epochs"] = args.pretrain_critic_epochs
+    if getattr(args, "pretrain_critic_lr", None) is not None:
+        a["pretrain_critic_lr"] = args.pretrain_critic_lr
+    if getattr(args, "disable_advantage_norm", None):
+        a["disable_advantage_norm"] = True
 
 
 seed = args_cli.seed if args_cli.seed is not None else random.randint(0, 10000)
@@ -272,6 +534,7 @@ _VEL_TASK_TO_ROBOT = {"Quadruped": "quadruped", "Humanoid": "humanoid", "Manipul
 if _is_classic:
     import os as _os
     import sys as _sys
+
     import numpy as np
     import torch
 
@@ -391,9 +654,19 @@ if _is_classic:
 
     _is_contraction = algorithm in _CONTRACTION_ALGOS
     num_envs = args_cli.num_envs if args_cli.num_envs is not None else _default_num_envs_classic(algorithm)
-    device = getattr(args_cli, "device", "cuda:0")
+    device = getattr(args_cli, "device", None)
+    if not device:
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     raw_env = gym.make(args_cli.task, num_envs=num_envs, device=device)
+    # Standalone PPO/SAC path: apply the euclidean/level reward switch straight
+    # to the env — C2RL applies the equivalent through its own set_ccm() call
+    # inside ContractionRunner (see c2rl.py), and normalize_agent_cfg pops these
+    # two keys out of agent_cfg["agent"] for ppo/sac so they never reach the
+    # real skrl PPO_CFG/SAC_CFG (which would reject them as unknown fields).
+    if not _is_contraction and (args_cli.reward_euclidean or args_cli.reward_level):
+        raw_env.unwrapped.reward_euclidean = bool(args_cli.reward_euclidean)
+        raw_env.unwrapped.reward_level = bool(args_cli.reward_level)
     if args_cli.eig_reshape is not None:
         if not hasattr(raw_env.unwrapped, "set_eig_reshape"):
             raise SystemExit("--eig_reshape requires a classic env_base env (got "
@@ -401,6 +674,38 @@ if _is_classic:
         raw_env.unwrapped.set_eig_reshape(args_cli.eig_reshape)
         print(f"[train] eig_reshape ACTIVE: Mahalanobis reward's M reshaped to "
               f"cond(M) = {args_cli.eig_reshape:g} every step")
+
+    # Reference preview: size the window to THIS run's effective horizon
+    # 1/(1-discount_factor) and append future-uref points to the obs. Done
+    # before the wrappers/runner so the widened observation_space propagates to
+    # the models and memory. discount_factor is already finalized here (CLI
+    # overrides at _apply_agent_overrides + any wandb-sweep overrides above).
+    if (args_cli.num_preview or args_cli.preview_full_trajectory) and hasattr(raw_env.unwrapped, "configure_preview"):
+        _gamma = float(agent_cfg["agent"].get("discount_factor", 0.99))
+        raw_env.unwrapped.configure_preview(args_cli.num_preview, _gamma,
+                                            include_xref=args_cli.preview_include_xref,
+                                            full_trajectory=args_cli.preview_full_trajectory,
+                                            include_uref=not args_cli.preview_no_uref)
+
+    # Asymmetric critic's privileged state channel — see --critic_encoder above.
+    # Independent of the actor's own preview config; must also run before the
+    # wrappers/runner so state_space (if any) propagates to the models/memory.
+    # O6 applies to EITHER critic class, so it is set before the
+    # --critic_encoder branch below (which only picks the privileged variant).
+    if getattr(args_cli, "critic_analytic_potential", False):
+        _cb = agent_cfg.get("models", {}).get("critic")
+        if isinstance(_cb, dict):
+            _cb["analytic_potential"] = True
+
+    if args_cli.critic_encoder and hasattr(raw_env.unwrapped, "configure_value_state"):
+        _gamma = float(agent_cfg["agent"].get("discount_factor", 0.99))
+        raw_env.unwrapped.configure_value_state(args_cli.critic_num_points, _gamma,
+                                                full_trajectory=args_cli.critic_full_trajectory)
+        _critic_block = agent_cfg.get("models", {}).get("critic")
+        if isinstance(_critic_block, dict):
+            _critic_block["encoder"] = args_cli.critic_encoder
+            _critic_block["combine"] = args_cli.critic_combine
+            _critic_block["embed_dim"] = args_cli.critic_embed_dim
 
     # Wrapper order is load-bearing: StatManagerEnvWrapper must see the flat
     # tensor observations BatchedGymnasiumWrapper produces, and WandbPlotWrapper
@@ -428,6 +733,17 @@ if _is_classic:
         from contractionRL.agents.skrl.runner import CLActorRunner
         _inject_angle_idx(agent_cfg, list(getattr(raw_env.unwrapped, "angle_idx", []) or []),
                           _resolve_symmetry_for_env(raw_env))
+        # network_architecture: sweep-friendly override applied to BOTH the
+        # actor (models.policy) and critic (models.value) hidden layers, so a
+        # PPO architecture sweep stays apples-to-apples against c3m's
+        # actor_architecture (which only has a policy net to vary — C3M has no
+        # critic) — see search/configs/ppo.yaml and c3m.yaml's comment on it.
+        _arch = agent_cfg.pop("network_architecture", None)
+        if _arch is not None:
+            for _blk in ("policy", "value"):
+                _net = agent_cfg.get("models", {}).get(_blk, {}).get("network")
+                if isinstance(_net, list) and _net:
+                    _net[0]["layers"] = list(_arch)
         runner = CLActorRunner(env, agent_cfg)
 
     # Contraction algorithms already namespace their own track_data() keys.
@@ -441,6 +757,22 @@ if _is_classic:
 
     _evaluate_classic_path_tracking(task=args_cli.task, runner=runner, args_cli=args_cli,
                                     _is_classic=_is_classic)
+    # Controlled comparison: re-eval the PURE base (residual bypassed) on the same
+    # frozen CMG the trained residual just used — the airtight base-vs-residual delta.
+    if getattr(args_cli, "eval_base_too", False):
+        _pol = getattr(runner.agent, "models", {}).get("policy", None)
+        if _pol is not None and getattr(_pol, "base_controller", None) is not None:
+            _pol._eval_base_only = True
+            _evaluate_classic_path_tracking(task=args_cli.task, runner=runner, args_cli=args_cli,
+                                            _is_classic=_is_classic, label="BASE")
+            _pol._eval_base_only = False
+        else:
+            print("[Eval] --eval_base_too: no CV-STEM-LQR base attached; skipping base eval.")
+    if args_cli.eval_held_out_seed is not None:
+        _evaluate_classic_path_tracking(task=args_cli.task, runner=runner, args_cli=args_cli,
+                                        _is_classic=_is_classic, label="HeldOut",
+                                        held_out_seed=args_cli.eval_held_out_seed,
+                                        held_out_trajectories=args_cli.eval_held_out_trajectories)
     finish_wandb(args_cli)
 
 
@@ -466,6 +798,8 @@ else:
     elif args_cli.ml_framework.startswith("jax"):
         from skrl.utils.runner.jax import Runner
 
+    import contractionRL.tasks  # noqa: F401
+
     from isaaclab.envs import (
         DirectMARLEnv,
         DirectMARLEnvCfg,
@@ -481,8 +815,6 @@ else:
 
     import isaaclab_tasks  # noqa: F401
     from isaaclab_tasks.utils.hydra import hydra_task_config
-
-    import contractionRL.tasks  # noqa: F401
 
     if args_cli.agent is None:
         agent_cfg_entry_point = f"skrl_{algorithm.replace('-', '_')}_cfg_entry_point"
@@ -523,7 +855,7 @@ else:
                     for layer in models_cfg[model_type].get("network", []):
                         if "activations" in layer:
                             layer["activations"] = args_cli.ppo_activations
-                            
+
         if args_cli.ppo_network_arch is not None:
             arch_str = args_cli.ppo_network_arch.replace("[", "").replace("]", "")
             layers = [int(x.strip()) for x in arch_str.split(",")]
@@ -561,6 +893,7 @@ else:
             import glob as _glob
             import re as _re
             import threading as _threading
+
             import wandb as _wandb
 
             agent_cfg["agent"]["experiment"]["wandb"] = ("WANDB_SWEEP_ID" not in os.environ)
@@ -666,8 +999,8 @@ else:
         # setting it through the plot wrapper would shadow it on the wrapper instance
         # instead of the real IsaacLabWrapper, silently breaking that reset.
         _skrl_env = env
-        import sys as _sys
         import os as _os
+        import sys as _sys
         _sys.path.append(_os.path.dirname(__file__))
         from wandb_plot_wrapper import WandbPlotWrapper
         # WandbPlotWrapper must wrap the SKRL-wrapped env (flat tensor obs +
@@ -767,7 +1100,7 @@ else:
             )
 
         env.close()
-        
+
         finish_wandb(args_cli)
 
     if __name__ == "__main__":

@@ -39,20 +39,18 @@ regardless of the environment's own device.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import numpy as np
 import torch
 from scipy.linalg import solve_continuous_are
-from torch.linalg import solve
-
 from skrl.agents.torch.base import Agent, AgentCfg
+from torch.linalg import solve
 
 from .angle_utils import wrap_diff
 from .math_utils import b_jacobian, jacobian
 from .rl_glue import filter_cfg_fields
-
 
 # ─────────────────────────────────────────────────────────────────────────── #
 # Configuration
@@ -138,7 +136,7 @@ class SDLQRAgent(Agent):
 
         obs_dim = int(observation_space.shape[0])
         u_dim_inferred = int(action_space.shape[0])
-        
+
         if u_dim is None:
             u_dim = u_dim_inferred
         if x_dim is None:
@@ -169,12 +167,12 @@ class SDLQRAgent(Agent):
         DfDx = jacobian(f, x, create_graph=False)
         DBDx = b_jacobian(B, x, u_dim, create_graph=False)
         f = f.detach(); B = B.detach()
-        
+
         A_batch = DfDx + torch.einsum('bxyu,bu->bxy', DBDx, uref)
-        
+
         actions = torch.zeros(batch_size, u_dim, device=self._compute_device)
         e_batch = wrap_diff(x - xref, self._angle_idx)
-        
+
         for i in range(batch_size):
             A = A_batch[i]
             B_mat = B[i]
@@ -258,7 +256,7 @@ class LQRAgent(Agent):
 
         obs_dim = int(observation_space.shape[0])
         u_dim_inferred = int(action_space.shape[0])
-        
+
         if u_dim is None:
             u_dim = u_dim_inferred
         if x_dim is None:
@@ -290,7 +288,7 @@ class LQRAgent(Agent):
         DBDx = b_jacobian(B_xref, xref, u_dim, create_graph=False)     # (batch, x, x, u)
 
         A_batch = DfDx + torch.einsum('bxyu,bu->bxy', DBDx, uref)
-        
+
         actions = torch.zeros(batch_size, u_dim, device=self._compute_device)
         e_batch = wrap_diff(x - xref, self._angle_idx)
 
@@ -302,7 +300,7 @@ class LQRAgent(Agent):
             e = e_batch[i]
             u = uref[i] - K @ e
             actions[i] = u
-            
+
         return actions
 
     def act(self, observations, states, *, timestep: int, timesteps: int):

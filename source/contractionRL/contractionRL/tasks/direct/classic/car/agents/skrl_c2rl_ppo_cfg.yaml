@@ -90,7 +90,7 @@ agent:
   # observation, which breaks the CLActor's obs_dim = 2*x_dim + u_dim layout).
   # Both 0.0 = off. Override per-run with --caps_temporal_scale /
   # --caps_spatial_scale / --caps_spatial_std. See patch_caps_regularizer.
-  caps_temporal_scale: 0.01  # weight on ||pi(s_t) - pi(s_t+1)||^2
+  caps_temporal_scale: 0.001  # weight on ||pi(s_t) - pi(s_t+1)||^2
   caps_spatial_scale: 0.0    # weight on ||pi(s) - pi(s_bar)||^2, s_bar ~ N(s, sigma^2)
   caps_spatial_std: 0.05     # sigma, in RAW observation units (see patch_caps_regularizer)
   discount_factor: 0.01  # deployed policy's discount factor (single policy — no con/opt duality)
@@ -167,7 +167,7 @@ cm:
 # no SDP. Either way, freeze before Phase B.
 cmg:
   cmg_memory_size: 131072
-  cmg_regress_epochs: 100
+  cmg_regress_epochs: 1000
   cmg_regress_lr: 1.0e-3
   cmg_regress_lr_scheduler: "StepLR"  # built the same way as empirical_dynamics' scheduler
   cmg_regress_lr_scheduler_kwargs:

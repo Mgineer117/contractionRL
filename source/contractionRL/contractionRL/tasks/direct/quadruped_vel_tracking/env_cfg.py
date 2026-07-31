@@ -5,14 +5,14 @@ import math
 import gymnasium as gym
 import numpy as np
 
-from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
-
 from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectRLEnvCfg, ViewerCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg
-from isaaclab.sim import SimulationCfg, PhysxCfg
+from isaaclab.sim import PhysxCfg, SimulationCfg
 from isaaclab.utils import configclass
+
+from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
 
 from ..common.vel_commands import VelCmdCfg
 

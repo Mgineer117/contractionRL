@@ -13,19 +13,16 @@ full ``(num_envs, T)`` error tensor:
                              ``lambda = -ln(e_T / e_0) / (T·dt)`` (clamped ≥ 0).
                              Logged both as ``contraction_rate`` and the
                              user-facing alias ``lambda``.
-  * ``running_lambda``     — per-STEP contraction rate averaged over one
-                             episode: ``mean_t max(0, ln(C_t/C_{t+1})/dt)`` on
-                             the normalized cost ``C = e/e(0)``, i.e. the rate
-                             satisfying ``C_{t+1} = e^{-lambda·dt}·C_t`` at every
-                             step where the cost actually decreased and 0 where
-                             it did not.  Steps spent in OVERSHOOT
-                             (``max(C_t, C_{t+1}) > 1``) also count as 0 — the
-                             descent back from a self-inflicted excursion is not
-                             credited as contraction — but they remain in the
-                             denominator, so overshoot dilutes the mean.
-                             Only emitted by
-                             :class:`StatManagerEnvWrapper` (it needs the full
-                             per-step curve, not just the endpoints).
+  * ``running_lambda``     — per-STEP rate averaged over an episode:
+                             ``mean_t max(0, ln(C_t/C_{t+1})/dt)`` on the
+                             normalized cost ``C = e/e(0)``.  0 at steps where
+                             the cost did not decrease, and 0 in OVERSHOOT
+                             (``max(C_t, C_{t+1}) > 1``) — the descent back from
+                             a self-inflicted excursion is not credited — but
+                             those steps stay in the denominator, so overshoot
+                             dilutes the mean.  Only from
+                             :class:`StatManagerEnvWrapper`, which has the full
+                             per-step curve rather than just the endpoints.
   * ``overshoot``          — peak normalized error ``e_max / e(0)`` (≥ 1 in
                              theory; a pure overshoot factor).
   * ``contraction_score``  — ``lambda / overshoot`` (higher = fast contraction
@@ -34,19 +31,14 @@ full ``(num_envs, T)`` error tensor:
 Each per-env quantity is reduced across the env population to a mean and a 95%
 CI half-width (``1.96·SEM``, see :func:`mean_confidence_interval`).
 
-Why streaming (and why the math is exactly the trapezoid): if ``err_sum`` is the
-running sum ``Σ_{k=0}^{T-1} e_k`` of the raw error norms recorded at times
-``t_k = k·dt``, then the trapezoidal integral of the sequence over
-``[t_0, t_{T-1}]`` is
+The streaming AUC is EXACTLY the trapezoid, not an approximation of it: with
+``err_sum = Σ_{k=0}^{T-1} e_k`` at times ``t_k = k·dt``,
 
-    ∫ e dt ≈ dt·(e_0/2 + e_1 + … + e_{T-2} + e_{T-1}/2)
-           = dt·(Σ_k e_k − e_0/2 − e_{T-1}/2)
-           = dt·(err_sum − 0.5·e_0 − 0.5·e_last),
+    ∫ e dt ≈ dt·(e_0/2 + e_1 + … + e_{T-1}/2) = dt·(err_sum − 0.5·e_0 − 0.5·e_last)
 
-so the NORMALIZED AUC ``∫ (e/e_0) dt = dt/e_0·(err_sum − 0.5·e_0 − 0.5·e_last)``
-needs only ``err_sum``, ``e_0`` and ``e_last`` — no full curve.  (Both endpoints
-get half weight; subtracting only ``e_0`` — or, worse, *adding* ``e_last`` — is
-a trapezoid-rule error that earlier per-algorithm copies of this code had.)
+so the normalized AUC needs only ``err_sum``, ``e_0``, ``e_last`` — no curve.
+BOTH endpoints get half weight; subtracting only ``e_0``, or worse ADDING
+``e_last``, is the trapezoid-rule error earlier per-algorithm copies had.
 """
 
 from __future__ import annotations
@@ -176,7 +168,7 @@ class StatManagerEnvWrapper:
     def __init__(self, env, *, num_envs_for_eval: int = 64):
         self.env = env
         self._num_envs_for_eval = num_envs_for_eval
-        
+
         self._initialized = False
         self._x_dim: int | None = None
         self._pos_dim: int | None = None
@@ -279,7 +271,7 @@ class StatManagerEnvWrapper:
         self._pos_dim = int(pd) if pd is not None else min(3, int(x_dim))
         self._dt = float(dt)
         self._max_ep_len = int(ep) if ep is not None else 1000
-        
+
         num_envs = int(getattr(self.env, "num_envs", 1))
         self._num_envs_for_eval = min(num_envs, self._num_envs_for_eval)
         N = self._num_envs_for_eval
@@ -294,7 +286,7 @@ class StatManagerEnvWrapper:
         self._tracking_steps = torch.zeros(N, dtype=torch.long, device=dev)
         self._completed_slots = torch.zeros(N, dtype=torch.bool, device=dev)
         self._e0 = torch.zeros(N, dtype=torch.float32, device=dev)
-        
+
         self._traj_x_buf = [[] for _ in range(N)]
         self._traj_xref_buf = [[] for _ in range(N)]
 
@@ -571,14 +563,14 @@ class StatManagerEnvWrapper:
                 self._completed_slots[slot] = False
                 self._traj_x_buf[slot] = []
                 self._traj_xref_buf[slot] = []
-                    
+
         # Update active slots
         active_slots = torch.nonzero((self._tracking_env_ids != -1) & (~self._completed_slots), as_tuple=True)[0]
-        
+
         for slot in active_slots:
             env_id = self._tracking_env_ids[slot]
             step = self._tracking_steps[slot]
-            
+
             if step == 0:
                 self._e0[slot] = err_vals[env_id].clamp(min=1e-8)
                 if maha_err_vals is not None:
@@ -598,10 +590,10 @@ class StatManagerEnvWrapper:
 
                 self._traj_x_buf[slot].append(obs_x[env_id])
                 self._traj_xref_buf[slot].append(obs_xref[env_id])
-            
+
             step += 1
             self._tracking_steps[slot] = step
-            
+
             # If reached max length, pad to end
             if step >= self._max_ep_len:
                 self._completed_slots[slot] = True
@@ -655,28 +647,22 @@ class StatManagerEnvWrapper:
     def _track_action_volatility(self, action, terminated, truncated) -> None:
         """Accumulate per-step ``||u_t - u_{t-1}||_2`` into per-episode means.
 
-        This is a MEASUREMENT of the deployed action sequence, not a penalty —
-        it is the executed action (exploration noise included), whereas CAPS'
-        temporal term regularizes the policy MEAN over sampled states. The two
-        are deliberately different quantities: this one is what the actuator
-        actually sees, so it stays meaningful for algorithms with no CAPS term
-        at all and is the thing to read when asking whether a policy is
-        physically deployable.
+        A MEASUREMENT of the deployed action sequence, not a penalty: the
+        EXECUTED action, exploration noise included, whereas CAPS' temporal term
+        regularizes the policy MEAN. Deliberately different quantities — this is
+        what the actuator actually sees, so it stays meaningful for algorithms
+        with no CAPS term and is what to read for physical deployability.
 
-        AUTORESET. Both env families reset done envs INSIDE ``step()`` and
-        return the fresh episode's first observation (see ``_init_flags``), so
-        the action taken on the step AFTER a done is computed from an unrelated
-        initial state. Differencing across that boundary would report a large
-        spurious jump whose size depends on the reset distribution rather than
-        on the policy. Pairs are therefore skipped whenever the PREVIOUS step
-        terminated or truncated for that env — which is also why the previous
-        done flags are carried on ``_prev_done`` rather than read from the
-        current step.
+        AUTORESET: both families reset done envs INSIDE ``step()`` and return the
+        new episode's first obs, so the action after a done comes from an
+        unrelated initial state. Differencing across that boundary reports a
+        spurious jump sized by the reset distribution, not the policy. Pairs are
+        skipped when the PREVIOUS step was done — hence ``_prev_done`` rather
+        than the current step's flags.
 
-        Units are raw action units per step (NOT per second): dividing by dt
-        would make the number depend on the integrator step, and dt is fixed
-        within an env anyway. Compare across configs of one env, not across
-        envs with different dt.
+        Units are raw action units per STEP, not per second: dividing by dt would
+        make the number depend on the integrator step. Compare across configs of
+        one env, never across envs with different dt.
         """
         if not torch.is_tensor(action):
             return
@@ -967,8 +953,9 @@ def log_tracking_plots(
     if _wandb_run() is None:
         return
     import matplotlib.pyplot as plt
-    import wandb
     from PIL import Image
+
+    import wandb
 
     label = title or prefix
 

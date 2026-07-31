@@ -195,7 +195,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         err_norm = torch.norm(vel_err_vec, dim=-1)
         self._episode_vel_auc += err_norm
         self._episode_vel_last = err_norm.detach().clone()
-        
+
         is_first_step = self.episode_length_buf <= 1
         self._episode_vel_initial[is_first_step] = err_norm[is_first_step]
 
@@ -208,7 +208,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         rew_rp = torch.sum(torch.square(self._robot.data.root_ang_vel_b[:, :2]), dim=1) * self.cfg.rew_roll_pitch
         rew_act_rate = torch.sum(torch.square(self._actions - self._prev_actions), dim=1) * self.cfg.rew_action_rate
 
-        rew_height = torch.square(self._robot.data.root_pos_w[:, 2] - getattr(self.cfg, "target_base_height", 0.34)) * getattr(self.cfg, "rew_base_height", -10.0)
+        rew_height = torch.square(self._robot.data.root_pos_w[:, 2] - self.cfg.target_base_height) * self.cfg.rew_base_height
 
         # Force-based foot contact + air time from the ContactSensor (robust,
         # terrain-independent — see env_cfg.contact_sensor).
@@ -244,13 +244,13 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
 
         total_reward = (self.cfg.rew_alive + rew_lin + rew_yaw + rew_flat + rew_z + rew_rp +
                         rew_height + rew_gait + rew_hip + rew_act_rate)
-        
+
         if not hasattr(self, "_episode_discounted_returns"):
             self._episode_discounted_returns = torch.zeros(self.num_envs, device=self.device)
             self._current_discounts = torch.ones(self.num_envs, device=self.device)
             self._episode_undiscounted_returns = torch.zeros(self.num_envs, device=self.device)
             self._episode_lengths_custom = torch.zeros(self.num_envs, device=self.device)
-            
+
         self._episode_discounted_returns += self._current_discounts * total_reward
         self._episode_undiscounted_returns += total_reward
         self._episode_lengths_custom += 1.0
@@ -316,12 +316,12 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
                 self.extras["log"].update(
                     reward_log_dict(reward_summary(undisc_returns, mask), self.device)
                 )
-            
+
             self._episode_discounted_returns[env_ids] = 0.0
             self._episode_undiscounted_returns[env_ids] = 0.0
             self._episode_lengths_custom[env_ids] = 0.0
             self._current_discounts[env_ids] = 1.0
-            
+
         self._episode_vel_auc[env_ids] = 0.0
         self._episode_vel_initial[env_ids] = 0.0
         self._episode_vel_last[env_ids] = 0.0
@@ -420,7 +420,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         n = base_pos.shape[0]
         if scale_len is None:
             scale_len = torch.ones(n, device=self.device)
-            
+
         s = scale_len.unsqueeze(-1)
         shaft_offset = torch.tensor(
             [self._ARROW_SHAFT_LEN / 2, 0.0, 0.0], device=self.device
@@ -464,7 +464,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         )
         cmd_quat = self._vel_world_xy_to_arrow(cmd_xy_w)
         cur_quat = self._vel_world_xy_to_arrow(self._robot.data.root_lin_vel_w[:, :2])
-        
+
         cmd_mag = torch.clamp(torch.norm(cmd_xy_w, dim=-1), min=0.01)
         cur_mag = torch.clamp(torch.norm(self._robot.data.root_lin_vel_w[:, :2], dim=-1), min=0.01)
 
@@ -474,7 +474,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         cmd_scale = torch.ones(2 * self.num_envs, 3, device=self.device)
         cmd_scale[:self.num_envs, 0] = cmd_mag  # scale shaft length
         cmd_scale[:, 1:] = 1.5  # Make command arrow 50% thicker
-        
+
         cur_scale = torch.ones(2 * self.num_envs, 3, device=self.device)
         cur_scale[:self.num_envs, 0] = cur_mag  # scale shaft length
         cur_scale[:, 1:] = 0.7  # Make current arrow thinner

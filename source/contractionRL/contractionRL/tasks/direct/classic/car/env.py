@@ -10,6 +10,7 @@ Control-affine dynamics:
 from __future__ import annotations
 
 import math
+
 import torch
 
 from ..common.env_base import BaseEnv
@@ -109,11 +110,47 @@ class CarEnv(BaseEnv):
             uref += torch.randn_like(uref) * torch.abs(0.1 * uref)
         return torch.clamp(uref, self.UREF_MIN, self.UREF_MAX)
 
+    def set_held_out_mode(self, seed: int | None, n_trajectories: int = 64) -> None:
+        """Fix a REPRODUCIBLE bank of ``n_trajectories`` reference-trajectory
+        weight vectors (the mixing coefficients over the 10 fixed sinusoidal
+        steering components — see ``system_reset``), drawn from a DEDICATED
+        ``torch.Generator`` seeded independently of the run's own training
+        seed/RNG stream. As long as ``seed`` differs from the training seed,
+        these specific path shapes are guaranteed never drawn during
+        training — a genuine held-out generalization test (UVFA-style: the
+        value function/policy is conditioned on the reference "goal"; this is
+        the held-out slice of that goal space), not just "a different random
+        draw from the same ongoing stream" the way a fresh eval env's default
+        ``torch.randn`` already gives you. ``system_reset`` cycles through
+        this fixed bank (round-robin over ``env_ids``) instead of drawing i.i.d.
+        random weights while active. ``seed=None`` reverts to that historic
+        i.i.d.-random behavior exactly (disables held-out mode).
+
+        Only the steering WEIGHTS are fixed — the initial state
+        (``define_initial_state``: start position/heading/velocity, initial
+        tracking error) still draws from the ordinary global RNG every reset,
+        same as training. The "goal" being held out is the reference PATH
+        SHAPE, not the starting condition.
+        """
+        if seed is None:
+            self._held_out_weights = None
+            return
+        gen = torch.Generator(device="cpu").manual_seed(int(seed))
+        freqs = list(range(1, 11))
+        w = torch.randn(int(n_trajectories), len(freqs), len(UREF_MIN), generator=gen)
+        w = w / torch.sqrt((w ** 2).sum(dim=1, keepdim=True))
+        self._held_out_weights = w.to(self.device)
+
     def system_reset(self, env_ids: torch.Tensor):
         xref_0, xe_0, x_0 = self.define_initial_state(env_ids)
         freqs = list(range(1, 11))
         n = len(env_ids)
-        weights = torch.randn(n, len(freqs), len(UREF_MIN), device=self.device)
-        weights = weights / torch.sqrt((weights ** 2).sum(dim=1, keepdim=True))
+        bank = getattr(self, "_held_out_weights", None)
+        if bank is not None:
+            idx = torch.arange(n, device=self.device) % bank.shape[0]
+            weights = bank[idx]
+        else:
+            weights = torch.randn(n, len(freqs), len(UREF_MIN), device=self.device)
+            weights = weights / torch.sqrt((weights ** 2).sum(dim=1, keepdim=True))
         xref_arr, uref_arr, length = self._rollout_reference(xref_0, freqs, weights)
         return x_0, xref_arr, uref_arr, length

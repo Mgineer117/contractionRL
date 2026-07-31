@@ -10,9 +10,7 @@ from __future__ import annotations
 
 import os
 import warnings
-from typing import Sequence
-
-
+from collections.abc import Sequence
 
 
 def filter_cfg_fields(cfg_dict: dict, dataclass_type, *, context: str) -> dict:

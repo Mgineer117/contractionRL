@@ -136,7 +136,7 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
         err_norm = torch.norm(vel_err_vec, dim=-1)
         self._episode_vel_auc += err_norm
         self._episode_vel_last = err_norm.detach().clone()
-        
+
         # episode_length_buf is incremented to 1 BEFORE _get_rewards runs (see
         # DirectRLEnv.step), so it is never 0 here — use <= 1 to capture the
         # first reward step. Matches quadruped_vel_tracking.
@@ -215,12 +215,12 @@ class HumanoidVelTrackingEnv(DirectRLEnv):
                 self.extras["log"].update(
                     reward_log_dict(reward_summary(undisc_returns, mask), self.device)
                 )
-            
+
             self._episode_discounted_returns[env_ids] = 0.0
             self._episode_undiscounted_returns[env_ids] = 0.0
             self._episode_lengths_custom[env_ids] = 0.0
             self._current_discounts[env_ids] = 1.0
-            
+
         self._episode_vel_auc[env_ids] = 0.0
         self._episode_vel_initial[env_ids] = 0.0
         self._episode_vel_last[env_ids] = 0.0

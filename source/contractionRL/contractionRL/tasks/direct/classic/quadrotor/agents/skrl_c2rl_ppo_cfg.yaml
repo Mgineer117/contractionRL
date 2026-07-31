@@ -90,7 +90,7 @@ agent:
   # observation, which breaks the CLActor's obs_dim = 2*x_dim + u_dim layout).
   # Override per-run with --caps_temporal_scale / --caps_spatial_scale /
   # --caps_spatial_std. See patch_caps_regularizer.
-  caps_temporal_scale: 0.01  # weight on ||pi(s_t) - pi(s_t+1)||^2
+  caps_temporal_scale: 0.001  # weight on ||pi(s_t) - pi(s_t+1)||^2
   caps_spatial_scale: 0.0    # weight on ||pi(s) - pi(s_bar)||^2, s_bar ~ N(s, sigma^2)
   caps_spatial_std: 0.05     # sigma, in RAW observation units (see patch_caps_regularizer)
 
@@ -118,13 +118,32 @@ cm:
   metric_source: cmg
   # Mahalanobis reward
   w_ub: 10.0  # Upper eigenvalue bound for the metric M(x)
-  w_lb: 0.1   # Lower eigenvalue bound for the metric M(x)
+  # lbd/w_lb/cm_eps/cvstem_r_scaler tuned 2026-07-29 via the REAL wandb sweep
+  # infra (search/search_cluster.sh --algorithm cvstem-lqr --env quadrotor —
+  # see search/configs/cvstem-lqr.yaml: online per-step SDP solve, full
+  # 400-step/64-env rollout, ABORTS on the first infeasible state anywhere,
+  # metric = Stability/auc_mean). An earlier LOCAL heuristic pass (checking
+  # only 200 static reference-sampled states, not a real closed-loop rollout)
+  # had picked lbd=0.1/r_scaler=5.0/w_lb=0.1 -- feasible, but the real sweep
+  # showed it is a WEAK operating point: AUC=9.72 at full 64-env scale, vs.
+  # the sweep's best of AUC=1.79. The real per-step-online-rollout test is a
+  # much stronger feasibility requirement than any static-sample check (44/45
+  # of the search space's grid points were 100% infeasible somewhere in a
+  # full rollout -- see the killed-off tuning notes in scratch/ for detail):
+  # only lbd<=1.0 combined with a WIDE w_ub (>=10, hence w_ub above stays at
+  # its 10.0 default) is ever feasible, and even then r_scaler is a fairly
+  # narrow window. Best of 13 feasible trials (of 93 total):
+  #   AUC=1.79  r_scaler=0.5657  lbd=0.5  w_lb=0.01  w_ub=10  cm_eps=1.0
+  # cm_eps=1.0 was the LOOSEST value in the searched grid ([0.001,0.01,0.1,1]) —
+  # every top-13 feasible trial used eps=1.0 (one exception at eps=0.1), so the
+  # true optimum may sit at an even looser margin than this grid covered.
+  w_lb: 0.01  # Lower eigenvalue bound for the metric M(x)
   lbd: 0.5    # Contraction rate λ — used by cmg_method's synthesis loss (CM SDP LMI for
               # "cvstem", CMG Cu/C1 loss for "ccm")
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled)
   # SDP contraction metric (cm_eps used by both cmg_method paths; cm_solver "cvstem" only)
-  cm_eps: 0.01  # Strict-definiteness margin on the contraction LMI
+  cm_eps: 1.0  # Strict-definiteness margin on the contraction LMI — see tuning note above
   cm_solver: MOSEK  # cvxpy SDP solver: SCS (default, no license) | CLARABEL (no license, tighter/slower) | MOSEK (commercial license, tightest/fastest — see README.md Installation)
   # cmg_method selects the training pipeline (see c2rl.py module docstring):
   #   "ccm"    — trains the CMG directly via C1/C2 loss minimization
@@ -145,7 +164,7 @@ cm:
   #              Control is penalized via this Riccati term, not bounded over an
   #              action range — see ncm_synthesis.py module docstring.
   cmg_method: cvstem
-  cvstem_r_scaler: 1.0  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only
+  cvstem_r_scaler: 0.5657  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only — see lbd's tuning note above
   # On SDP infeasibility AT A GIVEN STATE, retry that state alone with λ
   # halved, up to this many times, before giving up on it and dropping it from
   # the dataset — 0 disables this and reverts to dropping immediately. Warns

@@ -77,7 +77,6 @@ import os
 import time
 
 import numpy as np
-
 import viz_common
 from viz_common import (
     CLASSIC_ENVS,

@@ -23,7 +23,7 @@ parameters:
     values: [0.01, 0.05, 0.1, 0.3, 0.5, 1.0]
   # control backbones only — c3m's certificate needs u = uref + feedback(x-xref),
   # so plain `mlp` is not a valid option here (see the squashed-backbone policy).
-  agent.models.policy.backbone:
+  models.policy.backbone:
     values: [control, control-squashed]
   agent.actor_lr:
     values: [1.0e-5, 3.0e-5, 1.0e-4, 3.0e-4, 1.0e-3]

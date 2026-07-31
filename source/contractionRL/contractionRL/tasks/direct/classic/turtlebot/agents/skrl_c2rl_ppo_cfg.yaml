@@ -90,7 +90,7 @@ agent:
   # observation, which breaks the CLActor's obs_dim = 2*x_dim + u_dim layout).
   # Override per-run with --caps_temporal_scale / --caps_spatial_scale /
   # --caps_spatial_std. See patch_caps_regularizer.
-  caps_temporal_scale: 0.01  # weight on ||pi(s_t) - pi(s_t+1)||^2
+  caps_temporal_scale: 0.001  # weight on ||pi(s_t) - pi(s_t+1)||^2
   caps_spatial_scale: 0.0    # weight on ||pi(s) - pi(s_bar)||^2, s_bar ~ N(s, sigma^2)
   caps_spatial_std: 0.05     # sigma, in RAW observation units (see patch_caps_regularizer)
 

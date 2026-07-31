@@ -313,21 +313,40 @@ def _build_gaussian_policy(models_cfg: dict, block_name: str, obs_space, state_s
 
 
 def _build_critics(models_cfg: dict, block_name: str, base_algorithm: str, obs_space, act_space,
-                   device, x_dim, angle_idx: list, key_prefix: str = "", sym=None) -> dict:
+                   device, x_dim, angle_idx: list, key_prefix: str = "", sym=None,
+                   state_space=None, critic_encoder: str | None = None,
+                   critic_combine: str = "concat", critic_embed_dim: int = 64,
+                   critic_analytic_potential: bool = False, w_lb: float = 0.01) -> dict:
     """Build the value/critic model(s) for one policy — a single V(obs) model
     for PPO, or the twin-Q + target architecture (critic_1/2 + targets) for
     SAC. Used by ``_setup_c2rl`` (``key_prefix=""``, a single deployed policy).
+
+    ``critic_encoder`` (PPO only, set via ``models.critic.encoder`` /
+    ``--critic_encoder`` — see ``train.py``): when set AND the env exposes a
+    ``state_space`` (``BaseEnv.configure_value_state`` was called), builds an
+    asymmetric ``TrajectoryAwareValueModel`` reading skrl's privileged
+    ``states`` channel instead of ``EmbeddedDeterministicModel``'s
+    ``observations`` — see that class's docstring. ``None`` (default) keeps
+    the historic behavior exactly.
     """
-    from contractionRL.agents.skrl.models import EmbeddedDeterministicModel
+    from contractionRL.agents.skrl.models import EmbeddedDeterministicModel, TrajectoryAwareValueModel
 
     net = models_cfg.get(block_name, {}).get("network", [{}])
     hd = net[0].get("layers", [256, 256]) if net else [256, 256]
     act = net[0].get("activations", "tanh") if net else "tanh"
 
     if base_algorithm == "PPO":
+        if critic_encoder and state_space is not None:
+            return {f"{key_prefix}value": TrajectoryAwareValueModel(
+                state_space, act_space, device, hidden_dim=hd, activation=act,
+                x_dim=x_dim, angle_idx=angle_idx, encoder=critic_encoder,
+                combine=critic_combine, encoder_hidden=critic_embed_dim,
+                analytic_potential=critic_analytic_potential, w_lb=w_lb,
+            )}
         return {f"{key_prefix}value": EmbeddedDeterministicModel(
             obs_space, act_space, device, hidden_dim=hd, activation=act,
             x_dim=x_dim, angle_idx=angle_idx, sym=sym, use_actions=False,
+            analytic_potential=critic_analytic_potential, w_lb=w_lb,
         )}
     elif base_algorithm == "SAC":
         return {
@@ -650,11 +669,28 @@ class ContractionRunner:
             # metric + offline CMG synthesis knobs), merged into agent_cfg — the
             # "pretrained" metric_source builds+freezes a CMG here, "online"
             # solves the SDP per step and needs no network.
+            #
+            # The actuator-feasibility bound (u_lo/u_hi) comes from the env's
+            # OWN uref_min/uref_max, never from a config value — a hardcoded
+            # yaml bound silently drifts out of sync with the env (and was
+            # wrong-signed for asymmetric boxes like turtlebot's [0, 0.22]
+            # linear-velocity channel). U_MIN/U_MAX (2x the uref box, matching
+            # env_base.py's own physical actuator clamp) are the env's real
+            # bounds if exposed; else fall back to computing them here.
+            uref_min, uref_max, u_min, u_max = _env_attrs(
+                raw_env, "UREF_MIN", "UREF_MAX", "U_MIN", "U_MAX"
+            )
+            if u_min is None and uref_min is not None:
+                u_min = 2.0 * uref_min
+            if u_max is None and uref_max is not None:
+                u_max = 2.0 * uref_max
+            u_lo = u_min.tolist() if hasattr(u_min, "tolist") else u_min
+            u_hi = u_max.tolist() if hasattr(u_max, "tolist") else u_max
             self._setup_cvstem_lqr(skrl_env, device, obs_space, state_space, act_space,
                                    agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B,
                                    x_dim=x_dim, u_dim=u_dim, angle_idx=angle_idx, sym=sym,
                                    raw_cfg_snapshot=raw_cfg_snapshot,
-                                   cm_cfg=cm_cfg, cmg_cfg=cmg_cfg)
+                                   cm_cfg=cm_cfg, cmg_cfg=cmg_cfg, u_lo=u_lo, u_hi=u_hi)
         elif algo in ("c2rl-ppo", "c2rl-sac"):
             # base_algorithm is derived from the algo string itself (i.e. which
             # entry point / yaml you used), not a config toggle — see
@@ -712,10 +748,12 @@ class ContractionRunner:
     def _setup_sdlqr(self, env, device, obs_space, state_space, act_space,
                      agent_cfg, trainer_cfg, models_cfg, get_f_and_B, lqr: bool = False, x_dim=None, u_dim=None, angle_idx=None, sym=None,
                      raw_cfg_snapshot=None):
-        from contractionRL.agents.skrl.sdlqr import SDLQRAgent, LQRAgent, SDLQRCfg, LQRCfg
-        from skrl.trainers.torch import SequentialTrainer
         import dataclasses
+
+        from skrl.trainers.torch import SequentialTrainer
         from skrl.trainers.torch.base import TrainerCfg
+
+        from contractionRL.agents.skrl.sdlqr import LQRAgent, LQRCfg, SDLQRAgent, SDLQRCfg
 
         cfg_cls = LQRCfg if lqr else SDLQRCfg
         agent_cls = LQRAgent if lqr else SDLQRAgent
@@ -758,7 +796,7 @@ class ContractionRunner:
     def _setup_cvstem_lqr(self, env, device, obs_space, state_space, act_space,
                           agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B,
                           x_dim=None, u_dim=None, angle_idx=None, sym=None, raw_cfg_snapshot=None,
-                          cm_cfg=None, cmg_cfg=None):
+                          cm_cfg=None, cmg_cfg=None, u_lo=None, u_hi=None):
         """Build a CVSTEMLQRAgent — Tsukamoto's CV-STEM contraction controller.
 
         Analytical (like SD-LQR), so a SequentialTrainer / no gradient updates.
@@ -768,10 +806,12 @@ class ContractionRunner:
         metric_source='pretrained' a frozen CMG (MetricModel, BoundedCCM,
         constrain_eigenvalues=True) is built and synthesized inside the agent;
         'online' needs no network."""
-        from contractionRL.agents.skrl.cvstem_lqr import CVSTEMLQRAgent, CVSTEMLQRCfg
+        import dataclasses
+
         from skrl.trainers.torch import SequentialTrainer
         from skrl.trainers.torch.base import TrainerCfg
-        import dataclasses
+
+        from contractionRL.agents.skrl.cvstem_lqr import CVSTEMLQRAgent, CVSTEMLQRCfg
 
         # agent_cfg LAST so CLI overrides survive — see _setup_c2rl's identical merge.
         agent_cfg = {**(cm_cfg or {}), **(cmg_cfg or {}), **agent_cfg}
@@ -803,6 +843,8 @@ class ContractionRunner:
             x_dim=x_dim,
             u_dim=u_dim,
             angle_idx=angle_idx,
+            u_lo=u_lo,
+            u_hi=u_hi,
         )
         # Same fix as _setup_lqr_sdlqr above — pass trainer_cfg through in
         # full so `headless` (train.py) isn't silently dropped.
@@ -914,7 +956,14 @@ class ContractionRunner:
                                                   device, x_dim, angle_idx, agent_class=f"C2RL-{base_algorithm}",
                                                   sym=sym)
         models.update(_build_critics(models_cfg, "critic", base_algorithm, obs_space, act_space,
-                                     device, x_dim, angle_idx, key_prefix="", sym=sym))
+                                     device, x_dim, angle_idx, key_prefix="", sym=sym,
+                                     state_space=state_space,
+                                     critic_encoder=models_cfg.get("critic", {}).get("encoder"),
+                                     critic_combine=models_cfg.get("critic", {}).get("combine", "concat"),
+                                     critic_embed_dim=int(models_cfg.get("critic", {}).get("embed_dim", 64)),
+                                     critic_analytic_potential=bool(
+                                         models_cfg.get("critic", {}).get("analytic_potential", False)),
+                                     w_lb=float(agent_cfg.get("cm", {}).get("w_lb", 0.01))))
 
         # Pass the RAW agent_cfg dict (not a pre-parsed C2RLPPOCfg/C2RLSACCfg) —
         # C2RLAgent keeps the full dict in self._raw_cfg, which make_base_rl_cfg()

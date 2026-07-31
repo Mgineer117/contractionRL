@@ -195,15 +195,18 @@ def run_classic(args) -> list[dict]:
         sys.path.insert(0, _classic_dir)
     sys.path.append(os.path.dirname(__file__))
 
+    import contractionRL.tasks.direct.classic  # noqa: F401 — registers classic envs
     import gymnasium as gym
     import yaml
-
-    import contractionRL.tasks.direct.classic  # noqa: F401 — registers classic envs
-    from contractionRL.runners import ContractionRunner
-    from contractionRL.agents.skrl.runner import CLActorRunner
     from contractionRL.agents.skrl.contraction_metrics import StatManagerEnvWrapper
-    from train_utils import (BatchedGymnasiumWrapper, _default_num_envs_classic,
-                             _inject_angle_idx, _resolve_symmetry_for_env)
+    from contractionRL.agents.skrl.runner import CLActorRunner
+    from contractionRL.runners import ContractionRunner
+    from train_utils import (
+        BatchedGymnasiumWrapper,
+        _default_num_envs_classic,
+        _inject_angle_idx,
+        _resolve_symmetry_for_env,
+    )
 
     def _load_agent_cfg(algorithm: str) -> dict:
         entry_key = f"skrl_{algorithm.replace('-', '_')}_cfg_entry_point"
@@ -270,7 +273,7 @@ def run_classic(args) -> list[dict]:
                 _inject_angle_idx(agent_cfg, _angle_idx, _resolve_symmetry_for_env(env))
                 runner = CLActorRunner(env, agent_cfg)
 
-            print(f"  loading checkpoint …")
+            print("  loading checkpoint …")
             runner.agent.load(ckpt)
 
             max_steps = int(getattr(env, "max_episode_length", getattr(env, "max_episode_len", 1000))) + 1
@@ -286,16 +289,15 @@ def run_classic(args) -> list[dict]:
 # ── Isaac route ──────────────────────────────────────────────────────────── #
 
 def run_isaac(args, simulation_app) -> list[dict]:
+    import contractionRL.tasks  # noqa: F401 — registers Isaac tasks
     import gymnasium as gym
+    from contractionRL.agents.skrl.contraction_metrics import StatManagerEnvWrapper
+    from contractionRL.agents.skrl.runner import CLActorRunner
+    from contractionRL.runners import ContractionRunner
 
     from isaaclab_rl.skrl import SkrlVecEnvWrapper
+
     from isaaclab_tasks.utils import load_cfg_from_registry
-
-    import contractionRL.tasks  # noqa: F401 — registers Isaac tasks
-
-    from contractionRL.runners import ContractionRunner
-    from contractionRL.agents.skrl.runner import CLActorRunner
-    from contractionRL.agents.skrl.contraction_metrics import StatManagerEnvWrapper
 
     models = _discover_models(args.task, False, args.models_dir, args.algorithm, args.checkpoint)
     if not models:

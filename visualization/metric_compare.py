@@ -35,7 +35,6 @@ import os
 
 import numpy as np
 import torch
-
 import viz_common
 from viz_common import (
     CLASSIC_ENVS,

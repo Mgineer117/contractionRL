@@ -49,8 +49,8 @@ invariant of the 8-dim (x, xref) pair under a 3-dim symmetry group.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 import torch
 
@@ -105,7 +105,7 @@ class StateSymmetry:
 
     # ── construction ────────────────────────────────────────────────────── #
     @classmethod
-    def from_names(cls, names: Sequence[str], *, allow_se2: bool = True) -> "StateSymmetry":
+    def from_names(cls, names: Sequence[str], *, allow_se2: bool = True) -> StateSymmetry:
         names = tuple(str(n) for n in names)
         x_dim = len(names)
         angle_idx = tuple(i for i, n in enumerate(names) if n in _ANGULAR)
@@ -137,7 +137,7 @@ class StateSymmetry:
             angle_idx=angle_idx,
         )
 
-    def demote_to_translation(self) -> "StateSymmetry":
+    def demote_to_translation(self) -> StateSymmetry:
         """Drop back to the translation quotient (e.g. the numerical rotation
         equivariance check failed for this env's dynamics)."""
         if self.mode != "se2":
@@ -145,7 +145,7 @@ class StateSymmetry:
         return StateSymmetry(self.x_dim, self.names, "translation",
                              pos_idx=self.pos_idx, angle_idx=self.angle_idx)
 
-    def disabled(self) -> "StateSymmetry":
+    def disabled(self) -> StateSymmetry:
         return StateSymmetry(self.x_dim, self.names, "none", angle_idx=self.angle_idx)
 
     # ── derived legacy views ────────────────────────────────────────────── #

@@ -226,6 +226,15 @@ def build(algorithm: str, env: str, *, method: str, project: str) -> dict:
         # nothing the sweep reads.
         command.append("--skip_final_eval")
 
+    # Static store_true flags every trial gets, verbatim — NOT swept params.
+    # A store_true flag can't be a wandb `parameters:` entry: wandb always
+    # emits `--flag=<value>`, and argparse's store_true action raises on the
+    # explicit `=value` even for a recognized flag (unlike the dotted
+    # `agent.x`/`models.x` keys below, which train.py's parse_known_args
+    # silently leaves for apply_wandb_sweep_overrides to read off wandb.config
+    # instead — no such fallback exists for a real flag like --reward_euclidean).
+    command += list(cfg.get("extra_flags") or [])
+
     command.append("${args}")
 
     return {

@@ -62,7 +62,7 @@ class PathTrackingBase(DirectRLEnv):
             any norm/reward/metric — otherwise a wraparound (e.g. a yaw U-turn)
             would spike the error by ~2*pi.
     """
-    angle_idx: "Sequence[int]" = ()
+    angle_idx: Sequence[int] = ()
 
     # One name per PHYSICAL state dim (see agents/skrl/state_symmetry.py for the
     # vocabulary). Declaring names rather than raw indices is what lets the
@@ -76,7 +76,7 @@ class PathTrackingBase(DirectRLEnv):
     #
     # Subclasses whose width depends on the robot (joint count) should override
     # the ``state_names`` PROPERTY instead of this attribute.
-    _state_names: "Sequence[str]" = ()
+    _state_names: Sequence[str] = ()
 
     @property
     def state_names(self) -> tuple[str, ...]:
@@ -207,7 +207,9 @@ class PathTrackingBase(DirectRLEnv):
         """Inject a NeuralDynamics model for get_f_and_B (required for Isaac envs)."""
         self._dynamics_model = model
 
-    def set_ccm(self, ccm_gen, w_lb, device, tracking_scaler=None, control_scaler=None) -> None:
+    def set_ccm(self, ccm_gen, w_lb, device, tracking_scaler=None, control_scaler=None,
+                reward_euclidean=False, reward_level=False,
+                residual_anchor_scale=0.0, cvstem_r_scaler=1.0) -> None:
         """Inject the frozen CMG for C2RL's Phase B Mahalanobis reward.
 
         Mirrors classic/common/env_base.py's BaseEnv.set_ccm exactly (same
@@ -216,7 +218,21 @@ class PathTrackingBase(DirectRLEnv):
 
         The scalers default to None = keep the plain-reward weights set in
         __init__ (1.0 / 0.0).
+
+        The last four are classic-only reward variants (residual-base RL over
+        CV-STEM-LQR); _get_rewards here has no branch for them, so a non-default
+        value raises rather than silently training on the Mahalanobis reward.
         """
+        unsupported = [n for n, v in (("reward_euclidean", reward_euclidean),
+                                      ("reward_level", reward_level),
+                                      ("residual_anchor_scale", residual_anchor_scale),
+                                      ("cvstem_r_scaler", cvstem_r_scaler))
+                       if v not in (False, 0.0) and not (n == "cvstem_r_scaler" and v == 1.0)]
+        if unsupported:
+            raise NotImplementedError(
+                f"{type(self).__name__}._get_rewards implements only the Mahalanobis "
+                f"reward; classic-only knobs requested: {', '.join(unsupported)}."
+            )
         self.ccm_gen = ccm_gen
         self.w_lb = w_lb
         self.ccm_device = device
@@ -614,7 +630,9 @@ class PathTrackingBase(DirectRLEnv):
             # Computed over ALL finished envs (not just the few viz envs the old
             # fit_exponential_envelope path used), for tighter statistics.
             from contractionRL.agents.skrl.contraction_metrics import (
-                per_env_metrics, stability_log_dict, summarize,
+                per_env_metrics,
+                stability_log_dict,
+                summarize,
             )
             per_env = per_env_metrics(
                 e0=self._episode_e0[finished],

@@ -52,19 +52,17 @@ whose input distribution could drift. ``"online"`` pins its compute to CPU
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import numpy as np
 import torch
-
 from skrl.agents.torch.base import Agent, AgentCfg
 
 from .angle_utils import wrap_diff
 from .math_utils import bound_W, jacobian, spd_inverse
 from .ncm_synthesis import _solve_cm_metric_with_backoff
 from .rl_glue import filter_cfg_fields
-
 
 # Printed verbatim on the abort path. search/sweep_runner.py greps the child's
 # output for this exact string, so the two must stay in sync — it is the signal
@@ -106,6 +104,18 @@ class CVSTEMLQRCfg(AgentCfg):
     cm_eps: float = 0.01         # strict-definiteness margin on the LMI
     cm_solver: str = "SCS"       # cvxpy SDP solver (SCS | CLARABEL | MOSEK)
     max_lambda_reductions: int = 5  # per-state λ-backoff budget on infeasibility
+
+    # Actuator-feasibility check, evaluated on the REALIZED trajectory (not a
+    # per-state Monte Carlo prediction): every "online" step's actual
+    # controller output is compared against the env's own actuator box
+    # [u_lo, u_hi] (see ``u_lo``/``u_hi`` ctor args, derived from the env's
+    # UREF_MIN/UREF_MAX by ContractionRunner._setup_cvstem_lqr). Once the
+    # rollout ends, a channel fails if more than 5% of ITS ACTUAL executed
+    # samples fell outside its bound — same "95% must clear" threshold the old
+    # per-state check used, but measured from what the controller really did
+    # rather than a synthetic sample at an assumed tracking-error radius. See
+    # post_interaction() below. Subject to abort_on_infeasible, same as an LMI
+    # infeasibility. "online" only, no config knob needed.
 
     # "online" only. False (default) keeps the historical behavior: an infeasible
     # state falls back to zero feedback (u = u_ref) for that env and the rollout
@@ -150,6 +160,12 @@ class CVSTEMLQRAgent(Agent):
       ``models``: ``{"cmg": MetricModel}`` for ``"pretrained"`` (a
         BoundedCCM_Generator, ``constrain_eigenvalues=True``); ``{}`` for
         ``"online"``.
+      ``u_lo``/``u_hi``: SIGNED per-channel actuator bounds for the "online"
+        realized-trajectory actuator-feasibility check (post_interaction()) —
+        the CALLER (``ContractionRunner._setup_cvstem_lqr``) derives these
+        from the env's own ``UREF_MIN``/``UREF_MAX`` rather than a config
+        value, so they can never drift from the env's actual physical
+        actuator limits. ``None`` disables the check.
     """
 
     def __init__(
@@ -167,6 +183,8 @@ class CVSTEMLQRAgent(Agent):
         x_dim: int | None = None,
         u_dim: int | None = None,
         angle_idx: list | None = None,
+        u_lo: list | None = None,
+        u_hi: list | None = None,
     ) -> None:
         if isinstance(cfg, dict):
             cfg = CVSTEMLQRCfg(**filter_cfg_fields(cfg, CVSTEMLQRCfg, context="CVSTEMLQRAgent"))
@@ -193,6 +211,19 @@ class CVSTEMLQRAgent(Agent):
         self._cfg = cfg
         self._get_f_and_B = get_f_and_B
         self._get_rollout = get_rollout
+        self._u_lo = u_lo
+        self._u_hi = u_hi
+        # Realized-trajectory actuator-feasibility tally (see CVSTEMLQRCfg's
+        # comment and post_interaction() below) — per-channel within-bound
+        # counts accumulated as _compute_action_online actually runs, evaluated
+        # once the rollout ends.
+        if u_lo is not None and u_hi is not None:
+            self._bound_lo = torch.as_tensor(u_lo, dtype=torch.float32)
+            self._bound_hi = torch.as_tensor(u_hi, dtype=torch.float32)
+            self._u_within_count = torch.zeros(u_dim)
+            self._u_total_count = 0
+        else:
+            self._bound_lo = None
 
         self._metric_source = str(cfg.metric_source).lower()
         if self._metric_source not in ("online", "pretrained"):
@@ -362,6 +393,14 @@ class CVSTEMLQRAgent(Agent):
             K = (1.0 / r) * (B_np[i].T @ M)               # (u, x)
             K_t = torch.as_tensor(K, dtype=torch.float32, device=self._compute_device)
             actions[i] = uref[i] - K_t @ e_batch[i]
+        # Tally this step's REALIZED (pre-clamp) controls against the env's
+        # actual actuator box — see CVSTEMLQRCfg's comment and
+        # post_interaction() below. "online" only: this is where actions are
+        # actually computed from a fresh SDP solve each step.
+        if self._bound_lo is not None:
+            within = (actions.detach().cpu() >= self._bound_lo) & (actions.detach().cpu() <= self._bound_hi)
+            self._u_within_count += within.sum(dim=0).float()
+            self._u_total_count += actions.shape[0]
         return actions
 
     def act(self, observations, states, *, timestep: int, timesteps: int):
@@ -391,6 +430,29 @@ class CVSTEMLQRAgent(Agent):
 
     def post_interaction(self, *, timestep: int, timesteps: int) -> None:
         super().post_interaction(timestep=timestep, timesteps=timesteps)
+        # Realized-trajectory actuator-feasibility check, evaluated once the
+        # whole rollout is in: a channel fails if more than 5% of its ACTUAL
+        # executed samples fell outside the env's own actuator box (same
+        # threshold the old per-state Monte Carlo check used, applied here to
+        # what the controller really did instead of a synthetic sample at an
+        # assumed tracking-error radius). See CVSTEMLQRCfg's comment.
+        if (
+            self._bound_lo is not None
+            and timestep == timesteps - 1
+            and self._u_total_count > 0
+        ):
+            violation_rate = 1.0 - (self._u_within_count / self._u_total_count)
+            if torch.any(violation_rate > 0.05):
+                msg = (
+                    f"{INFEASIBLE_MARKER}: executed-control bound violation rate "
+                    f"{violation_rate.max().item():.1%} exceeds 5% over the "
+                    f"realized trajectory ({self._u_total_count} samples), "
+                    f"u_lo={self._u_lo}, u_hi={self._u_hi}."
+                )
+                if self._cfg.abort_on_infeasible:
+                    print(msg, flush=True)
+                    raise CVSTEMInfeasibleError(msg)
+                print(f"[CVSTEM-LQR] WARNING: {msg}", flush=True)
 
     def update(self, *, timestep: int, timesteps: int) -> None:
         pass  # analytical — no gradient updates

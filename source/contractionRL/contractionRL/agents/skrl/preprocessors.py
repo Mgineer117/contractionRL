@@ -7,11 +7,10 @@ the FULL observation vector is wrong for this layout.
 """
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
-
 from skrl.resources.preprocessors.torch import RunningStandardScaler
 from skrl.utils.spaces.torch import compute_space_size
 

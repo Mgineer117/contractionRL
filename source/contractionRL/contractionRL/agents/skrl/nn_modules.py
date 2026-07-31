@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Sequence
+from collections.abc import Sequence
 
 import numpy as np
 import torch
@@ -27,7 +27,7 @@ def _sym_from_names(names):
 
 
 from .angle_utils import embed_angles, embedded_dim, wrap_diff
-from .math_utils import rescale_residual
+from .math_utils import bound_W, rescale_residual, spd_inverse
 
 _MIN_LOG_STD = math.log(0.001)  # ≈ -6.908; annealing floor
 
@@ -90,8 +90,8 @@ class CCM_Generator(nn.Module):
         activation: str | nn.Module = "tanh",
         mode: str = "stochastic",
         device: str = "cpu",
-        angle_idx: "Sequence[int]" = (),
-        sym: "StateSymmetry | None" = None,
+        angle_idx: Sequence[int] = (),
+        sym: StateSymmetry | None = None,
     ):
         super().__init__()
         self.x_dim = x_dim
@@ -116,7 +116,7 @@ class CCM_Generator(nn.Module):
 
     def forward(self, x: torch.Tensor, deterministic: bool = True):
         n = x.shape[0]
-        h = self.backbone((self.sym.single_features(x) if self.sym is not None else embed_angles(x, self.angle_idx)))
+        h = self.backbone(self.sym.single_features(x) if self.sym is not None else embed_angles(x, self.angle_idx))
         mu = self.mu_head(h)
 
         if self.mode == "deterministic" or deterministic:
@@ -140,6 +140,324 @@ class CCM_Generator(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
+# CVSTEMLQRBase — analytic contraction controller as a residual-RL baseline
+# ─────────────────────────────────────────────────────────────────────────── #
+
+class CVSTEMLQRBase:
+    """The certified CV-STEM-LQR control law, packaged as a fixed baseline the
+    C2RL actor learns a RESIDUAL on top of.
+
+        u_base = uref - K(x)·e,   K(x) = (1/r)·B(x)ᵀ·M(x),   M(x) = W(x)⁻¹,
+        e = wrap_diff(x - xref)
+
+    Byte-for-byte ``CVSTEMLQRAgent._compute_action_pretrained``: same Phase-A
+    frozen CMG, same analytic ``B(x)``, same ``R = r_scaler·I``. That controller
+    already scores near the analytic tracking floor (~0.9 AUC on car), yet C2RL
+    normally ignores it and learns feedback from scratch. As the baseline, the
+    policy STARTS there and PPO can only improve it (clamped reward, actuator
+    limits, preview, discrete-dt and nonlinear corrections the linear gain misses).
+
+    Deliberately NOT an ``nn.Module``: it references the frozen CMG but must not
+    register it as a policy submodule, which would double-count the CMG in the
+    policy's parameters/checkpoint and in the optimizer. No learnable parameters
+    — ``u_base`` is a fixed detached offset like ``uref``, so gradients flow only
+    through the residual.
+    """
+
+    def __init__(self, ccm_gen, get_f_and_B, *, r_scaler, w_lb, x_dim, u_dim,
+                 angle_idx=()):
+        self.ccm_gen = ccm_gen
+        self.get_f_and_B = get_f_and_B
+        self.r = float(r_scaler) + 1e-5           # strictly positive (mirrors cvstem_lqr.py)
+        self.w_lb = float(w_lb)
+        self.x_dim = int(x_dim)
+        self.u_dim = int(u_dim)
+        self.angle_idx = list(angle_idx or [])
+
+    def __call__(self, state: torch.Tensor) -> torch.Tensor:
+        x = state[:, : self.x_dim]
+        xref = state[:, self.x_dim : 2 * self.x_dim]
+        uref = state[:, 2 * self.x_dim : 2 * self.x_dim + self.u_dim]
+        with torch.no_grad():
+            _f, B, _ = self.get_f_and_B(x)
+            B = B.to(torch.float32)
+            raw_W, _ = self.ccm_gen(x)
+            W = bound_W(raw_W, self.w_lb, self.x_dim,
+                        getattr(self.ccm_gen, "bounded", False))
+            M = spd_inverse(W)                                   # (b, x, x)
+            K = (1.0 / self.r) * torch.bmm(B.transpose(1, 2), M)  # (b, u, x)
+            e = wrap_diff(x - xref, self.angle_idx).unsqueeze(-1)  # (b, x, 1)
+            u = uref - torch.bmm(K, e).squeeze(-1)               # (b, u)
+        return u.detach()
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# Structured preview residuals — π(s) variants for residual RL on the
+# CV-STEM-LQR base. Each explicitly SEPARATES the roles of the current state x
+# (physics / stabilizing gains), the future preview P (path planning), and the
+# invariant tracking error e (what the feedback acts on) — versus the original
+# CLActor, which blends x, xref and P into ONE context feeding both W1 and W2.
+#
+# Contract (all variants): forward(state_feats, e, preview) -> residual (b, u_dim),
+# added on top of the analytic base u_base = uref - K·e. state_feats (b, S) are
+# the invariant current-config features (CLActor._state_feats), e (b, x_dim) the
+# canonical-frame error (CLActor._error_vec), preview (b, P) the future-reference
+# tail. All are zero-initialized (W2's output layer) so the actor STARTS exactly
+# at the CV-STEM-LQR base and PPO grows the residual from there. c = 3·x_dim is
+# the bilinear latent width (matches CLActor).
+# ─────────────────────────────────────────────────────────────────────────── #
+
+def _zero_last_linear(mlp: MLP) -> None:
+    """Zero an MLP's final Linear so its output starts at exactly 0."""
+    last = None
+    for m in mlp.net:
+        if isinstance(m, nn.Linear):
+            last = m
+    if last is not None:
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
+
+
+class DecoupledResidual(nn.Module):
+    """Option 1 — Decoupled matrices (physical / geometric split):
+
+        π = W2(P) · tanh( W1(x) · e )
+
+    ``W1`` (error → latent) is generated from the CURRENT STATE only — it
+    transforms the error according to the robot's present physical configuration.
+    ``W2`` (latent → control) is generated from the PREVIEW only — it allocates
+    control effort for the upcoming path geometry. Physics and path-planning are
+    thus produced by disjoint sub-networks."""
+
+    def __init__(self, x_dim, u_dim, state_dim, preview_dim, hidden, activation):
+        super().__init__()
+        self.x_dim, self.u_dim, self.c = x_dim, u_dim, 3 * x_dim
+        self.w1 = MLP(state_dim, hidden, self.c * x_dim, activation=activation)      # W1(x)
+        self.w2 = MLP(preview_dim, hidden, self.u_dim * self.c, activation=activation)  # W2(P)
+
+    def zero_output(self):
+        """Zero W2's output so π starts at 0 — used ONLY when warm-starting on an
+        analytic base (u = base + π). For the default u = uref + π (learn feedback
+        from scratch) the standard init is kept so the policy starts with feedback."""
+        _zero_last_linear(self.w2)
+
+    def forward(self, state_feats, e, preview, xref_feats=None, uref=None):
+        n = e.shape[0]
+        w1 = self.w1(state_feats).reshape(n, self.c, self.x_dim)
+        w2 = self.w2(preview).reshape(n, self.u_dim, self.c)
+        l1 = torch.tanh(torch.matmul(w1, e.unsqueeze(-1)))
+        return torch.matmul(w2, l1).squeeze(-1)
+
+
+class LatentPreviewResidual(nn.Module):
+    """Option 2 (recommended for generalization) — Latent preview bias:
+
+        π = W2(x) · tanh( W1(x) · e + f_prev(P) )
+
+    ``W1``/``W2`` are STRICT state-dependent gain schedulers (physics only). The
+    preview enters as an additive bias ``f_prev(P)`` in the latent PRE-tanh space,
+    so it preemptively nudges the error signal while remaining bounded by the tanh
+    saturation the state-dependent physical gains set. The preview can never alter
+    the stabilizing gains themselves — only bias what they act on — which is why
+    this generalizes best."""
+
+    def __init__(self, x_dim, u_dim, state_dim, preview_dim, hidden, activation):
+        super().__init__()
+        self.x_dim, self.u_dim, self.c = x_dim, u_dim, 3 * x_dim
+        self.w1 = MLP(state_dim, hidden, self.c * x_dim, activation=activation)   # W1(x)
+        self.w2 = MLP(state_dim, hidden, self.u_dim * self.c, activation=activation)  # W2(x)
+        self.f_prev = MLP(preview_dim, hidden, self.c, activation=activation)     # latent bias
+
+    def zero_output(self):
+        """Zero W2's output (see DecoupledResidual.zero_output)."""
+        _zero_last_linear(self.w2)
+
+    def forward(self, state_feats, e, preview, xref_feats=None, uref=None):
+        n = e.shape[0]
+        w1 = self.w1(state_feats).reshape(n, self.c, self.x_dim)
+        w2 = self.w2(state_feats).reshape(n, self.u_dim, self.c)
+        bias = self.f_prev(preview).unsqueeze(-1)                    # (n, c, 1)
+        l1 = torch.tanh(torch.matmul(w1, e.unsqueeze(-1)) + bias)
+        return torch.matmul(w2, l1).squeeze(-1)
+
+
+class PreviewSequenceEncoder(nn.Module):
+    """Encodes the preview tail as a SEQUENCE of ``num_points`` future
+    reference rows (each ``point_dim`` wide), instead of flattening it into
+    one vector for a plain MLP. Drop-in replacement for
+    ``MLP(preview_dim, hidden, out_dim)`` — same ``(n, preview_dim) -> (n,
+    out_dim)`` signature — so it can be swapped in for any FiLMResidual γ-gate
+    that reads "preview" without touching FiLMResidual.forward at all.
+
+    "gru": fed FARTHEST POINT FIRST (the tail is stored nearest-first, so this
+    reverses it). The final hidden state is then dominated by the near-term
+    point, the far future having already been squashed by the forget gates —
+    which is what makes "an RNN's forgetting resembles discounting" literally
+    true here. Fed nearest-first the final state would be dominated by the
+    FARTHEST point, the opposite of what discounting wants. The encoder is never
+    told gamma, unlike env_base's explicit geometric ladder, so any horizon-like
+    behavior is purely learned.
+
+    "attn": one learned query attends over all points via softmax
+    (order-independent) — lets training discover which offsets matter, with no
+    recency prior, as a deliberate contrast to "gru".
+    """
+
+    MODES = ("gru", "attn")
+
+    def __init__(self, preview_dim, point_dim, hidden, out_dim, mode="gru"):
+        super().__init__()
+        if mode not in self.MODES:
+            raise ValueError(f"PreviewSequenceEncoder: mode must be one of {self.MODES}, got {mode!r}")
+        if preview_dim % point_dim != 0:
+            raise ValueError(f"PreviewSequenceEncoder: preview_dim={preview_dim} is not a "
+                             f"multiple of point_dim={point_dim}")
+        self.num_points = preview_dim // point_dim
+        self.point_dim = point_dim
+        self.mode = mode
+        if mode == "gru":
+            self.rnn = nn.GRU(input_size=point_dim, hidden_size=hidden, batch_first=True)
+            self.proj = nn.Linear(hidden, out_dim)
+        else:
+            self.key = nn.Linear(point_dim, hidden)
+            self.value = nn.Linear(point_dim, hidden)
+            self.query = nn.Parameter(torch.randn(hidden) * (hidden ** -0.5))
+            self.proj = nn.Linear(hidden, out_dim)
+
+    def train(self, mode: bool = True) -> PreviewSequenceEncoder:
+        """Keep the GRU submodule permanently in train mode, regardless of
+        what the surrounding policy is set to. cuDNN's RNN kernel refuses to
+        run backward at all when its OWN training flag is False (either a
+        flat "called in eval mode" error, or — if a caller upstream needs
+        create_graph=True — a hard "double backwards not supported"
+        NotImplementedError) — and skrl's own act()/update() cycle toggles
+        eval()/train() on the whole policy in ways this module has no control
+        over (including inside vendored skrl/ code, off-limits to edit). This
+        GRU has no dropout, so train vs eval never changes its OUTPUT — only
+        whether cuDNN allows differentiating through it — so forcing it to
+        stay in train mode is free."""
+        super().train(mode)
+        if self.mode == "gru":
+            self.rnn.train(True)
+        return self
+
+    def forward(self, preview_flat: torch.Tensor) -> torch.Tensor:
+        n = preview_flat.shape[0]
+        points = preview_flat.reshape(n, self.num_points, self.point_dim)
+        if self.mode == "gru":
+            seq = points.flip(dims=[1])          # farthest-first -> nearest-last
+            _, h = self.rnn(seq)
+            return self.proj(h.squeeze(0))
+        k = self.key(points)                                     # (n, P, hidden)
+        v = self.value(points)                                   # (n, P, hidden)
+        scores = torch.einsum("h,nph->np", self.query, k) / (k.shape[-1] ** 0.5)
+        w = torch.softmax(scores, dim=-1).unsqueeze(-1)          # (n, P, 1)
+        return self.proj((w * v).sum(dim=1))
+
+
+class FiLMResidual(nn.Module):
+    """Option 3 — Preview-modulated gain scheduling (FiLM):
+
+        π = ( W2(x) ⊙ γ2(G2) ) · tanh( ( W1(x) ⊙ γ1(G1) ) · e )
+
+    ``W1(x)``/``W2(x)`` are the baseline stabilizing matrices; ``γ1(G1)``/``γ2(G2)``
+    are POSITIVE per-latent scales (softplus) that stiffen or relax the gains.
+    Scaling is element-wise over the latent dimension ``c``. Crucially, ``e``
+    enters MULTIPLICATIVELY inside the tanh (``(W1⊙γ1)·e``), so at e=0 the tanh
+    argument is exactly 0 REGARDLESS of the gate inputs — u(e=0)=uref always holds,
+    unlike LatentPreviewResidual's additive pre-tanh bias (see project memory:
+    that design breaks u(e=0)=uref once preview is nonzero → diverges).
+
+    ``gate1_source``/``gate2_source`` independently pick ``G1``/``G2``:
+    "preview" (default, future-UREF window), "xref_preview" (future-XREF-relative
+    window, needs ``xref_preview_dim>0``), "xref" (invariant features of the
+    CURRENT reference point — NOT raw xref, which would break translation/SE(2)
+    invariance), or "uref" (already frame-safe raw).
+
+    The two preview sources are not separate tensors: ``preview`` is the combined
+    tail construct_state produces ([future-uref] ++ [future-xref-relative]),
+    sliced internally at ``xref_preview_dim`` from the end. 0 (default) means no
+    xref-relative block and "preview" reads the whole tensor.
+
+    ``gate_encoder`` picks how a preview-window gate turns its P-point block into
+    the γ-network's input: "mlp" (default, flatten) or "gru"/"attn"
+    (PreviewSequenceEncoder — see that class). Ignored for "xref"/"uref" gates,
+    which are single points, not sequences."""
+
+    _GATE_SOURCES = ("preview", "xref_preview", "xref", "uref")
+    _SEQUENCE_SOURCES = ("preview", "xref_preview")
+    _GATE_ENCODERS = ("mlp",) + PreviewSequenceEncoder.MODES
+
+    def __init__(self, x_dim, u_dim, state_dim, preview_dim, hidden, activation,
+                 xref_feat_dim=None, gate1_source="preview", gate2_source="preview",
+                 gate_encoder="mlp", xref_preview_dim=0):
+        super().__init__()
+        self.x_dim, self.u_dim, self.c = x_dim, u_dim, 3 * x_dim
+        for name in (gate1_source, gate2_source):
+            if name not in self._GATE_SOURCES:
+                raise ValueError(f"FiLMResidual: gate source must be one of "
+                                 f"{self._GATE_SOURCES}, got {name!r}")
+        if gate_encoder not in self._GATE_ENCODERS:
+            raise ValueError(f"FiLMResidual: gate_encoder must be one of "
+                             f"{self._GATE_ENCODERS}, got {gate_encoder!r}")
+        self.gate1_source, self.gate2_source = gate1_source, gate2_source
+        self.gate_encoder = gate_encoder
+        # "preview" reads the FIRST (preview_dim - xref_preview_dim) columns of
+        # the combined tail (the uref block); "xref_preview" reads the LAST
+        # xref_preview_dim columns (see construct_state's tail ordering).
+        self.xref_preview_dim = int(xref_preview_dim)
+        self.uref_preview_dim = preview_dim - self.xref_preview_dim
+        gate_dims = {"preview": self.uref_preview_dim, "xref_preview": self.xref_preview_dim,
+                     "xref": xref_feat_dim, "uref": u_dim}
+        point_dims = {"preview": u_dim, "xref_preview": x_dim}
+        gate_hidden = hidden[-1] if isinstance(hidden, list) else hidden
+
+        def _make_gate(source):
+            if gate_encoder != "mlp" and source in self._SEQUENCE_SOURCES:
+                return PreviewSequenceEncoder(gate_dims[source], point_dim=point_dims[source],
+                                              hidden=gate_hidden, out_dim=self.c,
+                                              mode=gate_encoder)
+            return MLP(gate_dims[source], hidden, self.c, activation=activation)
+
+        self.w1 = MLP(state_dim, hidden, self.c * x_dim, activation=activation)   # W1(x)
+        self.w2 = MLP(state_dim, hidden, self.u_dim * self.c, activation=activation)  # W2(x)
+        self.g1 = _make_gate(gate1_source)  # γ1(G1)
+        self.g2 = _make_gate(gate2_source)  # γ2(G2)
+
+    def zero_output(self):
+        """Zero W2's output (see DecoupledResidual.zero_output)."""
+        _zero_last_linear(self.w2)
+
+    def _gate_input(self, source, preview, xref_feats, uref):
+        if source == "preview":
+            return preview[:, : self.uref_preview_dim]
+        if source == "xref_preview":
+            return preview[:, self.uref_preview_dim:]
+        return {"xref": xref_feats, "uref": uref}[source]
+
+    def forward(self, state_feats, e, preview, xref_feats=None, uref=None):
+        n = e.shape[0]
+        w1 = self.w1(state_feats).reshape(n, self.c, self.x_dim)
+        w2 = self.w2(state_feats).reshape(n, self.u_dim, self.c)
+        g1_in = self._gate_input(self.gate1_source, preview, xref_feats, uref)
+        g2_in = self._gate_input(self.gate2_source, preview, xref_feats, uref)
+        g1 = F.softplus(self.g1(g1_in)).unsqueeze(-1)   # (n, c, 1) — scale W1 rows (latent)
+        g2 = F.softplus(self.g2(g2_in)).unsqueeze(-2)   # (n, 1, c) — scale W2 cols (latent)
+        l1 = torch.tanh(torch.matmul(w1 * g1, e.unsqueeze(-1)))
+        return torch.matmul(w2 * g2, l1).squeeze(-1)
+
+
+# Registry the models layer uses to build a variant by name (see
+# models.CLActorModel). "bilinear" (original) and "feedforward" (preview-only,
+# ignores e) are handled directly by CLActor/CLActorModel, not here.
+PREVIEW_RESIDUAL_VARIANTS = {
+    "decoupled": DecoupledResidual,
+    "latent_bias": LatentPreviewResidual,
+    "film": FiLMResidual,
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
 # CLActor
 # ─────────────────────────────────────────────────────────────────────────── #
 
@@ -157,8 +475,9 @@ class CLActor(nn.Module):
         anneal_stddev: bool = False,
         hidden_dim: list[int] | None = None,
         activation: nn.Module | str = nn.Tanh(),
-        angle_idx: "Sequence[int]" = (),
-        sym: "StateSymmetry | None" = None,
+        angle_idx: Sequence[int] = (),
+        sym: StateSymmetry | None = None,
+        preview_dim: int = 0,
     ):
         super().__init__()
         self.x_dim = x_dim
@@ -168,6 +487,10 @@ class CLActor(nn.Module):
         # already relative, but the gains it is multiplied by were a function of
         # the ABSOLUTE (x, xref) pair, which is what failed to generalize.
         self.sym = sym
+        # Width of the reference-preview tail (future uref rows). Fed to the gain
+        # nets so the SCHEDULE anticipates where the reference is heading; the
+        # feedback error e is unchanged (preview shifts gains, not the setpoint).
+        self.preview_dim = int(preview_dim)
 
         if isinstance(activation, str):
             activation = {"tanh": nn.Tanh(), "relu": nn.ReLU()}[activation.lower()]
@@ -179,7 +502,20 @@ class CLActor(nn.Module):
         # the bilinear feedback error e = x - xref stays RAW and FULL-WIDTH (only
         # its angle dims get shortest-angle WRAPPED, not embedded), since the
         # feedback must still act on every state dim — see mean_control below.
-        input_dim = (sym.pair_dim() if sym is not None else 2 * embedded_dim(x_dim, self.angle_idx))
+        # Invariant current-configuration features of the (x, xref) pair — the
+        # "state x" role in the structured residual variants (nn_modules.
+        # DecoupledResidual / LatentPreviewResidual / FiLMResidual): the physics/
+        # geometry of the CURRENT instant, as opposed to the FUTURE preview P.
+        self.state_feat_dim = (sym.pair_dim() if sym is not None else 2 * embedded_dim(x_dim, self.angle_idx))
+        input_dim = self.state_feat_dim + self.preview_dim
+        # Invariant features of xref ALONE (single_features, not the (x,xref)
+        # PAIR) — for gating on "where the reference currently is" without the
+        # current tracking error mixed in. NOT raw xref: translating the whole
+        # scene by a constant must not change this (see recent "quotient
+        # absolute position out of every network input" fix) — single_features
+        # drops the symmetry directions (position / yaw) exactly like the CMG
+        # does, rather than rotating them (a metric-like quantity, not a vector).
+        self.xref_feat_dim = (sym.single_dim() if sym is not None else embedded_dim(x_dim, self.angle_idx))
 
         self.w1 = MLP(input_dim, hidden, self.c * x_dim, activation=activation)
         self.w2 = MLP(input_dim, hidden, self.c * u_dim, activation=activation)
@@ -204,10 +540,46 @@ class CLActor(nn.Module):
         uref = state[:, 2 * self.x_dim : 2 * self.x_dim + self.u_dim]
         return x, xref, uref
 
+    def _preview(self, state: torch.Tensor) -> torch.Tensor:
+        """The preview tail after [x, xref, uref], width ``preview_dim`` (0 = off)."""
+        if self.preview_dim <= 0:
+            return state[:, :0]
+        start = 2 * self.x_dim + self.u_dim
+        return state[:, start : start + self.preview_dim]
+
+    def _state_feats(self, state: torch.Tensor) -> torch.Tensor:
+        """Invariant current-configuration features of (x, xref) — the "state x"
+        role. Excludes the preview (that is the separate P role). Width
+        ``state_feat_dim``. See DecoupledResidual / LatentPreviewResidual / FiLMResidual."""
+        x, xref, _ = self.trim_state(state)
+        return (self.sym.pair_features(x, xref) if self.sym is not None
+                else torch.cat([embed_angles(x, self.angle_idx),
+                                embed_angles(xref, self.angle_idx)], -1))
+
+    def _xref_feats(self, state: torch.Tensor) -> torch.Tensor:
+        """Invariant features of xref ALONE (width ``xref_feat_dim``) — "where the
+        reference currently is", without the tracking error mixed in (contrast
+        _state_feats, the (x,xref) PAIR). Uses single_features, NOT raw xref —
+        see xref_feat_dim's docstring. Used to gate FiLMResidual's γ nets on the
+        current reference instead of (or alongside) the preview."""
+        _, xref, _ = self.trim_state(state)
+        return (self.sym.single_features(xref) if self.sym is not None
+                else embed_angles(xref, self.angle_idx))
+
+    def _error_vec(self, state: torch.Tensor) -> torch.Tensor:
+        """Canonical-frame invariant tracking error e (b, x_dim) — the vector the
+        bilinear feedback multiplies. Same parsing as ``_feedback`` (see
+        StateSymmetry.error_features)."""
+        x, xref, _ = self.trim_state(state)
+        return (self.sym.error_features(x, xref) if self.sym is not None
+                else wrap_diff(x - xref, self.angle_idx))
+
     def _feedback(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Raw (unbounded) bilinear feedback W2(x,xref) @ tanh(W1(x,xref) @ e) and uref."""
         x, xref, uref = self.trim_state(state)
         x_xref = (self.sym.pair_features(x, xref) if self.sym is not None else torch.cat([embed_angles(x, self.angle_idx), embed_angles(xref, self.angle_idx)], -1))
+        if self.preview_dim > 0:
+            x_xref = torch.cat([x_xref, self._preview(state)], dim=-1)
         n = x.shape[0]
         # Canonical-frame error: under SE(2) the position components are rotated
         # into the reference frame, so u depends only on invariants (see
@@ -224,6 +596,20 @@ class CLActor(nn.Module):
     def mean_control(self, state: torch.Tensor) -> torch.Tensor:
         feedback, uref = self._feedback(state)
         return uref + feedback
+
+    def zero_init_residual(self) -> None:
+        """Zero the feedback output layer (w2's final Linear) so the bilinear
+        feedback starts at exactly 0. Used with a CVSTEMLQRBase baseline so the
+        actor starts AT the analytic controller and PPO grows the residual from
+        there. w2's weights get gradient on the first update (the tanh(w1·e)
+        input is nonzero), so the residual is not frozen — only initialized off."""
+        last = None
+        for m in self.w2.net:
+            if isinstance(m, nn.Linear):
+                last = m
+        if last is not None:
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
 
     def mean_control_squashed(self, state: torch.Tensor, low: torch.Tensor, high: torch.Tensor) -> torch.Tensor:
         """Deterministic control law bounded into ``(low, high)`` by construction.
@@ -273,7 +659,7 @@ class NeuralDynamics(nn.Module):
         activation: str = "relu",
         device: str | None = None,
         angle_idx: Sequence[int] = (),
-        sym: "StateSymmetry | None" = None,
+        sym: StateSymmetry | None = None,
     ):
         super().__init__()
         self.x_dim = x_dim
@@ -344,7 +730,7 @@ class NeuralDynamics(nn.Module):
         print(f"[NeuralDynamics] saved → {path}")
 
     @classmethod
-    def load(cls, path: str, device: str | None = None) -> "NeuralDynamics":
+    def load(cls, path: str, device: str | None = None) -> NeuralDynamics:
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         model = cls(
             x_dim=ckpt["x_dim"],
@@ -380,7 +766,7 @@ class BoundedCCM_Generator(nn.Module):
         w_ub: float = 10.0,
         device: str = "cpu",
         angle_idx: Sequence[int] = (),
-        sym: "StateSymmetry | None" = None,
+        sym: StateSymmetry | None = None,
     ):
         super().__init__()
 
@@ -414,16 +800,40 @@ class BoundedCCM_Generator(nn.Module):
         n = flat.shape[0]
         S_raw = flat.view(n, self.x_dim, self.x_dim)
         S = 0.5 * (S_raw + S_raw.mT)           # symmetric; eigenvalues span ℝ
-        if S.device.type == "mps":             # eigh unsupported on MPS → run on CPU
-            lam, V = torch.linalg.eigh(S.cpu())
-            lam, V = lam.to(S.device), V.to(S.device)
-        else:                                  # CUDA/CPU: keep it on-device
-            lam, V = torch.linalg.eigh(S)
+        lam, V = self._robust_eigh(S)
         lam = self.w_lb + (self.w_ub - self.w_lb) * torch.sigmoid(lam)
         return V @ torch.diag_embed(lam) @ V.mT  # SPD, λ ∈ (w_lb, w_ub)
 
+    @staticmethod
+    def _robust_eigh(S: torch.Tensor):
+        """``torch.linalg.eigh`` with a jitter-retry fallback. eigh can raise
+        LinAlgError (code 3) on a symmetric matrix with (near-)degenerate
+        eigenvalues — sporadic during a long CMG regression as the raw network
+        output momentarily produces repeated eigenvalues. Adding a tiny diagonal
+        jitter breaks the degeneracy without meaningfully moving the bounded
+        eigenvalues (they pass through a sigmoid), turning a hard crash into a
+        negligible numerical nudge. Falls back to CPU (MPS lacks eigh)."""
+        on_cpu = S.device.type == "mps"
+        work = S.cpu() if on_cpu else S
+        eye = torch.eye(work.shape[-1], device=work.device, dtype=work.dtype)
+        for jitter in (0.0, 1e-6, 1e-4, 1e-2):
+            try:
+                lam, V = torch.linalg.eigh(work + jitter * eye)
+                if on_cpu:
+                    lam, V = lam.to(S.device), V.to(S.device)
+                return lam, V
+            except torch._C._LinAlgError:
+                continue
+        # Last resort: symmetric eigendecomposition via SVD (no convergence
+        # failure mode), sign-corrected — always succeeds on a real symmetric S.
+        U, s, _ = torch.linalg.svd(work + 1e-2 * eye)
+        lam = s
+        if on_cpu:
+            lam, U = lam.to(S.device), U.to(S.device)
+        return lam, U
+
     def forward(self, x: torch.Tensor, deterministic: bool = True):
-        logits = self.model((self.sym.single_features(x) if self.sym is not None else embed_angles(x, self.angle_idx)))
+        logits = self.model(self.sym.single_features(x) if self.sym is not None else embed_angles(x, self.angle_idx))
         mu = self.mu(logits)
 
         # Return-dict keys mirror CCM_Generator so the two are drop-in compatible.
@@ -449,3 +859,9 @@ class BoundedCCM_Generator(nn.Module):
             "logprobs": logprobs,
             "entropy": dist.entropy().sum(-1, keepdim=True),
         }
+
+
+# REMOVED 2026-07-30: GainNet / CVSTEMBoundedLQRBase (hard-control-bound gain).
+# Measured worse than the post-hoc actuator filter once deployed through regressed
+# networks: 98.4% held-out violation vs 24.6%. See ncm_synthesis.py's matching note.
+# Recover with `git log -S CVSTEMBoundedLQRBase`.
