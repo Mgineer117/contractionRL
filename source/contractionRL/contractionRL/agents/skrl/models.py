@@ -327,10 +327,16 @@ class CLActorModel(GaussianMixin, Model):
         film_gate1_source: str = "preview",
         film_gate2_source: str = "preview",
         # How a "preview"-sourced FiLM gate turns its P-point window into the
-        # γ-network input: "mlp" (default, flattens P points — original
-        # behavior) or "gru"/"attn" (nn_modules.PreviewSequenceEncoder — treats
-        # it as a sequence). Set via YAML models.policy.film_gate_encoder.
+        # γ-network input: "mlp" (flatten), "gru", or "attn" — all three route
+        # through nn_modules.PreviewSequenceEncoder and share film_gate_stride.
+        # Set via YAML models.policy.film_gate_encoder.
         film_gate_encoder: str = "mlp",
+        # Stride applied UNIFORMLY to film_gate_encoder's "mlp"/"gru"/"attn"
+        # (see nn_modules.PreviewSequenceEncoder): keep every stride-th
+        # preview point, nearest-first, instead of the full sequence. 1
+        # (default) = dense, every point — the original behavior. Set via
+        # YAML models.policy.film_gate_stride.
+        film_gate_stride: int = 1,
         # Must agree with the env's configure_preview(..., include_xref=...) —
         # see env_base.BaseEnv.construct_state. False (default) means the
         # preview tail is uref-only, exactly as before this option existed.
@@ -434,6 +440,7 @@ class CLActorModel(GaussianMixin, Model):
                                   gate1_source=film_gate1_source,
                                   gate2_source=film_gate2_source,
                                   gate_encoder=film_gate_encoder,
+                                  gate_stride=film_gate_stride,
                                   xref_preview_dim=self._xref_preview_dim)
                 self.residual_modules[_name] = _cls(
                     x_dim=x_dim, u_dim=u_dim,
@@ -1083,10 +1090,11 @@ class TrajectoryAwareValueModel(_AnalyticPotentialMixin, DeterministicMixin, Mod
     ``full_trajectory=True``), independent of the actor's own preview length.
 
     ``encoder`` picks how the P-point trajectory block is turned into a fixed
-    vector: "mlp" (flatten + plain MLP — fine for a short window) or
-    "gru"/"attn" (``PreviewSequenceEncoder`` — treats it as a sequence; the
-    natural choice for a long/full-trajectory window that would make a flat
-    MLP's input width scale with episode length).
+    vector: "mlp" (flatten), "gru", or "attn" — all three route through
+    ``PreviewSequenceEncoder`` and share ``encoder_stride`` (keep every
+    stride-th point, nearest-first; 1 = dense/every point). Stride is what
+    bounds "mlp"'s input width on a long/full-trajectory window — otherwise
+    it scales with episode length.
 
     ``combine`` picks how the state embedding phi(x) and the goal/trajectory
     embedding psi(traj) are turned into a scalar value:
@@ -1125,6 +1133,7 @@ class TrajectoryAwareValueModel(_AnalyticPotentialMixin, DeterministicMixin, Mod
         angle_idx: list | None = None,
         encoder: str = "mlp",
         encoder_hidden: int = 64,
+        encoder_stride: int = 1,
         combine: str = "concat",
         analytic_potential: bool = False,
         w_lb: float = 0.01,
@@ -1151,16 +1160,12 @@ class TrajectoryAwareValueModel(_AnalyticPotentialMixin, DeterministicMixin, Mod
 
         state_dim = int(self.observation_space.shape[0])
         self._traj_dim = state_dim - self.x_dim
-        if encoder == "mlp":
-            self.traj_encoder = MLP(self._traj_dim, [encoder_hidden, encoder_hidden],
-                                    encoder_hidden, activation=act_module)
-        elif encoder in PreviewSequenceEncoder.MODES:
-            self.traj_encoder = PreviewSequenceEncoder(
-                self._traj_dim, point_dim=self.x_dim, hidden=encoder_hidden,
-                out_dim=encoder_hidden, mode=encoder)
-        else:
-            raise ValueError(f"TrajectoryAwareValueModel: encoder must be 'mlp' or one of "
+        if encoder not in PreviewSequenceEncoder.MODES:
+            raise ValueError(f"TrajectoryAwareValueModel: encoder must be one of "
                              f"{PreviewSequenceEncoder.MODES}, got {encoder!r}")
+        self.traj_encoder = PreviewSequenceEncoder(
+            self._traj_dim, point_dim=self.x_dim, hidden=encoder_hidden,
+            out_dim=encoder_hidden, mode=encoder, stride=encoder_stride)
 
         if self.combine == "concat":
             self.net = MLP(embedded_dim(self.x_dim, self.angle_idx) + encoder_hidden,

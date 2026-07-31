@@ -125,6 +125,37 @@ def _resolve_caps_kwargs(agent_cfg: dict, args_cli, *, pop: bool) -> dict:
     return kwargs
 
 
+def disable_tensorboard_files() -> None:
+    """Stop skrl's SummaryWriter from touching disk, without breaking wandb logging.
+
+    skrl's ``SummaryWriter.__init__`` (skrl.utils.tensorboard) eagerly
+    constructs a real ``EventFileWriter``, which creates the run's tensorboard
+    event file on disk the moment the agent is built — regardless of whether
+    ``add_scalar`` is ever called. Those event files were the other big
+    contributor to the cluster's inode quota (alongside wandb/, see
+    ``install_wandb_scalar_hook``). ``install_wandb_scalar_hook`` mirrors
+    every ``add_scalar`` call into wandb by wrapping this same class, so
+    wandb logging must keep working after this call — only the on-disk
+    writer is replaced with a no-op stub.
+    """
+    import skrl.utils.tensorboard as _skrl_tb
+
+    class _NoopEventFileWriter:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def add_event(self, event) -> None:
+            pass
+
+        def flush(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    _skrl_tb.EventFileWriter = _NoopEventFileWriter
+
+
 def install_wandb_scalar_hook() -> None:
     """Mirror every skrl ``SummaryWriter.add_scalar`` into the active W&B run.
 
@@ -167,10 +198,36 @@ def apply_wandb_sweep_overrides(agent_cfg: dict) -> None:
     ``search/configs/``) is MERGED into the existing sub-dict rather than
     assigned: assigning would wipe sibling keys already at that path
     (``agent.class``, ``agent.lbd``, …) that the sweep isn't sampling.
+
+    Two synthetic, non-dotted keys fan a SINGLE sampled value out to both the
+    actor's and the critic's reference-trajectory encoder, so one bayes trial
+    always uses the SAME encoder (and stride) on both sides rather than
+    sampling them independently — wandb's nested-dict form only joins keys
+    that share a parent path (e.g. ``cm.w_lb``/``cm.w_ub``), which
+    ``models.policy.film_gate_encoder``/``models.critic.encoder`` don't:
+      ``xref_encoder``        -> models.policy.film_gate_encoder AND
+                                  models.critic.encoder
+      ``xref_encoder_stride`` -> models.policy.film_gate_stride AND
+                                  models.critic.encoder_stride
+    See search/configs/c2rl-ppo-cvstem.yaml.
     """
     import wandb
 
+    _FANOUT = {
+        "xref_encoder": (("models", "policy", "film_gate_encoder"),
+                          ("models", "critic", "encoder")),
+        "xref_encoder_stride": (("models", "policy", "film_gate_stride"),
+                                 ("models", "critic", "encoder_stride")),
+    }
+
     for dotted, value in wandb.config.items():
+        if dotted in _FANOUT:
+            for *parents, leaf in _FANOUT[dotted]:
+                node = agent_cfg
+                for key in parents:
+                    node = node.setdefault(key, {})
+                node[leaf] = value
+            continue
         *parents, leaf = dotted.split(".")
         node = agent_cfg
         for key in parents:

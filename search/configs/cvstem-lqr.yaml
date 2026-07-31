@@ -53,9 +53,7 @@ parameters:
   # deployed gain K = R⁻¹BᵀM, so this single knob moves the certificate and
   # the controller together — K stays the CERTIFIED CV-STEM gain.
   agent.r_scaler:
-    distribution: log_uniform_values
-    min: 0.1
-    max: 10.0
+    values: [0.01, 0.1, 0.5, 1.0, 3.0, 5.0, 10.0]
 
   # ── The CV-STEM LMI itself ───────────────────────────────────────────── #
   #   A·W̄ + W̄·Aᵀ - 2ν·B R⁻¹Bᵀ + 2λ·W̄ ⪯ -ε·I,   ν ≤ 1/w_lb,  χ ≤ ν·w_ub

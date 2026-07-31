@@ -301,11 +301,23 @@ class PreviewSequenceEncoder(nn.Module):
     "attn": one learned query attends over all points via softmax
     (order-independent) — lets training discover which offsets matter, with no
     recency prior, as a deliberate contrast to "gru".
+
+    "mlp": flattens the (possibly strided) points into one vector through a
+    plain MLP — no order/recency structure at all, a deliberate contrast to
+    "gru"/"attn".
+
+    ``stride`` applies UNIFORMLY to all three modes (keep every stride-th
+    point, nearest-first — offset 0 is never skipped): "mlp" sees fewer,
+    wider-spaced points to flatten (bounds its input width, which otherwise
+    scales with ``num_points`` and gets wasteful once the tail is a full
+    episode trajectory — see ``env_base.BaseEnv._full_trajectory_offsets``);
+    "gru"/"attn" see a shorter, cheaper sequence. ``stride=1`` (default)
+    keeps every point — the original dense behavior for any mode.
     """
 
-    MODES = ("gru", "attn")
+    MODES = ("mlp", "gru", "attn")
 
-    def __init__(self, preview_dim, point_dim, hidden, out_dim, mode="gru"):
+    def __init__(self, preview_dim, point_dim, hidden, out_dim, mode="gru", stride: int = 1):
         super().__init__()
         if mode not in self.MODES:
             raise ValueError(f"PreviewSequenceEncoder: mode must be one of {self.MODES}, got {mode!r}")
@@ -315,14 +327,18 @@ class PreviewSequenceEncoder(nn.Module):
         self.num_points = preview_dim // point_dim
         self.point_dim = point_dim
         self.mode = mode
+        self.stride = max(1, int(stride))
+        num_kept = len(range(0, self.num_points, self.stride))
         if mode == "gru":
             self.rnn = nn.GRU(input_size=point_dim, hidden_size=hidden, batch_first=True)
             self.proj = nn.Linear(hidden, out_dim)
-        else:
+        elif mode == "attn":
             self.key = nn.Linear(point_dim, hidden)
             self.value = nn.Linear(point_dim, hidden)
             self.query = nn.Parameter(torch.randn(hidden) * (hidden ** -0.5))
             self.proj = nn.Linear(hidden, out_dim)
+        else:  # mlp
+            self.mlp = MLP(num_kept * point_dim, [hidden], out_dim, activation=nn.Tanh())
 
     def train(self, mode: bool = True) -> PreviewSequenceEncoder:
         """Keep the GRU submodule permanently in train mode, regardless of
@@ -344,6 +360,10 @@ class PreviewSequenceEncoder(nn.Module):
     def forward(self, preview_flat: torch.Tensor) -> torch.Tensor:
         n = preview_flat.shape[0]
         points = preview_flat.reshape(n, self.num_points, self.point_dim)
+        if self.stride > 1:
+            points = points[:, ::self.stride, :]  # nearest-first, every stride-th point kept
+        if self.mode == "mlp":
+            return self.mlp(points.reshape(n, -1))
         if self.mode == "gru":
             seq = points.flip(dims=[1])          # farthest-first -> nearest-last
             _, h = self.rnn(seq)
@@ -379,18 +399,18 @@ class FiLMResidual(nn.Module):
     sliced internally at ``xref_preview_dim`` from the end. 0 (default) means no
     xref-relative block and "preview" reads the whole tensor.
 
-    ``gate_encoder`` picks how a preview-window gate turns its P-point block into
-    the γ-network's input: "mlp" (default, flatten) or "gru"/"attn"
-    (PreviewSequenceEncoder — see that class). Ignored for "xref"/"uref" gates,
-    which are single points, not sequences."""
+    ``gate_encoder`` picks how a preview-window gate turns its P-point block
+    into the γ-network's input: "mlp"/"gru"/"attn" (PreviewSequenceEncoder —
+    see that class; ``gate_stride`` applies uniformly to all three there).
+    Ignored for "xref"/"uref" gates, which are single points, not sequences."""
 
     _GATE_SOURCES = ("preview", "xref_preview", "xref", "uref")
     _SEQUENCE_SOURCES = ("preview", "xref_preview")
-    _GATE_ENCODERS = ("mlp",) + PreviewSequenceEncoder.MODES
+    _GATE_ENCODERS = PreviewSequenceEncoder.MODES
 
     def __init__(self, x_dim, u_dim, state_dim, preview_dim, hidden, activation,
                  xref_feat_dim=None, gate1_source="preview", gate2_source="preview",
-                 gate_encoder="mlp", xref_preview_dim=0):
+                 gate_encoder="mlp", xref_preview_dim=0, gate_stride=1):
         super().__init__()
         self.x_dim, self.u_dim, self.c = x_dim, u_dim, 3 * x_dim
         for name in (gate1_source, gate2_source):
@@ -413,10 +433,11 @@ class FiLMResidual(nn.Module):
         gate_hidden = hidden[-1] if isinstance(hidden, list) else hidden
 
         def _make_gate(source):
-            if gate_encoder != "mlp" and source in self._SEQUENCE_SOURCES:
+            if source in self._SEQUENCE_SOURCES:
                 return PreviewSequenceEncoder(gate_dims[source], point_dim=point_dims[source],
                                               hidden=gate_hidden, out_dim=self.c,
-                                              mode=gate_encoder)
+                                              mode=gate_encoder, stride=gate_stride)
+            # "xref"/"uref": a single point, not a sequence — stride is a no-op.
             return MLP(gate_dims[source], hidden, self.c, activation=activation)
 
         self.w1 = MLP(state_dim, hidden, self.c * x_dim, activation=activation)   # W1(x)
@@ -812,9 +833,21 @@ class BoundedCCM_Generator(nn.Module):
         output momentarily produces repeated eigenvalues. Adding a tiny diagonal
         jitter breaks the degeneracy without meaningfully moving the bounded
         eigenvalues (they pass through a sigmoid), turning a hard crash into a
-        negligible numerical nudge. Falls back to CPU (MPS lacks eigh)."""
+        negligible numerical nudge. Falls back to CPU (MPS lacks eigh).
+
+        Also sanitizes actual non-finite entries (NaN/Inf) in ``S`` before
+        decomposing: a raw ``mu`` head can overflow float32 for one unlucky
+        batch during a long regression (the training loop's grad-norm clip
+        gates the OPTIMIZER step, not the forward pass, so one bad batch's
+        activations can still overflow even though no bad weight update ever
+        lands). Both eigh AND its SVD last-resort raise LinAlgError on
+        non-finite input ("failed to converge") rather than just misordering
+        eigenvalues, so without this the fallback chain above is defeated by
+        the exact failure mode it exists to survive."""
         on_cpu = S.device.type == "mps"
         work = S.cpu() if on_cpu else S
+        if not torch.isfinite(work).all():
+            work = torch.nan_to_num(work, nan=0.0, posinf=1e4, neginf=-1e4)
         eye = torch.eye(work.shape[-1], device=work.device, dtype=work.dtype)
         for jitter in (0.0, 1e-6, 1e-4, 1e-2):
             try:

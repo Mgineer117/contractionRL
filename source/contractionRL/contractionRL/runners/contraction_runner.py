@@ -316,6 +316,7 @@ def _build_critics(models_cfg: dict, block_name: str, base_algorithm: str, obs_s
                    device, x_dim, angle_idx: list, key_prefix: str = "", sym=None,
                    state_space=None, critic_encoder: str | None = None,
                    critic_combine: str = "concat", critic_embed_dim: int = 64,
+                   critic_encoder_stride: int = 1,
                    critic_analytic_potential: bool = False, w_lb: float = 0.01) -> dict:
     """Build the value/critic model(s) for one policy — a single V(obs) model
     for PPO, or the twin-Q + target architecture (critic_1/2 + targets) for
@@ -341,6 +342,7 @@ def _build_critics(models_cfg: dict, block_name: str, base_algorithm: str, obs_s
                 state_space, act_space, device, hidden_dim=hd, activation=act,
                 x_dim=x_dim, angle_idx=angle_idx, encoder=critic_encoder,
                 combine=critic_combine, encoder_hidden=critic_embed_dim,
+                encoder_stride=critic_encoder_stride,
                 analytic_potential=critic_analytic_potential, w_lb=w_lb,
             )}
         return {f"{key_prefix}value": EmbeddedDeterministicModel(
@@ -961,6 +963,7 @@ class ContractionRunner:
                                      critic_encoder=models_cfg.get("critic", {}).get("encoder"),
                                      critic_combine=models_cfg.get("critic", {}).get("combine", "concat"),
                                      critic_embed_dim=int(models_cfg.get("critic", {}).get("embed_dim", 64)),
+                                     critic_encoder_stride=int(models_cfg.get("critic", {}).get("encoder_stride", 1)),
                                      critic_analytic_potential=bool(
                                          models_cfg.get("critic", {}).get("analytic_potential", False)),
                                      w_lb=float(agent_cfg.get("cm", {}).get("w_lb", 0.01))))

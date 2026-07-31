@@ -10,7 +10,15 @@ Classic gymnasium (--classic flag, no Isaac Sim required):
 """
 
 import argparse
+import os
 import sys
+
+# Local wandb run files (config/history/media, NOT the same as tensorboard
+# events) rack up one small file per run and are the #1 inode-quota killer on
+# the cluster's home filesystem (~72k files observed, see search sweeps).
+# ~/scratch has no file-count limit, so park them there instead — cloud
+# syncing is unaffected. Must be set before wandb is ever imported.
+os.environ.setdefault("WANDB_DIR", os.path.expanduser("~/scratch/wandb"))
 
 # ─── Pre-parse: must know --classic BEFORE any Isaac Sim imports ──────────── #
 _pre = argparse.ArgumentParser(add_help=False)
@@ -177,6 +185,11 @@ _ov.add_argument("--film_gate2_source", "--film-gate2-source",
 _ov.add_argument("--film_gate_encoder", "--film-gate-encoder",
                  dest="film_gate_encoder", type=str, default=None,
                  choices=["mlp", "gru", "attn"])
+# Applies to all three film_gate_encoder choices uniformly: keep every Nth
+# preview point (nearest-first), 1 = dense/every point — see
+# nn_modules.PreviewSequenceEncoder.
+_ov.add_argument("--film_gate_stride", "--film-gate-stride",
+                 dest="film_gate_stride", type=int, default=None)
 # C2RL only: after the trained eval, ALSO evaluate with the residual bypassed
 # (= pure CV-STEM-LQR base) on the IDENTICAL frozen CMG — a controlled base-vs-
 # residual comparison free of CMG-regression nondeterminism. See models.CLActorModel.
@@ -289,6 +302,10 @@ parser.add_argument("--critic_encoder", "--critic-encoder", type=str, default=No
                     help="Give the critic a privileged future-xref trajectory via a "
                          "separate state channel, encoded by this model (mlp/gru/attn). "
                          "Unset = historic critic (sees only the actor's own preview).")
+parser.add_argument("--critic_encoder_stride", "--critic-encoder-stride", type=int, default=1,
+                    help="Applies to all three critic_encoder choices uniformly: keep "
+                         "every Nth future-xref point (nearest-first), 1 = dense/every "
+                         "point, instead of the full trajectory.")
 parser.add_argument("--critic_num_points", "--critic-num-points", type=int, default=7,
                     help="Number of future-xref offsets in the critic's privileged "
                          "state (ignored if --critic_full_trajectory).")
@@ -400,10 +417,16 @@ from train_utils import (
     _resolve_symmetry_for_env,
     apply_agent_patches,
     apply_wandb_sweep_overrides,
+    disable_tensorboard_files,
     finish_wandb,
     install_wandb_scalar_hook,
     normalize_agent_cfg,
 )
+
+# No env's tensorboard event files are ever read back by anything in this repo
+# (all dashboards are wandb) — disable disk writes unconditionally, for both
+# --classic and Isaac Sim routes, regardless of whether wandb is enabled.
+disable_tensorboard_files()
 
 algorithm = args_cli.algorithm.lower()
 # Bare "c2rl" (no -ppo/-sac suffix) defaults to the PPO variant, since it has
@@ -482,6 +505,8 @@ def _apply_agent_overrides(agent_cfg, args):
             _policy_block["film_gate2_source"] = args.film_gate2_source
         if getattr(args, "film_gate_encoder", None):
             _policy_block["film_gate_encoder"] = args.film_gate_encoder
+        if getattr(args, "film_gate_stride", None) is not None:
+            _policy_block["film_gate_stride"] = args.film_gate_stride
         if getattr(args, "preview_include_xref", False):
             _policy_block["preview_includes_xref"] = True
         if getattr(args, "preview_no_uref", False):
@@ -703,9 +728,15 @@ if _is_classic:
                                                 full_trajectory=args_cli.critic_full_trajectory)
         _critic_block = agent_cfg.get("models", {}).get("critic")
         if isinstance(_critic_block, dict):
-            _critic_block["encoder"] = args_cli.critic_encoder
-            _critic_block["combine"] = args_cli.critic_combine
-            _critic_block["embed_dim"] = args_cli.critic_embed_dim
+            # setdefault, not assignment: a wandb sweep parameter under
+            # models.critic.* already landed in agent_cfg via
+            # apply_wandb_sweep_overrides ABOVE (before configure_value_state
+            # even runs) — a plain assignment here would silently clobber it
+            # back to this CLI/default value on every sweep trial.
+            _critic_block.setdefault("encoder", args_cli.critic_encoder)
+            _critic_block.setdefault("combine", args_cli.critic_combine)
+            _critic_block.setdefault("embed_dim", args_cli.critic_embed_dim)
+            _critic_block.setdefault("encoder_stride", args_cli.critic_encoder_stride)
 
     # Wrapper order is load-bearing: StatManagerEnvWrapper must see the flat
     # tensor observations BatchedGymnasiumWrapper produces, and WandbPlotWrapper
