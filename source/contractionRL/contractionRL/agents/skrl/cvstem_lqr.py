@@ -216,12 +216,19 @@ class CVSTEMLQRAgent(Agent):
         # Realized-trajectory actuator-feasibility tally (see CVSTEMLQRCfg's
         # comment and post_interaction() below) — per-channel within-bound
         # counts accumulated as _compute_action_online actually runs, evaluated
-        # once the rollout ends.
+        # once the rollout ends. Also tracks transient-window violations to catch
+        # early-episode high-gain saturation that average-based checks miss.
         if u_lo is not None and u_hi is not None:
             self._bound_lo = torch.as_tensor(u_lo, dtype=torch.float32)
             self._bound_hi = torch.as_tensor(u_hi, dtype=torch.float32)
             self._u_within_count = torch.zeros(u_dim)
             self._u_total_count = 0
+            # Transient-window tracking: early-episode violations concentrated
+            # in the first ~6% of steps (where error is largest, AUC-critical).
+            # See project_cvstem_car_best_params_invalid_2026-07-31 in memory.
+            self._u_within_count_transient = torch.zeros(u_dim)
+            self._u_total_count_transient = 0
+            self._transient_step = 0
         else:
             self._bound_lo = None
 
@@ -401,6 +408,12 @@ class CVSTEMLQRAgent(Agent):
             within = (actions.detach().cpu() >= self._bound_lo) & (actions.detach().cpu() <= self._bound_hi)
             self._u_within_count += within.sum(dim=0).float()
             self._u_total_count += actions.shape[0]
+            # Also tally transient phase (first ~6% of episode, ~30 steps for 500-step)
+            # to catch early violations concentrated when error is largest.
+            if self._transient_step < 30:
+                self._u_within_count_transient += within.sum(dim=0).float()
+                self._u_total_count_transient += actions.shape[0]
+                self._transient_step += 1
         return actions
 
     def act(self, observations, states, *, timestep: int, timesteps: int):
@@ -432,23 +445,43 @@ class CVSTEMLQRAgent(Agent):
         super().post_interaction(timestep=timestep, timesteps=timesteps)
         # Realized-trajectory actuator-feasibility check, evaluated once the
         # whole rollout is in: a channel fails if more than 5% of its ACTUAL
-        # executed samples fell outside the env's own actuator box (same
-        # threshold the old per-state Monte Carlo check used, applied here to
-        # what the controller really did instead of a synthetic sample at an
-        # assumed tracking-error radius). See CVSTEMLQRCfg's comment.
+        # executed samples fell outside the env's own actuator box. Also checks
+        # the TRANSIENT phase (first ~6% of steps) separately to catch early
+        # high-gain saturation that average-based checks miss (see
+        # project_cvstem_car_best_params_invalid_2026-07-31).
         if (
             self._bound_lo is not None
             and timestep == timesteps - 1
             and self._u_total_count > 0
         ):
+            # Whole-episode check
             violation_rate = 1.0 - (self._u_within_count / self._u_total_count)
-            if torch.any(violation_rate > 0.05):
-                msg = (
-                    f"{INFEASIBLE_MARKER}: executed-control bound violation rate "
-                    f"{violation_rate.max().item():.1%} exceeds 5% over the "
-                    f"realized trajectory ({self._u_total_count} samples), "
-                    f"u_lo={self._u_lo}, u_hi={self._u_hi}."
-                )
+            whole_episode_failed = torch.any(violation_rate > 0.05)
+
+            # Transient-phase check (if enough transient samples exist)
+            transient_failed = False
+            transient_violation_rate = None
+            if self._u_total_count_transient > 0:
+                transient_violation_rate = 1.0 - (self._u_within_count_transient / self._u_total_count_transient)
+                # Lower threshold for transient (10% vs 5% for whole episode) since
+                # early error is AUC-critical and transient violations concentrate there
+                transient_failed = torch.any(transient_violation_rate > 0.10)
+
+            if whole_episode_failed or transient_failed:
+                if transient_failed:
+                    msg = (
+                        f"{INFEASIBLE_MARKER}: transient-phase control bound violation rate "
+                        f"{transient_violation_rate.max().item():.1%} exceeds 10% over the "
+                        f"early episode ({self._u_total_count_transient} transient samples), "
+                        f"u_lo={self._u_lo}, u_hi={self._u_hi}."
+                    )
+                else:
+                    msg = (
+                        f"{INFEASIBLE_MARKER}: executed-control bound violation rate "
+                        f"{violation_rate.max().item():.1%} exceeds 5% over the "
+                        f"realized trajectory ({self._u_total_count} samples), "
+                        f"u_lo={self._u_lo}, u_hi={self._u_hi}."
+                    )
                 if self._cfg.abort_on_infeasible:
                     print(msg, flush=True)
                     raise CVSTEMInfeasibleError(msg)
