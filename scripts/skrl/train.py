@@ -563,6 +563,11 @@ if _is_classic:
     agent_cfg["trainer"]["close_environment_at_exit"] = False
     agent_cfg["trainer"]["headless"] = True
 
+    # Sweep trials are throwaway: don't let hundreds of trials each write
+    # ~10 full checkpoints to logs/ (see play.py:239,327 for the same idiom).
+    if "WANDB_SWEEP_ID" in os.environ:
+        agent_cfg["agent"]["experiment"]["checkpoint_interval"] = 0
+
     # W&B
     if not args_cli.no_wandb:
         import wandb as _wandb
@@ -845,6 +850,11 @@ else:
         agent_cfg["agent"]["experiment"]["directory"] = log_root_path
         agent_cfg["agent"]["experiment"]["experiment_name"] = log_dir
         log_dir = os.path.join(log_root_path, log_dir)
+
+        # Sweep trials are throwaway: don't let hundreds of trials each write
+        # ~10 full checkpoints to logs/ (see play.py:239,327 for the same idiom).
+        if "WANDB_SWEEP_ID" in os.environ:
+            agent_cfg["agent"]["experiment"]["checkpoint_interval"] = 0
 
         # W&B
         _wandb_video_thread = None
