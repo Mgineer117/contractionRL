@@ -133,12 +133,45 @@ Never `scancel -u $USER`. Prefer `search_cluster.sh --stop` (below) over raw
 
 ## 7. Partitions
 
-| Partition | Wall-time cap | `--account` needed | Notes |
-|---|---|---|---|
-| `scavenger` | 24 h | no | Largest, heterogeneous (V100→H200). `search_cluster.sh` auto-excludes GPUs too old for the installed torch. |
-| `eng-research-gpu` | 2 d | **`huytran1-ae-eng`** | ~5 nodes. |
-| `IllinoisComputes-GPU` | 3 d | **`huytran1-ae-eng`** | ~5 nodes. |
-| `ic-express` | **8 h** | no | One node, 16× MIG H100 slices but only **48 CPUs total** → at `--cpus-per-task=8`, max **6 concurrent jobs**. CPU-bound, not GPU-bound. Use `--time=07:45:00`. |
+| Partition | Wall-time cap | `--account` needed | GPU | Safe agents/GPU | Notes |
+|---|---|---|---|---|---|
+| `scavenger` | 24 h | no | H100 / H200 / L40S (≥48 GB) | 2 | Largest, heterogeneous. `search_cluster.sh` auto-excludes GPUs too old for the installed torch (V100). |
+| `eng-research-gpu` | 2 d | **`huytran1-ae-eng`** | **A10, 24 GB** | **1** | ~5 nodes × 8 A10. |
+| `IllinoisComputes-GPU` | 3 d | **`huytran1-ae-eng`** | A100 | 2 | ~5 nodes × 4 A100. |
+| `ic-express` | **8 h** | no | **H100 MIG `1g.20gb`, 20 GB** | **1** | One node, 16 slices but only **48 CPUs total** → at `--cpus-per-task=8`, max **6 concurrent jobs**. Use `--time=07:45:00`. |
+
+### Sizing `--agents-per-gpu` — check GPU **memory**, not slice count
+
+A single `c2rl-*-cvstem` trial can peak near **19 GB**: `regress_cmg`
+(`ncm_synthesis.py`) moves the whole CM dataset onto the GPU and then runs a
+batched `torch.linalg.eigh` per minibatch. So a 20 GB MIG slice or a 24 GB A10
+fits exactly **one** trial, and packing 2 agents there OOMs the second one.
+
+Confirmed 2026-08-01: at 2 agents/GPU, one ic-express job crash-looped 22×
+(`torch.OutOfMemoryError`, 21 dead W&B runs in ~7 min) while all 16 jobs on
+full-size GPUs were healthy. Read the real cap first:
+
+```bash
+sinfo -p <partition> -N -o '%.20P %.10n %.45G' | sort -u   # gres names carry the size
+```
+
+Note the MIG reporting trap: on a `1g.20gb` slice the OOM message reports
+`total capacity 19.62 GiB` (your slice) but lists processes from the **whole
+physical H100**, so unrelated 13–18 GB processes appear in the list. They are
+other users on other slices and are *not* your problem — MIG partitions memory
+strictly. Diagnose from your own slice's numbers only.
+
+**A crash-looping worker dominates the W&B dashboard.** It produces a dead run
+every ~20 s while a healthy worker takes many minutes per run, so "most runs
+crashed" in the UI can mean one bad job out of twenty. Count restarts per job
+before concluding the sweep is broken:
+
+```bash
+for f in $D/slurm_*.out; do echo "$(basename $f): $(grep -ac 're)starting' $f)"; done | sort -t: -k2 -rn
+```
+
+A healthy job shows exactly `agents_per_gpu` restarts; anything much higher is
+a crash loop.
 
 Partitions other than scavenger/ic-express reject jobs without `--account`
 (`srun: error: You must specify an account`). Verify with
