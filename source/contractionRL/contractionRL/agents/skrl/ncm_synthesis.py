@@ -919,11 +919,20 @@ def regress_cmg(
     SDP targets ``W*``. Stopping is driven solely by held-out validation loss,
     and the best-val-epoch weights are restored afterward.
     """
-    x = torch.as_tensor(dataset["x"]).to(torch.float32).to(device)
-    W_target = torch.as_tensor(dataset["W"]).to(torch.float32).to(device)
+    # The dataset stays resident on the HOST; only the minibatch actually being
+    # trained on is moved to the accelerator. Its footprint grows as
+    # cmg_memory_size x x_dim^2 (plus the same again for the targets), so
+    # holding it on the device charges every concurrent trial for the whole
+    # dataset for the whole regression, while the optimizer only ever needs one
+    # batch. Pinning makes the per-batch H2D copy async-capable.
+    x = torch.as_tensor(dataset["x"]).to(torch.float32)
+    W_target = torch.as_tensor(dataset["W"]).to(torch.float32)
+    if torch.device(device).type == "cuda":
+        x, W_target = x.pin_memory(), W_target.pin_memory()
     n = x.shape[0]
 
-    train_idx, val_idx = train_val_split(n, val_frac, device=device)
+    # Indices live wherever the data does, so `x[idx]` gathers on the host.
+    train_idx, val_idx = train_val_split(n, val_frac, device="cpu")
     n_train = train_idx.shape[0]
     x_val, W_val = x[val_idx], W_target[val_idx]
     stopper = EarlyStopper(patience=early_stop_patience if val_idx.shape[0] > 0 else 0)
@@ -936,7 +945,7 @@ def regress_cmg(
 
     pbar = _tqdm.tqdm(range(epochs), desc=f"{tag} CMG regression", file=sys.stdout)
     for epoch in pbar:
-        perm = train_idx[torch.randperm(n_train, device=device)]
+        perm = train_idx[torch.randperm(n_train)]
         iters = max(1, n_train // batch_size)
         total = 0.0
         batch_pbar = _tqdm.tqdm(
@@ -945,9 +954,11 @@ def regress_cmg(
         )
         for b in batch_pbar:
             idx = perm[b * batch_size : (b + 1) * batch_size]
-            raw_W, _ = ccm_gen(x[idx])
+            x_b = x[idx].to(device, non_blocking=True)
+            W_b = W_target[idx].to(device, non_blocking=True)
+            raw_W, _ = ccm_gen(x_b)
             W_pred = bound_W(raw_W, w_lb, x_dim, bounded)
-            loss = F.mse_loss(W_pred, W_target[idx])
+            loss = F.mse_loss(W_pred, W_b)
             opt.zero_grad()
             loss.backward()
             # Targets W* span [w_lb, w_ub] with a ratio up to 1e3, so a long
@@ -979,9 +990,10 @@ def regress_cmg(
                 # epoch, and OOM'd in practice well before training itself did.
                 val_sq_err, val_n = 0.0, 0
                 for vb in range(0, x_val.shape[0], batch_size):
-                    raw_W_val, _ = ccm_gen(x_val[vb : vb + batch_size])
+                    x_vb = x_val[vb : vb + batch_size].to(device, non_blocking=True)
+                    raw_W_val, _ = ccm_gen(x_vb)
                     W_pred_val = bound_W(raw_W_val, w_lb, x_dim, bounded)
-                    chunk = W_val[vb : vb + batch_size]
+                    chunk = W_val[vb : vb + batch_size].to(device, non_blocking=True)
                     val_sq_err += F.mse_loss(W_pred_val, chunk, reduction="sum").item()
                     val_n += chunk.numel()
                 val_loss = val_sq_err / val_n
