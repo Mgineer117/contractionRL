@@ -953,9 +953,8 @@ def log_tracking_plots(
     if _wandb_run() is None:
         return
     import matplotlib.pyplot as plt
-    from PIL import Image
-
     import wandb
+    from PIL import Image
 
     label = title or prefix
 

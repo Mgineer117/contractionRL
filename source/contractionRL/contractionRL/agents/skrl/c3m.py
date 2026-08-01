@@ -71,6 +71,7 @@ from .math_utils import (
     spd_inverse,
     weighted_gradients,
 )
+from .ref_window import RefWindow
 from .rl_glue import filter_cfg_fields
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -221,13 +222,16 @@ class C3MAgent(Agent):
             device=device,
         )
 
-        obs_dim = int(observation_space.shape[0])
-        u_dim_inferred = int(action_space.shape[0])
+        # The observation space DECLARES its layout ({x, xrefs, urefs}), so
+        # x_dim/u_dim are read, never guessed from obs_dim (the old
+        # (obs_dim - u_dim)//2 parity rule silently mis-split any other layout).
+        self._window = RefWindow.from_space(observation_space)
+
 
         if u_dim is None:
-            u_dim = u_dim_inferred
+            u_dim = self._window.u_dim
         if x_dim is None:
-            x_dim = (obs_dim - u_dim) // 2
+            x_dim = self._window.x_dim
 
         self._x_dim = x_dim
         self._u_dim = u_dim
@@ -359,6 +363,15 @@ class C3MAgent(Agent):
             return arr.to(torch.float32).to(dev)
         return torch.as_tensor(arr).to(torch.float32).to(dev)
 
+    def _c3m_pools(self):
+        """(xref, uref) pools for the FUTURE window slots — reuses ``self._data``,
+        the same random-triple draw the loss already batches over, so no extra
+        rollout is needed. ``None`` when the window is a single point (nothing to
+        fill) — ``RefWindow.synth_obs`` then holds the current reference."""
+        if self._window.length <= 1:
+            return None, None
+        return self._to_tensor(self._data["xref"]), self._to_tensor(self._data["uref"])
+
     def _compute_loss(self, idx):
         cfg = self._cfg
         device = self._device
@@ -411,8 +424,22 @@ class C3MAgent(Agent):
         # the real AUC divergence documented in project memory
         # (project_c3m_clip_actions_divergence.md,
         # project_c3m_env_divergence_2026-07-10.md).
-        state = torch.cat([x, xref, uref], dim=1)
-        u = self.models["policy"].compute({"observations": state}, role="policy")[0]
+        # Window slots 1.. are RANDOM plausible references (see
+        # RefWindow.synth_obs): the certificate must hold for the window content
+        # the actor actually meets, not just a constant one.
+        state = self._window.synth_obs(x, xref, uref, *self._c3m_pools())
+        # cuDNN's RNN kernel has NO double-backward support (a hard cuDNN API
+        # limitation, not a train/eval-mode issue) and this loss needs exactly
+        # that: K = jacobian(u, x, create_graph=True) is itself a backward
+        # through this forward, and _optimize_params then backprops through K.
+        # Only bites when the reference-window encoder is a GRU (--encoder gru),
+        # which since the window refactor sits inside the CERTIFIED control path
+        # (CLActor.w2) for every algorithm, C3M included. Disabling cuDNN for
+        # this one call switches PyTorch to its generic RNN path, which does
+        # support double-backward, at some extra compute cost here only.
+        # Same guard as C2RL's contraction-pretrain loop.
+        with torch.backends.cudnn.flags(enabled=False):
+            u = self.models["policy"].compute({"observations": state}, role="policy")[0]
         K = jacobian(u, x)
 
         A = DfDx + torch.einsum('bxyu,bu->bxy', DBDx, u)

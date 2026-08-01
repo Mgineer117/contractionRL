@@ -322,40 +322,30 @@ def _build_critics(models_cfg: dict, block_name: str, base_algorithm: str, obs_s
     for PPO, or the twin-Q + target architecture (critic_1/2 + targets) for
     SAC. Used by ``_setup_c2rl`` (``key_prefix=""``, a single deployed policy).
 
-    ``critic_encoder`` (PPO only, set via ``models.critic.encoder`` /
-    ``--critic_encoder`` — see ``train.py``): when set AND the env exposes a
-    ``state_space`` (``BaseEnv.configure_value_state`` was called), builds an
-    asymmetric ``TrajectoryAwareValueModel`` reading skrl's privileged
-    ``states`` channel instead of ``EmbeddedDeterministicModel``'s
-    ``observations`` — see that class's docstring. ``None`` (default) keeps
-    the historic behavior exactly.
+    The critic reads the SAME ``{x, xrefs, urefs}`` observation as the actor
+    (the privileged ``states`` channel is gone) and gets its independence from
+    its own architecture: ``V = MLP([phi(x, e) || psi(xrefs)])``, mirroring the
+    actor's ``W1(x)`` / ``W2(xrefs)`` split. ``critic_encoder`` selects psi's
+    encoder (mlp | gru | attn); it defaults to the actor's ``--encoder``.
     """
-    from contractionRL.agents.skrl.models import EmbeddedDeterministicModel, TrajectoryAwareValueModel
+    from contractionRL.agents.skrl.models import RefWindowValueModel
 
     net = models_cfg.get(block_name, {}).get("network", [{}])
     hd = net[0].get("layers", [256, 256]) if net else [256, 256]
     act = net[0].get("activations", "tanh") if net else "tanh"
+    common = dict(hidden_dim=hd, activation=act, x_dim=x_dim, angle_idx=angle_idx, sym=sym,
+                  encoder=critic_encoder or "mlp", encoder_hidden=critic_embed_dim,
+                  encoder_stride=critic_encoder_stride, combine=critic_combine)
 
     if base_algorithm == "PPO":
-        if critic_encoder and state_space is not None:
-            return {f"{key_prefix}value": TrajectoryAwareValueModel(
-                state_space, act_space, device, hidden_dim=hd, activation=act,
-                x_dim=x_dim, angle_idx=angle_idx, encoder=critic_encoder,
-                combine=critic_combine, encoder_hidden=critic_embed_dim,
-                encoder_stride=critic_encoder_stride,
-                analytic_potential=critic_analytic_potential, w_lb=w_lb,
-            )}
-        return {f"{key_prefix}value": EmbeddedDeterministicModel(
-            obs_space, act_space, device, hidden_dim=hd, activation=act,
-            x_dim=x_dim, angle_idx=angle_idx, sym=sym, use_actions=False,
-            analytic_potential=critic_analytic_potential, w_lb=w_lb,
+        return {f"{key_prefix}value": RefWindowValueModel(
+            obs_space, act_space, device, use_actions=False,
+            analytic_potential=critic_analytic_potential, w_lb=w_lb, **common,
         )}
     elif base_algorithm == "SAC":
         return {
-            f"{key_prefix}{k}": EmbeddedDeterministicModel(
-                obs_space, act_space, device, hidden_dim=hd, activation=act,
-                x_dim=x_dim, angle_idx=angle_idx, sym=sym, use_actions=True,
-            )
+            f"{key_prefix}{k}": RefWindowValueModel(
+                obs_space, act_space, device, use_actions=True, **common)
             for k in ("critic_1", "critic_2", "target_critic_1", "target_critic_2")
         }
     else:

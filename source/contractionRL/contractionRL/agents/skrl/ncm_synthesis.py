@@ -359,6 +359,12 @@ def solve_cm_metric(
     return Wv.astype(np.float32)
 
 
+# Cap on per-state λ-reduction warnings before they are suppressed (see
+# build_cm_dataset). A wrong envelope backs off on EVERY state, and 100k+
+# identical lines bury the aggregate summary that reports the effective λ.
+_MAX_REDUCTION_WARNINGS = 5
+
+
 def _lmi_residual(A_f: np.ndarray, B: np.ndarray, W: np.ndarray, lbd: float, *, r_scaler: float = 1.0) -> float:
     """Max eigenvalue of the contraction LMI at a SOLVED ``W`` — post-hoc numpy
     re-evaluation of what ``solve_cm_metric`` constrains.
@@ -642,8 +648,16 @@ def build_cm_dataset(
         if reductions > 0 and Wv is not None:
             n_reduced += 1
             reduced_lbds.append(lbd_used)
-            print(f"{tag} WARNING: state {i} infeasible at λ={lbd:.4g} — "
-                  f"reduced to λ={lbd_used:.4g} ({reductions} halving step(s)) to reach feasibility.")
+            # Rate-limited: when the envelope is wrong EVERY state backs off, and
+            # 100k+ identical lines bury the aggregate summary below — which is
+            # the line that actually tells you the effective λ. Print a few, then
+            # count silently.
+            if n_reduced <= _MAX_REDUCTION_WARNINGS:
+                print(f"{tag} WARNING: state {i} infeasible at λ={lbd:.4g} — "
+                      f"reduced to λ={lbd_used:.4g} ({reductions} halving step(s)) to reach feasibility.")
+                if n_reduced == _MAX_REDUCTION_WARNINGS:
+                    print(f"{tag} ... further per-state λ-reduction warnings suppressed; "
+                          f"see the aggregate summary at the end of synthesis.")
         if Wv is not None:
             xs.append(x_np[i])
             Ws.append(Wv)
@@ -683,6 +697,19 @@ def build_cm_dataset(
             f"min={np.min(reduced_lbds):.4g}, requested λ={lbd:.4g}) — those states' CMG targets "
             f"certify a SLOWER contraction rate than the rest of the dataset."
         )
+        # A near-total backoff means the ENVELOPE is wrong, not that a few
+        # outlying states are hard — and the feasibility rate cannot say so,
+        # because backoff is exactly what drives that rate to 100%. Call it out
+        # explicitly: otherwise a run reports "100% feasible" while every single
+        # metric certifies λ/2, and min_feasibility_rate can never fire.
+        if lambda_reduced_rate >= 0.99:
+            print(
+                f"{tag} WARNING: ESSENTIALLY EVERY state backed off — the metric is certified at "
+                f"λ≈{np.mean(reduced_lbds):.4g}, NOT the requested λ={lbd:.4g}, and "
+                f"feasibility_rate={feas_rate:.1%} cannot reveal this (backoff is what makes it "
+                f"100%). This is an ENVELOPE problem: lower w_lb / cvstem_r_scaler, or request "
+                f"the λ you are actually getting. " + infeasibility_hint
+            )
     print(
         f"{tag} NCM synthesis: {len(xs)}/{n} states feasible ({feas_rate:.1%}), "
         f"LMI residual mean={residual_mean:.3g} max={residual_max:.3g}"

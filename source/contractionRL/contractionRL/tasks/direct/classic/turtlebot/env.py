@@ -70,7 +70,7 @@ class TurtlebotEnv(BaseEnv):
     ):
         self.task = "turtlebot"
         super().__init__(
-            self._build_cfg(ENV_CONFIG, sample_mode=sample_mode, time_bound=time_bound, dt=dt),
+            self._build_cfg(ENV_CONFIG, sample_mode=sample_mode, time_bound=time_bound, dt=dt, **kwargs),
             num_envs=num_envs,
             device=device
         )

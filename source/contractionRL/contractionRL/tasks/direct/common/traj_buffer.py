@@ -67,6 +67,29 @@ class TrajectoryBuffer:
         u_ref = self._actions[traj_ids, t]
         return x_ref, u_ref
 
+    def get_window(
+        self,
+        traj_ids: torch.Tensor,
+        step: torch.Tensor,
+        window,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The reference WINDOW at steps ``t + k*offset``, ``k = 0..length-1``.
+
+        The Isaac counterpart of ``BaseEnv.construct_state``'s window lookup —
+        same clamping (hold the trajectory's final valid reference rather than
+        walking into padded territory), so both env families produce the same
+        layout from the same ``RefWindow``.
+
+        Returns ``(x_refs, u_refs)`` shaped ``(N, length, state_dim)`` /
+        ``(N, length, action_dim)``.
+        """
+        k = torch.arange(window.length, device=self.device, dtype=torch.long)
+        t = step.long().unsqueeze(-1) + k.unsqueeze(0) * window.offset      # (N, L)
+        last = (self._lengths[traj_ids] - 1).unsqueeze(-1)
+        t = torch.minimum(t, last).clamp(min=0)
+        ids = traj_ids.unsqueeze(-1).expand_as(t)
+        return self._states[ids, t], self._actions[ids, t]
+
     def initial_state(self, traj_ids: torch.Tensor) -> torch.Tensor:
         """Returns x_ref at step 0 for use during reset."""
         t = torch.zeros(len(traj_ids), dtype=torch.long, device=self.device)

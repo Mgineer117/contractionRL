@@ -139,16 +139,6 @@ _ov.add_argument("--value_loss_scale", "--value-loss-scale", type=float, default
 # c2rl.C2RLPPOCfg.cvstem_residual_base / nn_modules.CVSTEMLQRBase).
 _ov.add_argument("--cvstem_residual_base", "--cvstem-residual-base",
                  dest="cvstem_residual_base", action="store_true", default=None)
-# C2RL only: make the residual a pure anticipatory feedforward head of the
-# reference preview (see c2rl.C2RLPPOCfg.residual_feedforward). Needs --num_preview>0.
-_ov.add_argument("--residual_feedforward", "--residual-feedforward",
-                 dest="residual_feedforward", action="store_true", default=None)
-# C2RL only: π-network architecture — bilinear | feedforward | decoupled |
-# latent_bias | film (see c2rl.C2RLPPOCfg.residual_variant). Structured variants
-# need --num_preview>0.
-_ov.add_argument("--residual_variant", "--residual-variant",
-                 dest="residual_variant", type=str, default=None,
-                 choices=["bilinear", "feedforward", "decoupled", "latent_bias", "film"])
 # C2RL only: contraction-pretrain π before PPO (Cu≺0 vs the frozen CMG, NOT
 # cvstem-lqr) so u = uref + π starts stabilizing — see C2RLPPOCfg.
 _ov.add_argument("--residual_contraction_pretrain", "--residual-contraction-pretrain",
@@ -170,26 +160,6 @@ _ov.add_argument("--residual_pretrain_method", "--residual-pretrain-method",
 # see C2RLPPOCfg.residual_pretrain_clamp_target.
 _ov.add_argument("--residual_pretrain_clamp_target", "--residual-pretrain-clamp-target",
                  dest="residual_pretrain_clamp_target", action="store_true", default=None)
-# C2RL 'film' variant only: independently pick what γ1/γ2 gate on — "preview"
-# (default), "xref" (current reference point only), "uref" (current reference
-# control). See nn_modules.FiLMResidual / models.CLActorModel.
-_ov.add_argument("--film_gate1_source", "--film-gate1-source",
-                 dest="film_gate1_source", type=str, default=None,
-                 choices=["preview", "xref_preview", "xref", "uref"])
-_ov.add_argument("--film_gate2_source", "--film-gate2-source",
-                 dest="film_gate2_source", type=str, default=None,
-                 choices=["preview", "xref_preview", "xref", "uref"])
-# C2RL 'film' variant only: how a "preview"-sourced gate encodes its P-point
-# window — "mlp" (default, flattens P points, ORIGINAL behavior) or
-# "gru"/"attn" (nn_modules.PreviewSequenceEncoder — treats it as a sequence).
-_ov.add_argument("--film_gate_encoder", "--film-gate-encoder",
-                 dest="film_gate_encoder", type=str, default=None,
-                 choices=["mlp", "gru", "attn"])
-# Applies to all three film_gate_encoder choices uniformly: keep every Nth
-# preview point (nearest-first), 1 = dense/every point — see
-# nn_modules.PreviewSequenceEncoder.
-_ov.add_argument("--film_gate_stride", "--film-gate-stride",
-                 dest="film_gate_stride", type=int, default=None)
 # C2RL only: after the trained eval, ALSO evaluate with the residual bypassed
 # (= pure CV-STEM-LQR base) on the IDENTICAL frozen CMG — a controlled base-vs-
 # residual comparison free of CMG-regression nondeterminism. See models.CLActorModel.
@@ -253,76 +223,47 @@ _ov.add_argument("--memory_size", "--memory-size", "--sac_memory_size", "--sac-m
 parser.add_argument("--ppo_activations", "--ppo-activations", type=str, default=None)
 parser.add_argument("--ppo_network_arch", "--ppo-network-arch", type=str, default=None)
 
-# Reference preview (POMDP fix that makes a high discount_factor valid): append
-# NUM_PREVIEW future-uref points to the observation, spaced geometrically over
-# the discount's effective horizon 1/(1-discount_factor). 0 = off (historic
-# [x, xref, uref] layout). Applies to path-tracking layouts (classic + isaaclab).
-parser.add_argument("--num_preview", "--num-preview", "--preview_points",
-                    "--preview-points", type=int, default=0,
-                    help="Future-uref preview points appended to the obs (0 = off). "
-                         "Window extent = effective horizon 1/(1-discount_factor).")
-# Additionally append, at each of the SAME preview offsets, the future
-# reference position RELATIVE TO THE CURRENT STATE (xref_future - x, angle-
-# wrapped) — see env_base.BaseEnv.construct_state / set_preview_offsets.
-# Classic only. Off by default (byte-identical to the uref-only preview).
-parser.add_argument("--preview_include_xref", "--preview-include-xref",
-                    action="store_true", default=False,
-                    help="Widen the preview tail to also carry relative future-xref "
-                         "points (needs --num_preview>0).")
-# Drop the future-uref block from the preview tail entirely (xref-only
-# preview) — tests whether xref alone (uref is in principle recoverable by
-# differencing consecutive preview points) is enough. Needs
-# --preview_include_xref or the preview tail carries nothing. Default False
-# reproduces the historic uref-in-preview layout exactly.
-parser.add_argument("--preview_no_uref", "--preview-no-uref",
-                    action="store_true", default=False,
-                    help="Drop future-uref points from the preview tail (needs "
-                         "--preview_include_xref, else the preview is empty).")
-# Replace the geometric num_preview/gamma ladder with EVERY future step up to
-# episode end (env_base.BaseEnv._full_trajectory_offsets) — meant for a
-# sequence gate encoder (--film_gate_encoder gru/attn), which can learn its
-# own attention/forgetting over the whole remaining trajectory instead of a
-# hand-picked window. num_preview/discount_factor are ignored for sizing the
-# window when this is set. Cost: O(max_episode_len) per step instead of
-# O(num_preview) — GPU-only in practice, not for the CPU-only local sweeps.
-parser.add_argument("--preview_full_trajectory", "--preview-full-trajectory",
-                    action="store_true", default=False,
-                    help="Preview = every future step to episode end, not a "
-                         "num_preview/gamma-sized window. Pairs with "
-                         "--film_gate_encoder gru/attn.")
+# ── Reference window: the observation s = {x, xrefs, urefs} ──────────────── #
+# xrefs[k] = xref[t + k*ref_offset], k = 0..ref_length-1 (k=0 is the CURRENT
+# reference). This is the POMDP fix that makes a high discount_factor valid:
+# V(s) integrates the reward over ~1/(1-gamma) steps, so every reference point
+# inside that horizon must be in the observation. RefWindow.check_markov warns
+# at env construction when the window is too short for the discount.
+# Default AUTO: the length is derived from this run's discount_factor so the
+# window always spans the effective horizon 1/(1-gamma) — see
+# RefWindow.length_for_horizon. Sizing it by hand is what let a window sized for
+# one gamma be used at another, silently making V non-Markov (or 50x oversized)
+# with nothing in the logs saying so. Pass an explicit integer to override.
+parser.add_argument("--ref_length", "--ref-length", type=int, default=None,
+                    help="Reference points in the observation window. Default: AUTO — "
+                         "sized so the window spans the discount's effective horizon "
+                         "1/(1-discount_factor). Pass an int to pin it.")
+parser.add_argument("--ref_offset", "--ref-offset", type=int, default=1,
+                    help="Step stride between window points: xrefs[k] = xref[t + k*OFFSET]. "
+                         "Widens the span per point, at the cost of subsampling the "
+                         "horizon (>1 is reported as non-Markov — see RefWindow.check_markov).")
 
-# Asymmetric (privileged) critic: give the CRITIC ONLY a future-xref
-# trajectory via skrl's separate states/state_space channel — see
-# env_base.BaseEnv.configure_value_state / models.TrajectoryAwareValueModel —
-# completely independent of whatever preview the ACTOR's own observation
-# carries. Unset (default None) leaves the critic on the historic
-# EmbeddedDeterministicModel(observations) path exactly as before.
+# How BOTH the actor's W2(xrefs) and the critic's psi(xrefs) turn the reference
+# window into a fixed vector. Shared by design — the critic's independence comes
+# from its own architecture (phi/psi/combine), not a second encoder choice.
+parser.add_argument("--encoder", "--enc", type=str, default="mlp",
+                    choices=["mlp", "gru", "attn"],
+                    help="Reference-window encoder for the actor's W2 and the critic's "
+                         "psi: mlp (flatten), gru (recency-weighted), attn (learned "
+                         "attention over points).")
+parser.add_argument("--encoder_stride", "--encoder-stride", type=int, default=1,
+                    help="Keep every Nth window point (nearest-first) before encoding; "
+                         "1 = dense. Bounds 'mlp' input width on a long window.")
 parser.add_argument("--critic_encoder", "--critic-encoder", type=str, default=None,
                     choices=["mlp", "gru", "attn"],
-                    help="Give the critic a privileged future-xref trajectory via a "
-                         "separate state channel, encoded by this model (mlp/gru/attn). "
-                         "Unset = historic critic (sees only the actor's own preview).")
+                    help="Override the critic's psi encoder (defaults to --encoder).")
 parser.add_argument("--critic_encoder_stride", "--critic-encoder-stride", type=int, default=1,
-                    help="Applies to all three critic_encoder choices uniformly: keep "
-                         "every Nth future-xref point (nearest-first), 1 = dense/every "
-                         "point, instead of the full trajectory.")
-parser.add_argument("--critic_num_points", "--critic-num-points", type=int, default=7,
-                    help="Number of future-xref offsets in the critic's privileged "
-                         "state (ignored if --critic_full_trajectory).")
-parser.add_argument("--critic_full_trajectory", "--critic-full-trajectory",
-                    action="store_true", default=False,
-                    help="Critic's privileged state = every future step to episode "
-                         "end, not a --critic_num_points/gamma window.")
+                    help="Stride for the critic's psi encoder (see --encoder_stride).")
 parser.add_argument("--critic_combine", "--critic-combine", type=str, default="concat",
-                    choices=["concat", "bilinear", "film"],
-                    help="How the critic combines phi(x) and psi(traj): 'concat' "
-                         "(default, joint MLP over both embeddings) or 'bilinear' "
-                         "(true UVFA-style factorization: w^T(phi*psi) + linear terms, "
-                         "phi/psi never jointly fed to a net — see models."
-                         "TrajectoryAwareValueModel). Ignored unless --critic_encoder is set.")
-# Width of phi(x) / psi(traj). For 'bilinear' this bounds the RANK of the
-# state x goal interaction the critic can represent, so it is the key UVFA
-# hyperparameter (Schaul et al. 2015); 'concat' is far less sensitive to it.
+                    choices=["concat"],
+                    help="How the critic combines phi(x, e) and psi(xrefs). Only "
+                         "'concat' is active; 'bilinear'/'film' are commented out "
+                         "in models.py.")
 # O6: parameterize the critic as V(s) = f_theta(s) + ||e||^2_M, with the second
 # term computed analytically from the frozen CMG instead of learned. The
 # decrement reward's telescoping identity is V_shaped = (1-gamma)V_orig - Phi(s),
@@ -480,10 +421,6 @@ def _apply_agent_overrides(agent_cfg, args):
         agent_cfg["memory"]["memory_size"] = args.memory_size
     if getattr(args, "cvstem_residual_base", None):
         a["cvstem_residual_base"] = True
-    if getattr(args, "residual_feedforward", None):
-        a["residual_feedforward"] = True
-    if getattr(args, "residual_variant", None):
-        a["residual_variant"] = args.residual_variant
     if getattr(args, "residual_contraction_pretrain", None):
         a["residual_contraction_pretrain"] = True
     if getattr(args, "residual_pretrain_epochs", None) is not None:
@@ -494,23 +431,16 @@ def _apply_agent_overrides(agent_cfg, args):
         a["residual_pretrain_method"] = args.residual_pretrain_method
     if getattr(args, "residual_pretrain_clamp_target", None):
         a["residual_pretrain_clamp_target"] = True
-    # FiLM gate sources are MODEL kwargs (models.policy.*), not agent-config keys —
-    # contraction_runner passes models.policy's dict through verbatim as
-    # CLActorModel kwargs (see models.CLActorModel.__init__).
+    # Encoder settings are MODEL kwargs (models.policy.* / models.critic.*), not
+    # agent-config keys — contraction_runner passes those blocks through verbatim
+    # as model kwargs. setdefault, never assignment: a wandb sweep parameter under
+    # models.policy.* already landed in agent_cfg via apply_wandb_sweep_overrides,
+    # and a plain assignment would silently clobber it back to the CLI default on
+    # every trial.
     _policy_block = agent_cfg.get("models", {}).get("policy")
     if isinstance(_policy_block, dict):
-        if getattr(args, "film_gate1_source", None):
-            _policy_block["film_gate1_source"] = args.film_gate1_source
-        if getattr(args, "film_gate2_source", None):
-            _policy_block["film_gate2_source"] = args.film_gate2_source
-        if getattr(args, "film_gate_encoder", None):
-            _policy_block["film_gate_encoder"] = args.film_gate_encoder
-        if getattr(args, "film_gate_stride", None) is not None:
-            _policy_block["film_gate_stride"] = args.film_gate_stride
-        if getattr(args, "preview_include_xref", False):
-            _policy_block["preview_includes_xref"] = True
-        if getattr(args, "preview_no_uref", False):
-            _policy_block["preview_includes_uref"] = False
+        _policy_block.setdefault("encoder", args.encoder)
+        _policy_block.setdefault("encoder_stride", args.encoder_stride)
     if getattr(args, "reward_euclidean", None):
         a["reward_euclidean"] = True
     if getattr(args, "reward_level", None):
@@ -700,43 +630,42 @@ if _is_classic:
         print(f"[train] eig_reshape ACTIVE: Mahalanobis reward's M reshaped to "
               f"cond(M) = {args_cli.eig_reshape:g} every step")
 
-    # Reference preview: size the window to THIS run's effective horizon
-    # 1/(1-discount_factor) and append future-uref points to the obs. Done
-    # before the wrappers/runner so the widened observation_space propagates to
-    # the models and memory. discount_factor is already finalized here (CLI
-    # overrides at _apply_agent_overrides + any wandb-sweep overrides above).
-    if (args_cli.num_preview or args_cli.preview_full_trajectory) and hasattr(raw_env.unwrapped, "configure_preview"):
-        _gamma = float(agent_cfg["agent"].get("discount_factor", 0.99))
-        raw_env.unwrapped.configure_preview(args_cli.num_preview, _gamma,
-                                            include_xref=args_cli.preview_include_xref,
-                                            full_trajectory=args_cli.preview_full_trajectory,
-                                            include_uref=not args_cli.preview_no_uref)
+    # Reference window: size it for THIS run and rebuild observation_space.
+    # Must run BEFORE the wrappers/runner so the new space propagates to the
+    # models and the memory. discount_factor is already finalized here (CLI
+    # overrides at _apply_agent_overrides + any wandb-sweep overrides above), so
+    # the Markov check below reports against the gamma actually used.
+    _gamma = float(agent_cfg["agent"].get("discount_factor", 0.99))
+    if hasattr(raw_env.unwrapped, "configure_ref_window"):
+        _len = args_cli.ref_length
+        if _len is None:
+            # AUTO: size the window to THIS run's gamma. Done here, after every
+            # gamma override (CLI + wandb sweep) has landed, so a swept
+            # discount_factor resizes the observation to match instead of
+            # being evaluated against a stale hand-picked length.
+            from contractionRL.agents.skrl.ref_window import RefWindow as _RW
+            _len = _RW.length_for_horizon(
+                _gamma, int(raw_env.unwrapped.max_episode_len), args_cli.ref_offset)
+            print(f"[train] ref_length AUTO -> {_len} "
+                  f"(gamma={_gamma}, effective horizon "
+                  f"{_RW.effective_horizon(_gamma, int(raw_env.unwrapped.max_episode_len))} steps, "
+                  f"offset={args_cli.ref_offset})")
+        raw_env.unwrapped.configure_ref_window(
+            length=_len, offset=args_cli.ref_offset, gamma=_gamma)
 
-    # Asymmetric critic's privileged state channel — see --critic_encoder above.
-    # Independent of the actor's own preview config; must also run before the
-    # wrappers/runner so state_space (if any) propagates to the models/memory.
-    # O6 applies to EITHER critic class, so it is set before the
-    # --critic_encoder branch below (which only picks the privileged variant).
+    # O6 analytic-potential critic — see --critic_analytic_potential.
     if getattr(args_cli, "critic_analytic_potential", False):
         _cb = agent_cfg.get("models", {}).get("critic")
         if isinstance(_cb, dict):
             _cb["analytic_potential"] = True
 
-    if args_cli.critic_encoder and hasattr(raw_env.unwrapped, "configure_value_state"):
-        _gamma = float(agent_cfg["agent"].get("discount_factor", 0.99))
-        raw_env.unwrapped.configure_value_state(args_cli.critic_num_points, _gamma,
-                                                full_trajectory=args_cli.critic_full_trajectory)
-        _critic_block = agent_cfg.get("models", {}).get("critic")
-        if isinstance(_critic_block, dict):
-            # setdefault, not assignment: a wandb sweep parameter under
-            # models.critic.* already landed in agent_cfg via
-            # apply_wandb_sweep_overrides ABOVE (before configure_value_state
-            # even runs) — a plain assignment here would silently clobber it
-            # back to this CLI/default value on every sweep trial.
-            _critic_block.setdefault("encoder", args_cli.critic_encoder)
-            _critic_block.setdefault("combine", args_cli.critic_combine)
-            _critic_block.setdefault("embed_dim", args_cli.critic_embed_dim)
-            _critic_block.setdefault("encoder_stride", args_cli.critic_encoder_stride)
+    _critic_block = agent_cfg.get("models", {}).get("critic")
+    if isinstance(_critic_block, dict):
+        # setdefault, not assignment — see the policy block above.
+        _critic_block.setdefault("encoder", args_cli.critic_encoder or args_cli.encoder)
+        _critic_block.setdefault("combine", args_cli.critic_combine)
+        _critic_block.setdefault("embed_dim", args_cli.critic_embed_dim)
+        _critic_block.setdefault("encoder_stride", args_cli.critic_encoder_stride)
 
     # Wrapper order is load-bearing: StatManagerEnvWrapper must see the flat
     # tensor observations BatchedGymnasiumWrapper produces, and WandbPlotWrapper

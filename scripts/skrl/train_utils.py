@@ -171,7 +171,6 @@ def install_wandb_scalar_hook() -> None:
     themselves (see ``rl_glue.make_base_rl_cfg``).
     """
     import skrl.utils.tensorboard as _skrl_tb
-
     import wandb
 
     orig_add_scalar = _skrl_tb.SummaryWriter.add_scalar
@@ -204,19 +203,18 @@ def apply_wandb_sweep_overrides(agent_cfg: dict) -> None:
     always uses the SAME encoder (and stride) on both sides rather than
     sampling them independently — wandb's nested-dict form only joins keys
     that share a parent path (e.g. ``cm.w_lb``/``cm.w_ub``), which
-    ``models.policy.film_gate_encoder``/``models.critic.encoder`` don't:
-      ``xref_encoder``        -> models.policy.film_gate_encoder AND
-                                  models.critic.encoder
-      ``xref_encoder_stride`` -> models.policy.film_gate_stride AND
+    ``models.policy.encoder``/``models.critic.encoder`` don't:
+      ``xref_encoder``        -> models.policy.encoder AND models.critic.encoder
+      ``xref_encoder_stride`` -> models.policy.encoder_stride AND
                                   models.critic.encoder_stride
     See search/configs/c2rl-ppo-cvstem.yaml.
     """
     import wandb
 
     _FANOUT = {
-        "xref_encoder": (("models", "policy", "film_gate_encoder"),
+        "xref_encoder": (("models", "policy", "encoder"),
                           ("models", "critic", "encoder")),
-        "xref_encoder_stride": (("models", "policy", "film_gate_stride"),
+        "xref_encoder_stride": (("models", "policy", "encoder_stride"),
                                  ("models", "critic", "encoder_stride")),
     }
 
@@ -754,16 +752,16 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
             print(f"[Eval] --eval_held_out_seed set but {type(env.unwrapped).__name__} has no "
                   f"set_held_out_mode — falling back to ordinary i.i.d.-random eval trajectories.")
 
-    # Mirror the training env's reference-preview layout so the eval obs width
-    # matches what the models were built for (else x/xref/uref slicing shifts).
+    # Mirror the training env's reference WINDOW so the eval observation matches
+    # what the models were built for. A mismatch is not a shape error that
+    # surfaces loudly — RefWindow.split would raise, but only after the eval env
+    # has already been built — so copy the layout explicitly.
     from contractionRL.runners.contraction_runner import _unwrap_env
     _train_env = _unwrap_env(getattr(runner, "_env", None)) if getattr(runner, "_env", None) is not None else None
-    _offs = list(getattr(_train_env, "preview_offsets", []) or [])
-    _incl_xref = bool(getattr(_train_env, "_preview_include_xref", False))
-    if _offs and hasattr(env.unwrapped, "set_preview_offsets"):
-        env.unwrapped.set_preview_offsets(_offs, include_xref=_incl_xref)
-        print(f"[Eval] reference preview mirrored: offsets={_offs} "
-              f"include_xref={_incl_xref} -> obs_dim {env.unwrapped.observation_space.shape[0]}")
+    _w = getattr(_train_env, "ref_window", None)
+    if _w is not None and hasattr(env.unwrapped, "configure_ref_window"):
+        env.unwrapped.configure_ref_window(length=_w.length, offset=_w.offset)
+        print(f"[Eval] reference window mirrored: length={_w.length} offset={_w.offset}")
 
     reward_list, auc_list, C_list, lbd_list = [], [], [], []
     print(f"[Eval] Rolling out {num_groups * episodes_per_group} episodes on {task} …")
@@ -776,7 +774,13 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
             error_traj = []
             dt = env.unwrapped.dt
             while not done:
-                if isinstance(obs, torch.Tensor):
+                if isinstance(obs, dict):
+                    # {x, xrefs, urefs} — flatten exactly as skrl does so the
+                    # models see the same layout they were built for.
+                    obs_t = env.unwrapped.ref_window.flatten(
+                        *(torch.as_tensor(obs[k], dtype=torch.float32, device=device)
+                          for k in ("x", "xrefs", "urefs")))
+                elif isinstance(obs, torch.Tensor):
                     obs_t = obs.clone().detach().to(dtype=torch.float32, device=device)
                 else:
                     obs_t = torch.tensor(np.asarray(obs), dtype=torch.float32, device=device)

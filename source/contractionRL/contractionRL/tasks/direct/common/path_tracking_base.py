@@ -22,6 +22,7 @@ import torch
 from isaaclab.envs import DirectRLEnv
 
 from contractionRL.agents.skrl.angle_utils import wrap_diff
+from contractionRL.agents.skrl.ref_window import RefWindow
 
 from .eval_metrics import fit_exponential_envelope
 from .state_guard import carry_forward_nonfinite
@@ -135,6 +136,18 @@ class PathTrackingBase(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
         self._traj_buf = TrajectoryBuffer(cfg.traj_path, self.device)
+
+        # Reference window — the observation is s = {x, xrefs, urefs}, identical
+        # in layout to the classic envs (see agents/skrl/ref_window.py and
+        # classic/common/env_base.py). configure_ref_window() resizes it before
+        # the models are built.
+        self.ref_window = RefWindow(
+            x_dim=self._traj_buf.state_dim,
+            u_dim=self._traj_buf.action_dim,
+            length=int(getattr(cfg, "ref_length", 1) or 1),
+            offset=int(getattr(cfg, "ref_offset", 1) or 1),
+        )
+        self._rebuild_observation_space()
 
         n = self.num_envs
         self._traj_ids = torch.zeros(n, dtype=torch.long, device=self.device)
@@ -508,13 +521,59 @@ class PathTrackingBase(DirectRLEnv):
     # PathTracking logic (shared)
     # ------------------------------------------------------------------ #
 
+    def _rebuild_observation_space(self) -> None:
+        """Declare ``{x, xrefs, urefs}`` as the observation space.
+
+        Isaac's DirectRLEnv takes an integer width from the env cfg, so the
+        FLAT width is what it is told; the Dict is exposed alongside it for
+        ``RefWindow.from_space``. Both agree by construction (``flat_dim``).
+        """
+        lo, hi = self._state_bounds()
+        u_lo, u_hi = self._control_bounds()
+        self.observation_space = self.ref_window.space(lo, hi, u_lo, u_hi)
+        self.cfg.observation_space = self.ref_window.flat_dim
+        self.num_observations = self.ref_window.flat_dim
+
+    def _state_bounds(self):
+        """Per-dim (low, high) for the physical state. Unbounded by default —
+        the classic envs have real boxes, Isaac ones generally do not, and the
+        bounds are only used to declare the space."""
+        n = self.ref_window.x_dim
+        return (np.full(n, -np.inf, np.float32), np.full(n, np.inf, np.float32))
+
+    def _control_bounds(self):
+        lo = np.asarray(self.action_space.low, dtype=np.float32).reshape(-1)
+        hi = np.asarray(self.action_space.high, dtype=np.float32).reshape(-1)
+        return lo, hi
+
+    def configure_ref_window(self, length: int, offset: int = 1,
+                             gamma: float | None = None) -> None:
+        """Resize the reference window and rebuild ``observation_space`` —
+        the Isaac twin of ``BaseEnv.configure_ref_window``. Must be called
+        BEFORE the agent/memory are built. Idempotent."""
+        self.ref_window = RefWindow(x_dim=self.ref_window.x_dim, u_dim=self.ref_window.u_dim,
+                                    length=int(length), offset=int(offset))
+        self._rebuild_observation_space()
+        print(f"[PathTrackingBase] reference window: length={self.ref_window.length} "
+              f"offset={self.ref_window.offset} (spans "
+              f"{(self.ref_window.length - 1) * self.ref_window.offset} steps) -> "
+              f"obs {self.ref_window.flat_dim}-wide")
+        if gamma is not None:
+            warn = self.ref_window.check_markov(float(gamma), int(self.max_episode_length))
+            if warn:
+                print(warn)
+
     def _get_observations(self) -> dict:
         step = self.episode_length_buf.long()
-        self._x_ref, self._u_ref = self._traj_buf.get(self._traj_ids, step)
+        x_refs, u_refs = self._traj_buf.get_window(self._traj_ids, step, self.ref_window)
+        # Slot 0 is the CURRENT reference — what the reward and every metric use.
+        self._x_ref, self._u_ref = x_refs[:, 0], u_refs[:, 0]
         # sanitize so the policy never receives NaN/Inf from a diverging env
         x = self._sanitize_state(self._get_physical_state())
-        obs = torch.cat([x, self._x_ref, self._u_ref], dim=-1)
-        return {"policy": obs}
+        # Flat, in skrl's sorted-key Dict order (RefWindow.flatten) — Isaac's
+        # DirectRLEnv passes the "policy" tensor straight through without a
+        # Dict-space tensorize step, so flattening happens here.
+        return {"policy": self.ref_window.flatten(x, x_refs, u_refs)}
 
     def _get_rewards(self) -> torch.Tensor:
         # Refresh _x_ref/_u_ref for THIS step here rather than relying on

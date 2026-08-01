@@ -12,8 +12,9 @@ families that share the same interface:
 - **Classic envs** (`tasks/direct/classic/{car,cartpole,segway,turtlebot}`) — pure NumPy/gymnasium,
   no Isaac Sim, analytically synthesize their own reference trajectory every `reset()`.
 
-Every path-tracking env (Isaac and classic) shares `obs = [x, x_ref, u_ref]` and
-`reward = -‖x - x_ref‖²`-family reward, so any algorithm can train/eval on any env.
+Every path-tracking env (Isaac and classic) shares the reference-window observation
+`obs = {x, xrefs, urefs}` and a `reward = -‖x - xrefs[0]‖²`-family reward, so any algorithm
+can train/eval on any env.
 
 ## Commands
 
@@ -36,6 +37,11 @@ python scripts/list_envs.py --keyword classic
 
 # Train — classic (no Isaac Sim, --classic flag, num_envs is process-level SyncVectorEnv)
 python scripts/skrl/train.py --classic --task classic-car-v0 --algorithm c2rl-ppo --num_envs 4
+
+# Reference window + encoder (see Observation below). Size the window to span the
+# discount's effective horizon 1/(1-gamma) or the value function is non-Markov.
+python scripts/skrl/train.py --classic --task classic-car-v0 --algorithm c2rl-ppo \
+    --ref_length 51 --ref_offset 1 --encoder gru
 
 # Train — Isaac vel-tracking (locomotion pretrain) then path-tracking (contraction control)
 python scripts/skrl/train.py --task Quadruped-VelTracking-v0 --algorithm ppo --num_envs 4096 --headless
@@ -69,15 +75,36 @@ is in README.md — read it before guessing at a flag.
 **Envs** (`source/contractionRL/contractionRL/tasks/direct/`):
 - `classic/common/env_base.py` — `BaseEnv` shared by car/cartpole/segway/turtlebot. Analytical
   `get_f_and_B(x)`, generates its own reference trajectory each episode.
-- `common/path_tracking_base.py` — the Isaac-side equivalent interface (`[x, xref, uref]` layout,
+- `common/path_tracking_base.py` — the Isaac-side equivalent interface (`{x, xrefs, urefs}` layout,
   `Stability`/`Episode` W&B logging, `set_ccm` for the Mahalanobis reward).
 - Any member a contraction agent discovers via `getattr` (`get_f_and_B`, `get_rollout`, `set_ccm`,
   `x_dim`, `u_dim`) **must exist with the same signature on both families** —
   `tests/test_isaac_parity.py` enforces this statically without needing Isaac Sim.
 
+**Observation**: `obs = {x, xrefs, urefs}` (a gymnasium `Dict`), where
+`xrefs[k] = xref[t + k*ref_offset]` for `k = 0..ref_length-1`, clamped at the episode end.
+`xrefs[0]`/`urefs[0]` are the CURRENT reference. `agents/skrl/ref_window.py` owns the layout:
+`RefWindow.from_space` is how every model learns its input shape (nothing infers a layout from
+`obs_dim`), `RefWindow.split` is the ONLY place that knows the flat ordering skrl produces
+(`sorted(keys)` -> `[urefs, x, xrefs]`), and `Feats` owns the relative-position /
+wrapped-angle / SE(2) feature maps that every network input goes through.
+`RefWindow.check_markov` warns when the window is too short to span `1/(1-gamma)` — a shorter
+window makes V non-Markov, which is the POMDP the window exists to prevent.
+
+**Actor / critic**: one architecture each, both consuming the window through the same
+`--encoder` (`mlp` | `gru` | `attn`, via `PreviewSequenceEncoder`):
+
+- actor  `u = urefs[0] + W2(xrefs) · tanh(W1(x) · e)`, `e = error(x, xrefs[0])` — `W1` reads
+  the current configuration only, `W2` the reference path only.
+- critic `V = MLP([phi(x, e) ‖ psi(xrefs)])` (`combine: concat`; `bilinear`/`film` are
+  commented out in `models.py`).
+
+Both are exactly invariant to translating and (where the env is SE(2)) rotating the whole
+scene — enforced by `tests/test_models_window.py`.
+
 **Action convention**: every env applies `u_applied = action` directly — no env ever adds `uref`
-back in. Instead the *agent* folds `uref` into its output: `CLActor` computes `uref + feedback`;
-LQR/SD-LQR compute `uref - K·e`. PPO/SAC on path-tracking envs default to the `control` backbone
+back in. Instead the *agent* folds `urefs[0]` into its output: `CLActor` computes
+`urefs[0] + feedback`; LQR/SD-LQR compute `urefs[0] - K·e`. PPO/SAC on path-tracking envs default to the `control` backbone
 (`CLActorModel`), so their policy mean is also `uref + feedback` unless `backbone: mlp` is set.
 
 **C3M**: jointly trains a Riemannian metric `W(x)` (via the CMG) and a `CLActor` controller so all

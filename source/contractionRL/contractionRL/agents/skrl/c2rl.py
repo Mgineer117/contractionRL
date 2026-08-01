@@ -83,6 +83,7 @@ from skrl.memories.torch import RandomMemory
 from skrl.trainers.torch.base import Trainer, TrainerCfg
 
 from .math_utils import build_lr_scheduler
+from .ref_window import RefWindow
 from .rl_glue import filter_cfg_fields, make_base_rl_cfg
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -173,6 +174,10 @@ class C2RLPPOCfg(AgentCfg):
     # (the same frozen CMG from Phase A) and PPO learns only the correction. Needs
     # the 'control' backbone (a CLActor policy). See nn_modules.CVSTEMLQRBase.
     cvstem_residual_base: bool = False
+    # INERT since the actor architecture was fixed to W2(xrefs)·tanh(W1(x)·e).
+    # Kept so an older yaml carrying these keys still parses (a key the dataclass
+    # does not declare is silently dropped — see rl_glue.filter_cfg_fields).
+    # ── superseded ──
     # π-network variant: make the residual a pure ANTICIPATORY FEEDFORWARD head
     # (an MLP of the reference preview [uref, future-uref] only) instead of the
     # bilinear e-feedback. LQ-preview-optimal control = feedback(−K·e) [the base]
@@ -559,12 +564,16 @@ class C2RLAgent(Agent):
             device=device,
         )
 
-        obs_dim = int(observation_space.shape[0])
-        u_dim_inferred = int(action_space.shape[0])
+        # The observation space DECLARES its layout ({x, xrefs, urefs}), so
+        # x_dim/u_dim are read, never guessed from obs_dim (the old
+        # (obs_dim - u_dim)//2 parity rule silently mis-split any other layout).
+        self._window = RefWindow.from_space(observation_space)
+
+
         if u_dim is None:
-            u_dim = u_dim_inferred
+            u_dim = self._window.u_dim
         if x_dim is None:
-            x_dim = (obs_dim - u_dim) // 2
+            x_dim = self._window.x_dim
 
         self._x_dim = x_dim
         self._u_dim = u_dim
@@ -948,9 +957,10 @@ class C2RLAgent(Agent):
         feedforward uref (u = uref + π — π learns the whole feedback and the
         deployed policy stands on its own); with ``cvstem_residual_base`` the base
         becomes the analytic CV-STEM-LQR controller (warm-start, off by default).
-        ``residual_variant`` picks π's architecture (bilinear | decoupled |
-        latent_bias | film; feedforward only with a base). See the structured
-        residuals in nn_modules and CVSTEMLQRBase."""
+        π's architecture is now fixed: ``W2(xrefs)·tanh(W1(x)·e)`` (see
+        nn_modules.CLActor). The old ``residual_variant`` dispatch (bilinear /
+        decoupled / latent_bias / film / feedforward) is gone — those heads are
+        commented out in nn_modules."""
         policy = self._policy_model
         cl_actor = getattr(policy, "cl_actor", None)
         if cl_actor is None or not hasattr(policy, "base_controller"):
@@ -961,33 +971,10 @@ class C2RLAgent(Agent):
 
         use_base = bool(getattr(self._cfg, "cvstem_residual_base", False))
 
-        # 1) Select the π-network architecture (see C2RLPPOCfg.residual_variant /
-        # nn_modules structured residuals). Legacy residual_feedforward=True aliases
-        # "feedforward".
-        variant = getattr(self._cfg, "residual_variant", "bilinear") or "bilinear"
-        if getattr(self._cfg, "residual_feedforward", False):
-            variant = "feedforward"
-        needs_preview = variant in ("feedforward", "decoupled", "latent_bias", "film")
-        if needs_preview and getattr(policy, "_preview_dim", 0) <= 0:
-            print(f"[C2RL] residual_variant='{variant}' needs a reference preview "
-                  f"(--num_preview>0) — falling back to the bilinear e-feedback residual.",
-                  flush=True)
-            variant = "bilinear"
-        if variant == "feedforward" and not use_base:
-            # The feedforward head carries no feedback (independent of e), so
-            # u = uref + FF would leave the loop OPEN and fail to track. It is only
-            # meaningful on a base that already closes the loop (cvstem_residual_base).
-            print("[C2RL] residual_variant='feedforward' has no feedback term and needs "
-                  "cvstem_residual_base to close the loop — falling back to bilinear.",
-                  flush=True)
-            variant = "bilinear"
-        policy.residual_variant = variant
-        policy.residual_feedforward = (variant == "feedforward")  # keep legacy flag consistent
-
-        # 2) The control law is u = base + π. DEFAULT base = the reference feedforward
-        # uref (u = uref + π — π learns the whole feedback, the deployed policy standing
-        # on its own). Attach the analytic CV-STEM-LQR controller as the base ONLY when
-        # explicitly requested (cvstem_residual_base warm-start; off by default).
+        # The control law is u = base + π. DEFAULT base = the reference feedforward
+        # urefs[0] (u = uref + π — π learns the whole feedback, the deployed policy
+        # standing on its own). Attach the analytic CV-STEM-LQR controller as the
+        # base ONLY when explicitly requested (cvstem_residual_base warm-start).
         # Hard-control-bound dispatch DISABLED 2026-07-30 — see
         # C2RLPPOCfg.hard_control_bound's (commented) docstring above.
         # if use_base and getattr(self._cfg, "hard_control_bound", False):
@@ -997,36 +984,18 @@ class C2RLAgent(Agent):
             policy.base_controller = CVSTEMLQRBase(
                 self._ccm_gen, self._get_f_and_B,
                 r_scaler=self._cfg.cvstem_r_scaler, w_lb=self._cfg.w_lb,
-                x_dim=self._x_dim, u_dim=self._u_dim, angle_idx=self._angle_idx,
+                window=self._window, angle_idx=self._angle_idx,
             )
-            # Warm-start: zero π so training STARTS exactly at the analytic base.
-            if variant == "bilinear":
-                cl_actor.zero_init_residual()
-            elif variant in policy.residual_modules:
-                policy.residual_modules[variant].zero_output()
-            elif variant == "feedforward" and policy.ff_head is not None:
-                policy._zero_last_linear(policy.ff_head)
-        # else: base = uref (compute()), π keeps its STANDARD init so the policy
+            # Warm-start: zero W2's output so π starts at 0 and training STARTS
+            # exactly at the analytic base.
+            cl_actor.w2.zero_output()
+        # else: base = urefs[0] (compute()), π keeps its STANDARD init so the policy
         # starts with feedback and learns the full contraction law from scratch.
 
-        # 3) When a non-bilinear variant is active, the original CLActor bilinear
-        # feedback is bypassed — freeze it so only the selected module (+ logstd) trains.
-        if variant != "bilinear":
-            for name, p in cl_actor.named_parameters():
-                if name.startswith(("w1.", "w2.")):
-                    p.requires_grad_(False)
-
-        _desc = {
-            "bilinear":    "bilinear feedback W₂·tanh(W₁·e)",
-            "feedforward": "anticipatory FEEDFORWARD(preview), independent of e",
-            "decoupled":   "DECOUPLED W₂(P)·tanh(W₁(x)·e)",
-            "latent_bias": "LATENT-PREVIEW-BIAS W₂(x)·tanh(W₁(x)·e + f_prev(P))",
-            "film":        "FiLM (W₂(x)⊙γ₂(P))·tanh((W₁(x)⊙γ₁(P))·e)",
-        }[variant]
-        _base_desc = "CV-STEM-LQR(K=R⁻¹BᵀW⁻¹)" if use_base else "uref (reference feedforward)"
+        _base_desc = "CV-STEM-LQR(K=R⁻¹BᵀW⁻¹)" if use_base else "urefs[0] (reference feedforward)"
         _init = "π zero-init, warm-started AT the base" if use_base else "π standard-init, learns feedback from scratch"
-        print(f"[C2RL] control law: u = {_base_desc} + π  |  residual_variant='{variant}' "
-              f"({_desc})  |  {_init}.", flush=True)
+        print(f"[C2RL] control law: u = {_base_desc} + π  |  π = W₂(xrefs)·tanh(W₁(x)·e)"
+              f"  |  {_init}.", flush=True)
 
         if use_base and getattr(self._cfg, "cvstem_residual_distill", False):
             self._distill_residual_from_online()
@@ -1035,8 +1004,7 @@ class C2RLAgent(Agent):
             # CV-STEM-LQR base — measures the base's own AUC. Freeze EVERY residual
             # param; logstd stays trainable so PPO still has policy params.
             for name, p in policy.named_parameters():
-                if any(k in name for k in ("cl_actor.w1.", "cl_actor.w2.",
-                                           "ff_head.", "residual_modules.")):
+                if any(k in name for k in ("cl_actor.w1.", "cl_actor.w2.")):
                     p.requires_grad_(False)
             print("[C2RL] residual FROZEN at 0 — actor = pure CV-STEM-LQR baseline.",
                   flush=True)
@@ -1048,9 +1016,9 @@ class C2RLAgent(Agent):
                 and not (use_base and getattr(self._cfg, "residual_frozen", False))):
             method = getattr(self._cfg, "residual_pretrain_method", "contraction")
             if method == "cvstemlqr":
-                self._pretrain_residual_cvstemlqr(variant)
+                self._pretrain_residual_cvstemlqr()
             else:
-                self._pretrain_residual_contraction(variant)
+                self._pretrain_residual_contraction()
 
         # Ablation A (Phase-0 collapse diagnostics — see
         # residual_pretrain_init_log_std's docstring in C2RLPPOCfg): pretraining
@@ -1203,7 +1171,17 @@ class C2RLAgent(Agent):
                       flush=True)
         print("[C2RL] critic WARM-STARTED on frozen-actor Monte-Carlo returns.", flush=True)
 
-    def _pretrain_residual_contraction(self, variant: str) -> None:
+    def _window_pool(self, n: int, dev) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pools of plausible (xref, uref) rows to fill the FUTURE window slots
+        during pretraining — see the call sites. Empty when length == 1 (the
+        window is then just the current reference and there is nothing to fill)."""
+        if self._window.length <= 1:
+            return None, None
+        roll = self._get_rollout(n, "c3m")
+        return (torch.as_tensor(roll["xref"], dtype=torch.float32, device=dev),
+                torch.as_tensor(roll["uref"], dtype=torch.float32, device=dev))
+
+    def _pretrain_residual_contraction(self) -> None:
         """Pretrain π so u = base + π CONTRACTS w.r.t. the FROZEN Phase-A metric
         M(x): minimize the C3M closed-loop condition Cu = Ṁ + 2·sym(M(A+BK)) + 2λM
         ≺ 0 (the C3M pd_loss) over π ONLY. This is a contraction certificate learned
@@ -1218,7 +1196,6 @@ class C2RLAgent(Agent):
         (c3m._compute_loss). CMG is already frozen."""
         from torch import matmul, transpose
 
-        from .angle_utils import wrap_diff
         from .math_utils import (
             b_jacobian,
             bound_W,
@@ -1242,15 +1219,6 @@ class C2RLAgent(Agent):
         dev = self.device
         x_dim, u_dim = self._x_dim, self._u_dim
         bounded = getattr(self._ccm_gen, "bounded", False)
-        obs_dim = int(policy.observation_space.shape[0])
-        preview_dim = max(0, obs_dim - 2 * x_dim - u_dim)
-        # When the preview tail also carries relative-future-xref points (see
-        # models.CLActorModel / env_base.BaseEnv.construct_state), it is
-        # [uref-block, xref-block] — CLActorModel already computed the split
-        # (single source of truth, since it also derives it from obs_dim);
-        # 0 (default) means the whole tail is uref-only, unchanged below.
-        xref_preview_dim = int(getattr(policy, "_xref_preview_dim", 0))
-        uref_preview_dim = preview_dim - xref_preview_dim
         # π params: everything trainable in the policy except logstd (which does
         # not enter the deterministic control u the certificate is about).
         params = [p for n, p in policy.named_parameters()
@@ -1271,32 +1239,18 @@ class C2RLAgent(Agent):
         XR = torch.as_tensor(data["xref"], dtype=torch.float32, device=dev)
         UR = torch.as_tensor(data["uref"], dtype=torch.float32, device=dev)
         I = torch.eye(x_dim, device=dev)
-        # Preview pool: each preview slot is drawn i.i.d. from the SAME uniform
-        # uref distribution get_rollout("c3m") already samples (UREF_MIN..MAX) —
-        # a proxy for "a plausible future uref" without needing trajectory
-        # structure. Certifying Cu≺0 against RANDOM (not just zero) preview
-        # content is what prevents the deployment-time preview bias from pushing
-        # the actor out of the certified region (P=0-only pretraining diverged
-        # once a real, nonzero preview was fed in — see project memory).
-        n_prev_pts = uref_preview_dim // u_dim if uref_preview_dim else 0
-        if n_prev_pts:
-            pool = torch.as_tensor(self._get_rollout(max(N, 8192), "c3m")["uref"],
-                                   dtype=torch.float32, device=dev)
-        # Relative-future-xref block (see above) — sample plausible xref rows
-        # from the SAME rollout pool and subtract the (unpermuted) CURRENT x
-        # per-sample below, mirroring construct_state's wrap_angles(xref_future
-        # - x) exactly, so pretraining certifies Cu≺0 under the SAME kind of
-        # content the trained policy will actually see at deployment.
-        n_xref_pts = xref_preview_dim // x_dim if xref_preview_dim else 0
-        if n_xref_pts:
-            xref_pool = torch.as_tensor(self._get_rollout(max(N, 8192), "c3m")["xref"],
-                                        dtype=torch.float32, device=dev)
+        # Future-window pool: the window slots k>=1 are drawn i.i.d. from the SAME
+        # uniform reference distribution get_rollout("c3m") samples — a proxy for
+        # "a plausible future reference" without needing trajectory structure.
+        # Certifying Cu≺0 against RANDOM (not just zero / constant) window content
+        # is what prevents the deployment-time window from pushing the actor out of
+        # the certified region (zero-preview-only pretraining diverged once a real,
+        # nonzero window was fed in — see project memory).
+        pool_xr, pool_ur = self._window_pool(max(N, 8192), dev)
         self._ccm_gen.eval()
-        _prev_desc = (f"{n_prev_pts} RANDOM preview points"
-                      + (f" + {n_xref_pts} RANDOM relative-xref points" if n_xref_pts else "")
-                      if n_prev_pts or n_xref_pts else "preview zeroed")
-        print(f"[C2RL] contraction-pretraining π ({variant}) vs frozen CMG: "
-              f"{epochs} epochs × {N} states (Cu≺0, {_prev_desc})…", flush=True)
+        print(f"[C2RL] contraction-pretraining π vs frozen CMG: {epochs} epochs × {N} "
+              f"states (Cu≺0, window length={self._window.length} with RANDOM future "
+              f"reference points)…", flush=True)
         for ep in range(epochs):
             perm = torch.randperm(N, device=dev)
             tot, nb = 0.0, 0
@@ -1316,25 +1270,13 @@ class C2RLAgent(Agent):
                 DfDx = jacobian(f, x, create_graph=False).detach()
                 DBDx = b_jacobian(B, x, u_dim, create_graph=False).detach()
                 f = f.detach(); B = B.detach()
-                if n_prev_pts:
-                    prev = torch.cat([pool[torch.randint(0, pool.shape[0], (b,), device=dev)]
-                                      for _ in range(n_prev_pts)], dim=1)
-                else:
-                    prev = x[:, :0]
-                if n_xref_pts:
-                    x_detached = x.detach()
-                    xref_prev = torch.cat(
-                        [wrap_diff(xref_pool[torch.randint(0, xref_pool.shape[0], (b,), device=dev)]
-                                   - x_detached, self._angle_idx)
-                         for _ in range(n_xref_pts)], dim=1)
-                    prev = torch.cat([prev, xref_prev], dim=1)
-                state = torch.cat([x, xref, uref, prev], dim=1)
+                state = self._window.synth_obs(x, xref, uref, pool_xr, pool_ur)
                 # cuDNN's RNN kernel has NO double-backward support at all (not a
                 # train/eval-mode thing — a hard cuDNN API limitation) and this
                 # loop needs exactly that: K=jacobian(u,x, create_graph=True) is
                 # itself a backward through the forward below, and pd.backward()
-                # below then differentiates through THAT. Only matters when a
-                # FiLM gate uses a GRU (film_gate_encoder="gru"); harmless/no-op
+                # below then differentiates through THAT. Only matters when the
+                # window encoder is a GRU (--encoder gru); harmless/no-op
                 # otherwise. Disabling cuDNN for this one forward call switches
                 # PyTorch to its generic (non-cuDNN) RNN path, which does support
                 # double-backward, at some extra compute cost for this call only.
@@ -1359,7 +1301,7 @@ class C2RLAgent(Agent):
         print("[C2RL] π contraction-PRETRAINED (u = uref + π certified vs frozen CMG) — "
               "PPO now fine-tunes it on the Mahalanobis reward.", flush=True)
 
-    def _pretrain_residual_cvstemlqr(self, variant: str) -> None:
+    def _pretrain_residual_cvstemlqr(self) -> None:
         """Pretrain π so u = uref + π(s) MATCHES the analytic CV-STEM-LQR control
         law u_cvstemlqr(x,xref,uref) = uref - K(x)·e, K = R⁻¹BᵀW⁻¹, computed from
         the SAME frozen Phase-A metric M(x) as _pretrain_residual_contraction's
@@ -1372,7 +1314,6 @@ class C2RLAgent(Agent):
         policy.base_controller, so the deployed law stays u = uref + π exactly as
         in "contraction" mode. Same rollout/preview-pool sampling as
         _pretrain_residual_contraction, for a fair like-for-like comparison."""
-        from .angle_utils import wrap_diff
         from .nn_modules import CVSTEMLQRBase
         cfg = self._cfg
         policy = self._policy_model
@@ -1380,10 +1321,6 @@ class C2RLAgent(Agent):
                          # method's comment; identical values, just unlocks backward.
         dev = self.device
         x_dim, u_dim = self._x_dim, self._u_dim
-        obs_dim = int(policy.observation_space.shape[0])
-        preview_dim = max(0, obs_dim - 2 * x_dim - u_dim)
-        xref_preview_dim = int(getattr(policy, "_xref_preview_dim", 0))
-        uref_preview_dim = preview_dim - xref_preview_dim
         params = [p for n, p in policy.named_parameters()
                   if p.requires_grad and "log_std" not in n]
         if not params:
@@ -1392,7 +1329,7 @@ class C2RLAgent(Agent):
             return
         base = CVSTEMLQRBase(
             self._ccm_gen, self._get_f_and_B, r_scaler=cfg.cvstem_r_scaler,
-            w_lb=cfg.w_lb, x_dim=x_dim, u_dim=u_dim, angle_idx=self._angle_idx,
+            w_lb=cfg.w_lb, window=self._window, angle_idx=self._angle_idx,
         )
         lr = float(getattr(cfg, "residual_pretrain_lr", 1e-3))
         epochs = int(getattr(cfg, "residual_pretrain_epochs", 200))
@@ -1403,14 +1340,7 @@ class C2RLAgent(Agent):
         X = torch.as_tensor(data["x"], dtype=torch.float32, device=dev)
         XR = torch.as_tensor(data["xref"], dtype=torch.float32, device=dev)
         UR = torch.as_tensor(data["uref"], dtype=torch.float32, device=dev)
-        n_prev_pts = uref_preview_dim // u_dim if uref_preview_dim else 0
-        if n_prev_pts:
-            pool = torch.as_tensor(self._get_rollout(max(N, 8192), "c3m")["uref"],
-                                   dtype=torch.float32, device=dev)
-        n_xref_pts = xref_preview_dim // x_dim if xref_preview_dim else 0
-        if n_xref_pts:
-            xref_pool = torch.as_tensor(self._get_rollout(max(N, 8192), "c3m")["xref"],
-                                        dtype=torch.float32, device=dev)
+        pool_xr, pool_ur = self._window_pool(max(N, 8192), dev)
         # Actuator box the env actually applies. env_base.step clamps to
         # U_MIN/U_MAX = 2 * UREF_MIN/MAX, while self.action_space is declared at
         # the UREF bounds — hence the factor 2 here, which mirrors that step()
@@ -1422,32 +1352,18 @@ class C2RLAgent(Agent):
             u_lo = 2.0 * torch.as_tensor(self.action_space.low, dtype=torch.float32, device=dev)
 
         self._ccm_gen.eval()
-        _prev_desc = (f"{n_prev_pts} RANDOM preview points"
-                      + (f" + {n_xref_pts} RANDOM relative-xref points" if n_xref_pts else "")
-                      if n_prev_pts or n_xref_pts else "preview zeroed")
         _clamp_desc = (f", target CLAMPED to the applied actuator box "
                        f"[{u_lo.min().item():g}, {u_hi.max().item():g}]" if clamp_target else "")
-        print(f"[C2RL] cvstem-lqr regression-pretraining π ({variant}) vs analytic base: "
-              f"{epochs} epochs × {N} states (MSE, {_prev_desc}{_clamp_desc})…", flush=True)
+        print(f"[C2RL] cvstem-lqr regression-pretraining π vs analytic base: {epochs} "
+              f"epochs × {N} states (MSE, window length={self._window.length} with RANDOM "
+              f"future reference points{_clamp_desc})…", flush=True)
         for ep in range(epochs):
             perm = torch.randperm(N, device=dev)
             tot, nb = 0.0, 0
             for s in range(0, N, batch):
                 idx = perm[s:s + batch]
                 x, xref, uref = X[idx], XR[idx], UR[idx]
-                b = x.shape[0]
-                if n_prev_pts:
-                    prev = torch.cat([pool[torch.randint(0, pool.shape[0], (b,), device=dev)]
-                                      for _ in range(n_prev_pts)], dim=1)
-                else:
-                    prev = x[:, :0]
-                if n_xref_pts:
-                    xref_prev = torch.cat(
-                        [wrap_diff(xref_pool[torch.randint(0, xref_pool.shape[0], (b,), device=dev)]
-                                   - x, self._angle_idx)
-                         for _ in range(n_xref_pts)], dim=1)
-                    prev = torch.cat([prev, xref_prev], dim=1)
-                state = torch.cat([x, xref, uref, prev], dim=1)
+                state = self._window.synth_obs(x, xref, uref, pool_xr, pool_ur)
                 u = policy.compute({"observations": state}, role="policy")[0]
                 target = base(state)
                 if clamp_target:
@@ -1501,9 +1417,6 @@ class C2RLAgent(Agent):
                          getattr(self._ccm_gen, "bounded", False))
             K_frozen = (1.0 / r) * torch.bmm(B.transpose(1, 2), spd_inverse(Wf))
             dK = K_online - K_frozen                                           # (N, u, x)
-        obs_dim = int(policy.observation_space.shape[0])
-        preview_dim = max(0, obs_dim - 2 * x_dim - u_dim)
-
         params = [p for p in cl_actor.parameters() if p.requires_grad]
         opt = torch.optim.Adam(params, lr=1e-3)
         epochs = int(getattr(self._cfg, "residual_distill_epochs", 300))
@@ -1519,8 +1432,10 @@ class C2RLAgent(Agent):
                 # target is linear in e, PPO refines the exact operating range.
                 e = (torch.rand(b, x_dim, device=dev) * 2 - 1)
                 target = -torch.bmm(dK[idx], e.unsqueeze(-1)).squeeze(-1)      # (b, u)
-                obs = torch.cat([xi, xi - e, torch.zeros(b, u_dim, device=dev),
-                                 torch.zeros(b, preview_dim, device=dev)], dim=-1)
+                # Locally-constant reference held across the window — what the
+                # linear target -dK·e is defined against.
+                obs = self._window.synth_obs(
+                    xi, xi - e, torch.zeros(b, u_dim, device=dev))
                 feedback, _ = cl_actor._feedback(obs)
                 loss = torch.mean((feedback - target) ** 2)
                 opt.zero_grad(); loss.backward(); opt.step()

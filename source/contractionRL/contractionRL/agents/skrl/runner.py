@@ -128,137 +128,76 @@ def _assert_backbone_algo_compatible(backbone: str, agent_class: str | None) -> 
         )
 
 
+def _is_window_space(space) -> bool:
+    """True for a ``{x, xrefs, urefs}`` path-tracking observation. Velocity-
+    tracking envs keep a flat Box obs and route to skrl's stock models."""
+    import gymnasium as gym
+    return isinstance(space, gym.spaces.Dict) and {"x", "xrefs", "urefs"} <= set(space.spaces)
+
+
 def _gaussian_factory(observation_space, state_space, action_space, device,
                        backbone: str = "mlp", agent_class: str | None = None, **kwargs):
     # Hard guard: reject algorithm/backbone pairs that silently mistrain
     # (unbounded + SAC → divergence; squashed + PPO → no analytic entropy).
     _assert_backbone_algo_compatible(backbone, agent_class)
 
-    # x_dim: explicit ground truth for the [x, xref, uref] path-tracking
-    # split, set by callers that know it (e.g. contraction_runner.py's
-    # raw_env.x_dim). Popped once here so it never leaks into skrl's stock
-    # gaussian_model below, which has no such kwarg. Backbones with no
-    # reliable source for it (the classic CLActorRunner/yaml path) get None
-    # and fall back to each model's own dimension-parity guess.
+    # x_dim is now only a CROSS-CHECK against what the observation space
+    # declares (models raise on a mismatch) — never the source of the layout.
     x_dim = kwargs.pop("x_dim", None)
+    is_window = _is_window_space(observation_space)
+
+    def _hidden(default):
+        network = kwargs.pop("network", [{}])
+        hd = network[0].get("layers", default) if network else default
+        act = network[0].get("activations", None) if network else None
+        kwargs.pop("output", None)
+        return hd, act
 
     # "control" is the preferred spelling for the CLActor backbone;
     # "contraction" is kept as a backward-compatible alias.
-    if backbone in ("control", "contraction"):
-        obs_dim = observation_space.shape[0]
-        act_dim = action_space.shape[0]
-        # CLActorModel requires obs layout [x, x_ref, u_ref, preview?]: obs_dim
-        # == 2*x_dim + u_dim + preview_dim, preview_dim >= 0.
-        remainder = obs_dim - act_dim
-        if x_dim is not None:
-            # x_dim is already known (the common case — contraction_runner
-            # passes the env's own x_dim), so there is no guess to validate:
-            # just check the true invariant. Unlike the x_dim-unknown branch
-            # below, remainder need NOT be even — an odd-width preview tail
-            # (e.g. an odd-u_dim env like cartpole with an odd point count)
-            # is perfectly valid and was wrongly rejected here before.
-            if remainder < 2 * x_dim:
-                raise ValueError(
-                    f"backbone: contraction requires obs_dim >= 2*x_dim + u_dim, but got "
-                    f"obs_dim={obs_dim}, x_dim={x_dim}, act_dim={act_dim}."
-                )
-        # CLActorModel requires obs layout [x, x_ref, u_ref]: obs_dim == 2*x_dim + u_dim
-        # and x_dim must be an integer
-        elif remainder <= 0 or remainder % 2 != 0:
+    if backbone in ("control", "contraction", "control-squashed"):
+        if not is_window:
             raise ValueError(
-                f"backbone: contraction requires obs_dim = 2*x_dim + u_dim, but got "
-                f"obs_dim={obs_dim}, act_dim={act_dim} (remainder={remainder} is not even). "
-                f"Use backbone: mlp for velocity-tracking environments."
-            )
-        from contractionRL.agents.skrl.models import CLActorModel
-        network = kwargs.pop("network", [{}])
-        hidden_dim = network[0].get("layers", [128, 128]) if network else [128, 128]
-        kwargs.pop("output", None)
+                f"backbone: {backbone} requires a {{x, xrefs, urefs}} observation "
+                f"(a path-tracking env), got {type(observation_space).__name__}. "
+                f"Use backbone: mlp / mlp-squashed for velocity-tracking envs.")
+        from contractionRL.agents.skrl.models import CLActorModel, SquashedCLActorModel
+        hidden_dim, _ = _hidden([128, 128])
+        if backbone == "control-squashed":
+            return SquashedCLActorModel(
+                observation_space=observation_space, action_space=action_space,
+                device=device, hidden_dim=hidden_dim, x_dim=x_dim, **kwargs)
         kwargs.pop("initial_log_std", None)
-
         return CLActorModel(
-            observation_space=observation_space,
-            action_space=action_space,
-            device=device,
-            hidden_dim=hidden_dim,
-            x_dim=x_dim,
-            **kwargs,
-        )
+            observation_space=observation_space, action_space=action_space,
+            device=device, hidden_dim=hidden_dim, x_dim=x_dim, **kwargs)
 
-    if backbone == "control-squashed":
-        obs_dim = observation_space.shape[0]
-        act_dim = action_space.shape[0]
-        remainder = obs_dim - act_dim
-        if remainder <= 0 or remainder % 2 != 0:
-            raise ValueError(
-                f"backbone: control-squashed requires obs_dim = 2*x_dim + u_dim, but got "
-                f"obs_dim={obs_dim}, act_dim={act_dim} (remainder={remainder} is not even). "
-                f"Use backbone: mlp-squashed for velocity-tracking environments."
-            )
-        from contractionRL.agents.skrl.models import SquashedCLActorModel
-        network = kwargs.pop("network", [{}])
-        hidden_dim = network[0].get("layers", [128, 128]) if network else [128, 128]
-        kwargs.pop("output", None)
-        return SquashedCLActorModel(
-            observation_space=observation_space,
-            action_space=action_space,
-            device=device,
-            hidden_dim=hidden_dim,
-            x_dim=x_dim,
-            **kwargs,
-        )
-
-    if backbone == "mlp-squashed":
+    if backbone == "mlp-squashed" and is_window:
         from contractionRL.agents.skrl.models import SquashedMLPActorModel
-        network = kwargs.pop("network", [{}])
-        hidden_dim = network[0].get("layers", [256, 256]) if network else [256, 256]
-        activation = network[0].get("activations", "relu") if network else "relu"
-        kwargs.pop("output", None)
+        hidden_dim, activation = _hidden([256, 256])
         # log_std is state-dependent (network head) for this backbone, and
-        # squashing already bounds every sampled action — these two yaml
-        # keys (meaningful for the other backbones above) don't apply here.
+        # squashing already bounds every sampled action — these two yaml keys
+        # (meaningful for the other backbones) don't apply here.
         kwargs.pop("initial_log_std", None)
         kwargs.pop("clip_actions", None)
         return SquashedMLPActorModel(
-            observation_space=observation_space,
-            action_space=action_space,
-            device=device,
-            hidden_dim=hidden_dim,
-            activation=activation,
-            x_dim=x_dim,
-            **kwargs,
-        )
+            observation_space=observation_space, action_space=action_space, device=device,
+            hidden_dim=hidden_dim, activation=activation or "relu", x_dim=x_dim, **kwargs)
 
-    if backbone == "mlp":
-        # Path-tracking envs give obs = [x, xref, uref], i.e. obs_dim = 2*x_dim +
-        # u_dim (remainder even) — same layout check as the "control" backbone
-        # above. When it holds, "mlp" still adds uref to its output (mu = uref +
-        # MLP(obs)), just via a plain MLP over the full observation instead of
-        # CLActor's (x-xref)-only bilinear structure. Vel-tracking envs have no
-        # uref (remainder is odd for every current env), so they fall through
-        # to the stock stateless MLP below, unaffected.
-        obs_dim = observation_space.shape[0]
-        act_dim = action_space.shape[0]
-        remainder = obs_dim - act_dim
-        if remainder > 0 and remainder % 2 == 0:
-            from contractionRL.agents.skrl.models import MLPResidualActorModel
-            network = kwargs.pop("network", [{}])
-            hidden_dim = network[0].get("layers", [128, 128]) if network else [128, 128]
-            kwargs.pop("output", None)
-            initial_log_std = kwargs.pop("initial_log_std", 0.0)
-            return MLPResidualActorModel(
-                observation_space=observation_space,
-                action_space=action_space,
-                device=device,
-                hidden_dim=hidden_dim,
-                initial_log_std=initial_log_std,
-                x_dim=x_dim,
-                **kwargs,
-            )
+    if backbone == "mlp" and is_window:
+        # "mlp" still adds urefs[0] to its output (mu = uref + MLP(...)), just via
+        # a generic MLP over the encoded observation instead of CLActor's bilinear
+        # W1/W2 structure. Vel-tracking envs (flat Box obs) fall through below.
+        from contractionRL.agents.skrl.models import MLPResidualActorModel
+        hidden_dim, _ = _hidden([128, 128])
+        initial_log_std = kwargs.pop("initial_log_std", 0.0)
+        return MLPResidualActorModel(
+            observation_space=observation_space, action_space=action_space, device=device,
+            hidden_dim=hidden_dim, initial_log_std=initial_log_std, x_dim=x_dim, **kwargs)
 
     from skrl.utils.model_instantiators.torch import gaussian_model
-    kwargs.pop("angle_idx", None)
-    kwargs.pop("sym", None)
+    for _k in ("angle_idx", "sym", "encoder", "encoder_hidden", "encoder_stride"):
+        kwargs.pop(_k, None)
     return gaussian_model(
         observation_space=observation_space,
         state_space=state_space,
@@ -269,21 +208,17 @@ def _gaussian_factory(observation_space, state_space, action_space, device,
 
 
 def _deterministic_factory(observation_space, state_space, action_space, device, **kwargs):
-    """DeterministicMixin (value/critic) factory — the EmbeddedDeterministicModel
+    """DeterministicMixin (value/critic) factory — the RefWindowValueModel
     counterpart to ``_gaussian_factory`` above.
 
-    Value/critic networks see the SAME observation as the policy (including any
-    angle-bearing x/xref blocks), so they need the same continuous embedding —
-    skrl's stock ``deterministic_model`` instantiator has no notion of this
-    (it's vendored library code). This factory reads the same yaml ``network``/
-    ``angle_idx`` keys the policy factories do and builds
-    ``EmbeddedDeterministicModel`` instead. When ``angle_idx`` is empty (the
-    common case for envs with no wrapping angle in their state), this reduces
-    to a plain MLP over the observation (+ actions, for a Q-model) — the same
-    architecture stock ``deterministic_model`` would have built.
+    On a ``{x, xrefs, urefs}`` observation this builds the structured critic
+    ``V = MLP([phi(x, e) || psi(xrefs)])`` — the mirror of the actor's
+    ``W1(x)`` / ``W2(xrefs)`` split, with the reference window going through the
+    same ``--encoder`` (mlp | gru | attn) and the same relative-position /
+    wrapped-angle feature map. Velocity-tracking envs (flat Box obs) fall
+    through to skrl's stock ``deterministic_model``, which is what they used
+    before — it has no notion of an angle-bearing state, but they have none.
     """
-    from contractionRL.agents.skrl.models import EmbeddedDeterministicModel
-
     network = kwargs.pop("network", [{}])
     kwargs.pop("output", None)
     net_spec = network[0] if network else {}
@@ -291,7 +226,24 @@ def _deterministic_factory(observation_space, state_space, action_space, device,
     hidden_dim = net_spec.get("layers", [256, 256])
     activation = net_spec.get("activations", "tanh")
 
-    return EmbeddedDeterministicModel(
+    if not _is_window_space(observation_space):
+        from skrl.utils.model_instantiators.torch import deterministic_model
+        for _k in ("angle_idx", "sym", "x_dim", "encoder", "encoder_hidden",
+                   "encoder_stride", "combine", "analytic_potential", "w_lb"):
+            kwargs.pop(_k, None)
+        return deterministic_model(
+            observation_space=observation_space, state_space=state_space,
+            action_space=action_space, device=device,
+            network=network or [{}], output="ONE", **kwargs)
+
+    from contractionRL.agents.skrl.models import RefWindowValueModel
+
+    # yaml spells psi's width "embed_dim" (matching --critic_embed_dim); the
+    # model calls it encoder_hidden, shared with the actor's encoder.
+    if "embed_dim" in kwargs:
+        kwargs.setdefault("encoder_hidden", int(kwargs.pop("embed_dim")))
+
+    return RefWindowValueModel(
         observation_space=observation_space,
         action_space=action_space,
         device=device,

@@ -62,6 +62,7 @@ from skrl.agents.torch.base import Agent, AgentCfg
 from .angle_utils import wrap_diff
 from .math_utils import bound_W, jacobian, spd_inverse
 from .ncm_synthesis import _solve_cm_metric_with_backoff
+from .ref_window import RefWindow
 from .rl_glue import filter_cfg_fields
 
 # Printed verbatim on the abort path. search/sweep_runner.py greps the child's
@@ -198,12 +199,16 @@ class CVSTEMLQRAgent(Agent):
             device=device,
         )
 
-        obs_dim = int(observation_space.shape[0])
-        u_dim_inferred = int(action_space.shape[0])
+        # The observation space DECLARES its layout ({x, xrefs, urefs}), so
+        # x_dim/u_dim are read, never guessed from obs_dim (the old
+        # (obs_dim - u_dim)//2 parity rule silently mis-split any other layout).
+        self._window = RefWindow.from_space(observation_space)
+
+
         if u_dim is None:
-            u_dim = u_dim_inferred
+            u_dim = self._window.u_dim
         if x_dim is None:
-            x_dim = (obs_dim - u_dim) // 2
+            x_dim = self._window.x_dim
 
         self._x_dim = x_dim
         self._u_dim = u_dim

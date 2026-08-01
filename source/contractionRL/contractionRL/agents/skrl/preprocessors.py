@@ -78,28 +78,41 @@ class RunningRewardScaler(nn.Module):
         return self.scale * rewards / std
 
 
+def _window_length(size, x_dim: int, u_dim: int) -> int:
+    """Window length from the observation space — read from the declared Dict
+    when there is one, else inferred from the flat width."""
+    import gymnasium as gym
+    if isinstance(size, gym.spaces.Dict) and "xrefs" in size.spaces:
+        return int(size["xrefs"].shape[0])
+    obs_dim = compute_space_size(size, occupied_size=True)
+    if (obs_dim - x_dim) % (x_dim + u_dim):
+        raise ValueError(
+            f"PathTrackingObservationScaler: obs_dim={obs_dim} is not x_dim + "
+            f"L*(x_dim + u_dim) for x_dim={x_dim}, u_dim={u_dim}.")
+    return (obs_dim - x_dim) // (x_dim + u_dim)
+
+
 class PathTrackingObservationScaler(nn.Module):
-    """``RunningStandardScaler`` restricted to the ``[x, xref]`` portion of a
-    ``[x, xref, uref]`` observation, and further excluding ``angle_idx``
-    columns of ``x``/``xref``.
+    """``RunningStandardScaler`` restricted to the ``x``/``xrefs`` portion of a
+    ``{x, xrefs, urefs}`` observation, further excluding ``angle_idx`` columns.
 
     Two things must stay raw for this repo's residual/embedding math to be
     correct (see ``c2rl.py``'s module docstring and ``angle_utils.py``):
 
-      - ``uref``: the residual backbones (``control``/``mlp``, squashed or
-        not) slice ``uref`` straight out of the observation and add it to the
+      - ``urefs``: the residual backbones (``control``/``mlp``, squashed or
+        not) take ``urefs[0]`` straight out of the observation and add it to the
         network's feedback — for the squashed backbones, that add happens
         AFTER tanh-squashing (see ``models.py``'s ``_TanhSquashMixin``).
         Normalizing ``uref`` would make the applied control law
         ``uref_norm + feedback`` instead of ``uref + feedback``, distorting
         the reference-tracking residual.
-      - ``angle_idx`` columns of ``x``/``xref``: ``models.py`` replaces each
+      - ``angle_idx`` columns of ``x``/``xrefs``: ``ref_window.Feats`` replaces each
         with ``(cos, sin)`` via ``embed_angles`` so the network sees a
         continuous, periodic input. Standardizing the raw angle first
         (``(theta - mean) / std``) breaks that periodicity — ``cos``/``sin``
         of a shifted-and-rescaled angle is not ``2*pi``-periodic in ``theta``.
 
-    Everything else in ``x``/``xref`` (non-angle physical states) is
+    Everything else in ``x``/``xrefs`` (non-angle physical states) is
     standardized exactly like the stock ``RunningStandardScaler``, using its
     own running mean/std fit ONLY over that normalized subset.
     """
@@ -116,19 +129,29 @@ class PathTrackingObservationScaler(nn.Module):
         device: str | torch.device | None = None,
     ) -> None:
         super().__init__()
+        from .ref_window import RefWindow
+
+        # The layout is whatever the space declares; build the mask off the SAME
+        # flat ordering RefWindow.split uses (sorted keys: urefs, x, xrefs).
+        window = RefWindow(x_dim=int(x_dim), u_dim=int(u_dim),
+                           length=_window_length(size, x_dim, u_dim))
         obs_dim = compute_space_size(size, occupied_size=True)
-        if obs_dim != 2 * x_dim + u_dim:
+        if obs_dim != window.flat_dim:
             raise ValueError(
-                "PathTrackingObservationScaler requires the [x, xref, uref] layout "
-                f"(obs_dim == 2*x_dim + u_dim), got obs_dim={obs_dim}, x_dim={x_dim}, "
-                f"u_dim={u_dim}."
+                "PathTrackingObservationScaler: observation width does not match the "
+                f"{{x, xrefs, urefs}} layout — got obs_dim={obs_dim}, expected "
+                f"{window.flat_dim} (x_dim={x_dim}, u_dim={u_dim}, length={window.length})."
             )
         angle_set = {int(i) for i in angle_idx}
+        L = window.length
         normalize = torch.ones(obs_dim, dtype=torch.bool)
-        normalize[2 * x_dim :] = False  # uref block: never normalized
+        normalize[: L * u_dim] = False          # urefs block: never normalized
+        x_start = L * u_dim
+        xrefs_start = x_start + x_dim
         for i in angle_set:
-            normalize[i] = False  # x block angle column
-            normalize[x_dim + i] = False  # xref block angle column (mirrored layout)
+            normalize[x_start + i] = False      # x block angle column
+            for k in range(L):                  # every xrefs point's angle column
+                normalize[xrefs_start + k * x_dim + i] = False
         norm_idx = normalize.nonzero(as_tuple=True)[0]
         self.register_buffer("_normalize_idx", norm_idx)
         self._scaler = RunningStandardScaler(
