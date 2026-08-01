@@ -166,8 +166,33 @@ r.system_metrics['system.gpu.0.memoryAllocatedBytes']   # device-wide
 Read it on a partition where your job has the GPU to itself, or it includes
 other tenants. A single ic-express job OOM-looping while every other job on
 the same sweep is healthy means **that node was contended**, not that the
-packing is wrong — cancel and resubmit that partition rather than re-packing
+packing is wrong — move that partition's jobs elsewhere rather than re-packing
 the whole fleet.
+
+#### How to tell contention from your own footprint
+
+The OOM message names every process and its usage. Read *your own* line
+("Including non-PyTorch memory, this process has …") and compare it against
+the others, then **re-read the same message after a full cancel/resubmit
+cycle**: PIDs that persist unchanged across your restart are not yours.
+
+Observed 2026-08-01 on `ccc0482` (ic-express), 40 min apart and across a
+complete teardown of every one of our jobs:
+
+```
+Process 2735560 has 13.67 GiB   <- same PIDs in both messages: NOT ours
+Process 2735561 has 13.67 GiB
+Process 2738449 has 14.49 GiB
+Process 2738964 has 18.02 GiB
+Process 160876  has  998 MiB    <- ours, ~1 GB each, new PIDs each cycle
+...
+Including non-PyTorch memory, this process has 364.00 MiB memory in use
+```
+
+~60 GB held by one other user, while all five of our agents together used
+~5 GB. Re-packing to 1 agent/GPU would have changed nothing. **ic-express is
+worth skipping** whenever it shows this; scavenger absorbs the jobs at the same
+2 agents/GPU with a longer wall-time.
 
 **A crash-looping worker dominates the W&B dashboard.** It produces a dead run
 every ~20 s while a healthy worker takes many minutes per run, so "most runs
