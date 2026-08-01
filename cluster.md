@@ -133,33 +133,41 @@ Never `scancel -u $USER`. Prefer `search_cluster.sh --stop` (below) over raw
 
 ## 7. Partitions
 
-| Partition | Wall-time cap | `--account` needed | GPU | Safe agents/GPU | Notes |
-|---|---|---|---|---|---|
-| `scavenger` | 24 h | no | H100 / H200 / L40S (≥48 GB) | 2 | Largest, heterogeneous. `search_cluster.sh` auto-excludes GPUs too old for the installed torch (V100). |
-| `eng-research-gpu` | 2 d | **`huytran1-ae-eng`** | **A10, 24 GB** | **1** | ~5 nodes × 8 A10. |
-| `IllinoisComputes-GPU` | 3 d | **`huytran1-ae-eng`** | A100 | 2 | ~5 nodes × 4 A100. |
-| `ic-express` | **8 h** | no | **H100 MIG `1g.20gb`, 20 GB** | **1** | One node, 16 slices but only **48 CPUs total** → at `--cpus-per-task=8`, max **6 concurrent jobs**. Use `--time=07:45:00`. |
-
-### Sizing `--agents-per-gpu` — check GPU **memory**, not slice count
-
-A single `c2rl-*-cvstem` trial can peak near **19 GB**: `regress_cmg`
-(`ncm_synthesis.py`) moves the whole CM dataset onto the GPU and then runs a
-batched `torch.linalg.eigh` per minibatch. So a 20 GB MIG slice or a 24 GB A10
-fits exactly **one** trial, and packing 2 agents there OOMs the second one.
-
-Confirmed 2026-08-01: at 2 agents/GPU, one ic-express job crash-looped 22×
-(`torch.OutOfMemoryError`, 21 dead W&B runs in ~7 min) while all 16 jobs on
-full-size GPUs were healthy. Read the real cap first:
+| Partition | Wall-time cap | `--account` needed | GPU | Notes |
+|---|---|---|---|---|
+| `scavenger` | 24 h | no | H100 / H200 / L40S (≥48 GB) | Largest, heterogeneous. `search_cluster.sh` auto-excludes GPUs too old for the installed torch (V100). |
+| `eng-research-gpu` | 2 d | **`huytran1-ae-eng`** | A10, 24 GB | ~5 nodes × 8 A10. |
+| `IllinoisComputes-GPU` | 3 d | **`huytran1-ae-eng`** | A100 | ~5 nodes × 4 A100. |
+| `ic-express` | **8 h** | no | H100 MIG `1g.20gb`, 20 GB | One node, 16 slices but only **48 CPUs total** → at `--cpus-per-task=8`, max **6 concurrent jobs**. Use `--time=07:45:00`. |
 
 ```bash
-sinfo -p <partition> -N -o '%.20P %.10n %.45G' | sort -u   # gres names carry the size
+sinfo -p <partition> -N -o '%.20P %.10n %.45G' | sort -u   # gres names carry the GPU size
 ```
 
-Note the MIG reporting trap: on a `1g.20gb` slice the OOM message reports
-`total capacity 19.62 GiB` (your slice) but lists processes from the **whole
-physical H100**, so unrelated 13–18 GB processes appear in the list. They are
-other users on other slices and are *not* your problem — MIG partitions memory
-strictly. Diagnose from your own slice's numbers only.
+### Sizing `--agents-per-gpu`
+
+**2 agents/GPU is fine on every partition above.** A `c2rl-*-cvstem` trial's
+real GPU footprint is **~1.7 GB** (measured device-wide on a dedicated A10
+running exactly one agent), and `regress_cmg` peaks at ~310 MB reserved on the
+full 131 k-state car dataset. Two agents is ~3.5 GB against a 20 GB floor.
+
+Do **not** infer the per-trial footprint from an OOM message on a MIG slice.
+On a `1g.20gb` slice the error reports `total capacity 19.62 GiB` (your slice)
+but enumerates processes from the **whole physical H100**, so unrelated
+13–18 GB processes from other users on other slices appear in the list and make
+it look as though your own trial is enormous. On 2026-08-01 that misread led to
+halving the packing on two partitions for no reason. Get the real number from
+W&B system metrics instead:
+
+```python
+r.system_metrics['system.gpu.0.memoryAllocatedBytes']   # device-wide
+```
+
+Read it on a partition where your job has the GPU to itself, or it includes
+other tenants. A single ic-express job OOM-looping while every other job on
+the same sweep is healthy means **that node was contended**, not that the
+packing is wrong — cancel and resubmit that partition rather than re-packing
+the whole fleet.
 
 **A crash-looping worker dominates the W&B dashboard.** It produces a dead run
 every ~20 s while a healthy worker takes many minutes per run, so "most runs
