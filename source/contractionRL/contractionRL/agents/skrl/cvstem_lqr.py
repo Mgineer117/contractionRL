@@ -324,11 +324,8 @@ class CVSTEMLQRAgent(Agent):
     # ── action computation ─────────────────────────────────────────────────── #
 
     def _split_obs(self, obs: torch.Tensor):
-        x_dim, u_dim = self._x_dim, self._u_dim
-        x = obs[:, :x_dim]
-        xref = obs[:, x_dim : 2 * x_dim]
-        uref = obs[:, 2 * x_dim : 2 * x_dim + u_dim]
-        return x, xref, uref
+        x, xrefs, urefs = self._window.split(obs)
+        return x, xrefs[:, 0], urefs[:, 0]
 
     def _compute_action_pretrained(self, obs: torch.Tensor) -> torch.Tensor:
         """Vectorized on-device gain from the frozen CMG:
@@ -356,12 +353,13 @@ class CVSTEMLQRAgent(Agent):
         expects, with control entering only through the Riccati term."""
         cfg = self._cfg
         r = cfg.r_scaler + 1e-5
-        x_dim, u_dim = self._x_dim, self._u_dim
+        u_dim = self._u_dim
         batch_size = obs.shape[0]
 
-        x = obs[:, :x_dim].float().to(self._compute_device).requires_grad_()
-        xref = obs[:, x_dim : 2 * x_dim].float().to(self._compute_device)
-        uref = obs[:, 2 * x_dim : 2 * x_dim + u_dim].float().to(self._compute_device)
+        x_w, xrefs, urefs = self._window.split(obs)
+        x = x_w.float().to(self._compute_device).requires_grad_()
+        xref = xrefs[:, 0].float().to(self._compute_device)
+        uref = urefs[:, 0].float().to(self._compute_device)
 
         with torch.enable_grad():
             f, B, _ = self._get_f_and_B(x)

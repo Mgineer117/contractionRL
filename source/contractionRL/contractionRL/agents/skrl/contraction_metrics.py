@@ -172,6 +172,7 @@ class StatManagerEnvWrapper:
         self._initialized = False
         self._x_dim: int | None = None
         self._pos_dim: int | None = None
+        self._x_off: int | None = None  # start of the x block in the flat obs
         self._dt: float | None = None
         self._max_ep_len: int | None = None
 
@@ -259,7 +260,9 @@ class StatManagerEnvWrapper:
             return True
         # "num_dim_x" is the classic BaseEnv name; "x_dim" is the Isaac
         # path-tracking property (path_tracking_base.py). Both env families
-        # share the [x, xref, uref] observation layout this wrapper slices.
+        # emit the {x, xrefs, urefs} window FLATTENED as
+        # [urefs | x | xrefs] (sorted(keys), see ref_window.py) — the x block
+        # does NOT start at 0, so every slice below is taken from _x_off.
         x_dim = self._first_attr("num_dim_x", "x_dim")
         dt = self._first_attr("step_dt", "dt")
         ep = self._first_attr("max_episode_length", "max_episode_len")
@@ -267,6 +270,13 @@ class StatManagerEnvWrapper:
             return False
 
         self._x_dim = int(x_dim)
+        rw = self._first_attr("ref_window")
+        if rw is None:
+            raise RuntimeError(
+                "StatManagerEnvWrapper: env exposes no `ref_window`; cannot locate the "
+                "x/xrefs blocks in the flat observation. Every path-tracking env must "
+                "declare one (see agents/skrl/ref_window.py).")
+        self._x_off = int(rw.length * rw.u_dim)
         pd = self._first_attr("pos_dimension")
         self._pos_dim = int(pd) if pd is not None else min(3, int(x_dim))
         self._dt = float(dt)
@@ -464,7 +474,7 @@ class StatManagerEnvWrapper:
         if not self._ensure_stats():
             return
 
-        xd, pd = self._x_dim, self._pos_dim
+        xd, pd, off = self._x_dim, self._pos_dim, self._x_off
 
         unwrapped = getattr(self.env, "unwrapped", self.env)
         if isinstance(info, dict) and "tracking_error" in info:
@@ -485,7 +495,7 @@ class StatManagerEnvWrapper:
                 error = torch.tensor(err, dtype=torch.float32, device=self._device()).reshape(-1, 1)
             error = error.reshape(-1)
         else:
-            diff = obs[:, :xd] - obs[:, xd:2 * xd]
+            diff = obs[:, off:off + xd] - obs[:, off + xd:off + 2 * xd]
             angle_idx = self._first_attr("angle_idx")
             if angle_idx:
                 for idx in angle_idx:
@@ -527,8 +537,8 @@ class StatManagerEnvWrapper:
                     maha_err_vals = torch.where(init_flags.reshape(-1), fresh_m, maha_err_vals)
             self._maha_seen = True
 
-        obs_x = obs[:, :pd].detach().cpu().numpy()
-        obs_xref = obs[:, xd:xd + pd].detach().cpu().numpy()
+        obs_x = obs[:, off:off + pd].detach().cpu().numpy()
+        obs_xref = obs[:, off + xd:off + xd + pd].detach().cpu().numpy()
 
         # For each env that is initializing, complete its old slot if any, and start a new one
         init_indices = torch.nonzero(init_flags, as_tuple=True)[0]
