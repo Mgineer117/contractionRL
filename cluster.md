@@ -232,6 +232,28 @@ resubmits `$0`, so each clone keeps its own partition forever.
 To add more workers to an already-running sweep, just `sbatch` the existing
 `job.sbatch` again — never rerun `search_cluster.sh`.
 
+### Troubleshooting: `Error: Sweep <id> not found`
+
+Every worker restarting every few seconds with
+
+```
+wandb: ERROR Find detailed error logs at: .../wandb/debug-cli.<user>.log
+Error: Sweep UIUC-LIRA/contractionRL-Search/<id> not found
+```
+
+means the sweep was **deleted server-side** (e.g. cleaned up in the W&B UI).
+The sweep is the only shared state, so every job on every partition dies at the
+next agent start — but jobs that already picked up a trial keep training to
+completion, which makes the fleet look half-healthy. Confirm with:
+
+```bash
+python -c "import wandb; print(len(list(wandb.Api().project('contractionRL-Search', entity='UIUC-LIRA').sweeps())))"
+```
+
+`0` means everything was deleted. There is no recovery — `scancel` this
+sweep's jobs and go back to Step 1 to create a new sweep. Deleting a sweep in
+the UI to tidy up crashed runs will kill a healthy running search.
+
 ### Step 3 — stop it
 
 ```bash
