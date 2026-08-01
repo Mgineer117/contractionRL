@@ -328,6 +328,7 @@ def apply_agent_patches(agent, *, algorithm: str, annealing: dict, caps: dict,
         patch_caps_regularizer,
         patch_kl_logging,
         patch_ppo_std_annealing,
+        patch_prune_checkpoints,
         patch_sac_entropy_clamp,
     )
 
@@ -338,6 +339,9 @@ def apply_agent_patches(agent, *, algorithm: str, annealing: dict, caps: dict,
     patch_caps_regularizer(agent, **caps)
     if namespace:
         patch_algo_namespace(agent, algorithm.upper())
+    # Wraps write_checkpoint (not post_interaction), so it is independent of
+    # the patch_auc_checkpoint ordering rule above.
+    patch_prune_checkpoints(agent)
     patch_auc_checkpoint(agent, metric=best_metric_for(algorithm))
 
 

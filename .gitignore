@@ -76,13 +76,16 @@ nohup.out
 **/*.pth
 **/*.ckpt
 
-# Generated DATA (dynamics_data.npz, cm_data*.npz). Separate from logs/ because
-# these are INPUTS to later runs of other algorithms rather than the output of
-# one run — deleting logs/ must never force a re-synthesis. Ignored purely on
-# size: the current set is ~800 MB (a single dynamics_data.npz is 154 MB), far
-# past what belongs in git. The small tracked npz under visualization/cache/ is
-# a deliberate exception and stays versioned.
-# /data/
+# Generated DATA (dynamics_data.npz, cm_data*.npz) is deliberately TRACKED, not
+# ignored. These are INPUTS to later runs of other algorithms rather than the
+# output of one run: cm_data*.npz is the CV-STEM/CCM synthesis result, which
+# costs a long serial cvxpy SDP solve to regenerate. Versioning it is what stops
+# every cluster checkout from re-running that synthesis, so deleting logs/ (or
+# provisioning a fresh cluster node) never forces a re-synthesis.
+# Keep an eye on size — GitHub rejects single files over 100 MB. The current
+# tree is ~35 MB total (largest file 14 MB); if a dynamics_data.npz ever lands
+# here at the ~150 MB it can reach for Isaac envs, it needs git-lfs or an
+# explicit ignore rule rather than a plain commit.
 
 # Per-launch generated W&B sweep yamls (search.sh writes one per sweep, into
 # search/logs/). The searched space itself is versioned in search/configs/.

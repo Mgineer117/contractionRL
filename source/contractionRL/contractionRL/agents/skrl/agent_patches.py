@@ -12,6 +12,7 @@ allocates memory tensors). ``patch_caps_regularizer`` relies on it.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import torch
 
@@ -502,3 +503,32 @@ def patch_auc_checkpoint(agent, metric: str = "auc") -> None:
         _orig_post(timestep=timestep, timesteps=timesteps)
 
     agent.post_interaction = _metric_post
+
+
+def patch_prune_checkpoints(agent) -> None:
+    """Keep only the newest ``agent_<timestep>.pt``, alongside ``best_agent.pt``.
+
+    skrl writes one full checkpoint every ``checkpoint_interval`` steps and
+    never removes the previous ones — with the configs' ``checkpoint_interval:
+    "auto"`` (= timesteps/10) that is 10 full snapshots per run, none of which
+    are useful once the next one lands. Only the latest snapshot (to resume
+    from) and ``best_agent.pt`` (selected by ``patch_auc_checkpoint``'s metric)
+    are ever actually loaded, so the older snapshots are pure disk/inode cost.
+
+    ``best_agent.pt`` is untouched: it does not match the ``agent_*.pt`` glob.
+    """
+    _orig_write = getattr(agent, "write_checkpoint", None)
+    if _orig_write is None:
+        return
+
+    def _pruning_write(*, timestep: int, timesteps: int) -> None:
+        _orig_write(timestep=timestep, timesteps=timesteps)
+        # ponytail: assumes skrl's default whole-agent layout (store_separately
+        # is unset repo-wide). If store_separately is ever turned on, the
+        # per-module "<name>_<tag>.pt" files need the same prune-by-prefix.
+        ckpt_dir = Path(getattr(agent, "experiment_dir", "")) / "checkpoints"
+        snapshots = sorted(ckpt_dir.glob("agent_*.pt"), key=lambda p: p.stat().st_mtime)
+        for stale in snapshots[:-1]:
+            stale.unlink(missing_ok=True)
+
+    agent.write_checkpoint = _pruning_write
