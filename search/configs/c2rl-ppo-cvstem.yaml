@@ -32,59 +32,42 @@ runner:
 # models.policy.backbone stays pinned at `control` — the CLActor u = uref +
 # feedback(x-xref) form is load-bearing for C2RL's Mahalanobis reward, not a
 # free tuning axis, so it is deliberately NOT re-opened here.
-# Static flags on every trial's command line — env-observation/state-space
-# shape has to be fixed BEFORE the model is built, so it cannot come from the
-# swept `parameters:` block below (those only reach agent_cfg via
-# apply_wandb_sweep_overrides, which runs too late to affect env construction
-# — see train.py). This turns on the DENSE full-episode reference tail for
-# BOTH the actor's preview (--preview_full_trajectory/--preview_include_xref)
-# and the critic's privileged state (--critic_full_trajectory), and enables
-# the asymmetric critic at all (--critic_encoder; the sweep's xref_encoder
-# below overrides this placeholder — see train.py's setdefault). What VARIES
-# per trial is only how that fixed-shape tail gets encoded, jointly for both
-# actor and critic (xref_encoder / xref_encoder_stride below).
+# Static flags on every trial's command line. NOTE the reference-window LENGTH
+# is deliberately absent: it defaults to AUTO, derived per trial from that
+# trial's discount_factor (RefWindow.length_for_horizon), so a swept gamma
+# resizes the observation to span its own effective horizon 1/(1-gamma).
+# Pinning a length here is what previously let the window be sized for one gamma
+# and used at another. Only the STRIDE is fixed, since it is a layout choice
+# rather than a horizon one.
 extra_flags:
-  - "--preview_full_trajectory"
-  - "--preview_include_xref"
-  - "--critic_encoder"
-  - "mlp"
-  - "--critic_full_trajectory"
+  - "--ref_offset"
+  - "1"
 
 parameters:
-  # agent.discount_factor:
-  #   values: [0.1, 0.3, 0.5, 0.7, 0.9, 0.99]
+  # gamma=0.9 -> effective horizon 10 steps -> AUTO ref_length 11 (offset 1).
+  # The window is sized per-trial from THIS value (RefWindow.length_for_horizon),
+  # so changing gamma here resizes the observation to match automatically.
   agent.discount_factor:
-    value: 0.01 # [0.1, 0.3, 0.5, 0.7, 0.9, 0.99]
-  # ── xref/reference encoding (actor + critic) ────────────────────────────── #
-  # "film" is the only residual_variant whose gates can read the reference
-  # tail through a swappable encoder (see nn_modules.FiLMResidual) — the
-  # bilinear default has no such hook, and re-opening residual_variant itself
-  # is out of scope here (see the module-level note above).
-  agent.residual_variant:
-    value: film
-  # Both gates read the xref-relative preview block (not uref, not the
-  # single-point current xref) — the actual "whole reference trajectory"
-  # signal --preview_full_trajectory/--preview_include_xref above widened.
-  models.policy.film_gate1_source:
-    value: xref_preview
-  models.policy.film_gate2_source:
-    value: xref_preview
+    value: 0.9
+  # ── Reference-window encoding (actor W2 + critic psi) ────────────────────── #
   # "mlp" flattens the (strided) points; "gru"/"attn" consume them as a
-  # sequence — see nn_modules.PreviewSequenceEncoder. xref_encoder_stride
-  # applies UNIFORMLY to all three (keep every stride-th point, nearest-
-  # first; 1 = dense/every point) — it is NOT specific to one encoder type.
+  # sequence — see nn_modules.PreviewSequenceEncoder. The stride applies
+  # UNIFORMLY to all three (keep every stride-th point, nearest-first; 1 =
+  # dense/every point) — it is NOT specific to one encoder type.
   # SIMULTANEOUS, not independent: these two synthetic keys each fan out to
-  # BOTH the actor's film_gate_encoder/film_gate_stride AND the critic's
-  # encoder/encoder_stride (see train_utils.apply_wandb_sweep_overrides) —
-  # one trial always uses the SAME encoder and stride on both sides, since
-  # wandb's per-path nested-dict join only works when the two targets share
-  # a parent key, which models.policy.* and models.critic.* don't.
+  # BOTH models.policy.encoder/encoder_stride AND models.critic.encoder/
+  # encoder_stride (see train_utils.apply_wandb_sweep_overrides) — one trial
+  # always uses the SAME encoder and stride on both sides, since wandb's
+  # per-path nested-dict join only works when the two targets share a parent
+  # key, which models.policy.* and models.critic.* don't.
   xref_encoder:
     values: [mlp, gru, attn]
+  # Trimmed to the window AUTO actually builds at gamma=0.9 (11 points): stride
+  # 1/2/3/5 keep 11/6/4/3 points. The old ladder went to 20, which on an
+  # 11-point window keeps ONE point — a degenerate "sequence" that makes the
+  # gru/attn arms identical to a 1-point mlp and wastes trials.
   xref_encoder_stride:
-    values: [1, 3, 5, 10, 20]
-  models.critic.combine:
-    values: [concat, bilinear, film]
+    values: [1, 2, 3, 5]
   # ── Actor pretraining before PPO ────────────────────────────────────────── #
   # Whether π gets pretrained at all before Phase B. False reproduces
   # from-scratch PPO (only viable per prior runs at low discount_factor/small
