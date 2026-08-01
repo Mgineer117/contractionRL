@@ -190,9 +190,31 @@ Including non-PyTorch memory, this process has 364.00 MiB memory in use
 ```
 
 ~60 GB held by one other user, while all five of our agents together used
-~5 GB. Re-packing to 1 agent/GPU would have changed nothing. **ic-express is
-worth skipping** whenever it shows this; scavenger absorbs the jobs at the same
-2 agents/GPU with a longer wall-time.
+~5 GB. Re-packing to 1 agent/GPU would have changed nothing.
+
+#### `ccc0482` (ic-express) runs un-scheduled work — SLURM cannot see it
+
+Two facts that only make sense together. First, an `--gres=gpu:1` here is a
+**20 GB MIG slice** (`nvidia_h100_80gb_hbm3_1g.20gb`), never the 80 GB card —
+torch will report `total capacity 19.62 GiB`. Second, as of 2026-08-01 that
+card also carried ~61 GB of work SLURM did not know about:
+
+```bash
+srun -p ic-express --gres=gpu:1 -c 1 -t 3:00 -w ccc0482 bash -c \
+  'nvidia-smi --query-compute-apps=pid,used_memory --format=csv; ps -eo pid,user,etime,cmd | grep python'
+```
+
+showed four `python3 finetune_lm.py` processes (user `rianatri`, LLM
+finetuning) at 14–18 GB each and **8 days 7 hours elapsed** — on a partition
+whose wall-time cap is 8 hours — while `squeue -w ccc0482` listed **0 jobs from
+any user** and `scontrol` said `State=IDLE, CPUAlloc=0`.
+
+So the scheduler hands out slices of a card that is already full, and a trial
+needing 270 MB dies with 225 MB free. **A node reporting IDLE is not proof it
+is free** — check `nvidia-smi` on the node itself before trusting it. Until an
+admin clears this, skip ic-express; scavenger absorbs the jobs at the same
+2 agents/GPU with a longer wall-time. This is worth reporting to campus cluster
+support, since it silently breaks any user scheduled onto that node.
 
 **A crash-looping worker dominates the W&B dashboard.** It produces a dead run
 every ~20 s while a healthy worker takes many minutes per run, so "most runs
