@@ -524,15 +524,24 @@ class PathTrackingBase(DirectRLEnv):
     def _rebuild_observation_space(self) -> None:
         """Declare ``{x, xrefs, urefs}`` as the observation space.
 
-        Isaac's DirectRLEnv takes an integer width from the env cfg, so the
-        FLAT width is what it is told; the Dict is exposed alongside it for
-        ``RefWindow.from_space``. Both agree by construction (``flat_dim``).
+        ``single_observation_space["policy"]`` is the one that MATTERS: skrl's
+        Isaac Lab wrapper reads the model-facing space from there (and only
+        falls back to ``observation_space``), and DirectRLEnv built it in
+        ``__init__`` from the cfg's integer width — a stale Box that neither
+        matches ``flat_dim`` (which moves with ``ref_length``) nor lets
+        ``RefWindow.from_space`` recover the layout. Set all three, and emit the
+        matching nested dict from ``_get_observations``, so the flat tensor skrl
+        produces is byte-identical to the classic family's.
         """
         lo, hi = self._state_bounds()
         u_lo, u_hi = self._control_bounds()
-        self.observation_space = self.ref_window.space(lo, hi, u_lo, u_hi)
-        self.cfg.observation_space = self.ref_window.flat_dim
+        space = self.ref_window.space(lo, hi, u_lo, u_hi)
+        self.observation_space = space
+        self.cfg.observation_space = space
         self.num_observations = self.ref_window.flat_dim
+        single = getattr(self, "single_observation_space", None)
+        if single is not None and "policy" in single.spaces:
+            single["policy"] = space
 
     def _state_bounds(self):
         """Per-dim (low, high) for the physical state. Unbounded by default —
@@ -570,10 +579,12 @@ class PathTrackingBase(DirectRLEnv):
         self._x_ref, self._u_ref = x_refs[:, 0], u_refs[:, 0]
         # sanitize so the policy never receives NaN/Inf from a diverging env
         x = self._sanitize_state(self._get_physical_state())
-        # Flat, in skrl's sorted-key Dict order (RefWindow.flatten) — Isaac's
-        # DirectRLEnv passes the "policy" tensor straight through without a
-        # Dict-space tensorize step, so flattening happens here.
-        return {"policy": self.ref_window.flatten(x, x_refs, u_refs)}
+        # The Dict itself, matching the declared space (see
+        # _rebuild_observation_space): skrl's wrapper tensorizes+flattens it by
+        # sorted(keys), producing exactly RefWindow.flatten's ordering — the
+        # same flat tensor the classic family emits. Flattening here instead
+        # would contradict the space and desync the two families.
+        return {"policy": {"x": x, "xrefs": x_refs, "urefs": u_refs}}
 
     def _get_rewards(self) -> torch.Tensor:
         # Refresh _x_ref/_u_ref for THIS step here rather than relying on

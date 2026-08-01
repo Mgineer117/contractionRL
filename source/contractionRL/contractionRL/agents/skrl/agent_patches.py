@@ -214,21 +214,23 @@ def patch_ppo_std_annealing(agent, std_dev_annealing: bool, kwargs: dict | None 
     agent.post_interaction = _annealed_post
 
 
-def _resolve_x_dim(policy) -> int | None:
-    """Length of the leading ``x`` block of a ``[x, xref, uref]`` observation,
-    or ``None`` for a flat observation with no such split.
+def _resolve_x_slice(policy) -> tuple[int, int] | None:
+    """``(start, stop)`` of the ``x`` block inside the FLAT observation, or
+    ``None`` for an observation with no window layout.
 
-    Every backbone knows this number but spells it differently: residual/
-    squashed MLPs use ``_x_dim``; CLActorModel/SquashedCLActorModel keep it only
-    on their ``cl_actor`` submodule. Missing that last case silently returned
-    None for exactly the two backbones where the x-only restriction is
-    load-bearing (see patch_caps_regularizer on uref pass-through).
+    The flat tensor is ``[urefs | x | xrefs]`` (skrl flattens a Dict space by
+    ``sorted(keys)`` — see ref_window.py), so ``x`` does NOT start at 0. Slicing
+    ``[:x_dim]`` here perturbed the leading urefs columns and left the state
+    untouched — the exact inverse of what the spatial term is for.
+
+    Every backbone carries the layout as a ``RefWindow``; CLActorModel /
+    SquashedCLActorModel keep it only on their ``cl_actor`` submodule.
     """
-    for owner, attr in ((policy, "x_dim"), (policy, "_x_dim"),
-                        (getattr(policy, "cl_actor", None), "x_dim")):
-        x_dim = getattr(owner, attr, None) if owner is not None else None
-        if x_dim:
-            return int(x_dim)
+    for owner in (policy, getattr(policy, "cl_actor", None)):
+        window = getattr(owner, "window", None) if owner is not None else None
+        if window is not None:
+            start = window.length * window.u_dim
+            return start, start + window.x_dim
     return None
 
 
@@ -287,8 +289,9 @@ def patch_caps_regularizer(
     neither is hit. PPO's kl_threshold break leaves the flag armed and it is
     consumed by the next update's policy scale — still never a critic/entropy one.
 
-    SPATIAL PERTURBATION covers only the leading ``x`` block when the policy
-    exposes an x_dim (else the whole obs). For control backbones
+    SPATIAL PERTURBATION covers only the ``x`` block when the policy exposes a
+    ``RefWindow`` (else the whole obs) — note ``x`` sits in the MIDDLE of the
+    flat ``[urefs | x | xrefs]`` observation, see ``_resolve_x_slice``. For control backbones
     ``u = uref + feedback(x - xref)``, so perturbing uref shifts the output by
     exactly that amount — irreducible feedforward pass-through that would floor
     L_S and push the policy to suppress its own uref term.
@@ -312,7 +315,7 @@ def patch_caps_regularizer(
         return
 
     device = getattr(memory, "device", None) or next(policy.parameters()).device
-    x_dim = _resolve_x_dim(policy)
+    x_slice = _resolve_x_slice(policy)
 
     # skrl's own "no preprocessor" fallback is _empty_preprocessor, which already
     # swallows the train= kwarg — so both branches are callable the same way.
@@ -400,8 +403,12 @@ def patch_caps_regularizer(
 
         if spatial_scale > 0.0:
             noise = torch.randn_like(obs) * spatial_std
-            if x_dim:
-                noise[:, x_dim:] = 0.0  # see docstring: never perturb xref/uref
+            if x_slice is not None:
+                # Zero everything OUTSIDE the x block — see docstring: never
+                # perturb xrefs/urefs (x sits in the middle of the flat obs).
+                lo, hi = x_slice
+                noise[:, :lo] = 0.0
+                noise[:, hi:] = 0.0
             bar_mean = _policy_mean(obs + noise, states)
             l_s = ((mean - bar_mean) ** 2).sum(dim=-1).mean()
             agent.track_data("Loss / CAPS spatial", l_s.item())
