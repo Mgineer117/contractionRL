@@ -551,8 +551,14 @@ class PathTrackingBase(DirectRLEnv):
         return (np.full(n, -np.inf, np.float32), np.full(n, np.inf, np.float32))
 
     def _control_bounds(self):
-        lo = np.asarray(self.action_space.low, dtype=np.float32).reshape(-1)
-        hi = np.asarray(self.action_space.high, dtype=np.float32).reshape(-1)
+        # single_action_space, NOT action_space: DirectRLEnv's `action_space` is
+        # the BATCHED one (num_envs x u_dim), so .low.reshape(-1) there is
+        # num_envs*u_dim long and the urefs block would be declared that wide —
+        # RefWindow.from_space then reads u_dim = num_envs*u_dim and the whole
+        # observation layout is wrong (num_envs-dependent, no less).
+        space = getattr(self, "single_action_space", None) or self.action_space
+        lo = np.asarray(space.low, dtype=np.float32).reshape(-1)
+        hi = np.asarray(space.high, dtype=np.float32).reshape(-1)
         return lo, hi
 
     def configure_ref_window(self, length: int, offset: int = 1,
