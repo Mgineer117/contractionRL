@@ -6,6 +6,8 @@ models:
   policy:
     class: GaussianMixin # DeterministicMixin
     backbone: control  # PPO is unbounded; uref+feedback can exceed the declared action space
+    encoder: gru
+    encoder_stride: 3
     clip_actions: false
     clip_log_std: true
     min_log_std: -20.0
@@ -74,10 +76,11 @@ agent:
   value_loss_scale: 0.5  # Weight coefficient for the value function loss term
   kl_threshold: 0.02 # Early stopping threshold based on Kullback-Leibler divergence
   time_limit_bootstrap: true  # Bootstrap value at episode truncation instead of treating it as terminal
+  residual_contraction_pretrain: false
   rewards_shaper_scale: 1.0
   use_state_norm: false  # OFF by default — see c2rl.py module docstring / rl_glue.make_base_rl_cfg
   use_value_norm: true   # Same, but for the value function's output (PPO only)
-  use_reward_norm: true  # Non-biasing running-std reward normalizer (r/std, no centering) — tames the
+  use_reward_norm: false  # Non-biasing running-std reward normalizer (r/std, no centering) — tames the
                          # w_lb/w_ub-dependent Mahalanobis-reward scale/heavy-tail before GAE; see rl_glue.
 
   # ── CAPS action smoothness (Mysore et al. 2021) ─────────────────────────── #
@@ -90,7 +93,7 @@ agent:
   # observation, which breaks the CLActor's obs_dim = 2*x_dim + u_dim layout).
   # Both 0.0 = off. Override per-run with --caps_temporal_scale /
   # --caps_spatial_scale / --caps_spatial_std. See patch_caps_regularizer.
-  caps_temporal_scale: 0.001  # weight on ||pi(s_t) - pi(s_t+1)||^2
+  caps_temporal_scale: 0.0  # weight on ||pi(s_t) - pi(s_t+1)||^2
   caps_spatial_scale: 0.0    # weight on ||pi(s) - pi(s_bar)||^2, s_bar ~ N(s, sigma^2)
   caps_spatial_std: 0.05     # sigma, in RAW observation units (see patch_caps_regularizer)
   discount_factor: 0.01  # deployed policy's discount factor (single policy — no con/opt duality)
@@ -121,7 +124,7 @@ cm:
   lbd: 1.5    # Contraction rate λ — used by cmg_method's synthesis loss (CM SDP LMI for
               # "cvstem", CMG Cu/C1 loss for "ccm")
   tracking_scaler: 1.0  # Q: tracking-error weight
-  control_scaler: 0.0   # R: control-effort weight (0 = disabled)
+  control_scaler: 0.0   # R: control-effort weight (0 = disabled, already 0)
   # SDP contraction metric (cm_eps used by both cmg_method paths; cm_solver "cvstem" only)
   cm_eps: 0.1   # Strict-definiteness margin on the contraction LMI
   cm_solver: MOSEK  # cvxpy SDP solver: SCS (default, no license) | CLARABEL (no license, tighter/slower) | MOSEK (commercial license, tightest/fastest — see README.md Installation)
