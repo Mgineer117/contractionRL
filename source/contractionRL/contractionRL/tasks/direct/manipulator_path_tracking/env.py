@@ -98,4 +98,12 @@ class ManipulatorPathTrackingEnv(PathTrackingBase):
         root[:, :3] += self.scene.env_origins[env_ids]
         self._robot.write_root_pose_to_sim(root[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(root[:, 7:], env_ids)
-        self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+        # joint_ids=self._arm_ids, NOT None: None means EVERY joint of the
+        # articulation, which for the Franka is 9 (7 arm + 2 gripper fingers),
+        # while the reference state carries only the 7 arm joints. Passing None
+        # raised "value tensor of shape [N, 7] cannot be broadcast to indexing
+        # result of shape [N, 9]" inside write_joint_position_to_sim — on the
+        # very first reset(), so every algorithm on this env died before its
+        # first step. _apply_action already scopes to _arm_ids; this is the one
+        # place that did not.
+        self._robot.write_joint_state_to_sim(joint_pos, joint_vel, self._arm_ids, env_ids)

@@ -81,6 +81,13 @@ from .rl_glue import filter_cfg_fields
 @dataclass
 class C3MCfg(AgentCfg):
     batch_size: int = 1024
+    # Size of the static (x, xref, uref) buffer C3M trains over — the yaml's
+    # `memory.memory_size`. C3M builds no skrl memory of its own, so this used
+    # to be read off `self.memory`, which is always None here: every C3M yaml
+    # declared memory.memory_size and NOTHING read it (the hardcoded fallback
+    # happened to equal the declared 131072, which is why it went unnoticed,
+    # and why --memory_size silently did nothing on C3M).
+    memory_size: int = 131072
     W_lr: float = 3e-4
     u_lr: float = 3e-4
     # Alias for u_lr: some configs/sweeps name the controller LR "actor_lr".
@@ -289,7 +296,7 @@ class C3MAgent(Agent):
             self._dynamics_lr_scheduler = None
 
         # ── Data buffer (numpy; static for analytical, or pre-generated) ────── #
-        self._memory_size = getattr(self.memory, "memory_size", 131072) if self.memory is not None else 131072
+        self._memory_size = int(cfg.memory_size)
         self._data = get_rollout(self._memory_size, "c3m")
         self._get_rollout = get_rollout
         self._batch_size = cfg.batch_size

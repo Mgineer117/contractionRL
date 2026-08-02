@@ -450,6 +450,21 @@ def _solve_cm_metric_with_backoff(
 # Offline dataset synthesis ("cvstem")
 # ─────────────────────────────────────────────────────────────────────────── #
 
+def _rollout_np(block, x_dim: int) -> np.ndarray:
+    """One ``get_rollout`` block as ``(n, x_dim)`` float32 numpy.
+
+    The two env families return DIFFERENT types from ``get_rollout``: the
+    classic envs return torch tensors (they compute in torch on-device), the
+    Isaac ones return numpy (``PathTrackingBase.get_rollout`` converts). Every
+    other consumer routes through ``torch.as_tensor``, which accepts both — this
+    was the one place that called ``.cpu()`` directly, so C2RL's CMG synthesis
+    raised ``'numpy.ndarray' object has no attribute 'cpu'`` on every Isaac run
+    while working fine on classic.
+    """
+    arr = block.detach().cpu().numpy() if hasattr(block, "detach") else np.asarray(block)
+    return np.asarray(arr, dtype=np.float32)[:, :x_dim]
+
+
 def _sample_cm_states(
     get_rollout, *, num_samples: int, x_dim: int,
     x_samples: np.ndarray | None, random_ratio: float, tag: str = "[C2RL]",
@@ -477,8 +492,7 @@ def _sample_cm_states(
     n_ref = num_samples - n_rand
     parts: list[np.ndarray] = []
     if n_ref > 0:
-        ref = np.asarray(get_rollout(n_ref, "c3m")["x"].cpu(), dtype=np.float32)[:, :x_dim]
-        parts.append(ref)
+        parts.append(_rollout_np(get_rollout(n_ref, "c3m")["x"], x_dim))
     if n_rand > 0:
         if x_samples is not None:
             pool = np.asarray(x_samples, dtype=np.float32)[:, :x_dim]
@@ -491,11 +505,8 @@ def _sample_cm_states(
         else:
             # "dynamics" mode tiles states by num_control_per_state; ask for 1 so we
             # get n_rand DISTINCT states (we only use x, not the paired controls).
-            rand = np.asarray(
-                get_rollout(n_rand, "dynamics", num_control_per_state=1)["x"].cpu(),
-                dtype=np.float32,
-            )[:, :x_dim]
-            parts.append(rand)
+            parts.append(_rollout_np(
+                get_rollout(n_rand, "dynamics", num_control_per_state=1)["x"], x_dim))
     x_np = np.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
     return x_np
 

@@ -10,6 +10,11 @@ import numpy as np
 import torch
 
 from contractionRL.agents.skrl.ref_window import RefWindow
+from contractionRL.tasks.direct.common.reward import (
+    mahalanobis_sq,
+    metric_from_ccm,
+    tracking_reward,
+)
 from contractionRL.tasks.direct.common.state_guard import carry_forward_nonfinite
 
 
@@ -263,71 +268,29 @@ class BaseEnv(gym.Env):
         tracking_error = torch.norm(next_error, p=2, dim=-1) ** 2
         control_effort = torch.norm(u, p=2, dim=-1) ** 2
 
-        if getattr(self, "reward_euclidean", False):
-            # AUC-aligned reward paired with the CV-STEM-LQR residual baseline
-            # (cvstem_residual_base): the contraction certificate lives in the
-            # analytic baseline, so the learned residual is free to minimize the
-            # TRUE tracking error the eval AUC measures — not the frozen-CMG
-            # Mahalanobis proxy the baseline already ~minimizes (which let PPO
-            # only drift it, 1.06 -> 1.19). See nn_modules.CVSTEMLQRBase.
-            if getattr(self, "reward_level", False):
-                # LEVEL form: r = -‖e‖. AUC = ∫‖e‖/‖e0‖ dt, so the discounted sum
-                # of -‖e‖ IS (minus) the error integral — the tightest possible
-                # alignment. The DECREMENT form below telescopes to the ENDPOINT
-                # error e0²-eT², which a dawdle-then-settle policy games while
-                # keeping AUC high (measured plateau at 0.96). Linear norm (not
-                # squared) matches AUC's ‖e‖ weighting exactly.
-                err_norm = torch.norm(next_error, p=2, dim=-1)
-                reward = -self.tracking_scaler * err_norm \
-                    - self.control_scaler * control_effort
-            else:
-                # DECREMENT form: raw Euclidean error decrement ‖e_prev‖²-‖e_next‖²
-                # (M = I) — same telescoping shape as the Mahalanobis reward.
-                prev_sq = torch.norm(error, p=2, dim=-1) ** 2
-                reward = self.tracking_scaler * (prev_sq - tracking_error) \
-                    - self.control_scaler * control_effort
-            maha_tracking_error = None
-        elif getattr(self, "ccm_gen", None) is not None:
-            from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
+        # Evaluate + cache the contraction metric at both ends of the transition;
+        # `tracking_reward` (common/reward.py) picks the reward form from it.
+        # maha_tracking_error is eᵀM(x)e, the metric-weighted analog of the plain
+        # Euclidean error, so StatManagerEnvWrapper can plot a
+        # "normalized_maha_error" curve alongside "normalized_error".
+        M = next_M = None
+        if getattr(self, "ccm_gen", None) is not None:
             with torch.no_grad():
                 if not hasattr(self, "M"):
                     self.M = torch.zeros(self.num_envs, self.num_dim_x, self.num_dim_x, device=self.device)
-                M = self.M[env_ids]
-                next_W_raw, _ = self.ccm_gen(next_x)
-                next_W = bound_W(next_W_raw, self.w_lb, self.num_dim_x, getattr(self.ccm_gen, "bounded", False))
-                next_M = spd_inverse(next_W)
+                M = self._apply_eig_reshape(self.M[env_ids])
+                next_M = metric_from_ccm(self.ccm_gen, next_x, self.w_lb)
                 self.M[env_ids] = next_M
-
-                M = self._apply_eig_reshape(M)
                 next_M = self._apply_eig_reshape(next_M)
 
-                err_t = error.unsqueeze(-1)
-                next_err_t = next_error.unsqueeze(-1)
-
-                V = torch.bmm(torch.bmm(err_t.transpose(1, 2), M), err_t).squeeze(-1).squeeze(-1)
-                next_V = torch.bmm(torch.bmm(next_err_t.transpose(1, 2), next_M), next_err_t).squeeze(-1).squeeze(-1)
-
-                if getattr(self, "reward_level", False):
-                    # LEVEL form: R(t) = -‖e(t+1)‖²_M. Same rationale as the
-                    # euclidean reward_level branch above — the DECREMENT form
-                    # V - next_V telescopes to the endpoint error V_0 - V_T
-                    # (policy-independent up to that constant only at γ=1;
-                    # at γ<1 it still vanishes almost everywhere near the
-                    # optimum, starving PPO's advantage of signal exactly
-                    # where this policy lives — see project memory on the
-                    # single-update collapse). The level form's per-step
-                    # signal never vanishes.
-                    reward = -self.tracking_scaler * next_V - self.control_scaler * control_effort
-                else:
-                    reward = self.tracking_scaler * (V - next_V) - self.control_scaler * control_effort
-                # Mahalanobis tracking error V = eᵀM(x)e (squared, like
-                # "tracking_error" above) — the metric-weighted analog of the
-                # plain Euclidean error, so StatManagerEnvWrapper can plot a
-                # "normalized_maha_error" curve alongside "normalized_error".
-                maha_tracking_error = next_V
-        else:
-            reward = -self.tracking_scaler * tracking_error - self.control_scaler * control_effort
-            maha_tracking_error = None
+        reward, maha_tracking_error = tracking_reward(
+            error, next_error, control_effort,
+            tracking_scaler=self.tracking_scaler,
+            control_scaler=self.control_scaler,
+            M=M, next_M=next_M,
+            reward_level=bool(getattr(self, "reward_level", False)),
+            reward_euclidean=bool(getattr(self, "reward_euclidean", False)),
+        )
 
         # Residual TRUST anchor (residual RL over CV-STEM-LQR): penalize the
         # applied action's deviation from the analytic base action u_base =
@@ -336,14 +299,12 @@ class BaseEnv(gym.Env):
         # the decrement reward), so this keeps the policy at the base unless a
         # deviation strictly helps tracking. See set_ccm / CVSTEMLQRBase.
         if getattr(self, "residual_anchor_scale", 0.0) > 0 and getattr(self, "ccm_gen", None) is not None:
-            from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
             with torch.no_grad():
                 r = self.cvstem_r + 1e-5
                 uref_curr = self.uref[env_ids, torch.clamp(t_idx, max=self.max_episode_len - 1)]
                 _f, B, _ = self.get_f_and_B(x)
-                Wb = bound_W(self.ccm_gen(x)[0], self.w_lb, self.num_dim_x,
-                             getattr(self.ccm_gen, "bounded", False))
-                Kb = (1.0 / r) * torch.bmm(B.transpose(1, 2).to(torch.float32), spd_inverse(Wb))
+                Kb = (1.0 / r) * torch.bmm(B.transpose(1, 2).to(torch.float32),
+                                           metric_from_ccm(self.ccm_gen, x, self.w_lb))
                 e_b = self.wrap_angles(x - xref_curr).unsqueeze(-1)
                 u_base = uref_curr - torch.bmm(Kb, e_b).squeeze(-1)
                 # ``u`` reaching get_rewards has ALREADY been clamped to
@@ -399,19 +360,15 @@ class BaseEnv(gym.Env):
                 self.M = torch.zeros(self.num_envs, self.num_dim_x, self.num_dim_x, device=self.device)
             if not hasattr(self, "init_maha_error"):
                 self.init_maha_error = torch.zeros(self.num_envs, device=self.device)
-            from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
             with torch.no_grad():
-                W_raw, _ = self.ccm_gen(x_0)
-                W = bound_W(W_raw, self.w_lb, self.num_dim_x, getattr(self.ccm_gen, "bounded", False))
-                M0 = spd_inverse(W)
+                M0 = metric_from_ccm(self.ccm_gen, x_0, self.w_lb)
                 self.M[env_ids] = M0
                 # Squared Mahalanobis error e0ᵀM(x0)e0 for e0/e(0) normalization
                 # of the maha error curve — mirrors init_tracking_error above,
                 # but angle-wrapped since M-weighting an unwrapped angle error
                 # would be meaningless.
-                e0 = self.wrap_angles(x_0 - self.xref[env_ids, 0]).unsqueeze(-1)
-                self.init_maha_error[env_ids] = torch.bmm(
-                    torch.bmm(e0.transpose(1, 2), M0), e0).squeeze(-1).squeeze(-1)
+                e0 = self.wrap_angles(x_0 - self.xref[env_ids, 0])
+                self.init_maha_error[env_ids] = mahalanobis_sq(e0, M0)
 
     def step(self, u: torch.Tensor):
         if not isinstance(u, torch.Tensor):

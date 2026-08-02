@@ -33,6 +33,15 @@ def b_jacobian(B: torch.Tensor, x: torch.Tensor, u_dim: int, create_graph: bool 
 
 
 def Jacobian_Matrix(M: torch.Tensor, x: torch.Tensor, create_graph: bool = True) -> torch.Tensor:
+    """Full ``(bs, m, m, n)`` Jacobian ``∂M/∂x``, one reverse-mode pass per entry.
+
+    Costs ``m²`` graph-retaining ``grad`` calls and a ``bs·m²·n`` buffer, so it
+    scales badly in the state dimension: at the classic car's ``m=n=6`` that is
+    36 calls and ~0.9 MB, but at the quadruped's 36 it is 1296 calls and ~191 MB
+    (batch 1024), which is exactly how C3M ran out of CUDA memory on Isaac.
+    Only ``weighted_gradients``' detach path still needs the assembled Jacobian
+    — everything else should take the JVP route below.
+    """
     bs = x.shape[0]
     m = M.size(-1)
     n = x.size(1)
@@ -47,13 +56,37 @@ def Jacobian_Matrix(M: torch.Tensor, x: torch.Tensor, create_graph: bool = True)
 
 def weighted_gradients(W: torch.Tensor, v: torch.Tensor, x: torch.Tensor,
                        detach: bool = False, create_graph: bool = True) -> torch.Tensor:
-    """Material derivative Ẇ = Σᵢ (∂W/∂xᵢ) vᵢ → (n, d, d)."""
+    """Material derivative Ẇ = Σᵢ (∂W/∂xᵢ) vᵢ → (n, d, d).
+
+    This is a Jacobian-VECTOR product, so the full ``∂W/∂x`` never has to exist:
+    the double-backward below gets it in TWO reverse-mode passes regardless of
+    the state dimension, instead of ``Jacobian_Matrix``' ``m²``.
+
+        s = Σ W⊙u          →  g = ∂s/∂x = uᵀ(∂W/∂x)
+        t = Σ g⊙v          →  ∂t/∂u    = (∂W/∂x)·v          ∎
+
+    ``u`` is a dummy variable that only exists to carry the (i,j) index through
+    the second differentiation. Verified to match the assembled-Jacobian result
+    to float32 round-off in both value and gradient (including the second-order
+    term through the CMG's parameters, which is what C3M's contraction loss
+    differentiates).
+
+    The ``detach`` path still assembles the Jacobian: it needs ``∂W/∂x`` treated
+    as a CONSTANT while keeping the gradient through ``v``, and the two are not
+    separable once the JVP has contracted them into one tensor. That path is
+    C3M's ``detach_warmup_frac`` warmup only, which every shipped config leaves
+    at 0.0, so the memory-critical path is the JVP.
+    """
     assert v.size() == x.size()
-    bs = x.shape[0]
     if detach:
+        bs = x.shape[0]
         return (Jacobian_Matrix(W, x, create_graph).detach() * v.view(bs, 1, 1, -1)).sum(dim=3)
-    else:
-        return (Jacobian_Matrix(W, x, create_graph) * v.view(bs, 1, 1, -1)).sum(dim=3)
+
+    u = torch.ones_like(W, requires_grad=True)
+    g = grad((W * u).sum(), x, create_graph=True, retain_graph=True, allow_unused=True)[0]
+    if g is None:                      # W does not depend on x
+        return torch.zeros_like(W)
+    return grad((g * v).sum(), u, create_graph=create_graph, retain_graph=True)[0]
 
 
 _RESCALE_EPS = 1e-6  # keeps half-scales/atanh args away from 0 / +-1 (log(0)/atanh divergence)

@@ -108,10 +108,20 @@ cm:
   # num_envs is in the thousands and f/B come from a learned NeuralDynamics,
   # so a per-step solve per env is orders of magnitude too slow.
   metric_source: cmg
+  # cmg_method — HOW the Phase-A CMG is trained. MUST be set explicitly: C2RLCfg
+  # defaults to "cvstem", which solves one contraction-metric SDP per sampled
+  # state (cmg_memory_size = 8192 of them). Measured single-solve cost with SCS
+  # at lbd=0.5/w_lb=0.01/w_ub=10 is 0.30s at the classic car's x_dim=6 but 23.4s
+  # at the quadruped's 36 and 111.6s at the humanoid's 50 — i.e. ~53 h and
+  # ~254 h of synthesis before training starts. The SDP is FEASIBLE at these
+  # dimensions, just hopelessly slow, so the Isaac envs use the gradient-trained
+  # C1/C2 CCM loss instead (no per-state SDP). Every classic config sets this
+  # key too; omitting it here is what silently made C2RL unrunnable on Isaac.
+  cmg_method: ccm
   # Mahalanobis reward
   w_ub: 10.0  # Upper eigenvalue bound for the metric M(x)
   w_lb: 0.1   # Lower eigenvalue bound for the metric M(x)
-  lbd: 0.5    # Contraction rate λ — used by cmg_method's synthesis loss (default "ccm": CMG C1 loss)
+  lbd: 0.5    # Contraction rate λ — used by cmg_method's synthesis loss (set to "ccm" above: CMG C1 loss; the Cfg DEFAULT is "cvstem")
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled)
   # SDP contraction metric (cm_eps used by both cmg_method paths; cm_solver "cvstem" only)

@@ -647,7 +647,7 @@ class ContractionRunner:
 
         if algo in ("c3m",):
             self._setup_c3m(skrl_env, device, obs_space, state_space, act_space,
-                            agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B, x_dim, u_dim,
+                            agent_cfg, trainer_cfg, models_cfg, memory_cfg, get_rollout, get_f_and_B, x_dim, u_dim,
                             angle_idx=angle_idx, sym=sym, raw_cfg_snapshot=raw_cfg_snapshot)
         elif algo in ("lqr", "sdlqr"):
             # LQR/SD-LQR build no networks (get_f_and_B is either analytical or
@@ -694,10 +694,18 @@ class ContractionRunner:
                              cm_cfg=cm_cfg, cmg_cfg=cmg_cfg, empirical_dynamics_cfg=empirical_dynamics_cfg)
 
     def _setup_c3m(self, env, device, obs_space, state_space, act_space,
-                   agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None,
+                   agent_cfg, trainer_cfg, models_cfg, memory_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None,
                    angle_idx=None, sym=None, raw_cfg_snapshot=None):
         angle_idx = list(angle_idx or [])
         from contractionRL.agents.skrl.c3m import C3MAgent, C3MCfg, C3MSkrlTrainer, C3MTrainerCfg
+
+        # C3M builds no skrl memory — its buffer is the static get_rollout draw
+        # sized by C3MCfg.memory_size. Route the yaml's memory.memory_size (and
+        # so --memory_size) into that field, or the key is declared and read by
+        # nobody. -1 ("dynamic") keeps the dataclass default.
+        _mem = memory_cfg.get("memory_size", -1) if memory_cfg else -1
+        if _mem not in (None, -1):
+            agent_cfg.setdefault("memory_size", _mem)
 
         models = _build_c3m_models(models_cfg, agent_cfg, obs_space, act_space, device, x_dim, u_dim, angle_idx, sym)
         w_lb = agent_cfg.get("w_lb", 0.1)

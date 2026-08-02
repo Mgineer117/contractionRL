@@ -877,6 +877,13 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
 
     _json_name = f"eval_results{'_' + label.lower() if label else ''}.json"
     out_json = os.path.join(agent.experiment_dir, _json_name)
+    # skrl creates experiment_dir LAZILY — only when it first writes a
+    # checkpoint or a tensorboard event. A run shorter than checkpoint_interval/
+    # write_interval (a smoke test, a sweep trial, a cluster job that hits its
+    # wall clock) never triggers that, so the eval would crash with
+    # FileNotFoundError at the very end, throwing away the results it just spent
+    # the whole rollout computing.
+    os.makedirs(agent.experiment_dir, exist_ok=True)
     with open(out_json, "w") as f:
         json.dump(results, f, indent=2)
     print(f"[Eval] Saved → {out_json}")
@@ -949,9 +956,6 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
         print(f"[Eval] SKIPPED — env {type(unwrapped).__name__} has no get_tracking_error().")
         return
 
-    _act_low = torch.as_tensor(skrl_env.action_space.low, dtype=torch.float32, device=skrl_env.device)
-    _act_high = torch.as_tensor(skrl_env.action_space.high, dtype=torch.float32, device=skrl_env.device)
-
     # Non-terminating evaluation: flip the cfg flag (read every step by
     # _get_dones) and restore afterwards.
     prev_flag = getattr(unwrapped.cfg, "terminate_on_fall", True)
@@ -976,8 +980,19 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
                 # policies) gives the deterministic action; deterministic
                 # policies (e.g. C3M's CLDeterministicActorModel) have no
                 # separate mean, so their raw action IS already deterministic.
+                #
+                # NOT clamped to the action space, matching both the training
+                # loop and _evaluate_classic_path_tracking. Every env applies
+                # u_applied = action directly, and the contraction controllers
+                # fold uref into their output (u = urefs[0] + feedback, or
+                # uref - K·e), which legitimately leaves the uref-sized action
+                # box. Clamping here measured a DIFFERENT controller than the
+                # one trained — it silently truncates exactly the feedback term
+                # the contraction certificate is about, and it did so only on
+                # the Isaac side, so Isaac and classic numbers for the same
+                # algorithm were not comparable.
                 actions, outputs = agent.act(obs, None, timestep=0, timesteps=0)
-                actions = torch.clamp(outputs.get("mean_actions", actions), _act_low, _act_high)
+                actions = outputs.get("mean_actions", actions)
             obs_dict, rewards, terminated, truncated, _ = skrl_env.step(actions)
             obs = obs_dict["policy"] if isinstance(obs_dict, dict) else obs_dict
             total_reward += rewards.squeeze(-1)
@@ -1056,6 +1071,7 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
         print(f"[Eval] contraction rate : {lbd_mean:.4f} ± {lbd_ci:.4f}  (C·e^(−λkΔt), min AUC)")
 
     out_json = os.path.join(agent.experiment_dir, "eval_results.json")
+    os.makedirs(agent.experiment_dir, exist_ok=True)  # lazily created by skrl — see the classic evaluator
     with open(out_json, "w") as f:
         json.dump(results, f, indent=2)
     print(f"[Eval] Saved → {out_json}")

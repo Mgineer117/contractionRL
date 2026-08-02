@@ -17,12 +17,26 @@ from torch.distributions import Normal
 from .state_symmetry import StateSymmetry
 
 
-def _sym_from_names(names):
+def _sym_from_names(names, mode=None):
     """Rebuild the symmetry a checkpoint was TRAINED with, so a reload cannot
-    silently change the network input layout."""
+    silently change the network input layout.
+
+    ``mode`` is the saved ``StateSymmetry.mode``. It matters because
+    ``from_names`` always returns the STRONGEST symmetry the names permit, while
+    the net may have been built with a weaker one (a dynamics/CMG net uses the
+    translation-only demotion — see ContractionRunner._cmg_symmetry). Without
+    it, se2 is rebuilt where translation was trained and the input width is
+    wrong. ``None`` (a checkpoint written before this was stored) keeps the old
+    from_names behaviour.
+    """
     if not names:
         return None
-    return StateSymmetry.from_names(names)
+    sym = StateSymmetry.from_names(names)
+    if mode == "translation":
+        return sym.demote_to_translation()
+    if mode == "none":
+        return sym.disabled()
+    return sym
 
 
 from .angle_utils import embed_angles, embedded_dim, wrap_diff
@@ -714,6 +728,15 @@ class NeuralDynamics(nn.Module):
                 "activation": self._activation_str,
                 "angle_idx": self.angle_idx,
                 "state_names": list(getattr(self.sym, "names", ()) or ()),
+                # The MODE, not just the names: StateSymmetry.from_names(names)
+                # always rebuilds the strongest symmetry those names allow
+                # (se2), but a dynamics net is built with the CMG's DEMOTED
+                # symmetry (translation only — see _cmg_symmetry). Storing names
+                # alone lost that demotion, so a checkpoint trained at
+                # 36-2+1 = 35 inputs was reloaded as an se2 net expecting 33 and
+                # died in load_state_dict — which is every lqr/sdlqr run on an
+                # Isaac env, since those consume a C3M/C2RL dynamics.pt.
+                "sym_mode": getattr(self.sym, "mode", None),
                 "state_dict": self.state_dict(),
             },
             path,
@@ -730,7 +753,7 @@ class NeuralDynamics(nn.Module):
             activation=ckpt["activation"],
             device=device,
             angle_idx=ckpt.get("angle_idx", []),
-            sym=_sym_from_names(ckpt.get("state_names")),
+            sym=_sym_from_names(ckpt.get("state_names"), ckpt.get("sym_mode")),
         )
         model.load_state_dict(ckpt["state_dict"])
         model.eval()

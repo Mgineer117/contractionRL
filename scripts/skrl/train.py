@@ -143,6 +143,18 @@ _ov.add_argument("--cvstem_residual_base", "--cvstem-residual-base",
 # cvstem-lqr) so u = uref + π starts stabilizing — see C2RLPPOCfg.
 _ov.add_argument("--residual_contraction_pretrain", "--residual-contraction-pretrain",
                  dest="residual_contraction_pretrain", action="store_true", default=None)
+_ov.add_argument("--cmg_regress_epochs", "--cmg-regress-epochs",
+                 dest="cmg_regress_epochs", type=int, default=None,
+                 help="Override cmg.cmg_regress_epochs (C2RL Phase-A CMG synthesis). Like the "
+                      "dynamics pretrain, this is a FIXED cost paid before training and is "
+                      "independent of --num_timesteps — the default 1000 epochs measures ~8.6 s/it "
+                      "on the quadruped, i.e. ~2.4 h before the first env step.")
+_ov.add_argument("--dynamics_pretrain_epochs", "--dynamics-pretrain-epochs",
+                 dest="dynamics_pretrain_epochs", type=int, default=None,
+                 help="Override empirical_dynamics.dynamics_pretrain_epochs (C3M/C2RL). The "
+                      "NeuralDynamics pretrain is a FIXED cost paid before training starts and "
+                      "is independent of --num_timesteps — 500 epochs is ~54 min on the "
+                      "quadruped — so a short run needs this to be short too.")
 _ov.add_argument("--residual_pretrain_epochs", "--residual-pretrain-epochs",
                  dest="residual_pretrain_epochs", type=int, default=None)
 _ov.add_argument("--residual_pretrain_batch", "--residual-pretrain-batch",
@@ -390,6 +402,44 @@ _DEFAULT_NUM_ENVS_PPO_CLASSIC = 1024
 
 
 
+def _setup_ref_window(raw_env, gamma, args):
+    """Size the reference window for THIS run and rebuild ``observation_space``.
+
+    Must run BEFORE the wrappers/runner so the new space propagates to the
+    models and the memory, and AFTER every discount_factor override (CLI +
+    wandb sweep) has landed, so a swept gamma resizes the observation to match
+    instead of being evaluated against a stale hand-picked length.
+
+    Shared by the classic and Isaac branches: this used to live inline in the
+    classic branch only, so ``--ref_length``/``--ref_offset`` were silently
+    ignored on every Isaac run and Isaac path-tracking was stuck at whatever
+    ``cfg.ref_length`` said (1), i.e. no reference preview at all regardless of
+    gamma. The two env families name the episode length differently
+    (``max_episode_len`` steps on classic, ``max_episode_length`` on Isaac's
+    DirectRLEnv), which is the only reason this needs to look for both.
+    """
+    env = raw_env.unwrapped
+    if not hasattr(env, "configure_ref_window"):
+        return
+    horizon = getattr(env, "max_episode_len", None)
+    if horizon is None:
+        horizon = getattr(env, "max_episode_length", None)
+    if horizon is None:
+        print("[train] ref window: env exposes no episode length; leaving it at the cfg default.")
+        return
+    horizon = int(horizon)
+
+    length = args.ref_length
+    if length is None:
+        from contractionRL.agents.skrl.ref_window import RefWindow as _RW
+        length = _RW.length_for_horizon(gamma, horizon, args.ref_offset)
+        print(f"[train] ref_length AUTO -> {length} "
+              f"(gamma={gamma}, effective horizon "
+              f"{_RW.effective_horizon(gamma, horizon)} steps, "
+              f"offset={args.ref_offset})")
+    env.configure_ref_window(length=length, offset=args.ref_offset, gamma=gamma)
+
+
 def _apply_agent_overrides(agent_cfg, args):
     """Write every set agent-config override into agent_cfg, by YAML key name.
 
@@ -419,6 +469,28 @@ def _apply_agent_overrides(agent_cfg, args):
             a[key] = (str(val).lower() == "true")
     if args.memory_size is not None:
         agent_cfg["memory"]["memory_size"] = args.memory_size
+    if getattr(args, "cmg_regress_epochs", None) is not None:
+        # Same dual-location problem as dynamics_pretrain_epochs: the classic
+        # configs declare this under the top-level `cmg:` section, and it is
+        # also a C2RLCfg field. Set it wherever it is declared.
+        _e = args.cmg_regress_epochs
+        _t = [d for d in (a, agent_cfg.get("cmg"))
+              if isinstance(d, dict) and "cmg_regress_epochs" in d]
+        for _d in _t or [a]:
+            _d["cmg_regress_epochs"] = _e
+    if getattr(args, "dynamics_pretrain_epochs", None) is not None:
+        # The two algorithm families declare this key in DIFFERENT yaml
+        # sections: C3M/LQR/SD-LQR put it under `agent:`, C2RL under the
+        # top-level `empirical_dynamics:` that ContractionRunner merges in
+        # (see _setup_contraction). Writing to only one silently no-ops on the
+        # other — the override appeared to be accepted while the run still did
+        # all 500 epochs. So set it wherever it is already declared, and fall
+        # back to `agent:` if it is declared nowhere.
+        _epochs = args.dynamics_pretrain_epochs
+        _targets = [d for d in (a, agent_cfg.get("empirical_dynamics"))
+                    if isinstance(d, dict) and "dynamics_pretrain_epochs" in d]
+        for _d in _targets or [a]:
+            _d["dynamics_pretrain_epochs"] = _epochs
     if getattr(args, "cvstem_residual_base", None):
         a["cvstem_residual_base"] = True
     if getattr(args, "residual_contraction_pretrain", None):
@@ -641,22 +713,7 @@ if _is_classic:
     # overrides at _apply_agent_overrides + any wandb-sweep overrides above), so
     # the Markov check below reports against the gamma actually used.
     _gamma = float(agent_cfg["agent"].get("discount_factor", 0.99))
-    if hasattr(raw_env.unwrapped, "configure_ref_window"):
-        _len = args_cli.ref_length
-        if _len is None:
-            # AUTO: size the window to THIS run's gamma. Done here, after every
-            # gamma override (CLI + wandb sweep) has landed, so a swept
-            # discount_factor resizes the observation to match instead of
-            # being evaluated against a stale hand-picked length.
-            from contractionRL.agents.skrl.ref_window import RefWindow as _RW
-            _len = _RW.length_for_horizon(
-                _gamma, int(raw_env.unwrapped.max_episode_len), args_cli.ref_offset)
-            print(f"[train] ref_length AUTO -> {_len} "
-                  f"(gamma={_gamma}, effective horizon "
-                  f"{_RW.effective_horizon(_gamma, int(raw_env.unwrapped.max_episode_len))} steps, "
-                  f"offset={args_cli.ref_offset})")
-        raw_env.unwrapped.configure_ref_window(
-            length=_len, offset=args_cli.ref_offset, gamma=_gamma)
+    _setup_ref_window(raw_env, _gamma, args_cli)
 
     # O6 analytic-potential critic — see --critic_analytic_potential.
     if getattr(args_cli, "critic_analytic_potential", False):
@@ -935,6 +992,12 @@ else:
             )
 
         env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
+        # Reference window — same call the classic branch makes, and it must
+        # happen here: before SkrlVecEnvWrapper/the runner read
+        # single_observation_space["policy"] to shape the models. No-ops on the
+        # vel-tracking envs, which have no reference window at all.
+        _setup_ref_window(env, float(agent_cfg["agent"].get("discount_factor", 0.99)), args_cli)
 
         if isinstance(env.unwrapped, DirectMARLEnv) and algorithm in ["ppo"]:
             env = multi_agent_to_single_agent(env)

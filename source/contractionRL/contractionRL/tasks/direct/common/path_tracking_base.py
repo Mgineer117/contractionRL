@@ -25,6 +25,7 @@ from contractionRL.agents.skrl.angle_utils import wrap_diff
 from contractionRL.agents.skrl.ref_window import RefWindow
 
 from .eval_metrics import fit_exponential_envelope
+from .reward import metric_from_ccm, tracking_reward
 from .state_guard import carry_forward_nonfinite
 from .traj_buffer import TrajectoryBuffer
 
@@ -153,7 +154,14 @@ class PathTrackingBase(DirectRLEnv):
         self._traj_ids = torch.zeros(n, dtype=torch.long, device=self.device)
         self._x_ref = torch.zeros(n, self._traj_buf.state_dim, device=self.device)
         self._u_ref = torch.zeros(n, self._traj_buf.action_dim, device=self.device)
-        self._actions = torch.zeros(n, self.action_space.shape[0], device=self.device)
+        # u_dim from the UNBATCHED space — DirectRLEnv's `action_space` is the
+        # BATCHED one (num_envs x u_dim), so `.shape[0]` there is num_envs and
+        # this buffer came out (num_envs, num_envs). It was invisible while
+        # nothing read it before _pre_physics_step rebinds it to the real
+        # actions, but _get_rewards now takes ||u||^2 off it for the shared
+        # control-effort term, which would have been a wrongly-shaped norm on
+        # the first step of every episode. Same confusion as _control_bounds.
+        self._actions = torch.zeros(n, self.ref_window.u_dim, device=self.device)
         self._prev_actions = torch.zeros_like(self._actions)
 
         # last known-finite physical state, for the divergence guard (see
@@ -204,6 +212,8 @@ class PathTrackingBase(DirectRLEnv):
         self.ccm_gen = None
         self.tracking_scaler = 1.0
         self.control_scaler = 0.0
+        self.reward_level = False
+        self.reward_euclidean = False
         # Certified/target contraction rate + metric-conditioning inputs for
         # the THEORETICAL exponential bound on the PathTracking figure. All
         # None by default (curve omitted) — set via set_contraction_certificate().
@@ -232,20 +242,26 @@ class PathTrackingBase(DirectRLEnv):
         The scalers default to None = keep the plain-reward weights set in
         __init__ (1.0 / 0.0).
 
-        The last four are classic-only reward variants (residual-base RL over
-        CV-STEM-LQR); _get_rewards here has no branch for them, so a non-default
-        value raises rather than silently training on the Mahalanobis reward.
+        ``reward_level``/``reward_euclidean`` select the reward FORM and are
+        honoured here identically to classic — they are arguments to the shared
+        ``common/reward.tracking_reward``, so there is no per-family branch left
+        that could diverge.
+
+        ``residual_anchor_scale``/``cvstem_r_scaler`` are the residual-base-RL
+        knobs, which need the analytic CV-STEM-LQR base an Isaac env has no
+        closed form for. _get_rewards has no branch for them, so a non-default
+        value raises rather than silently training on the unanchored reward.
         """
-        unsupported = [n for n, v in (("reward_euclidean", reward_euclidean),
-                                      ("reward_level", reward_level),
-                                      ("residual_anchor_scale", residual_anchor_scale),
+        unsupported = [n for n, v in (("residual_anchor_scale", residual_anchor_scale),
                                       ("cvstem_r_scaler", cvstem_r_scaler))
                        if v not in (False, 0.0) and not (n == "cvstem_r_scaler" and v == 1.0)]
         if unsupported:
             raise NotImplementedError(
-                f"{type(self).__name__}._get_rewards implements only the Mahalanobis "
-                f"reward; classic-only knobs requested: {', '.join(unsupported)}."
+                f"{type(self).__name__}._get_rewards has no analytic CV-STEM-LQR base; "
+                f"classic-only knobs requested: {', '.join(unsupported)}."
             )
+        self.reward_level = bool(reward_level)
+        self.reward_euclidean = bool(reward_euclidean)
         self.ccm_gen = ccm_gen
         self.w_lb = w_lb
         self.ccm_device = device
@@ -492,8 +508,21 @@ class PathTrackingBase(DirectRLEnv):
         envelope C * exp(-lambda * k * dt) bounding the error curve. angle_idx
         dims (e.g. yaw) are shortest-angle wrapped before the norm — see
         _get_rewards for why an unwrapped difference would be wrong.
+
+        Reads the SANITIZED state and applies the same ``_ERROR_CLAMP`` as
+        ``_get_rewards``, so the evaluator's AUC/overshoot/rate see exactly the
+        quantity the reward saw. Reading the raw state here made a single
+        diverged env NaN the AUC for the whole batch (auc_mean = nan) while
+        overshoot and contraction rate — computed from the same curve but
+        normalized — still came out finite, which reads as a metrics bug rather
+        than as the divergence it actually is. The guard is carry-forward by
+        design (this family never terminates on divergence), so the metric must
+        honour it too.
         """
-        return torch.norm(wrap_diff(self._get_physical_state() - self._x_ref, self.angle_idx), dim=-1)
+        x = self._sanitize_state(self._get_physical_state())
+        err = torch.norm(wrap_diff(x - self._x_ref, self.angle_idx), dim=-1)
+        return torch.nan_to_num(err, nan=self._ERROR_CLAMP,
+                                posinf=self._ERROR_CLAMP).clamp(max=self._ERROR_CLAMP)
 
     @property
     def x_dim(self) -> int:
@@ -614,7 +643,16 @@ class PathTrackingBase(DirectRLEnv):
         # are unaffected (wrap_diff is a no-op there, and a no-op entirely when
         # angle_idx is empty).
         error = wrap_diff(x - self._x_ref, self.angle_idx)
-        error_norm = torch.norm(error, dim=-1).clamp(max=self._ERROR_CLAMP)   # (N,)
+        # Clamp the error VECTOR (not just its norm) to _ERROR_CLAMP, so the
+        # reward, AUC and Stability curves all see the same bounded quantity: a
+        # diverged env yields a large-but-FINITE penalty rather than a NaN/Inf
+        # that wrecks the value function and the running normalizers. Scaling
+        # the vector rather than clamping the norm separately is what keeps the
+        # Mahalanobis reward (which consumes the vector) consistent with the
+        # Euclidean one (which consumes the norm).
+        error_norm = torch.norm(error, dim=-1)
+        error = error * (self._ERROR_CLAMP / error_norm.clamp(min=1e-12)).clamp(max=1.0).unsqueeze(-1)
+        error_norm = error_norm.clamp(max=self._ERROR_CLAMP)   # (N,)
 
         # accumulate streaming metric state: running error sum (AUC integrand),
         # initial error e0 (on the episode's first step), and peak error e_max.
@@ -642,36 +680,37 @@ class PathTrackingBase(DirectRLEnv):
             self._viz_pos_live[rows, idx] = pos[in_range].detach().cpu().numpy()
             self._viz_state_live[rows, idx] = x[:viz_n][in_range].detach().cpu().numpy()
 
+        # The SAME reward as the classic family — literally the same functions
+        # (see common/reward.py). V = ‖e‖²_M with M from the frozen CMG when
+        # C2RL injected one (potential form, q·(V-V′) - r·‖u‖²) and M = I
+        # otherwise (level form, -q‖e‖² - r‖u‖², the plain PPO/SAC/LQR
+        # baseline). _get_rewards only ever sees the POST-transition state (no
+        # separate "prev x" lookup buffer like the reference trajectory has), so
+        # the previous step's error vector + metric are cached explicitly in
+        # _prev_error/_prev_M (seeded at _reset_idx) rather than recomputed.
+        #
+        # error_norm below is the CLAMPED norm, so a diverged step yields a
+        # large-but-finite penalty rather than a NaN that wrecks the value
+        # function / normalizers.
+        # nan_to_num first, mirroring classic BaseEnv.step's guard on u: nothing
+        # sanitizes the ACTIONS on this side (the divergence guard covers the
+        # STATE only), so a diverging policy's non-finite action would otherwise
+        # reach the reward through this norm.
+        control_effort = torch.norm(torch.nan_to_num(self._actions), p=2, dim=-1) ** 2
+        prev_error, M, next_M = error, None, None
         if self.ccm_gen is not None:
-            # C2RL Phase B: Lyapunov-decrease reward tracking_scaler*(V - next_V)
-            # - control_scaler*||u||^2, V = error^T M error, M = the frozen
-            # CMG's metric at the corresponding state — mirrors classic
-            # env_base.py's get_rewards exactly. _get_rewards only ever sees
-            # the POST-transition state (no separate "prev x" lookup buffer
-            # like the reference trajectory has), so the previous step's
-            # error vector + metric are cached explicitly in
-            # _prev_error/_prev_M (seeded at _reset_idx) rather than
-            # recomputed from a stored trajectory.
-            from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
             with torch.no_grad():
-                next_W_raw, _ = self.ccm_gen(x)
-                next_W = bound_W(next_W_raw, self.w_lb, error.shape[-1], getattr(self.ccm_gen, "bounded", False))
-                next_M = spd_inverse(next_W)
-
-                prev_err_t = self._prev_error.unsqueeze(-1)
-                next_err_t = error.unsqueeze(-1)
-                V = torch.bmm(torch.bmm(prev_err_t.transpose(1, 2), self._prev_M), prev_err_t).squeeze(-1).squeeze(-1)
-                next_V = torch.bmm(torch.bmm(next_err_t.transpose(1, 2), next_M), next_err_t).squeeze(-1).squeeze(-1)
-
-                control_effort = torch.norm(self._actions, p=2, dim=-1) ** 2
-                reward = self.tracking_scaler * (V - next_V) - self.control_scaler * control_effort
-
-                self._prev_error = error.clone()
-                self._prev_M = next_M
-        else:
-            # -||error||_I^2, using the sanitized+clamped norm so a diverged step
-            # can't emit a huge/NaN reward that wrecks the value fn / normalizers.
-            reward = -(error_norm * error_norm)
+                prev_error, M = self._prev_error, self._prev_M
+                next_M = metric_from_ccm(self.ccm_gen, x, self.w_lb)
+                self._prev_error, self._prev_M = error.clone(), next_M
+        reward, _maha = tracking_reward(
+            prev_error, error, control_effort,
+            tracking_scaler=self.tracking_scaler,
+            control_scaler=self.control_scaler,
+            M=M, next_M=next_M,
+            reward_level=self.reward_level,
+            reward_euclidean=self.reward_euclidean,
+        )
         self._episode_reward += reward
         return reward
 
@@ -786,15 +825,11 @@ class PathTrackingBase(DirectRLEnv):
         # meaningful V rather than a stale value from the env's previous
         # episode — mirrors classic env_base.py's reset_idx M-seeding.
         if self.ccm_gen is not None:
-            from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
             if not hasattr(self, "_prev_M"):
                 state_dim = self._traj_buf.state_dim
                 self._prev_error = torch.zeros(self.num_envs, state_dim, device=self.device)
                 self._prev_M = torch.zeros(self.num_envs, state_dim, state_dim, device=self.device)
             with torch.no_grad():
                 x0 = self._get_physical_state()[env_ids]
-                error0 = wrap_diff(x0 - x_ref_init, self.angle_idx)
-                W0_raw, _ = self.ccm_gen(x0)
-                W0 = bound_W(W0_raw, self.w_lb, x0.shape[-1], getattr(self.ccm_gen, "bounded", False))
-                self._prev_error[env_ids] = error0
-                self._prev_M[env_ids] = spd_inverse(W0)
+                self._prev_error[env_ids] = wrap_diff(x0 - x_ref_init, self.angle_idx)
+                self._prev_M[env_ids] = metric_from_ccm(self.ccm_gen, x0, self.w_lb)
