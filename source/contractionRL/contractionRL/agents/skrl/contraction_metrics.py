@@ -13,14 +13,12 @@ full ``(num_envs, T)`` error tensor:
                              ``lambda = -ln(e_T / e_0) / (T·dt)`` (clamped ≥ 0).
                              Logged both as ``contraction_rate`` and the
                              user-facing alias ``lambda``.
-  * ``running_lambda``     — per-STEP rate averaged over an episode:
-                             ``mean_t max(0, ln(C_t/C_{t+1})/dt)`` on the
-                             normalized cost ``C = e/e(0)``.  0 at steps where
-                             the cost did not decrease, and 0 in OVERSHOOT
-                             (``max(C_t, C_{t+1}) > 1``) — the descent back from
-                             a self-inflicted excursion is not credited — but
-                             those steps stay in the denominator, so overshoot
-                             dilutes the mean.  Only from
+  * ``running_lambda``     — whole-EPISODE rate, averaged over episodes:
+                             per episode, ``max(0, ln(C_0/C_T)/T)`` on the
+                             normalized cost ``C = e/e(0)`` if the cost
+                             decreased end-to-end, else ``0`` (an episode that
+                             ended up higher than it started is scored 0, not
+                             dropped from the average). Only from
                              :class:`StatManagerEnvWrapper`, which has the full
                              per-step curve rather than just the endpoints.
   * ``overshoot``          — peak normalized error ``e_max / e(0)`` (≥ 1 in
@@ -359,44 +357,26 @@ class StatManagerEnvWrapper:
         lambda_vec = torch.clamp(min_lambdas / rate_divisor, min=0.0, max=10.0)
         score_vec = lambda_vec / torch.clamp(best_C, min=1e-6)
 
-        # 5. Running-mean lambda — the per-STEP contraction rate, averaged over
-        #    the episode.  Where the normalized cost actually decreases, the
-        #    rate that makes the one-step contraction condition
-        #        C(s_{t+1}) = e^{-lambda·dt}·C(s_t)
-        #    hold with equality is  lambda_t = ln(C_t / C_{t+1}) / dt;  where it
-        #    does NOT decrease that expression is ≤ 0 and the step contributes 0
-        #    (no contraction observed on that step, not a negative rate).  So
-        #    the clamp below IS the "did a decrement happen?" test.
-        #
-        #    Unlike `lambda_vec` above — an endpoint/envelope quantity dominated
-        #    by the worst curve — this one is a per-step average, so a policy
-        #    that contracts steadily and one that plunges once then coasts are
-        #    distinguishable.
-        #
-        #    Steps taken while the cost is OVERSHOOTING — i.e. anywhere on the
-        #    step the normalized cost sits above its initial value C = 1 — are
-        #    credited 0 as well, even if the cost is falling there: recovering
-        #    from an excursion the policy itself caused is not contraction, and
-        #    without this a policy that blows the error up and then dives back
-        #    would score a *higher* running lambda than one that never
-        #    overshot (the recovery leg has a large ln(C_t/C_{t+1})).  Those
-        #    steps stay in the denominator, so overshoot dilutes the mean.
-        step_dt = dt_array.clamp(min=1e-8)
-        step_lambda = ((torch.log(errs[:, :-1]) - torch.log(errs[:, 1:])) / (step_dt * rate_divisor)).clamp(min=0.0)
-        no_overshoot = (torch.maximum(errs[:, :-1], errs[:, 1:]) <= 1.0).float()
-        step_lambda = step_lambda * no_overshoot
-        # Only average over the steps this slot REALLY recorded: an episode that
-        # terminated early was padded with its final error out to the horizon
-        # (see _record), and those flat padded steps carry lambda == 0 — counting
-        # them would scale every short episode's mean down by its own length.
+        # 5. Running-mean lambda — the whole-EPISODE contraction rate, averaged
+        #    over episodes.  For each episode slot, compare the normalized cost
+        #    at the end of the episode to its start (C = 1): if it decreased,
+        #    the rate that makes the endpoint contraction condition
+        #        C(T) = e^{-lambda·T}·C(0)
+        #    hold with equality is  lambda = ln(C(0) / C(T)) / T;  if the cost
+        #    did NOT decrease over the episode, the slot contributes 0 (no
+        #    contraction observed) rather than a negative rate.  Unlike the
+        #    old per-step version, an increasing episode is counted as an
+        #    explicit 0 rather than dropped from the effective average, so a
+        #    policy that diverges is scored down rather than merely diluted.
         lengths = self._tracking_steps.clamp(max=self._max_ep_len).reshape(-1, 1)
-        k = torch.arange(self._max_ep_len - 1, device=self._device()).reshape(1, -1)
-        valid = (k < (lengths - 1)).float()
-        counts = valid.sum(dim=1)
-        running_lambda_vec = (step_lambda * valid).sum(dim=1) / counts.clamp(min=1.0)
-        # A slot with < 2 recorded samples has no transition to measure.
+        end_idx = (lengths - 1).clamp(min=0)  # (N, 1), last REAL recorded index
+        err_end = torch.gather(errs, 1, end_idx).squeeze(1)
+        t_end = torch.gather(self._time_buffer, 1, end_idx).squeeze(1).clamp(min=1e-8)
+        err_start = errs[:, 0]
+        episode_lambda = (torch.log(err_start) - torch.log(err_end)) / (t_end * rate_divisor)
+        decreased = err_end < err_start
         running_lambda_vec = torch.where(
-            counts > 0, running_lambda_vec, torch.zeros_like(running_lambda_vec))
+            decreased, episode_lambda.clamp(min=0.0), torch.zeros_like(episode_lambda))
 
         auc_m, auc_ci = mean_confidence_interval(auc_vec.detach().cpu().numpy(), 0.95)
         lambda_m, lambda_ci = mean_confidence_interval(lambda_vec.detach().cpu().numpy(), 0.95)
@@ -987,22 +967,17 @@ def log_tracking_plots(
                  for i, errs in traj.items() if errs is not None and len(errs) > 0]
         if not items:
             return
-        n_sub = int(math.ceil(len(items) / PER_SUBPLOT))
-        nrows, ncols = _grid_dims(n_sub)
-        fig, axes = plt.subplots(nrows, ncols, figsize=(5.5 * ncols, 3.8 * nrows), squeeze=False)
-        flat = axes.flatten()
-        for s in range(n_sub):
-            ax = flat[s]
-            for i, errs_arr in items[s * PER_SUBPLOT:(s + 1) * PER_SUBPLOT]:
-                e0 = max(float(errs_arr[0]), 1e-8)
-                norm = errs_arr / e0
-                auc = float(_trapz(norm, dx=float(dt)))
-                ax.plot(norm, label=f"Env {i} (AUC: {auc:.2f})")
-            ax.set_xlabel("Step"); ax.set_ylabel(ylabel)
-            ax.legend(fontsize="x-small"); ax.grid(True, alpha=0.3)
-        for s in range(n_sub, len(flat)):
-            flat[s].axis("off")
-        fig.suptitle(f"{label} {plot_title}")
+        # One shared axes, all curves overlaid thin/translucent — with dozens
+        # of eval envs a per-env legend/grid is unreadable; a thin overlay
+        # instead shows the trend (and its spread) at a glance.
+        fig, ax = plt.subplots(figsize=(7.0, 4.5))
+        for i, errs_arr in items:
+            e0 = max(float(errs_arr[0]), 1e-8)
+            norm = errs_arr / e0
+            ax.plot(norm, linewidth=0.5, alpha=0.5)
+        ax.set_xlabel("Step"); ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+        fig.suptitle(f"{label} {plot_title} ({len(items)} envs)")
         fig.tight_layout()
         _push(fig, key)
 
