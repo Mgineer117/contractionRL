@@ -13,21 +13,33 @@ full ``(num_envs, T)`` error tensor:
                              ``lambda = -ln(e_T / e_0) / (T·dt)`` (clamped ≥ 0).
                              Logged both as ``contraction_rate`` and the
                              user-facing alias ``lambda``.
-  * ``running_lambda``     — whole-EPISODE rate, averaged over episodes:
-                             per episode, ``max(0, ln(C_0/C_T)/T)`` on the
+  * ``running_lambda``     — whole-EPISODE rate, averaged over episodes that
+                             CONTRACTED: per episode, ``ln(C_0/C_T)/T`` on the
                              normalized cost ``C = e/e(0)`` if the cost
-                             decreased end-to-end, else ``0`` (an episode that
-                             ended up higher than it started is scored 0, not
-                             dropped from the average). Only from
-                             :class:`StatManagerEnvWrapper`, which has the full
-                             per-step curve rather than just the endpoints.
+                             decreased end-to-end; episodes that did not are
+                             dropped from the average, not counted as 0. Only
+                             from :class:`StatManagerEnvWrapper`, which has
+                             the full per-step curve rather than just the
+                             endpoints.
   * ``overshoot``          — peak normalized error ``e_max / e(0)`` (≥ 1 in
                              theory; a pure overshoot factor).
   * ``contraction_score``  — ``lambda / overshoot`` (higher = fast contraction
                              with little overshoot).
+  * ``peak``               — distribution of per-episode PEAKS (``max_t
+                             e(t)/e(0)``) across the env population, reported
+                             as ``peak_mean``/``peak_median``/``peak_p95`` —
+                             unlike ``overshoot`` (a single worst-curve
+                             envelope constant ``C``), this is the actual
+                             spread of how bad the worst moment gets. Only
+                             from :class:`StatManagerEnvWrapper`.
 
 Each per-env quantity is reduced across the env population to a mean and a 95%
-CI half-width (``1.96·SEM``, see :func:`mean_confidence_interval`).
+CI half-width (``1.96·SEM``, see :func:`mean_confidence_interval`); ``peak``
+is the exception, reported as mean/median/p95 instead of mean/CI95.
+
+Action volatility (see :meth:`StatManagerEnvWrapper._action_volatility_summary`)
+is a separate smoothness diagnostic on the action stream, not a stability/
+contraction metric — it is logged under ``Episode/*``, not ``Stability/*``.
 
 The streaming AUC is EXACTLY the trapezoid, not an approximation of it: with
 ``err_sum = Σ_{k=0}^{T-1} e_k`` at times ``t_k = k·dt``,
@@ -182,6 +194,9 @@ class StatManagerEnvWrapper:
         self._recent_C: float = 1e2
         self._recent_score_mean: float = 0.0
         self._recent_score_ci95: float = 0.0
+        self._recent_peak_mean: float = 0.0
+        self._recent_peak_median: float = 0.0
+        self._recent_peak_p95: float = 0.0
 
         # Mahalanobis-error twins of the above (Stability_maha/* — C2RL only).
         self._recent_maha_auc_mean: float = 1e2
@@ -193,6 +208,9 @@ class StatManagerEnvWrapper:
         self._recent_maha_C: float = 1e2
         self._recent_maha_score_mean: float = 0.0
         self._recent_maha_score_ci95: float = 0.0
+        self._recent_maha_peak_mean: float = 0.0
+        self._recent_maha_peak_median: float = 0.0
+        self._recent_maha_peak_p95: float = 0.0
         # Bumped each time a full eval buffer is reduced to metrics — lets
         # callers (e.g. C3M's eval loop) detect that a rollout actually
         # produced FRESH numbers instead of silently re-reading stale ones.
@@ -330,6 +348,13 @@ class StatManagerEnvWrapper:
 
         # 2. Find curve with highest overshoot
         max_overshoots = torch.max(errs, dim=1).values
+        # Distribution of per-episode PEAKS (max normalized error over the
+        # episode) — mean/median/95th-percentile, as opposed to `C` above
+        # (a single worst-curve envelope constant).
+        peaks_np = max_overshoots.detach().cpu().numpy()
+        peak_mean = float(np.mean(peaks_np))
+        peak_median = float(np.median(peaks_np))
+        peak_p95 = float(np.percentile(peaks_np, 95))
         worst_idx = torch.argmax(max_overshoots)
         x_worst = errs[worst_idx]
         t_worst = self._time_buffer[worst_idx]
@@ -358,16 +383,15 @@ class StatManagerEnvWrapper:
         score_vec = lambda_vec / torch.clamp(best_C, min=1e-6)
 
         # 5. Running-mean lambda — the whole-EPISODE contraction rate, averaged
-        #    over episodes.  For each episode slot, compare the normalized cost
-        #    at the end of the episode to its start (C = 1): if it decreased,
-        #    the rate that makes the endpoint contraction condition
+        #    over episodes that actually contracted.  For each episode slot,
+        #    compare the normalized cost at the end of the episode to its
+        #    start (C = 1): if it decreased, the rate that makes the endpoint
+        #    contraction condition
         #        C(T) = e^{-lambda·T}·C(0)
-        #    hold with equality is  lambda = ln(C(0) / C(T)) / T;  if the cost
-        #    did NOT decrease over the episode, the slot contributes 0 (no
-        #    contraction observed) rather than a negative rate.  Unlike the
-        #    old per-step version, an increasing episode is counted as an
-        #    explicit 0 rather than dropped from the effective average, so a
-        #    policy that diverges is scored down rather than merely diluted.
+        #    hold with equality is  lambda = ln(C(0) / C(T)) / T.  Episodes
+        #    that did NOT decrease are dropped from the average entirely (not
+        #    counted as a 0) — this is a rate over CONTRACTING episodes only,
+        #    not a score that also penalizes non-contracting ones.
         lengths = self._tracking_steps.clamp(max=self._max_ep_len).reshape(-1, 1)
         end_idx = (lengths - 1).clamp(min=0)  # (N, 1), last REAL recorded index
         err_end = torch.gather(errs, 1, end_idx).squeeze(1)
@@ -375,12 +399,14 @@ class StatManagerEnvWrapper:
         err_start = errs[:, 0]
         episode_lambda = (torch.log(err_start) - torch.log(err_end)) / (t_end * rate_divisor)
         decreased = err_end < err_start
-        running_lambda_vec = torch.where(
-            decreased, episode_lambda.clamp(min=0.0), torch.zeros_like(episode_lambda))
+        running_lambda_vec = episode_lambda[decreased]
 
         auc_m, auc_ci = mean_confidence_interval(auc_vec.detach().cpu().numpy(), 0.95)
         lambda_m, lambda_ci = mean_confidence_interval(lambda_vec.detach().cpu().numpy(), 0.95)
-        run_m, run_ci = mean_confidence_interval(running_lambda_vec.detach().cpu().numpy(), 0.95)
+        if running_lambda_vec.numel() > 0:
+            run_m, run_ci = mean_confidence_interval(running_lambda_vec.detach().cpu().numpy(), 0.95)
+        else:
+            run_m, run_ci = 0.0, 0.0
         score_m, score_ci = mean_confidence_interval(score_vec.detach().cpu().numpy(), 0.95)
         return {
             "auc_mean": float(auc_m), "auc_ci95": float(auc_ci),
@@ -388,6 +414,7 @@ class StatManagerEnvWrapper:
             "running_lambda_mean": float(run_m), "running_lambda_ci95": float(run_ci),
             "score_mean": float(score_m), "score_ci95": float(score_ci),
             "C": float(best_C.item()),
+            "peak_mean": peak_mean, "peak_median": peak_median, "peak_p95": peak_p95,
         }
 
     def _compute_batched_metrics(self):
@@ -405,6 +432,9 @@ class StatManagerEnvWrapper:
         self._recent_score_mean = m["score_mean"]
         self._recent_score_ci95 = m["score_ci95"]
         self._recent_C = m["C"]
+        self._recent_peak_mean = m["peak_mean"]
+        self._recent_peak_median = m["peak_median"]
+        self._recent_peak_p95 = m["peak_p95"]
 
         # Same reduction on the SQUARED Mahalanobis Lyapunov V(t)/V(0) =
         # ‖e(t)‖²_M/‖e(0)‖²_M — the quantity the CCM certificate contracts
@@ -421,6 +451,9 @@ class StatManagerEnvWrapper:
             self._recent_maha_score_mean = mm["score_mean"]
             self._recent_maha_score_ci95 = mm["score_ci95"]
             self._recent_maha_C = mm["C"]
+            self._recent_maha_peak_mean = mm["peak_mean"]
+            self._recent_maha_peak_median = mm["peak_median"]
+            self._recent_maha_peak_p95 = mm["peak_p95"]
 
         self._compute_count += 1
 
@@ -734,20 +767,24 @@ class StatManagerEnvWrapper:
                 if maha_summary:
                     info["log"].update(
                         stability_log_dict(maha_summary, self._device(), tab="Stability_maha"))
+                # Action volatility isn't a stability/contraction metric — it's
+                # a smoothness diagnostic on the action stream — so it gets
+                # its own Episode/* tab rather than living under Stability/*.
+                volatility = self._action_volatility_summary()
+                if volatility:
+                    info["log"].update(
+                        stability_log_dict(volatility, self._device(), tab="Episode"))
 
         return obs, reward, terminated, truncated, info
 
     def stability_summary(self) -> dict[str, float]:
         if not self._initialized:
             return {}
-        # Measured from actions alone, so it needs none of the buffer machinery
-        # below — merged in only once an episode has finished (see
-        # _action_volatility_summary).
-        volatility = self._action_volatility_summary()
         # Every metric carries the "{name}_mean"/"{name}_ci95" key shape that
         # track_stability_summary documents and patch_auc_checkpoint
         # (agent_patches.py) looks up. C is a single shared scalar, so its
-        # ci95 is 0 by construction.
+        # ci95 is 0 by construction. peak_{mean,median,p95} have no ci95 twin
+        # (they're a one-shot distribution summary, not a mean/CI pair).
         return {
             "auc_mean": self._recent_auc_mean,
             "auc_ci95": self._recent_auc_ci95,
@@ -759,7 +796,9 @@ class StatManagerEnvWrapper:
             "overshoot_ci95": 0.0,
             "contraction_score_mean": self._recent_score_mean,
             "contraction_score_ci95": self._recent_score_ci95,
-            **volatility,
+            "peak_mean": self._recent_peak_mean,
+            "peak_median": self._recent_peak_median,
+            "peak_p95": self._recent_peak_p95,
         }
 
     def stability_maha_summary(self) -> dict[str, float]:
@@ -782,6 +821,9 @@ class StatManagerEnvWrapper:
             "overshoot_ci95": 0.0,
             "contraction_score_mean": self._recent_maha_score_mean,
             "contraction_score_ci95": self._recent_maha_score_ci95,
+            "peak_mean": self._recent_maha_peak_mean,
+            "peak_median": self._recent_maha_peak_median,
+            "peak_p95": self._recent_maha_peak_p95,
         }
 
     def trajectories(self):
