@@ -125,6 +125,13 @@ class C2RLPPOCfg(AgentCfg):
     use_reward_norm: bool = False  # non-biasing running-std reward normalizer (r/std) — see rl_glue.make_base_rl_cfg
     rewards_shaper_scale: float = 1.0  # yaml convenience for PPO_CFG's rewards_shaper — see rl_glue.make_base_rl_cfg
     std_dev_annealing_kwargs: dict | None = None  # forwarded to patch_ppo_std_annealing()
+    # True (default): log_std follows the fixed schedule in
+    # std_dev_annealing_kwargs and is NOT learned (CLActor builds it with
+    # requires_grad=False and the patch overwrites it every step).
+    # False: PPO learns log_std through the policy loss, as in stock PPO. The
+    # schedule then does not apply, and entropy_loss_scale is left as configured
+    # (the annealing patch zeroes it, since a bonus would fight the schedule).
+    std_dev_annealing: bool = True
     # CAPS action-smoothness regularization on the POLICY LOSS (both 0 = off).
     # Not a reward term: it leaves the MDP, the observation and the dynamics
     # untouched, so the offline CV-STEM synthesis stays valid. See
@@ -708,10 +715,23 @@ class C2RLAgent(Agent):
             spatial_std=parsed_cfg.caps_spatial_std,
         )
         _std_dev_annealing_kwargs = parsed_cfg.std_dev_annealing_kwargs
-        # Always anneal for PPO, regardless of the policy's backbone — SAC keeps
-        # this off since it learns log_std via its own automatic entropy tuning
-        # (see SquashedCLActorModel's docstring in models.py).
-        patch_ppo_std_annealing(self._rl_agent, self._base_algorithm == "PPO", _std_dev_annealing_kwargs)
+        # Anneal for PPO unless the config opts out, regardless of the policy's
+        # backbone — SAC keeps this off since it learns log_std via its own
+        # automatic entropy tuning (see SquashedCLActorModel's docstring).
+        _anneal = self._base_algorithm == "PPO" and parsed_cfg.std_dev_annealing
+        patch_ppo_std_annealing(self._rl_agent, _anneal, _std_dev_annealing_kwargs)
+        if self._base_algorithm == "PPO" and not _anneal:
+            # CLActor builds logstd with requires_grad=False (it exists to be
+            # annealed, see nn_modules.CLActor), and patch_ppo_std_annealing —
+            # the only other thing that touches it — is now a no-op. Without
+            # this flip the parameter would simply stay frozen at its initial
+            # value and "learned std" would silently mean "constant std".
+            lsp = getattr(self._rl_agent.policy, "log_std_parameter", None)
+            if lsp is None:
+                raise RuntimeError(
+                    "std_dev_annealing=False asks PPO to LEARN log_std, but the policy "
+                    f"({type(self._rl_agent.policy).__name__}) exposes no log_std_parameter.")
+            lsp.requires_grad_(True)
 
         self._rl_agent.init()
 

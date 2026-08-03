@@ -63,6 +63,10 @@ agent:
   learning_rate_scheduler: KLAdaptiveLR # matches the standalone PPO baseline for this env
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.02
+  # false -> PPO LEARNS log_std through the policy loss (stock-PPO behavior) and
+  # the schedule below is ignored; true -> log_std is frozen and driven by the
+  # schedule. Override per-run with --std_dev_annealing false.
+  std_dev_annealing: true
   std_dev_annealing_kwargs:
     schedule: exponential
     final_log_std: -4.6

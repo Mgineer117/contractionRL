@@ -208,6 +208,9 @@ _ov.add_argument("--use_state_norm", "--use-state-norm", "--ppo_use_state_norm",
                  "--ppo-use-state-norm", type=str, default=None)
 _ov.add_argument("--use_value_norm", "--use-value-norm", "--ppo_use_value_norm",
                  "--ppo-use-value-norm", type=str, default=None)
+# "false" makes PPO LEARN log_std through the policy loss instead of following
+# the fixed std_dev_annealing_kwargs schedule (C2RL-PPO only; see C2RLPPOCfg).
+_ov.add_argument("--std_dev_annealing", "--std-dev-annealing", type=str, default=None)
 # SAC.
 _ov.add_argument("--batch_size", "--batch-size", "--sac_batch_size", "--sac-batch-size",
                  type=int, default=None)
@@ -413,7 +416,7 @@ def _apply_agent_overrides(agent_cfg, args):
     if args.gae_lambda is not None:
         a["lambda"] = args.gae_lambda      # skrl PPO's GAE key
         a["gae_lambda"] = args.gae_lambda  # yaml's own spelling
-    for key in ("use_state_norm", "use_value_norm"):
+    for key in ("use_state_norm", "use_value_norm", "std_dev_annealing"):
         val = getattr(args, key, None)
         if val is not None:
             a[key] = (str(val).lower() == "true")
