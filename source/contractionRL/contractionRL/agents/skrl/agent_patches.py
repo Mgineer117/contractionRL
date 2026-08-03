@@ -443,9 +443,9 @@ def patch_algo_namespace(agent, algo_name: str) -> None:
     did, leaving skrl's own keys ("Loss / Policy loss", ...) un-namespaced.
 
     "Reward / *" is deliberately exempt: skrl's base Agent writes that EXACT key
-    straight into tracking_data (bypassing track_data) to pick best_agent.pt,
-    and patch_auc_checkpoint injects into it — renaming would silently break
-    both. Stability/*, Episode/*, Info/* also bypass track_data, so unaffected.
+    straight into tracking_data (bypassing track_data) to pick best_agent.pt, so
+    renaming would silently break selection. Stability/*, Episode/*, Info/* also
+    bypass track_data, so they are unaffected either way.
     """
     orig_track_data = agent.track_data
 
@@ -471,35 +471,70 @@ def best_metric_for(algorithm: str) -> str:
     return "contraction_score" if norm in ("c3m", "cvstem-lqr") else "auc"
 
 
+BEST_METRIC_KEY = "Checkpoint / best metric"
+
+
 def patch_auc_checkpoint(agent, metric: str = "auc") -> None:
     """Override agent.post_interaction to pick best_agent.pt by ``metric``.
 
-    skrl saves best_agent.pt by the highest 'Reward / Total reward (mean)'.
-    This redirects that rule by injecting a stability metric into the SAME key
-    (base skrl reads exactly that key in post_interaction).
+    skrl selects best_agent.pt by the highest ``Reward / Total reward (mean)``,
+    read straight out of ``tracking_data`` in its ``post_interaction``. This
+    used to be redirected by OVERWRITING that key with the stability metric —
+    which silently turned a reward panel into ``-AUC``: ``(mean)`` no longer
+    measured the same quantity as the untouched ``(min)``/``(max)`` (still real
+    episode returns), so a diverging run plotted its "mean" BELOW its "min".
+
+    Instead the metric now goes to its own :data:`BEST_METRIC_KEY` panel, and
+    the best-module bookkeeping is done here against that value, mirroring
+    skrl's own logic. Base skrl's reward-based selection is then neutralized by
+    parking ``checkpoint_best_modules["reward"]`` at ``+inf`` so its
+    ``reward > stored`` test can never overwrite the modules chosen here.
+    ``write_checkpoint`` still runs from the base call and persists them.
 
     "contraction_score": ``Stability/contraction_score_mean``, higher better, so
     no sign flip. "auc": ``-Stability/auc_mean`` (or ``-Episode/auc`` for
     vel-tracking), flipped since lower is better. If the chosen metric isn't
-    logged this step the base reward is left alone — no cross-fallback between
-    the two. See ``best_metric_for`` for the algorithm→metric mapping.
+    logged this step, no selection happens — no cross-fallback between the two.
+    See ``best_metric_for`` for the algorithm→metric mapping.
     """
+    import copy
+
     _orig_post = getattr(agent, "post_interaction", None)
     if _orig_post is None:
         return
 
-    def _metric_post(*, timestep: int, timesteps: int) -> None:
+    best = {"value": -float("inf")}
+
+    def _current_metric():
         # Stability/* carries a "_mean" suffix; Episode/auc (vel-tracking) does
         # not — it comes from a different logging path.
         if metric == "contraction_score":
             score_list = agent.tracking_data.get("Stability/contraction_score_mean")
-            if score_list:
-                agent.track_data("Reward / Total reward (mean)", score_list[-1])
-        else:
-            # Prioritize Stability/auc (path tracking) over Episode/auc (velocity tracking)
-            score_list = agent.tracking_data.get("Stability/auc_mean") or agent.tracking_data.get("Episode/auc")
-            if score_list:
-                agent.track_data("Reward / Total reward (mean)", -score_list[-1])
+            return float(score_list[-1]) if score_list else None
+        # Prioritize Stability/auc (path tracking) over Episode/auc (velocity tracking)
+        score_list = agent.tracking_data.get("Stability/auc_mean") or agent.tracking_data.get("Episode/auc")
+        return -float(score_list[-1]) if score_list else None
+
+    def _metric_post(*, timestep: int, timesteps: int) -> None:
+        value = _current_metric()
+        if value is not None:
+            agent.track_data(BEST_METRIC_KEY, value)
+
+        # Mirror skrl's cadence: it updates best modules then writes them, both
+        # gated on checkpoint_interval inside the base call below.
+        ts = timestep + 1
+        if ts > 1 and agent.checkpoint_interval > 0 and not ts % agent.checkpoint_interval:
+            if value is not None and value > best["value"]:
+                best["value"] = value
+                agent.checkpoint_best_modules["timestep"] = ts
+                agent.checkpoint_best_modules["saved"] = False
+                agent.checkpoint_best_modules["modules"] = {
+                    k: copy.deepcopy(agent._get_internal_value(v))
+                    for k, v in agent.checkpoint_modules.items()
+                }
+        # Park the base's comparison value so its own reward-based selection can
+        # never win. Must be set every call, not just on checkpoint steps.
+        agent.checkpoint_best_modules["reward"] = float("inf")
         _orig_post(timestep=timestep, timesteps=timesteps)
 
     agent.post_interaction = _metric_post
