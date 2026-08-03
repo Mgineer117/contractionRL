@@ -49,6 +49,16 @@ class TrajectoryBuffer:
     def sample_traj_ids(self, num_envs: int) -> torch.Tensor:
         return torch.randint(0, self.num_trajs, (num_envs,), device=self.device)
 
+    def full(self, traj_ids: torch.Tensor) -> torch.Tensor:
+        """The WHOLE reference trajectory per env: ``(N, traj_len, state_dim)``.
+
+        Plot/metric code needs the complete reference path, not the windowed
+        slice ``get_window`` returns — a window is sampled at the ref offset
+        and only spans the horizon, so reconstructing "the reference" from it
+        yields an offset-dependent subsample of the true path.
+        """
+        return self._states[traj_ids]
+
     def get(
         self,
         traj_ids: torch.Tensor,

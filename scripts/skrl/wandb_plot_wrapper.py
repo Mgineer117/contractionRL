@@ -151,7 +151,9 @@ class WandbPlotWrapper:
         # both drops flat placeholder lines and keeps every figure
         # (normalized_error / normalized_maha_error / path_tracking) on the SAME
         # env set and ordering.
-        plot_keys = sorted(k for k in traj_err if traj_x.get(k))
+        # len(), not truthiness — a numpy array raises on `if arr`.
+        plot_keys = sorted(k for k in traj_err
+                           if traj_x.get(k) is not None and len(traj_x[k]) > 0)
         if not plot_keys:
             return
         traj_x = {k: traj_x.get(k, []) for k in plot_keys}

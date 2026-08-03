@@ -495,6 +495,16 @@ class PathTrackingBase(DirectRLEnv):
         """
         return torch.norm(wrap_diff(self._get_physical_state() - self._x_ref, self.angle_idx), dim=-1)
 
+    def get_reference_trajectory(self) -> torch.Tensor:
+        """WHOLE reference path per env: ``(num_envs, T, x_dim)``.
+
+        The classic twin is ``BaseEnv.get_reference_trajectory``; both exist so
+        logging code plots the complete reference against the policy rollout
+        instead of rebuilding a reference from the (offset-subsampled,
+        horizon-truncated) observation window. See tests/test_isaac_parity.py.
+        """
+        return self._traj_buf.full(self._traj_ids)
+
     @property
     def x_dim(self) -> int:
         return self._traj_buf.state_dim

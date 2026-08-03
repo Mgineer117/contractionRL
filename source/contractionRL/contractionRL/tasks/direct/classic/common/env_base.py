@@ -142,6 +142,16 @@ class BaseEnv(gym.Env):
     # control dimensions identically for both env families (it looks for
     # x_dim/u_dim; without these, a classic env building a NeuralDynamics —
     # use_empirical_dynamics=true — got None for both).
+    def get_reference_trajectory(self) -> torch.Tensor:
+        """WHOLE reference path per env: ``(num_envs, max_episode_len, x_dim)``.
+
+        The Isaac twin is ``PathTrackingBase.get_reference_trajectory``; both
+        exist so logging code plots the complete reference against the policy
+        rollout instead of rebuilding a reference from the (offset-subsampled,
+        horizon-truncated) observation window. See tests/test_isaac_parity.py.
+        """
+        return self.xref
+
     @property
     def x_dim(self) -> int:
         return self.num_dim_x

@@ -49,6 +49,25 @@ The streaming AUC is EXACTLY the trapezoid, not an approximation of it: with
 so the normalized AUC needs only ``err_sum``, ``e_0``, ``e_last`` — no curve.
 BOTH endpoints get half weight; subtracting only ``e_0``, or worse ADDING
 ``e_last``, is the trapezoid-rule error earlier per-algorithm copies had.
+
+Trajectory plots (``{prefix}/path_tracking``) show the POLICY ROLLOUT against
+the WHOLE reference path:
+
+  * the rollout is recorded per step and ends when the episode does;
+  * the reference is captured once per episode from the env itself
+    (``get_reference_trajectory()``, present on both env families), NOT
+    accumulated from the observation window.
+
+The window is subsampled at ``ref_offset`` and truncated to the horizon, so a
+reference rebuilt from it is an offset-dependent subsample of the real path —
+the reference-window layout must never reach the logs. Consequently the two
+curves have DIFFERENT lengths and each gets its own time axis.
+
+The flat window layout is ``[urefs | x | xrefs]`` (``RefWindow.flatten``), so
+the ``x`` block starts at ``length*u_dim`` — nonzero even for a length-1
+window. ``_record`` slices past it and asserts the observation width matches
+``ref_window.flat_dim``, because a layout drift here yields plots and metrics
+that are wrong but entirely plausible-looking.
 """
 
 from __future__ import annotations
@@ -182,6 +201,12 @@ class StatManagerEnvWrapper:
         self._initialized = False
         self._x_dim: int | None = None
         self._pos_dim: int | None = None
+        # Column where the `x` block starts in the flat observation. The
+        # ref_window layout is [urefs | x | xrefs] (RefWindow.flatten), so this
+        # is length*u_dim — NONZERO even for a length-1 window. 0 only for a
+        # non-window env (plain Isaac cartpole), which has no urefs block.
+        self._x_offset: int = 0
+        self._expected_obs_width: int | None = None
         self._dt: float | None = None
         self._max_ep_len: int | None = None
 
@@ -275,10 +300,14 @@ class StatManagerEnvWrapper:
             return True
         # "num_dim_x" is the classic BaseEnv name; "x_dim" is the Isaac
         # path-tracking property (path_tracking_base.py). Both env families
-        # share the [x, xref, uref] observation layout this wrapper slices.
+        # share the ref_window's [urefs | x | xrefs] flat layout (ref_window.py
+        # RefWindow.flatten) — x starts AFTER the urefs block, not at column 0.
         x_dim = self._first_attr("num_dim_x", "x_dim")
         dt = self._first_attr("step_dt", "dt")
         ep = self._first_attr("max_episode_length", "max_episode_len")
+        ref_window = self._first_attr("ref_window")
+        self._x_offset = int(ref_window.length * ref_window.u_dim) if ref_window is not None else 0
+        self._expected_obs_width = int(ref_window.flat_dim) if ref_window is not None else None
         if x_dim is None or dt is None:
             return False
 
@@ -477,7 +506,19 @@ class StatManagerEnvWrapper:
         if not self._ensure_stats():
             return
 
-        xd, pd = self._x_dim, self._pos_dim
+        xd, pd, xo = self._x_dim, self._pos_dim, self._x_offset
+
+        # The slicing below hard-codes the ref_window layout. If the observation
+        # is not the width that layout implies, every slice is silently off and
+        # the plots/metrics come out wrong-but-plausible (this exact drift
+        # shipped once: the window landed but this wrapper still assumed the old
+        # [x, xref, uref] order). Fail loudly instead.
+        if self._expected_obs_width is not None and obs.shape[-1] != self._expected_obs_width:
+            raise RuntimeError(
+                f"StatManagerEnvWrapper: observation is {obs.shape[-1]}-wide but the env's "
+                f"ref_window (x_dim={xd}, length*u_dim={xo}) implies "
+                f"{self._expected_obs_width}. The [urefs | x | xrefs] slicing this wrapper "
+                f"uses no longer matches the observation layout.")
 
         unwrapped = getattr(self.env, "unwrapped", self.env)
         if isinstance(info, dict) and "tracking_error" in info:
@@ -498,7 +539,7 @@ class StatManagerEnvWrapper:
                 error = torch.tensor(err, dtype=torch.float32, device=self._device()).reshape(-1, 1)
             error = error.reshape(-1)
         else:
-            diff = obs[:, :xd] - obs[:, xd:2 * xd]
+            diff = obs[:, xo:xo + xd] - obs[:, xo + xd:xo + 2 * xd]
             angle_idx = self._first_attr("angle_idx")
             if angle_idx:
                 for idx in angle_idx:
@@ -540,8 +581,20 @@ class StatManagerEnvWrapper:
                     maha_err_vals = torch.where(init_flags.reshape(-1), fresh_m, maha_err_vals)
             self._maha_seen = True
 
-        obs_x = obs[:, :pd].detach().cpu().numpy()
-        obs_xref = obs[:, xd:xd + pd].detach().cpu().numpy()
+        obs_x = obs[:, xo:xo + pd].detach().cpu().numpy()
+
+        # The reference is taken as the env's WHOLE trajectory, captured once
+        # when a slot opens — NOT accumulated from the observation window. The
+        # window is subsampled at ref_offset and truncated to the horizon, so a
+        # reference rebuilt from it is an offset-dependent subsample of the real
+        # path; the plot must show the full reference against the policy
+        # rollout. get_reference_trajectory() exists on both env families.
+        ref_traj = self._first_attr("get_reference_trajectory")
+        full_xref = None
+        if callable(ref_traj):
+            full_xref = ref_traj()
+            if torch.is_tensor(full_xref):
+                full_xref = full_xref[..., :pd].detach().cpu().numpy()
 
         # For each env that is initializing, complete its old slot if any, and start a new one
         init_indices = torch.nonzero(init_flags, as_tuple=True)[0]
@@ -575,7 +628,10 @@ class StatManagerEnvWrapper:
                 self._tracking_steps[slot] = 0
                 self._completed_slots[slot] = False
                 self._traj_x_buf[slot] = []
-                self._traj_xref_buf[slot] = []
+                # Whole reference path for THIS episode, captured now (it is
+                # resampled per episode by reset_idx), not grown per step.
+                self._traj_xref_buf[slot] = (
+                    [] if full_xref is None else list(full_xref[int(env_idx)]))
 
         # Update active slots
         active_slots = torch.nonzero((self._tracking_env_ids != -1) & (~self._completed_slots), as_tuple=True)[0]
@@ -601,8 +657,8 @@ class StatManagerEnvWrapper:
                     self._eval_buffer_maha[slot, step] = (maha_err_vals[env_id] / self._e0_maha[slot]) ** 2
                 self._time_buffer[slot, step] = step * self._dt
 
+                # Rollout only — the reference was captured whole at slot open.
                 self._traj_x_buf[slot].append(obs_x[env_id])
-                self._traj_xref_buf[slot].append(obs_xref[env_id])
 
             step += 1
             self._tracking_steps[slot] = step
@@ -1032,9 +1088,12 @@ def log_tracking_plots(
     # ── Position trajectory vs reference grid ─────────────────────────────── #
     pos_items = []
     for i in traj_x:
-        xs = traj_x.get(i) or []
-        refs = traj_xref.get(i) or []
-        if len(xs) == 0 or len(refs) == 0:
+        # `x if x else []` (or `x or []`) would raise on a numpy array — these
+        # dicts hold lists today but are fed by callers, so test emptiness by
+        # length, never by truthiness.
+        xs = traj_x.get(i)
+        refs = traj_xref.get(i)
+        if xs is None or refs is None or len(xs) == 0 or len(refs) == 0:
             continue
         tx = np.asarray(xs, dtype=np.float64)
         txref = np.asarray(refs, dtype=np.float64)
@@ -1053,10 +1112,14 @@ def log_tracking_plots(
         for s in range(n_sub):
             ax = flat[s]
             for i, tx, txref, _d in pos_items[s * PER_SUBPLOT:(s + 1) * PER_SUBPLOT]:
+                # Separate time axes: tx is the policy ROLLOUT (ends early when
+                # the episode terminates), txref is the WHOLE reference path.
+                # Sharing one axis would truncate the reference to the rollout.
                 t = np.arange(len(tx))
+                tref = np.arange(len(txref))
                 if d0 == 1:
                     ax.scatter(t, tx[:, 0], c=t, cmap="viridis", s=8, label=f"x (env {i})")
-                    ax.plot(t, txref[:, 0], "--", label=f"x_ref (env {i})")
+                    ax.plot(tref, txref[:, 0], "--", label=f"x_ref (env {i})")
                     ax.set_xlabel("Step"); ax.set_ylabel("Position")
                 elif d0 == 2:
                     ax.scatter(tx[:, 0], tx[:, 1], c=t, cmap="viridis", s=8, label=f"x (env {i})")
