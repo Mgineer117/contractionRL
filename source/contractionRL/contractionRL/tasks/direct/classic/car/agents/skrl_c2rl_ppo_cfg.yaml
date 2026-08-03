@@ -67,7 +67,8 @@ agent:
   learning_rate: 1.0e-6   # Global step size for neural network optimization
   learning_rate_scheduler: KLAdaptiveLR # matches the standalone PPO baseline for this env
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.02
+    kl_threshold: 0.01   # TARGET KL the scheduler steers toward (not the early-stop)
+    max_lr: 1.0e-3       # ceiling; learning_rate above is the floor it climbs from
   # false -> PPO LEARNS log_std through the policy loss (stock-PPO behavior) and
   # the schedule below is ignored; true -> log_std is frozen and driven by the
   # schedule. Override per-run with --std_dev_annealing false.
@@ -83,7 +84,12 @@ agent:
   value_clip: 0.0  # Clipping bound for the value function update
   entropy_loss_scale: 0.0 # Coefficient to encourage exploration by maximizing action entropy
   value_loss_scale: 0.5  # Weight coefficient for the value function loss term
-  kl_threshold: 0.02 # Early stopping threshold based on Kullback-Leibler divergence
+  # HARD early-stop: skrl's PPO breaks out of the epoch when a minibatch's KL
+  # exceeds this (ppo.py: `if self.cfg.kl_threshold and kl_divergence > ...`).
+  # 2x the scheduler's TARGET (learning_rate_scheduler_kwargs.kl_threshold=0.01),
+  # so the scheduler has room to pull the LR down before the hard stop fires; it
+  # also coincides with KLAdaptiveLR's own decrease trigger (kl_factor=2).
+  kl_threshold: 0.02
   time_limit_bootstrap: true  # Bootstrap value at episode truncation instead of treating it as terminal
   residual_contraction_pretrain: false
   rewards_shaper_scale: 1.0
@@ -132,14 +138,11 @@ cm:
   w_lb: 0.1  # Lower eigenvalue bound for the metric M(x)
   # Contraction rate λ — used by cmg_method's synthesis loss (CM SDP LMI for
   # "cvstem", CMG Cu/C1 loss for "ccm").
-  # 0.963 = the largest λ feasible at EVERY sampled (x, u) over the full
-  # state/control box at w_lb=0.1, w_ub=10, cvstem_r_scaler=1.5, with the
-  # implied gain K=(1/r)·Bᵀ·W⁻¹ still inside the control box
-  # (scripts/find_uniform_lambda.py; identical under uniform and u-vertex
-  # sampling). The previous 1.5 was unreachable ANYWHERE in the box, so
-  # _solve_cm_metric_with_backoff halved it on essentially every state and
-  # landed on 0.75 — certifying a weaker rate than was actually available.
-  lbd: 0.963
+  # 0.790 with cvstem_r_scaler 0.0878: measured by scripts/find_uniform_lambda.py
+  # under TUBE sampling -- 4 reference trajectories rolled out 50 steps under the
+  # CV-STEM control u = uref - (1/r)B^T M e, requiring the LMI (with the real Wdot
+  # from consecutive states) AND u inside the control box at every step.
+  lbd: 0.790
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled, already 0)
   # SDP contraction metric (cm_eps used by both cmg_method paths; cm_solver "cvstem" only)
@@ -164,7 +167,7 @@ cm:
   #              Control is penalized via this Riccati term, not bounded over an
   #              action range — see ncm_synthesis.py module docstring.
   cmg_method: cvstem
-  cvstem_r_scaler: 1.5  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only
+  cvstem_r_scaler: 0.0878  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only
   # On SDP infeasibility AT A GIVEN STATE, retry that state alone with λ
   # halved, up to this many times, before giving up on it and dropping it from
   # the dataset — 0 disables this and reverts to dropping immediately. Warns
