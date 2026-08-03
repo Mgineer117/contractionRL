@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import torch
 
 from ..common.env_base import BaseEnv
+
+# Amplitude of the commanded velocity profile the reference tracks (m/s). Keeps
+# |pos_x| well inside X_MIN/X_MAX over an episode so _rollout_reference never
+# clamps the reference -- a clamped reference violates its own dynamics.
+VEL_REF_SCALE = 0.15
 
 # Denote angle indices to handle smooth transition
 STATE_NAMES = ("pos_x", "pitch", "vel_x_b", "pitch_rate")
@@ -124,27 +130,77 @@ class SegwayEnv(BaseEnv):
         Bbot[:, 3, 2] = -(-1.8 * torch.cos(theta) - 10.9) / (torch.cos(theta) - 24.7)
         return Bbot
 
+    def _balance_gain(self):
+        """LQR gain about the upright equilibrium, cached. Position is left FREE.
+
+        A segway has one input for four states and cannot hold position while
+        balancing, so the reference controller regulates (pitch, velocity,
+        pitch_rate) only and lets pos_x follow from the velocity profile. The
+        position column is zeroed out of the error rather than out of ``Q``, so
+        the gain itself stays the plain CARE solution.
+        """
+        if getattr(self, "_K_bal", None) is None:
+            from scipy.linalg import solve_continuous_are
+            x0 = torch.zeros(1, self.num_dim_x, device=self.device)
+            x0.requires_grad_(True)
+            f, B, _ = self.get_f_and_B(x0)
+            A = torch.zeros(self.num_dim_x, self.num_dim_x, device=self.device)
+            for i in range(self.num_dim_x):
+                g = torch.autograd.grad(f[0, i], x0, retain_graph=True)[0]
+                A[i] = g[0]
+            A_np = A.detach().cpu().numpy().astype(float)
+            B_np = B[0].detach().cpu().numpy().astype(float)
+            Q = np.diag([0.0, 10.0, 1.0, 1.0])          # position unweighted
+            R = np.eye(self.num_dim_control) * 0.1
+            P = solve_continuous_are(A_np, B_np, Q, R)
+            self._K_bal = torch.as_tensor((np.linalg.solve(R, B_np.T @ P)),
+                                         dtype=torch.float32, device=self.device)
+        return self._K_bal
+
     def sample_reference_controls(self, freqs, weights, _t, infos, add_noise=False):
+        """Reference control that CLOSES A LOOP around the reference state.
+
+        The segway is open-loop unstable (2.82 rad/s pole), so an open-loop uref
+        makes the REFERENCE ITSELF tip over -- which is why this env used to pin
+        uref to 0 and hand back a constant reference at the origin. Instead the
+        reference tracks a smooth velocity profile built from ``freqs`` under a
+        fixed LQR balance gain:
+
+            v_des(t) = sum_i w_i sin(2 pi f_i t / T)
+            uref     = -K_bal * (xref_t - [pos_free, 0, v_des, 0])
+
+        ``(xref, uref)`` stays DYNAMICALLY FEASIBLE by construction because
+        ``_rollout_reference`` integrates the true plant with exactly this uref --
+        closing the loop changes which trajectory is generated, never whether it
+        satisfies the dynamics.
+        """
         n = weights.shape[0]
-        xref_0 = infos["xref_0"]
-        uref = torch.zeros(n, self.num_dim_control, device=self.device)
-        uref[:, 0] = 10.2 * xref_0[:, 2] / 47.9
+        xref_t = infos.get("xref_t", infos["xref_0"])
+        v_des = torch.zeros(n, device=self.device)
         for i, freq in enumerate(freqs):
-            weight = weights[:, i, :]
-            term = weight[:, 0] * ((-1) ** int(freq * _t / self.time_bound)) * math.sin(freq * _t / self.time_bound * 2 * math.pi)
-            uref[:, 0] += term
+            v_des = v_des + weights[:, i, 0] * math.sin(
+                freq * _t / self.time_bound * 2 * math.pi)
+        x_des = xref_t.clone()
+        x_des[:, 1] = 0.0            # upright
+        x_des[:, 2] = v_des          # track the velocity profile
+        x_des[:, 3] = 0.0            # no pitch rate
+        uref = -(xref_t - x_des) @ self._balance_gain().T
         if add_noise:
             uref += torch.randn_like(uref) * torch.abs(0.1 * uref)
         return torch.clamp(uref, self.UREF_MIN, self.UREF_MAX)
 
     def system_reset(self, env_ids: torch.Tensor):
         xref_0, xe_0, x_0 = self.define_initial_state(env_ids)
-        freqs = []
+        # A real reference, not the constant origin. Possible only because
+        # sample_reference_controls closes a loop (see there); the old freqs=[]
+        # plus a 0.0* weight scale existed because an open-loop uref tips the
+        # reference over. VEL_REF_SCALE bounds the commanded velocity so the
+        # reference stays inside X_MIN/X_MAX without _rollout_reference's clamp
+        # engaging -- a clamped reference is NOT dynamically feasible.
+        freqs = list(range(1, 6))
         n = len(env_ids)
-        if len(freqs) > 0:
-            weights = torch.randn(n, len(freqs), len(UREF_MIN), device=self.device)
-            weights = 0.0 * weights / torch.sqrt((weights**2).sum(dim=1, keepdim=True))
-        else:
-            weights = torch.zeros(n, 0, len(UREF_MIN), device=self.device)
+        weights = torch.randn(n, len(freqs), len(UREF_MIN), device=self.device)
+        weights = VEL_REF_SCALE * weights / torch.sqrt(
+            (weights**2).sum(dim=1, keepdim=True))
         xref_arr, uref_arr, length = self._rollout_reference(xref_0, freqs, weights)
         return x_0, xref_arr, uref_arr, length

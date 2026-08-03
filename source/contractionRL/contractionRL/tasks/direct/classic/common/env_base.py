@@ -212,8 +212,14 @@ class BaseEnv(gym.Env):
         uref_list = []
 
         for i, _t in enumerate(self.t):
-            uref_t = self.sample_reference_controls(freqs, weights, _t, {"xref_0": xref_0})
             xref_prev = xref_list[-1]
+            # xref_t (the CURRENT reference state) is passed as well as xref_0, so a
+            # subclass can close a loop when building its reference. Without it the
+            # reference could only ever be an OPEN-LOOP plant rollout, which diverges
+            # for an open-loop-unstable plant (segway, cartpole) and forces those envs
+            # to a constant reference at the equilibrium.
+            uref_t = self.sample_reference_controls(
+                freqs, weights, _t, {"xref_0": xref_0, "xref_t": xref_prev})
             f_x, B_x, _ = self.get_f_and_B(xref_prev)
             x_dot = f_x + torch.bmm(B_x, uref_t.unsqueeze(-1)).squeeze(-1)
             next_x = xref_prev + self.dt * x_dot

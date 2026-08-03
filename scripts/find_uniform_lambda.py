@@ -459,6 +459,147 @@ def plot_tube(env, tube, block, path, *, rho, sigma, xref=None):
     return path
 
 
+def tube_segments(tube, block, *, num_segments, seg_len, seed):
+    """Indices of ``num_segments`` CONTIGUOUS runs of ``seg_len`` tube steps.
+
+    Contiguous, because the joint program's ``Ẇ`` couples sample ``k`` to sample
+    ``k-1`` and that is only a material derivative if the two are genuinely one
+    ``dt`` apart on the SAME rollout. Random point subsampling cannot support the
+    coupling at all.
+
+    Returns ``(flat_indices, segment_start_positions)``; the latter are the
+    positions where ``Ẇ`` must be dropped, exactly as at a trajectory start.
+    """
+    T = tube[1].shape[0] // int(block)
+    rng = np.random.default_rng(seed)
+    seg_len = min(int(seg_len), T)
+    idx, starts = [], set()
+    for _ in range(int(num_segments)):
+        j = int(rng.integers(int(block)))
+        t0 = int(rng.integers(0, max(T - seg_len, 1)))
+        starts.add(len(idx))
+        idx.extend((t0 + i) * int(block) + j for i in range(seg_len))
+    return np.asarray(idx, dtype=np.int64), starts
+
+
+def solve_cm_joint(A_seq, B_seq, starts, *, lbd, w_lb, w_ub, eps, solver, r_scaler,
+                   dt, chi_weight=None, nu_weight=1.0):
+    """ONE CV-STEM program over every sampled state -- Tsukamoto's actual form.
+
+    The pointwise version (``solve_cm_metric`` called per state) deviates from
+    CV-STEM in two ways that this fixes:
+
+    * ``nu`` (metric SCALE) and ``chi`` (CONDITION NUMBER) are SHARED across all
+      states, as in CV-STEM, instead of being re-optimized per state. Pointwise
+      they are per-state, so ``chi`` bounds nothing globally and the deployed
+      metric field is not the program's optimum.
+    * ``Ẇ`` couples consecutive states as JOINT decision variables:
+      ``Ẇ̄_k = (W̄_k - W̄_{k-1})/dt`` with BOTH free. Pointwise, ``W̄_{k-1}`` was
+      already solved and entered as a CONSTANT, so the optimizer could not trade
+      off against its predecessor -- a greedy relaxation, not the program.
+
+    The LMI is the same one derived from the closed loop
+    ``δẋ = (A - B R⁻¹BᵀM)δx``: requiring ``Ṁ + MA + AᵀM - 2MBR⁻¹BᵀM ⪯ -2λM`` and
+    applying the congruence ``W = M⁻¹`` (so ``WṀW = -Ẇ``) gives
+    ``-Ẇ + AW + WAᵀ + 2λW - 2BR⁻¹Bᵀ ⪯ 0``; substituting ``W = W̄/ν`` and scaling
+    by ``ν`` puts ``ν`` on the Riccati term, which is why it appears there and
+    nowhere else.
+
+    Returns ``(W_list, nu, chi)`` or ``(None, None, None)`` if infeasible.
+    """
+    import cvxpy as cp
+    n = A_seq[0].shape[0]
+    N = len(A_seq)
+    r = float(r_scaler) + 1e-5
+    Id = np.eye(n)
+    nu = cp.Variable(nonneg=True)
+    chi = cp.Variable(nonneg=True)
+    Wb = [cp.Variable((n, n), symmetric=True) for _ in range(N)]
+    cons = [nu <= 1.0 / w_lb, chi <= nu * w_ub]
+    for k in range(N):
+        cons += [Wb[k] >> Id, Wb[k] << chi * Id]
+        A, B = A_seq[k], B_seq[k]
+        S = A @ Wb[k] + Wb[k] @ A.T + 2.0 * lbd * Wb[k] - (2.0 / r) * nu * (B @ B.T)
+        if k not in starts:                      # true one-dt predecessor
+            S = S - (Wb[k] - Wb[k - 1]) / dt     # -Ẇ, both operands FREE
+        cons += [S << -eps * Id]
+    cw = (1.0 / lbd) if chi_weight is None else chi_weight   # Tsukamoto's chi/alpha
+    prob = cp.Problem(cp.Minimize(cw * chi + nu_weight * nu), cons)
+    try:
+        prob.solve(solver=solver)
+    except Exception:  # noqa: BLE001 — an infeasible/failed solve is a signal, not a crash
+        return None, None, None
+    if prob.status not in ("optimal", "optimal_inaccurate") or Wb[0].value is None:
+        return None, None, None
+    scale = float(nu.value)
+    if not np.isfinite(scale) or scale <= 0:
+        return None, None, None
+    Ws = []
+    for k in range(N):
+        M = np.asarray(Wb[k].value, dtype=np.float64)
+        Ws.append(0.5 * (M + M.T) / scale)       # deploy W = W̄/ν
+    return Ws, scale, float(chi.value)
+
+
+def joint_summary(tube, env, *, lbd, w_lb, w_ub, eps, solver, r_scaler, ctl_lo, ctl_hi,
+                  jac_mode, block, num_segments, seg_len, seed=0, use_wdot=True):
+    """``(feasible, actuator_violation_rate, nu, chi, n_states)`` from ONE joint solve.
+
+    Reported instead of ``tube_violation_rates`` so the summary describes the
+    program the search actually gated on. A pointwise re-verification would print
+    numbers from a DIFFERENT (and weaker) program than the one that produced
+    lambda*.
+    """
+    idx, starts = tube_segments(tube, block, num_segments=num_segments,
+                               seg_len=seg_len, seed=seed)
+    xs, urefs, es = tube[1][idx], tube[2][idx], tube[3][idx]
+    A, B = generalized_jacobians(env, xs, urefs, mode=jac_mode)
+    Ws, nu, chi = solve_cm_joint(
+        [A[k] for k in range(len(idx))], [B[k] for k in range(len(idx))], starts,
+        lbd=lbd, w_lb=w_lb, w_ub=w_ub, eps=eps, solver=solver, r_scaler=r_scaler,
+        dt=float(env.dt))
+    if Ws is None:
+        return False, float("nan"), None, None, len(idx)
+    bad = 0
+    for k in range(len(idx)):
+        u, _ = cvstem_control(Ws[k], B[k], es[k], urefs[k], r_scaler)
+        bad += int(np.any((u < ctl_lo - 1e-9) | (u > ctl_hi + 1e-9)))
+    return True, bad / max(len(idx), 1), nu, chi, len(idx)
+
+
+def feasible_tube_joint(tube, env, *, lbd, w_lb, w_ub, eps, solver, r_scaler,
+                        ctl_lo, ctl_hi, jac_mode, block, num_segments, seg_len,
+                        max_violation, check_u=True, seed=0, use_wdot=True):
+    """Feasibility of the JOINT CV-STEM program over contiguous tube segments.
+
+    LMI feasibility is necessarily all-or-nothing here -- one convex program
+    either solves or does not, which is CV-STEM's own semantics. ``max_violation``
+    therefore applies ONLY to the actuator check, which is a post-hoc test on the
+    solved ``K = R⁻¹BᵀM`` and not part of the program.
+
+    Returns ``(ok, None, reason)``.
+    """
+    idx, starts = tube_segments(tube, block, num_segments=num_segments,
+                               seg_len=seg_len, seed=seed)
+    xs, urefs, es = tube[1][idx], tube[2][idx], tube[3][idx]
+    A, B = generalized_jacobians(env, xs, urefs, mode=jac_mode)
+    Ws, _nu, _chi = solve_cm_joint(
+        [A[k] for k in range(len(idx))], [B[k] for k in range(len(idx))], starts,
+        lbd=lbd, w_lb=w_lb, w_ub=w_ub, eps=eps, solver=solver, r_scaler=r_scaler,
+        dt=(float(env.dt) if use_wdot else 0.0) or float(env.dt))
+    if Ws is None:
+        return False, None, SDP_INFEASIBLE
+    if not check_u:
+        return True, None, ""
+    bad = 0
+    for k in range(len(idx)):
+        u, _ = cvstem_control(Ws[k], B[k], es[k], urefs[k], r_scaler)
+        bad += int(np.any((u < ctl_lo - 1e-9) | (u > ctl_hi + 1e-9)))
+    if bad / max(len(idx), 1) > max_violation:
+        return False, None, ACTUATOR_INFEASIBLE
+    return True, None, ""
+
+
 def tube_violation_rates(tube, env, *, lbd, w_lb, w_ub, eps, solver, r_scaler,
                          ctl_lo, ctl_hi, use_wdot, jac_mode, check_u=True,
                          subsample=400, seed=0):
@@ -669,6 +810,14 @@ def main() -> int:
                         "systematically infeasible startup behind mostly-converged "
                         "samples (segway: 10%% over the first 30 steps, 0%% after, 2%% "
                         "overall). Mirrors cvstem_lqr.py's transient tally")
+    p.add_argument("--num-segments", "--num_segments", type=int, default=12,
+                   help="tube mode: CONTIGUOUS segments drawn from the tube per probe. "
+                        "Contiguous because the joint program's Wdot couples sample k to "
+                        "k-1, which is only a material derivative if they are one dt "
+                        "apart on the same rollout")
+    p.add_argument("--seg-len", "--seg_len", type=int, default=15,
+                   help="tube mode: steps per segment. num_segments*seg_len states enter "
+                        "ONE CV-STEM program with shared nu/chi")
     p.add_argument("--subsample", type=int, default=400,
                    help="tube samples verified per (lambda, r) probe. The tube itself is "
                         "generated once and is much larger; this is the per-probe cost "
@@ -776,16 +925,15 @@ def main() -> int:
                           w_lb=env_wlb["w_lb"], w_ub=env_wlb["w_ub"], eps=args.cm_eps,
                           solver=args.solver, ctl_lo=ctl_lo, ctl_hi=ctl_hi,
                           use_wdot=args.wdot, jac_mode=args.jacobian, check_u=check_u,
-                          subsample=args.subsample, seed=args.seed,
-                          max_violation=args.max_violation,
+                          seed=args.seed, max_violation=args.max_violation,
                           block=args.num_trajs * args.num_ics * args.num_noisy,
-                          transient_steps=args.transient_steps)
+                          num_segments=args.num_segments, seg_len=args.seg_len)
         else:
             common = dict(w_lb=env_wlb["w_lb"], w_ub=env_wlb["w_ub"], eps=args.cm_eps,
                           solver=args.solver, ctl_lo=ctl_lo, ctl_hi=ctl_hi, env=env,
                           dt=float(env.dt), use_wdot=args.wdot, jac_mode=args.jacobian,
                           check_u=check_u, xs=xs, es=es, urefs=urefs)
-        _checker = ((lambda **kw: feasible_tube(**kw)) if args.sampling == "tube"
+        _checker = ((lambda **kw: feasible_tube_joint(**kw)) if args.sampling == "tube"
                     else (lambda **kw: feasible_everywhere_cvstem(A, B, **kw)))
         r, why = feasible_with_r_backoff(
             _checker, lbd=lbd, r_scaler=args.r_scaler,
@@ -917,20 +1065,21 @@ def main() -> int:
                  if check_u else ""))
         return 2
     if rho_star is not None:
-        rate_kw = dict(lbd=lo, w_lb=env_wlb["w_lb"], w_ub=env_wlb["w_ub"],
-                       eps=args.cm_eps, solver=args.solver, r_scaler=r_used["r"],
-                       ctl_lo=ctl_lo, ctl_hi=ctl_hi, use_wdot=args.wdot,
-                       jac_mode=args.jacobian, check_u=check_u,
-                       subsample=args.subsample, seed=args.seed)
         block = args.num_trajs * args.num_ics * args.num_noisy
+        ok_j, a_rate, nu_j, chi_j, n_st = joint_summary(
+            tube_box["tube"], env, lbd=lo, w_lb=env_wlb["w_lb"], w_ub=env_wlb["w_ub"],
+            eps=args.cm_eps, solver=args.solver, r_scaler=r_used["r"],
+            ctl_lo=ctl_lo, ctl_hi=ctl_hi, jac_mode=args.jacobian, block=block,
+            num_segments=args.num_segments, seg_len=args.seg_len, seed=args.seed)
         print(f"\n[uniform-lambda] rho* = {rho_star:.4g} of the XE_INIT box, "
-              f"sigma={args.sigma:g}, budget {args.max_violation:.1%}:")
-        for name, sub in (("whole tube", tube_box["tube"]),
-                          (f"transient (first {args.transient_steps} steps)",
-                           transient_slice(tube_box["tube"], block, args.transient_steps))):
-            s_rate, a_rate, n_ck = tube_violation_rates(sub, env, **rate_kw)
-            print(f"    {name:<38} SDP-infeasible {s_rate:6.1%}   "
-                  f"actuator-violating {a_rate:6.1%}   (n={n_ck})")
+              f"sigma={args.sigma:g}: JOINT CV-STEM over {n_st} states "
+              f"({args.num_segments} contiguous segments x {args.seg_len} steps), "
+              f"SHARED nu/chi")
+        print(f"    LMI {'FEASIBLE' if ok_j else 'INFEASIBLE'} (one program, "
+              f"all-or-nothing)   nu={nu_j if nu_j is None else round(nu_j, 3)}   "
+              f"chi={chi_j if chi_j is None else round(chi_j, 2)}")
+        print(f"    actuator-violating {a_rate:.1%} of states "
+              f"(post-hoc on K=R^-1 B^T M; budget {args.max_violation:.1%})")
     print(f"\n[uniform-lambda] RESULT: uniform contraction rate lambda* = {lo:.4f}"
           + (f"  on a tube of rho* = {rho_star:.4g}" if rho_star is not None else "")
           + f"  at r_scaler = {r_used['r']:g}"
@@ -949,9 +1098,10 @@ def main() -> int:
               f"  reachable tube induced by noise sigma={args.sigma:g}, at the measured\n"
               f"  violation rates above (budget --max-violation={args.max_violation:g}).")
     print(f"  NOTE: sampled, not a proof — it holds over the {n_samples} tube points\n"
-          f"  ({args.subsample} verified per probe). Raise "
-          + ("--num-ics/--num-noisy/--horizon/--subsample" if args.sampling == "tube"
-             else "--num-states/--num-controls") + " to tighten it.")
+          + (f"  ({args.num_segments * args.seg_len} entered the joint program per probe). "
+             "Raise --num-segments/--seg-len/--num-ics/--num-noisy/--horizon"
+             if args.sampling == "tube" else
+             "  Raise --num-states/--num-controls") + " to tighten it.")
     return 0
 
 
