@@ -22,9 +22,25 @@ X_MAX = [5.0, math.pi / 3, 1.0, math.pi]
 XREF_INIT_MIN = [0.0, 0, 0.0, 0]
 XREF_INIT_MAX = [0.0, 0, 0.0, 0]
 
-# Initial perturbation to the reference state
-XE_INIT_MIN = [-1.0, -math.pi / 3, -0.5, -math.pi]
-XE_INIT_MAX = [1.0, math.pi / 3, 0.5, math.pi]
+# Initial perturbation to the reference state, i.e. the reset error every
+# algorithm is scored on (define_initial_state: x_0 = xref_0 + xe_0).
+#
+# pitch/pitch_rate are NOT +-pi/3 and +-pi. That box contained initial
+# conditions this plant cannot recover from with its own control box: the
+# segway's open-loop unstable pole is 2.82 rad/s (a 0.35 s tip-over time
+# constant) and u in [-6, 6] buys 12.1 rad/s^2 of pitch authority, so a reset at
+# 60 deg of tilt AND 180 deg/s of pitch rate is already past the point of no
+# return. Measured with an LQR (Q=I, R=0.1I) clipped to the env's own box:
+# 135/256 resets recovered balance at +-pi/3, +-pi -- i.e. nearly half of every
+# algorithm's episodes were unrecoverable at t=0, which is noise in the mean of
+# every Stability/* metric, not a difficulty setting.
+#
+# +-pi/12 (15 deg) and +-pi/12 (15 deg/s) is the largest box measured to give
+# 256/256 recovery, and it also drops peak |u| demand from 84.4 to 17.3.
+# pos/vel stay at full range: they only enter the position error, which cannot
+# tip the plant over.
+XE_INIT_MIN = [-1.0, -math.pi / 12, -0.5, -math.pi / 12]
+XE_INIT_MAX = [1.0, math.pi / 12, 0.5, math.pi / 12]
 
 # initial reference state perturbation bounds for c3m
 lim = 1.0

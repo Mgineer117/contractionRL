@@ -121,8 +121,14 @@ cm:
   w_lb: 0.01  # Lower eigenvalue bound for the metric M(x). NOT 0.1: the CV-STEM SDP
               # normalizes W and caps nu <= 1/w_lb, and at 0.1 that cap alone makes
               # segway 0% feasible at every lambda (measured 0/32 -> 32/32 at 0.01).
-  lbd: 0.1    # Contraction rate λ — used by cmg_method's synthesis loss (CM SDP LMI for
-              # "cvstem", CMG Cu/C1 loss for "ccm")
+  lbd: 0.984  # Contraction rate λ — used by cmg_method's synthesis loss (CM SDP LMI for
+              # "cvstem", CMG Cu/C1 loss for "ccm").
+              # Measured by scripts/find_uniform_lambda.py on the closed-loop tube
+              # (n=1 ref x m=8 ICs x p=4 noisy rollouts, sigma=1.0 = the policy's own
+              # initial_log_std, horizon=200): feasible at rho=1, i.e. over the WHOLE
+              # XE_INIT box, with 0% SDP-infeasible and 0% actuator-violating on both
+              # the whole tube and its transient. n=1 is deliberate: segway's reference
+              # is identically zero (see the env's freqs=[]), so extra refs are copies.
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled)
   # SDP contraction metric (cm_eps used by both cmg_method paths; cm_solver "cvstem" only)
@@ -147,7 +153,12 @@ cm:
   #              Control is penalized via this Riccati term, not bounded over an
   #              action range — see ncm_synthesis.py module docstring.
   cmg_method: cvstem
-  cvstem_r_scaler: 0.01  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only
+  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only.
+  # NOT 0.01: that implied K = (1/r)BᵀW⁻¹ with |u| ~ 1000 against segway's ±6 box,
+  # i.e. bang-bang saturation rather than a realizable certified gain — the same
+  # invalidity found on the car. 0.25 is what find_uniform_lambda's r ladder
+  # actually certified at lbd above. r ≥ 2 makes the LMI infeasible on segway.
+  cvstem_r_scaler: 0.25
   # On SDP infeasibility AT A GIVEN STATE, retry that state alone with λ
   # halved, up to this many times, before giving up on it and dropping it from
   # the dataset — 0 disables this and reverts to dropping immediately. Warns
