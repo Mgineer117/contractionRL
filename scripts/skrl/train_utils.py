@@ -288,22 +288,33 @@ def normalize_agent_cfg(agent_cfg: dict, *, algorithm: str) -> dict:
     # Legacy annealing spellings — superseded by the backbone-driven decision
     # below, but still present in older configs, and skrl's PPO_CFG/SAC_CFG
     # would reject them as unknown fields.
-    for key in ("anneal_stddev", "anneal_log_std", "std_dev_annealing"):
+    for key in ("anneal_stddev", "anneal_log_std"):
         a.pop(key, None)
+    # std_dev_annealing/_kwargs follow the reward_euclidean rule below: skrl's
+    # PPO_CFG/SAC_CFG reject them, but C2RL builds its sub-agent from this SAME
+    # dict via rl_glue.make_base_rl_cfg and reads both off C2RLPPOCfg. Popping
+    # unconditionally made them invisible to C2RL, which then fell back to the
+    # dataclass/patch DEFAULTS: `std_dev_annealing: true` (so
+    # `--std_dev_annealing false` did nothing) and kwargs=None (so the yaml
+    # schedule was ignored and log_std annealed LINEARLY to -2.0, sigma~=0.135,
+    # instead of exponentially to the configured final_log_std).
     # reward_euclidean/reward_level are env-side switches (applied straight to
     # the raw env in train.py's standalone branch — see _apply_agent_overrides'
     # caller), not real PPO_CFG/SAC_CFG fields. C2RL reads them off its own
     # dataclass instead (c2rl.py), so only pop for the two skrl-native algos —
     # left in place they'd raise the same "unexpected keyword argument" crash
     # the `models` dotted-path bug did.
+    std_kwargs = a.get("std_dev_annealing_kwargs")
     if algorithm in ("ppo", "sac"):
         a.pop("reward_euclidean", None)
         a.pop("reward_level", None)
+        a.pop("std_dev_annealing", None)
+        a.pop("std_dev_annealing_kwargs", None)
     return {
         "std_dev_annealing": (
             agent_cfg.get("models", {}).get("policy", {}).get("backbone") in CONTROL_BACKBONES
         ),
-        "std_dev_annealing_kwargs": a.pop("std_dev_annealing_kwargs", None),
+        "std_dev_annealing_kwargs": std_kwargs,
     }
 
 

@@ -90,6 +90,11 @@ parser.add_argument("--wandb_project", "--wandb-project", type=str, default="con
                     help="W&B project name.")
 parser.add_argument("--wandb_run_name", "--wandb-run-name", type=str, default=None,
                     help="W&B run name.")
+parser.add_argument("--wandb_batch", "--wandb-batch", type=str, default=None,
+                    help="Free-text label grouping this launch, recorded to wandb.config as "
+                         "`run_batch` so one relaunch is filterable/groupable apart from the "
+                         "previous one. Defaults to the run date (YYYY-MM-DD), which already "
+                         "separates today's runs from yesterday's with no flag.")
 
 # Isaac Sim-specific
 parser.add_argument("--video", action="store_true", default=False,
@@ -603,6 +608,14 @@ if _is_classic:
         # Consistent run name: CLI override > YAML-provided name > deterministic
         # default that matches the local log directory (logs/classic/<algo>/<ts>).
         _wkw["name"] = args_cli.wandb_run_name or _wkw.get("name") or f"classic_{algorithm}_{_run_ts}"
+        # wandb.run.name is NOT a config key, so it can't be filtered/grouped on
+        # in the runs table — mirror it into the config, alongside a batch label
+        # that defaults to the run date so a relaunch is separable from the
+        # previous day's runs without passing anything.
+        _wkw.setdefault("config", {}).update({
+            "run_name": _wkw["name"],
+            "run_batch": args_cli.wandb_batch or _run_ts.split("_")[0],
+        })
 
         # A sweep must init EARLY: its sampled hyperparameters only exist on
         # wandb.config once the run is live, and they have to reach agent_cfg
@@ -935,6 +948,11 @@ else:
         # default that matches the local experiment_name (tensorboard dir), so
         # every W&B run can be correlated with its local log directory.
         _wkw["name"] = args_cli.wandb_run_name or _wkw.get("name") or agent_cfg["agent"]["experiment"]["experiment_name"]
+        # See the classic branch: run.name isn't filterable, run_batch is.
+        _wkw.setdefault("config", {}).update({
+            "run_name": _wkw["name"],
+            "run_batch": args_cli.wandb_batch or datetime.now().strftime("%Y-%m-%d"),
+        })
 
         dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
         dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)

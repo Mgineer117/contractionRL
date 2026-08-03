@@ -60,10 +60,10 @@ agent:
   learning_rate: 1.0e-6   # Global step size for neural network optimization
   learning_rate_scheduler: KLAdaptiveLR # matches the standalone PPO baseline for this env
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.01
+    kl_threshold: 0.008
   std_dev_annealing_kwargs:
     schedule: exponential
-    final_log_std: -4.6
+    final_log_std: -6.9
     power: 2.0
   random_timesteps: 0
   learning_starts: 0

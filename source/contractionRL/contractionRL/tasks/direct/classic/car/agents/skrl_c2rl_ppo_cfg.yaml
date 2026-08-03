@@ -10,8 +10,11 @@ models:
     encoder_stride: 3
     clip_actions: false
     clip_log_std: true
-    # -6.9 = log(0.001), the SAME floor the annealing path uses
-    # (nn_modules._MIN_LOG_STD). Matters when std_dev_annealing is false: with a
+    # -6.9 = log(0.001), matching std_dev_annealing_kwargs.final_log_std below
+    # so the clamp never truncates the schedule. (nn_modules._MIN_LOG_STD is the
+    # same number but belongs to CLActor.anneal_stddev, a path C2RL never takes:
+    # train.py only installs it when the runner's agent exposes `.policy`, and
+    # C2RLAgent does not.) Matters when std_dev_annealing is false: with a
     # LEARNED log_std and entropy_loss_scale 0.0, PPO shrinks sigma monotonically,
     # and skrl's -20 default lets it reach ~2e-9 — a numerically degenerate
     # log_prob and zero exploration for the rest of the run.
@@ -67,7 +70,7 @@ agent:
   learning_rate: 1.0e-6   # Global step size for neural network optimization
   learning_rate_scheduler: KLAdaptiveLR # matches the standalone PPO baseline for this env
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.01   # TARGET KL the scheduler steers toward (not the early-stop)
+    kl_threshold: 0.008   # TARGET KL the scheduler steers toward (not the early-stop)
     max_lr: 1.0e-3       # ceiling; learning_rate above is the floor it climbs from
   # false -> PPO LEARNS log_std through the policy loss (stock-PPO behavior) and
   # the schedule below is ignored; true -> log_std is frozen and driven by the
@@ -75,7 +78,7 @@ agent:
   std_dev_annealing: true
   std_dev_annealing_kwargs:
     schedule: exponential
-    final_log_std: -4.6
+    final_log_std: -6.9
     power: 2.0
   random_timesteps: 0
   learning_starts: 0
@@ -86,7 +89,7 @@ agent:
   value_loss_scale: 0.5  # Weight coefficient for the value function loss term
   # HARD early-stop: skrl's PPO breaks out of the epoch when a minibatch's KL
   # exceeds this (ppo.py: `if self.cfg.kl_threshold and kl_divergence > ...`).
-  # 2x the scheduler's TARGET (learning_rate_scheduler_kwargs.kl_threshold=0.01),
+  # 2.5x the scheduler's TARGET (learning_rate_scheduler_kwargs.kl_threshold=0.008),
   # so the scheduler has room to pull the LR down before the hard stop fires; it
   # also coincides with KLAdaptiveLR's own decrease trigger (kl_factor=2).
   kl_threshold: 0.02
