@@ -41,10 +41,15 @@ Two differences from ``build_cm_dataset`` are deliberate:
 * States and controls are drawn UNIFORMLY from the env's own ``[X_MIN, X_MAX]``
   and ``[U_MIN, U_MAX]`` boxes, not from rollouts. A uniform claim has to be
   tested on the whole box, not on the on-policy tube.
-* The LMI uses the GENERALIZED Jacobian ``A(x,u) = df/dx + sum_k u_k dB_k/dx``.
-  With the drift-only Jacobian the control never enters the LMI at all, so
-  sampling ``u`` would be pure waste and the certificate would ignore exactly
-  the term that makes a control-affine system's contraction rate u-dependent.
+* ``--jacobian`` selects which ``A`` enters the LMI. DEFAULT ``drift``
+  (``A = df/dx``) matches what ``build_cm_dataset`` actually solves and what
+  this repo's CV-STEM docstring specifies (control enters ONLY through the
+  Riccati penalty on ``B``), so the answer transfers to real synthesis. Note
+  that under ``drift`` the control does NOT enter the LMI, so the m control
+  samples per state have no effect on lambda*. ``generalized``
+  (``+ sum_k u_k dB_k/dx``) is the differential Jacobian a u-dependent rate
+  would need, but it is NOT the program this repo solves -- its lambda* does
+  not transfer.
 
 Sampling is ``n`` states x ``m`` controls = ``n*m`` LMI points.
 ``--u-mode uniform`` (default) draws the ``m`` controls INDEPENDENTLY for each
@@ -86,7 +91,7 @@ def _boxes(env):
     return x_lo, x_hi, u_lo, u_hi
 
 
-def generalized_jacobians(env, x_np, u_np, device="cpu"):
+def generalized_jacobians(env, x_np, u_np, device="cpu", mode="generalized"):
     """``A(x,u) = df/dx + sum_k u_k dB_k/dx`` and ``B(x)`` for each sample.
 
     Returns ``(A, B)`` with shapes ``(n, x_dim, x_dim)`` and ``(n, x_dim, u_dim)``.
@@ -96,9 +101,17 @@ def generalized_jacobians(env, x_np, u_np, device="cpu"):
         f, B, _ = env.get_f_and_B(x)
         DfDx = jacobian(f, x, create_graph=False)                    # (n, x, x)
         DBDx = b_jacobian(B, x, B.shape[-1], create_graph=False)     # (n, x, x, u)
-    u = torch.as_tensor(u_np, dtype=torch.float32, device=device)
-    # sum_k u_k * dB_k/dx — the term the drift-only Jacobian drops.
-    A = DfDx + torch.einsum("nxyu,nu->nxy", DBDx, u)
+    if mode == "drift":
+        # EXACTLY what build_cm_dataset feeds the LMI (ncm_synthesis.py: DfDx =
+        # jacobian(f, x)). Tsukamoto's CV-STEM as implemented here uses the DRIFT
+        # Jacobian; control enters only through the Riccati penalty on B. Use
+        # this when the answer must transfer to actual synthesis -- note u then
+        # does not enter the LMI at all, so sampling it changes nothing.
+        A = DfDx
+    else:
+        # sum_k u_k * dB_k/dx — the term the drift-only Jacobian drops.
+        u = torch.as_tensor(u_np, dtype=torch.float32, device=device)
+        A = DfDx + torch.einsum("nxyu,nu->nxy", DBDx, u)
     return (A.detach().cpu().numpy().astype(np.float64),
             B.detach().cpu().numpy().astype(np.float64))
 
@@ -251,6 +264,12 @@ def main() -> int:
                    help="if infeasible, widen the envelope (w_lb /= step, w_ub *= step) "
                         "up to --max-envelope-steps times until a lambda exists")
     p.add_argument("--max-envelope-steps", "--max_envelope_steps", type=int, default=6)
+    p.add_argument("--jacobian", choices=("drift", "generalized"), default="drift",
+                   help="drift: A = df/dx, EXACTLY what build_cm_dataset solves, so the "
+                        "answer transfers to synthesis (u does not enter the LMI). "
+                        "generalized: A = df/dx + sum_k u_k dB_k/dx -- physically the "
+                        "right differential Jacobian, but NOT the program this repo "
+                        "(or the CV-STEM reference) actually solves")
     p.add_argument("--lbd-max", "--lbd_max", type=float, default=4.0)
     p.add_argument("--tol", type=float, default=0.01, help="bisection tolerance on lambda")
     p.add_argument("--seed", type=int, default=0)
@@ -310,10 +329,10 @@ def main() -> int:
         print("[uniform-lambda] Wdot OFF (--no-wdot): static LMI, the material "
               "derivative is dropped — lambda* will be optimistic")
 
-    A, B = generalized_jacobians(env, xs, us)
+    A, B = generalized_jacobians(env, xs, us, mode=args.jacobian)
     A_next = B_next = None
     if xs_next is not None:
-        A_next, B_next = generalized_jacobians(env, xs_next, us)
+        A_next, B_next = generalized_jacobians(env, xs_next, us, mode=args.jacobian)
 
     # Actuator feasibility. The certified gain is K = (1/r)·B^T·W^-1 and the
     # applied control is uref + K·e, so a metric is only usable if the FEEDBACK
