@@ -82,6 +82,25 @@ from contractionRL.agents.skrl.math_utils import b_jacobian, jacobian  # noqa: E
 from contractionRL.agents.skrl.ncm_synthesis import solve_cm_metric  # noqa: E402
 
 
+def expand_2x(lo, hi):
+    """The control box as a 2x expansion of the reference box, SIGN-AWARE.
+
+    "2x" means each bound moves twice as far FROM ZERO, which is a plain
+    doubling only when the bound already points away from zero:
+
+        lower bound < 0 -> 2*lo   (more negative = wider)
+        lower bound > 0 -> lo/2   (closer to zero = wider; 2*lo would SHRINK it)
+        upper bound > 0 -> 2*hi
+        upper bound < 0 -> hi/2
+
+    Multiplying every bound by 2 would narrow the box from any side whose bound
+    sits on the far side of zero (a positive lower bound, a negative upper one),
+    i.e. silently tighten the actuator budget instead of widening it.
+    """
+    lo, hi = np.asarray(lo, dtype=np.float64), np.asarray(hi, dtype=np.float64)
+    return np.where(lo < 0, 2.0 * lo, lo / 2.0), np.where(hi > 0, 2.0 * hi, hi / 2.0)
+
+
 def _boxes(env):
     """The env's own state/control boxes as numpy, whatever it calls them."""
     x_lo = env.X_MIN.detach().cpu().numpy()
@@ -343,12 +362,21 @@ def main() -> int:
         env.XE_MAX.detach().cpu().numpy()))
     check_u = not args.no_actuator_check
     if args.feedback_budget:
-        # Worst case over uref: lo = U_MIN - UREF_MIN, hi = U_MAX - UREF_MAX.
-        # Checking against the FULL control box instead would be 2x too lenient
-        # wherever UREF spans half of U (car, cartpole, quadrotor all do).
+        # The control box is the SIGN-AWARE 2x expansion of the reference box
+        # (see expand_2x). Derive it rather than trusting U_MIN/U_MAX, and warn
+        # if the env disagrees -- a mismatch means the budget below is wrong.
         ur_lo = env.UREF_MIN.detach().cpu().numpy()
         ur_hi = env.UREF_MAX.detach().cpu().numpy()
-        fb_lo, fb_hi = u_lo - ur_lo, u_hi - ur_hi
+        ctl_lo, ctl_hi = expand_2x(ur_lo, ur_hi)
+        if not (np.allclose(ctl_lo, u_lo, atol=1e-6) and np.allclose(ctl_hi, u_hi, atol=1e-6)):
+            print(f"[uniform-lambda] WARNING: env's control box "
+                  f"[{np.round(u_lo, 3)}, {np.round(u_hi, 3)}] != the 2x expansion of "
+                  f"UREF [{np.round(ctl_lo, 3)}, {np.round(ctl_hi, 3)}]; using the "
+                  f"expansion for the feedback budget.")
+        # u = uref + K·e must stay in the control box FOR EVERY uref, so the
+        # budget is the worst case over uref: lo = ctl_lo - UREF_MIN (uref at its
+        # smallest leaves the least room below), hi = ctl_hi - UREF_MAX.
+        fb_lo, fb_hi = ctl_lo - ur_lo, ctl_hi - ur_hi
     else:
         fb_lo, fb_hi = u_lo, u_hi
     if check_u:
