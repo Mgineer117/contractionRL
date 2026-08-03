@@ -33,9 +33,20 @@ full ``(num_envs, T)`` error tensor:
                              spread of how bad the worst moment gets. Only
                              from :class:`StatManagerEnvWrapper`.
 
+``auc`` additionally reports ORDER STATISTICS across the env population —
+``auc_median``/``auc_p05``/``auc_p25``/``auc_p75``/``auc_p95``/``auc_max``.
+``auc_mean`` alone cannot separate "the whole population got worse" from "two
+envs blew up": these envs never terminate, so a diverged env is PINNED at the
+position bound (``env_base.step``) while its reference drives away, and its
+error — hence its AUC — grows for the remainder of the episode. One such env
+lands orders of magnitude above a healthy ``~1.2``, which makes the mean a
+de-facto COUNT of blow-ups over the ``num_envs_for_eval`` slots. A flat median
+under a thrashing mean is precisely that signature, and says the instability is
+a rare-failure-rate problem rather than a degradation of typical tracking.
+
 Each per-env quantity is reduced across the env population to a mean and a 95%
 CI half-width (``1.96·SEM``, see :func:`mean_confidence_interval`); ``peak``
-is the exception, reported as mean/median/p95 instead of mean/CI95.
+and the ``auc`` percentiles above are the exceptions.
 
 Action volatility (see :meth:`StatManagerEnvWrapper._action_volatility_summary`)
 is a separate smoothness diagnostic on the action stream, not a stability/
@@ -220,6 +231,12 @@ class StatManagerEnvWrapper:
         self._recent_score_mean: float = 0.0
         self._recent_score_ci95: float = 0.0
         self._recent_peak_mean: float = 0.0
+        self._recent_auc_median: float = 1e2
+        self._recent_auc_p05: float = 1e2
+        self._recent_auc_p25: float = 1e2
+        self._recent_auc_p75: float = 1e2
+        self._recent_auc_p95: float = 1e2
+        self._recent_auc_max: float = 1e2
         self._recent_peak_median: float = 0.0
         self._recent_peak_p95: float = 0.0
 
@@ -234,6 +251,12 @@ class StatManagerEnvWrapper:
         self._recent_maha_score_mean: float = 0.0
         self._recent_maha_score_ci95: float = 0.0
         self._recent_maha_peak_mean: float = 0.0
+        self._recent_maha_auc_median: float = 1e2
+        self._recent_maha_auc_p05: float = 1e2
+        self._recent_maha_auc_p25: float = 1e2
+        self._recent_maha_auc_p75: float = 1e2
+        self._recent_maha_auc_p95: float = 1e2
+        self._recent_maha_auc_max: float = 1e2
         self._recent_maha_peak_median: float = 0.0
         self._recent_maha_peak_p95: float = 0.0
         # Bumped each time a full eval buffer is reduced to metrics — lets
@@ -374,6 +397,20 @@ class StatManagerEnvWrapper:
         # 1. AUC per env (trapezoid over the true per-slot time base)
         dt_array = self._time_buffer[:, 1:] - self._time_buffer[:, :-1]
         auc_vec = torch.sum(dt_array * 0.5 * (errs[:, :-1] + errs[:, 1:]), dim=1)
+        # Order statistics of the per-env AUC. auc_mean alone cannot distinguish
+        # "the whole population got worse" from "a couple of envs blew up": with
+        # non-terminating envs a diverged one is PINNED at the position bound
+        # (env_base.step) and its error grows for the rest of the episode, so its
+        # AUC lands orders of magnitude above a healthy ~1.2 and the mean becomes
+        # a de-facto count of blow-ups. A flat median against a thrashing mean is
+        # exactly that signature.
+        auc_np = auc_vec.detach().cpu().numpy()
+        auc_median = float(np.median(auc_np))
+        auc_p05 = float(np.percentile(auc_np, 5))
+        auc_p25 = float(np.percentile(auc_np, 25))
+        auc_p75 = float(np.percentile(auc_np, 75))
+        auc_p95 = float(np.percentile(auc_np, 95))
+        auc_max = float(np.max(auc_np))
 
         # 2. Find curve with highest overshoot
         max_overshoots = torch.max(errs, dim=1).values
@@ -444,6 +481,8 @@ class StatManagerEnvWrapper:
             "score_mean": float(score_m), "score_ci95": float(score_ci),
             "C": float(best_C.item()),
             "peak_mean": peak_mean, "peak_median": peak_median, "peak_p95": peak_p95,
+            "auc_median": auc_median, "auc_p05": auc_p05, "auc_p25": auc_p25,
+            "auc_p75": auc_p75, "auc_p95": auc_p95, "auc_max": auc_max,
         }
 
     def _compute_batched_metrics(self):
@@ -462,6 +501,12 @@ class StatManagerEnvWrapper:
         self._recent_score_ci95 = m["score_ci95"]
         self._recent_C = m["C"]
         self._recent_peak_mean = m["peak_mean"]
+        self._recent_auc_median = m["auc_median"]
+        self._recent_auc_p05 = m["auc_p05"]
+        self._recent_auc_p25 = m["auc_p25"]
+        self._recent_auc_p75 = m["auc_p75"]
+        self._recent_auc_p95 = m["auc_p95"]
+        self._recent_auc_max = m["auc_max"]
         self._recent_peak_median = m["peak_median"]
         self._recent_peak_p95 = m["peak_p95"]
 
@@ -481,6 +526,12 @@ class StatManagerEnvWrapper:
             self._recent_maha_score_ci95 = mm["score_ci95"]
             self._recent_maha_C = mm["C"]
             self._recent_maha_peak_mean = mm["peak_mean"]
+            self._recent_maha_auc_median = mm["auc_median"]
+            self._recent_maha_auc_p05 = mm["auc_p05"]
+            self._recent_maha_auc_p25 = mm["auc_p25"]
+            self._recent_maha_auc_p75 = mm["auc_p75"]
+            self._recent_maha_auc_p95 = mm["auc_p95"]
+            self._recent_maha_auc_max = mm["auc_max"]
             self._recent_maha_peak_median = mm["peak_median"]
             self._recent_maha_peak_p95 = mm["peak_p95"]
 
@@ -853,6 +904,12 @@ class StatManagerEnvWrapper:
             "contraction_score_mean": self._recent_score_mean,
             "contraction_score_ci95": self._recent_score_ci95,
             "peak_mean": self._recent_peak_mean,
+            "auc_median": self._recent_auc_median,
+            "auc_p05": self._recent_auc_p05,
+            "auc_p25": self._recent_auc_p25,
+            "auc_p75": self._recent_auc_p75,
+            "auc_p95": self._recent_auc_p95,
+            "auc_max": self._recent_auc_max,
             "peak_median": self._recent_peak_median,
             "peak_p95": self._recent_peak_p95,
         }
@@ -878,6 +935,12 @@ class StatManagerEnvWrapper:
             "contraction_score_mean": self._recent_maha_score_mean,
             "contraction_score_ci95": self._recent_maha_score_ci95,
             "peak_mean": self._recent_maha_peak_mean,
+            "auc_median": self._recent_maha_auc_median,
+            "auc_p05": self._recent_maha_auc_p05,
+            "auc_p25": self._recent_maha_auc_p25,
+            "auc_p75": self._recent_maha_auc_p75,
+            "auc_p95": self._recent_maha_auc_p95,
+            "auc_max": self._recent_maha_auc_max,
             "peak_median": self._recent_maha_peak_median,
             "peak_p95": self._recent_maha_peak_p95,
         }

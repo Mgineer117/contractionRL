@@ -335,13 +335,17 @@ class CLActorModel(GaussianMixin, Model):
         encoder: str = "mlp",
         encoder_hidden: int = 64,
         encoder_stride: int = 1,
+        anneal_stddev: bool = True,
         **kwargs,
     ):
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
         GaussianMixin.__init__(self, clip_actions=clip_actions, clip_log_std=clip_log_std,
                                min_log_std=min_log_std, max_log_std=max_log_std)
+        # anneal_stddev=False -> logstd is a LEARNED parameter (requires_grad=True)
+        # and CLActor.anneal_stddev() becomes inert, so nothing overwrites what
+        # the policy gradient learns. True (default) is the frozen/scheduled path.
         self.cl_actor = _build_cl_actor(observation_space, action_space, x_dim, angle_idx, sym,
-                                        hidden_dim, activation, True,
+                                        hidden_dim, activation, anneal_stddev,
                                         encoder, encoder_hidden, encoder_stride)
         self.log_std_parameter = self.cl_actor.logstd
 

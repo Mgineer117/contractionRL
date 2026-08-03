@@ -10,7 +10,12 @@ models:
     encoder_stride: 3
     clip_actions: false
     clip_log_std: true
-    min_log_std: -20.0
+    # -6.9 = log(0.001), the SAME floor the annealing path uses
+    # (nn_modules._MIN_LOG_STD). Matters when std_dev_annealing is false: with a
+    # LEARNED log_std and entropy_loss_scale 0.0, PPO shrinks sigma monotonically,
+    # and skrl's -20 default lets it reach ~2e-9 — a numerically degenerate
+    # log_prob and zero exploration for the rest of the run.
+    min_log_std: -6.9
     max_log_std: 2.0
     network:
     - name: net

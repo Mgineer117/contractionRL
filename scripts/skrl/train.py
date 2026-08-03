@@ -420,6 +420,14 @@ def _apply_agent_overrides(agent_cfg, args):
         val = getattr(args, key, None)
         if val is not None:
             a[key] = (str(val).lower() == "true")
+    # One switch, two places: the agent flag controls the annealing PATCH, while
+    # the CLActor must also be BUILT with a learnable logstd. Setting only the
+    # former leaves self.anneal=True on the model, so CLActor.anneal_stddev()
+    # would still overwrite whatever the policy gradient learned.
+    if getattr(args, "std_dev_annealing", None) is not None:
+        _pol = agent_cfg.get("models", {}).get("policy")
+        if isinstance(_pol, dict):
+            _pol["anneal_stddev"] = a["std_dev_annealing"]
     if args.memory_size is not None:
         agent_cfg["memory"]["memory_size"] = args.memory_size
     if getattr(args, "cvstem_residual_base", None):
