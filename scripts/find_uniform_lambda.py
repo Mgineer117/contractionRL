@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import math
 import os
 import sys
 
@@ -145,27 +146,45 @@ def feasible_everywhere(A, B, *, lbd, w_lb, w_ub, eps, solver, r_scaler,
 
 def feasible_with_r_backoff(A, B, *, lbd, r_scaler, max_r_steps, step_factor=1.5,
                             log=print, **kw):
-    """Smallest ``r_scaler`` in ``{r, r*s, r*s^2, ...}`` making EVERY sample feasible.
+    """An ``r_scaler`` on the ladder ``r0 * s^k``, k in [-N, N], feasible EVERYWHERE.
 
-    r must be uniform across the box (it defines one metric family), so this
-    searches for a single r that works everywhere rather than letting each state
-    pick its own. Returns ``(r_used, None)`` on success, ``(None, reason)`` on
-    failure. An SDP-infeasible verdict aborts immediately: growing r only
-    removes control authority, so it cannot recover.
+    r is searched in BOTH directions because the two constraints push opposite
+    ways, and neither bound alone defines the answer:
+
+    * SDP infeasible      -> r must SHRINK. Smaller r enlarges the ``B R^-1 B^T``
+      term, i.e. adds control authority, which is what makes the LMI solvable.
+    * actuator saturated   -> r must GROW. Larger r shrinks ``K = (1/r) B^T W^-1``,
+      pulling the feedback back inside the control box.
+
+    So feasibility in r is a BAND: too small saturates the actuator, too large
+    kills the LMI. Growing only (the earlier behaviour) reported envs as
+    infeasible whenever their band lay BELOW the starting r -- cartpole, segway
+    and quadrotor all did at w_lb=0.1.
+
+    r must be uniform across the box (it defines one metric family), so a single
+    r has to work at every sample. Returns ``(r_used, None)`` or ``(None, reason)``.
     """
-    r = r_scaler
-    for k in range(max_r_steps + 1):
+    # Ascending ladder: low r first (LMI-friendly), high r last (actuator-friendly).
+    ladder = sorted({r_scaler * (step_factor ** k)
+                     for k in range(-max_r_steps, max_r_steps + 1)})
+    saw_sdp = saw_act = False
+    for r in ladder:
         ok, bad, reason = feasible_everywhere(A, B, lbd=lbd, r_scaler=r, **kw)
         if ok:
-            if k:
+            if r != r_scaler:
                 log(f"      r_scaler {r_scaler:g} -> {r:g} "
-                    f"(x{step_factor:g} {k} time(s)) to clear the actuator box")
+                    f"(x{step_factor:g}^{round(math.log(r / r_scaler, step_factor))})")
             return r, None
-        if reason == SDP_INFEASIBLE:
-            return None, f"SDP infeasible at sample {bad} (r={r:g}); raising r cannot help"
-        r *= step_factor
-    return None, (f"actuator box still saturated after {max_r_steps} x{step_factor:g} "
-                  f"steps (r={r / step_factor:g})")
+        saw_sdp |= reason == SDP_INFEASIBLE
+        saw_act |= reason == ACTUATOR_INFEASIBLE
+    span = f"[{ladder[0]:.4g}, {ladder[-1]:.4g}]"
+    if saw_sdp and saw_act:
+        why = "no r works: small r saturates the actuator, large r kills the LMI"
+    elif saw_sdp:
+        why = "SDP infeasible across the whole r ladder (envelope too tight)"
+    else:
+        why = "actuator saturated across the whole r ladder"
+    return None, f"{why} over r in {span}"
 
 
 def main() -> int:
