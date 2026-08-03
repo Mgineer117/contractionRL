@@ -211,6 +211,11 @@ _ov.add_argument("--use_value_norm", "--use-value-norm", "--ppo_use_value_norm",
 # "false" makes PPO LEARN log_std through the policy loss instead of following
 # the fixed std_dev_annealing_kwargs schedule (C2RL-PPO only; see C2RLPPOCfg).
 _ov.add_argument("--std_dev_annealing", "--std-dev-annealing", type=str, default=None)
+# Train on a FIXED set of num_envs reference trajectories (one minted per env
+# slot on its first reset) instead of drawing a fresh one every episode. The
+# initial error stays random — this fixes the task, not the initial condition.
+_ov.add_argument("--fix_ref_trajectories", "--fix-ref-trajectories",
+                 action="store_true", default=False)
 # SAC.
 _ov.add_argument("--batch_size", "--batch-size", "--sac_batch_size", "--sac-batch-size",
                  type=int, default=None)
@@ -668,6 +673,12 @@ if _is_classic:
                   f"offset={args_cli.ref_offset})")
         raw_env.unwrapped.configure_ref_window(
             length=_len, offset=args_cli.ref_offset, gamma=_gamma)
+
+    if getattr(args_cli, "fix_ref_trajectories", False):
+        if not hasattr(raw_env.unwrapped, "set_fix_ref_trajectories"):
+            raise SystemExit("--fix_ref_trajectories requires a path-tracking env (got "
+                             f"{type(raw_env.unwrapped).__name__})")
+        raw_env.unwrapped.set_fix_ref_trajectories(True)
 
     # O6 analytic-potential critic — see --critic_analytic_potential.
     if getattr(args_cli, "critic_analytic_potential", False):

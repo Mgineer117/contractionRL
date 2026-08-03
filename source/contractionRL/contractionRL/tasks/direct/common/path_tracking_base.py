@@ -151,6 +151,9 @@ class PathTrackingBase(DirectRLEnv):
 
         n = self.num_envs
         self._traj_ids = torch.zeros(n, dtype=torch.long, device=self.device)
+        # See set_fix_ref_trajectories. Off by default: every reset redraws.
+        self.fix_ref_trajectories = False
+        self._ref_fixed = torch.zeros(n, dtype=torch.bool, device=self.device)
         self._x_ref = torch.zeros(n, self._traj_buf.state_dim, device=self.device)
         self._u_ref = torch.zeros(n, self._traj_buf.action_dim, device=self.device)
         self._actions = torch.zeros(n, self.action_space.shape[0], device=self.device)
@@ -495,6 +498,24 @@ class PathTrackingBase(DirectRLEnv):
         """
         return torch.norm(wrap_diff(self._get_physical_state() - self._x_ref, self.angle_idx), dim=-1)
 
+    def set_fix_ref_trajectories(self, flag: bool) -> None:
+        """Freeze (or unfreeze) the per-env reference trajectories.
+
+        The classic twin is ``BaseEnv.set_fix_ref_trajectories``; both exist so
+        the training entry point can set this uniformly (see
+        tests/test_isaac_parity.py). Isaac references come from a fixed dataset,
+        so "fixing" here means pinning each env slot to ONE sampled traj id for
+        the whole run rather than redrawing every episode. Turning it ON clears
+        the assignment so the next reset re-mints it.
+        """
+        self.fix_ref_trajectories = bool(flag)
+        if not hasattr(self, "_ref_fixed"):
+            self._ref_fixed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._ref_fixed[:] = False
+        print(f"[PathTrackingBase] fix_ref_trajectories={self.fix_ref_trajectories}"
+              + (f" ({self.num_envs} fixed reference trajectories)"
+                 if self.fix_ref_trajectories else " (resampled every episode)"))
+
     def get_reference_trajectory(self) -> torch.Tensor:
         """WHOLE reference path per env: ``(num_envs, T, x_dim)``.
 
@@ -761,8 +782,17 @@ class PathTrackingBase(DirectRLEnv):
         self._episode_steps[env_ids] = 0
         self._episode_reward[env_ids] = 0.0
 
-        # sample reference trajectories
-        self._traj_ids[env_ids] = self._traj_buf.sample_traj_ids(len(env_ids))
+        # sample reference trajectories — unless fix_ref_trajectories pinned a
+        # permanent one per env slot on its first reset (see
+        # set_fix_ref_trajectories); then only the not-yet-assigned slots draw.
+        if getattr(self, "fix_ref_trajectories", False):
+            fresh = ~self._ref_fixed[env_ids]
+            if bool(fresh.any()):
+                new_ids = env_ids[fresh]
+                self._traj_ids[new_ids] = self._traj_buf.sample_traj_ids(len(new_ids))
+                self._ref_fixed[new_ids] = True
+        else:
+            self._traj_ids[env_ids] = self._traj_buf.sample_traj_ids(len(env_ids))
 
         # initialise robot to match x_ref at step 0
         x_ref_init = self._traj_buf.initial_state(self._traj_ids[env_ids])  # (n, state_dim)
