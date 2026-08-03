@@ -7,8 +7,10 @@ num_envs: 64
 method: grid
 
 metric:
-  name: "Reward / Total reward (mean)"
-  goal: maximize
+  # AUC, minimized — see c2rl-ppo-ccm.yaml. Previously implicit via
+  # patch_auc_checkpoint's overwrite of the reward key; now stated directly.
+  name: "Stability/auc_mean"
+  goal: minimize
 
 parameters:
   agent.discount_factor:

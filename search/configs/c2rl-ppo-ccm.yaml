@@ -7,8 +7,14 @@ num_envs: 1024
 method: grid
 
 metric:
-  name: "Reward / Total reward (mean)"
-  goal: maximize
+  # AUC, minimized — same target as the cvstem sibling. Stated explicitly here
+  # because it used to be implicit: patch_auc_checkpoint overwrote
+  # "Reward / Total reward (mean)" with -Stability/auc_mean, so naming the
+  # reward key and maximizing it silently meant "minimize AUC". That overwrite
+  # is gone (the reward panels are real rewards again), so the intent has to be
+  # spelled out or this sweep would quietly switch to optimizing raw reward.
+  name: "Stability/auc_mean"
+  goal: minimize
 
 parameters:
   # Coarser than the cvstem sweep's 7-point ladder: ccm additionally enumerates
