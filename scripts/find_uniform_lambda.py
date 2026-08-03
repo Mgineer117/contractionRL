@@ -108,7 +108,8 @@ ACTUATOR_INFEASIBLE = "actuator"
 
 
 def feasible_everywhere(A, B, *, lbd, w_lb, w_ub, eps, solver, r_scaler,
-                        u_lo=None, u_hi=None, rho=0.0):
+                        u_lo=None, u_hi=None, rho=0.0,
+                        A_next=None, B_next=None, dt=0.0):
     """Is every sample feasible at this ``(lambda, r_scaler)``?
 
     Returns ``(ok, first_failure_index, reason)``. ``reason`` distinguishes the
@@ -121,25 +122,44 @@ def feasible_everywhere(A, B, *, lbd, w_lb, w_ub, eps, solver, r_scaler,
       ``K = (1/r) B^T W^-1`` saturates the actuator box. Raising r_scaler shrinks
       K, so THIS is the one r-doubling fixes.
 
+    With ``A_next``/``B_next``/``dt`` the check uses the (x, u, x_next) TRIPLE and
+    includes the material derivative: solve at x for W̄(x), then require the LMI
+    at x_next to hold WITH ``-Ẇ ≈ (W̄(x) - W̄(x_next))/dt`` folded in
+    (``_add_wdot_term``). Without it the static LMI omits Ẇ entirely, which is
+    not the contraction condition and is optimistic — Ẇ is a term the rest of
+    the LMI has to dominate.
+
     Bails at the first failure: one is enough to disqualify the pair.
     """
     check_u = rho > 0 and u_lo is not None and u_hi is not None
+    use_wdot = A_next is not None and dt > 0
+    kw = dict(w_lb=w_lb, w_ub=w_ub, eps=eps, solver=solver, r_scaler=r_scaler)
     for i in range(A.shape[0]):
-        W = solve_cm_metric(
-            A[i], B[i], lbd=lbd, w_lb=w_lb, w_ub=w_ub, eps=eps,
-            solver=solver, r_scaler=r_scaler,
-            u_lo=u_lo, u_hi=u_hi, rho=(rho if check_u else 0.0),
-        )
+        if use_wdot:
+            # Step 1: metric at x. Needs W̄ (normalized) to difference against.
+            got = solve_cm_metric(A[i], B[i], lbd=lbd, return_wbar=True, **kw)
+            W_prev, Wbar_prev = got if isinstance(got, tuple) else (got, None)
+            if W_prev is None:
+                return False, i, SDP_INFEASIBLE
+            # Step 2: metric at x_next, with -Ẇ = (W̄_prev - W̄)/dt in the LMI.
+            W = solve_cm_metric(
+                A_next[i], B_next[i], lbd=lbd, W_prev_bar=Wbar_prev, dt=dt,
+                u_lo=u_lo, u_hi=u_hi, rho=(rho if check_u else 0.0), **kw)
+        else:
+            W = solve_cm_metric(
+                A[i], B[i], lbd=lbd,
+                u_lo=u_lo, u_hi=u_hi, rho=(rho if check_u else 0.0), **kw)
         if W is not None:
             continue
         if not check_u:
             return False, i, SDP_INFEASIBLE
         # Re-solve WITHOUT the actuator check to tell the modes apart. Only on
         # failure, so the common path still costs one solve.
-        W_plain = solve_cm_metric(
-            A[i], B[i], lbd=lbd, w_lb=w_lb, w_ub=w_ub, eps=eps,
-            solver=solver, r_scaler=r_scaler,
-        )
+        if use_wdot:
+            W_plain = solve_cm_metric(A_next[i], B_next[i], lbd=lbd,
+                                      W_prev_bar=Wbar_prev, dt=dt, **kw)
+        else:
+            W_plain = solve_cm_metric(A[i], B[i], lbd=lbd, **kw)
         return False, i, (ACTUATOR_INFEASIBLE if W_plain is not None else SDP_INFEASIBLE)
     return True, -1, ""
 
@@ -220,6 +240,17 @@ def main() -> int:
                         "saturation, lambda SHRINKS by it (default 1.5; 2.0 = doubling)")
     p.add_argument("--no-actuator-check", "--no_actuator_check", action="store_true",
                    help="skip the control-bound check (lambda* becomes optimistic)")
+    p.add_argument("--no-feedback-budget", "--no_feedback_budget", dest="feedback_budget",
+                   action="store_false",
+                   help="check K.e against the FULL control box instead of the budget "
+                        "U-UREF that is actually left for feedback (u = uref + K.e)")
+    p.add_argument("--no-wdot", "--no_wdot", dest="wdot", action="store_false",
+                   help="drop the material derivative: solve the STATIC LMI instead of "
+                        "the (x,u,x_next) form. Optimistic -- Wdot must be dominated")
+    p.add_argument("--auto-envelope", "--auto_envelope", action="store_true",
+                   help="if infeasible, widen the envelope (w_lb /= step, w_ub *= step) "
+                        "up to --max-envelope-steps times until a lambda exists")
+    p.add_argument("--max-envelope-steps", "--max_envelope_steps", type=int, default=6)
     p.add_argument("--lbd-max", "--lbd_max", type=float, default=4.0)
     p.add_argument("--tol", type=float, default=0.01, help="bisection tolerance on lambda")
     p.add_argument("--seed", type=int, default=0)
@@ -259,31 +290,74 @@ def main() -> int:
     print(f"[uniform-lambda] w_lb={args.w_lb} w_ub={args.w_ub} eps={args.cm_eps} "
           f"r_scaler={args.r_scaler} solver={args.solver}")
 
+    # (x, u, x_next) triples for the material derivative. x_next comes from the
+    # env's OWN one-step integration (env_base.step: x + dt*(f + B u)), so W is
+    # differenced between states that are genuinely consecutive under the
+    # dynamics rather than between unrelated samples.
+    xs_next = None
+    if args.wdot:
+        x_t = torch.as_tensor(xs, dtype=torch.float32)
+        u_t = torch.as_tensor(us, dtype=torch.float32)
+        with torch.no_grad():
+            f_t, B_t, _ = env.get_f_and_B(x_t)
+            xdot = f_t + torch.bmm(B_t, u_t.unsqueeze(-1)).squeeze(-1)
+        xs_next = env.wrap_angles(x_t + float(env.dt) * xdot)
+        xs_next = torch.clamp(xs_next, env.X_MIN, env.X_MAX).numpy().astype(np.float64)
+        print(f"[uniform-lambda] Wdot ON: LMI at x_next includes "
+              f"-Wdot ~ (Wbar(x) - Wbar(x_next))/dt, dt={float(env.dt):g} "
+              f"(2 solves/sample)")
+    else:
+        print("[uniform-lambda] Wdot OFF (--no-wdot): static LMI, the material "
+              "derivative is dropped — lambda* will be optimistic")
+
     A, B = generalized_jacobians(env, xs, us)
+    A_next = B_next = None
+    if xs_next is not None:
+        A_next, B_next = generalized_jacobians(env, xs_next, us)
 
     # Actuator feasibility. The certified gain is K = (1/r)·B^T·W^-1 and the
-    # applied feedback is K·e, so a metric is only usable if that fits the env's
-    # OWN control box at a realistic error magnitude. Without this, lambda can be
+    # applied control is uref + K·e, so a metric is only usable if the FEEDBACK
+    # fits in what the control box leaves after uref. Without this, lambda can be
     # pushed arbitrarily high by shrinking r — which is exactly the bang-bang
     # saturation that made an earlier "best" (lbd=2, r=0.01) result meaningless.
     rho = args.rho if args.rho is not None else float(np.linalg.norm(
         env.XE_MAX.detach().cpu().numpy()))
     check_u = not args.no_actuator_check
+    if args.feedback_budget:
+        # Worst case over uref: lo = U_MIN - UREF_MIN, hi = U_MAX - UREF_MAX.
+        # Checking against the FULL control box instead would be 2x too lenient
+        # wherever UREF spans half of U (car, cartpole, quadrotor all do).
+        ur_lo = env.UREF_MIN.detach().cpu().numpy()
+        ur_hi = env.UREF_MAX.detach().cpu().numpy()
+        fb_lo, fb_hi = u_lo - ur_lo, u_hi - ur_hi
+    else:
+        fb_lo, fb_hi = u_lo, u_hi
     if check_u:
-        print(f"[uniform-lambda] actuator check ON: |K·e| must sit in "
-              f"[{np.round(u_lo, 3)}, {np.round(u_hi, 3)}] at ‖e‖=rho={rho:.3f} "
-              f"(95% of directions); r_scaler grows x{args.step_factor:g} up to "
-              f"{args.max_r_steps} times on violation")
+        print(f"[uniform-lambda] actuator check ON: K·e must sit in "
+              f"[{np.round(fb_lo, 3)}, {np.round(fb_hi, 3)}] at ‖e‖=rho={rho:.3f} "
+              f"(95% of directions)"
+              + (" [feedback budget = U - UREF]" if args.feedback_budget
+                 else " [full control box]"))
+        if np.any(fb_hi <= fb_lo) or np.any((fb_lo >= 0) & (fb_hi > 0)):
+            print("[uniform-lambda] WARNING: the feedback budget does not straddle 0 on "
+                  "every channel.\n  A symmetric feedback K·e cannot stay inside a "
+                  "one-sided budget, so this env is\n  actuator-infeasible BY "
+                  "CONSTRUCTION (turtlebot's v channel is the known case).")
     else:
         print("[uniform-lambda] actuator check OFF (--no-actuator-check): lambda* will be "
               "optimistic — a feasible metric may still saturate the actuator")
 
-    common = dict(w_lb=args.w_lb, w_ub=args.w_ub, eps=args.cm_eps, solver=args.solver,
-                  u_lo=(u_lo if check_u else None), u_hi=(u_hi if check_u else None),
-                  rho=(rho if check_u else 0.0))
     r_used = {"r": args.r_scaler}
+    env_wlb = {"w_lb": args.w_lb, "w_ub": args.w_ub}
 
     def _check(lbd):
+        common = dict(w_lb=env_wlb["w_lb"], w_ub=env_wlb["w_ub"], eps=args.cm_eps,
+                      solver=args.solver,
+                      u_lo=(fb_lo if check_u else None),
+                      u_hi=(fb_hi if check_u else None),
+                      rho=(rho if check_u else 0.0),
+                      A_next=A_next, B_next=B_next,
+                      dt=(float(env.dt) if A_next is not None else 0.0))
         r, why = feasible_with_r_backoff(
             A, B, lbd=lbd, r_scaler=args.r_scaler,
             max_r_steps=(args.max_r_steps if check_u else 0),
@@ -323,13 +397,28 @@ def main() -> int:
     print(f"[uniform-lambda] lambda ladder: {len(grid)} values from {args.lbd_max:g} "
           f"down to {LBD_FLOOR:g} by /{args.step_factor:g} ...")
     ok_grid = [v for v in grid if _check(v)]
+    # ENLARGE THE ENVELOPE rather than reporting "infeasible" and stopping: a
+    # tight {w_lb, w_ub} is a modelling choice, not a property of the plant, and
+    # w_lb=0.1 admits no uniform lambda on cartpole/segway/turtlebot/quadrotor.
+    # Widen symmetrically (w_lb down, w_ub up) until some lambda exists.
+    if not ok_grid and args.auto_envelope:
+        for k in range(1, args.max_envelope_steps + 1):
+            env_wlb["w_lb"] = args.w_lb / (args.step_factor ** k)
+            env_wlb["w_ub"] = args.w_ub * (args.step_factor ** k)
+            print(f"[uniform-lambda] widening envelope (step {k}): "
+                  f"w_lb={env_wlb['w_lb']:.4g} w_ub={env_wlb['w_ub']:.4g}")
+            ok_grid = [v for v in grid if _check(v)]
+            if ok_grid:
+                break
     if not ok_grid:
-        print("\n[uniform-lambda] RESULT: no feasible lambda anywhere on the ladder.\n"
-              "  The {w_lb, w_ub, eps, r_scaler} envelope itself is infeasible over this\n"
-              "  box. Widen w_ub / lower w_lb / lower cm_eps rather than lowering lambda."
-              + ("\n  If the failures above are the ACTUATOR box, raise --max-r-steps:\n"
-                 "  a very small starting r_scaler needs many steps to reach a gain\n"
-                 "  that fits (r=0.01 needed 6 doublings to clear it on the car)."
+        print("\n[uniform-lambda] RESULT: no feasible lambda anywhere on the ladder"
+              + (f" (envelope widened to w_lb={env_wlb['w_lb']:.4g}, "
+                 f"w_ub={env_wlb['w_ub']:.4g})." if args.auto_envelope else ".")
+              + "\n  The {w_lb, w_ub, eps, r_scaler} envelope is infeasible over this box."
+              + ("" if args.auto_envelope else
+                 "\n  Re-run with --auto-envelope to widen w_lb/w_ub automatically.")
+              + ("\n  If the failures above are the ACTUATOR box, raise --max-r-steps,\n"
+                 "  or check the WARNING above about a one-sided feedback budget."
                  if check_u else ""))
         return 2
 
@@ -357,12 +446,15 @@ def main() -> int:
     # actually certified lambda*, not whatever the last (rejected) probe set.
     _check(lo)
     print(f"\n[uniform-lambda] RESULT: uniform contraction rate lambda* = {lo:.4f}"
-          f"  at r_scaler = {r_used['r']:g}")
-    print(f"  Largest lambda feasible at EVERY sampled (x, u) with w_lb={args.w_lb}, "
-          f"w_ub={args.w_ub}"
+          f"  at r_scaler = {r_used['r']:g}"
+          f"  (w_lb={env_wlb['w_lb']:.4g}, w_ub={env_wlb['w_ub']:.4g}"
+          f"{', Wdot ON' if A_next is not None else ', Wdot OFF'})")
+    print(f"  Largest lambda feasible at EVERY sampled (x, u) with "
+          f"w_lb={env_wlb['w_lb']:.4g}, w_ub={env_wlb['w_ub']:.4g}"
           + (f", and whose gain K=(1/r)·B^T·W^-1 keeps |K·e| inside the control box "
              f"at ‖e‖={rho:.3f}." if check_u else " (actuator check DISABLED)."))
-    print(f"  Set `lbd: {lo:.3f}` and `cvstem_r_scaler: {r_used['r']:g}` to synthesize "
+    print(f"  Set `lbd: {lo:.3f}`, `cvstem_r_scaler: {r_used['r']:g}`, "
+          f"`w_lb: {env_wlb['w_lb']:.4g}`, `w_ub: {env_wlb['w_ub']:.4g}` to synthesize "
           f"with no per-state backoff.\n"
           f"  NOTE: this is a sampled certificate, not a proof — it holds over the\n"
           f"  {xs.shape[0]} points tested. Raise --num-states/--num-controls to tighten it.")
