@@ -400,6 +400,65 @@ def build_tube(env, *, rho, num_ics, num_noisy, horizon, sigma, jac_mode, seed=0
     return cat(xs_prev), cat(xs), cat(us_ref), cat(es)
 
 
+def plot_tube(env, tube, block, path, *, rho, sigma, xref=None):
+    """Save a figure of the references and the tube built around them.
+
+    One panel per state dimension (reference bold, tube rollouts thin) plus an
+    ``|e|`` panel and a phase-plane panel. Purely diagnostic -- the point is to
+    make "is the tube actually a neighbourhood of the reference" checkable by eye
+    rather than by trusting the sampler.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    xs, es = tube[1], tube[3]
+    x_dim = xs.shape[1]
+    T = xs.shape[0] // block
+    # build_tube concatenates STEP-MAJOR: reshape to (time, rollout, dim).
+    X = xs[:T * block].reshape(T, block, x_dim)
+    E = es[:T * block].reshape(T, block, x_dim)
+    names = list(getattr(env, "state_names", [f"x{i}" for i in range(x_dim)]))
+    ncol = min(4, x_dim + 2)
+    nrow = int(np.ceil((x_dim + 2) / ncol))
+    fig, ax = plt.subplots(nrow, ncol, figsize=(4.2 * ncol, 3.0 * nrow), squeeze=False)
+    ax = ax.ravel()
+    tt = np.arange(T) * float(env.dt)
+    show = min(block, 40)
+    for d in range(x_dim):
+        for j in range(show):
+            ax[d].plot(tt, X[:, j, d], lw=0.5, alpha=0.35, color="tab:blue")
+        if xref is not None:
+            ax[d].plot(tt, xref[:T, d], lw=2.2, color="k", label="reference")
+            ax[d].legend(fontsize=7, loc="upper right")
+        ax[d].set_title(names[d] if d < len(names) else f"x{d}", fontsize=9)
+        ax[d].set_xlabel("t [s]", fontsize=8)
+    en = np.linalg.norm(E, axis=2)
+    ax[x_dim].plot(tt, en, lw=0.5, alpha=0.3, color="tab:red")
+    ax[x_dim].plot(tt, en.mean(axis=1), lw=2.2, color="k", label="mean |e|")
+    ax[x_dim].set_title(f"tube error |e|  (rho={rho:g}, sigma={sigma:g})", fontsize=9)
+    ax[x_dim].set_xlabel("t [s]", fontsize=8)
+    ax[x_dim].legend(fontsize=7)
+    # Phase plane on the two most dynamic dims.
+    d0, d1 = np.argsort(-E.std(axis=(0, 1)))[:2]
+    ax[x_dim + 1].plot(E[:, :show, d0], E[:, :show, d1], lw=0.5, alpha=0.35,
+                       color="tab:blue")
+    ax[x_dim + 1].scatter(E[0, :, d0], E[0, :, d1], s=14, color="tab:orange",
+                          zorder=3, label="rho-shell ICs")
+    ax[x_dim + 1].scatter([0], [0], marker="*", s=160, color="k", zorder=4,
+                          label="reference")
+    ax[x_dim + 1].set_title(f"error phase plane: {names[d0]} vs {names[d1]}", fontsize=9)
+    ax[x_dim + 1].legend(fontsize=7)
+    for k in range(x_dim + 2, len(ax)):
+        ax[k].axis("off")
+    fig.suptitle(f"{env.__class__.__name__}: {block} tube rollouts x {T} steps "
+                 f"(rho={rho:g}, sigma={sigma:g})", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+    return path
+
+
 def tube_violation_rates(tube, env, *, lbd, w_lb, w_ub, eps, solver, r_scaler,
                          ctl_lo, ctl_hi, use_wdot, jac_mode, check_u=True,
                          subsample=400, seed=0):
@@ -600,6 +659,10 @@ def main() -> int:
                         "rate rather than demanding zero, so a small budget here matches "
                         "the deployed controller; with noise ON a 0 budget is stricter "
                         "than the noiseless check was")
+    p.add_argument("--plot", default=None, metavar="PATH",
+                   help="save a PNG of the references and the tube built around them "
+                        "(per-dim trajectories, |e| decay, error phase plane with the "
+                        "rho-shell ICs) so the tube can be checked by eye")
     p.add_argument("--transient-steps", "--transient_steps", type=int, default=30,
                    help="the leading steps of each rollout gated SEPARATELY against "
                         "--max-violation. Without this split a tube-wide rate hides a "
@@ -820,6 +883,19 @@ def main() -> int:
             print(f"\n[uniform-lambda] === rho={rho:.4g} "
                   f"({tube_box['tube'][1].shape[0]} tube samples, "
                   f"|e| mean={e_norm.mean():.3f} max={e_norm.max():.3f}) ===")
+            if args.plot:
+                _blk = args.num_trajs * args.num_ics * args.num_noisy
+                _p = plot_tube(env, tube_box["tube"], _blk, args.plot, rho=rho,
+                               sigma=args.sigma,
+                               xref=env.xref[0].numpy().astype(np.float64))
+                print(f"[uniform-lambda] tube plot -> {_p}")
+                n_distinct = len(np.unique(np.round(
+                    env.xref.numpy().reshape(env.num_envs, -1), 9), axis=0))
+                print(f"[uniform-lambda] distinct reference trajectories: "
+                      f"{n_distinct} of {env.num_envs} requested"
+                      + ("  (this env's reference is identically zero -- it is a "
+                         "REGULATION task, see the env's freqs=[])"
+                         if float(env.xref.abs().max()) == 0.0 else ""))
             lo = search_lambda()
             if lo is not None:
                 break
