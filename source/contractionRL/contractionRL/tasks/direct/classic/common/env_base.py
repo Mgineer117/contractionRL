@@ -106,15 +106,15 @@ class BaseEnv(gym.Env):
         self.init_tracking_error = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self.episode_reward = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
 
-        # fix_ref_trajectories: sample ONE reference trajectory per env slot on
-        # its first reset and reuse it for every later episode, so the policy
-        # trains on a FIXED set of num_envs references instead of a fresh draw
-        # each episode. The initial ERROR stays random (see reset_idx) — this
-        # fixes the task, not the initial condition. Off by default.
+        # fix_ref_trajectories: mint ONE episode per env slot on its first reset
+        # — reference trajectory AND initial state — and replay it for every
+        # later episode, so the policy trains on a FIXED set of num_envs tasks
+        # instead of a fresh draw each time. Off by default. See reset_idx.
         self.fix_ref_trajectories = bool(env_config.get("fix_ref_trajectories", False))
         self._ref_fixed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._fixed_xref = torch.zeros_like(self.xref)
         self._fixed_uref = torch.zeros_like(self.uref)
+        self._fixed_x0 = torch.zeros_like(self.x_t)
 
         # The privileged critic-only `states` channel is gone: the critic now
         # reads the SAME {x, xrefs, urefs} observation as the actor and gets its
@@ -153,13 +153,15 @@ class BaseEnv(gym.Env):
     # x_dim/u_dim; without these, a classic env building a NeuralDynamics —
     # use_empirical_dynamics=true — got None for both).
     def set_fix_ref_trajectories(self, flag: bool) -> None:
-        """Freeze (or unfreeze) the per-env reference trajectories.
+        """Freeze (or unfreeze) the per-env episodes: reference AND initial state.
 
-        The Isaac twin is ``PathTrackingBase.set_fix_ref_trajectories``; both
-        exist so the training entry point can set this uniformly (see
-        tests/test_isaac_parity.py). Turning it ON drops any previously stored
-        paths, so the next reset re-mints them — otherwise a mid-run toggle
-        would silently resurrect references sampled under different settings.
+        Each env slot replays one fixed (xref, uref, x_0) for the whole run, so
+        the policy sees exactly ``num_envs`` distinct tasks. The Isaac twin is
+        ``PathTrackingBase.set_fix_ref_trajectories`` (there the initial state
+        is derived from the reference's first point, so pinning the trajectory
+        id already pins the start). Turning it ON drops any previously stored
+        episodes, so the next reset re-mints them — otherwise a mid-run toggle
+        would silently resurrect episodes sampled under different settings.
         """
         self.fix_ref_trajectories = bool(flag)
         self._ref_fixed[:] = False
@@ -426,22 +428,21 @@ class BaseEnv(gym.Env):
         x_0, xref_arr, uref_arr, _ = self.system_reset(env_ids)
         xref_arr = torch.clamp(xref_arr, self.X_MIN, self.X_MAX)
         if self.fix_ref_trajectories:
-            # First reset of a slot mints its permanent reference; later resets
-            # discard the freshly sampled one and restore the stored path.
+            # First reset of a slot mints its permanent episode — reference AND
+            # initial state; later resets discard the freshly sampled ones and
+            # restore the stored pair. Pinning the reference alone would leave
+            # x_0 = xref[0] + xe_0 redrawing xe_0 every episode, so the task
+            # would still vary through its initial condition.
             fresh = ~self._ref_fixed[env_ids]
             if bool(fresh.any()):
                 new_ids = env_ids[fresh]
                 self._fixed_xref[new_ids] = xref_arr[fresh]
                 self._fixed_uref[new_ids] = uref_arr[fresh]
+                self._fixed_x0[new_ids] = x_0[fresh]
                 self._ref_fixed[new_ids] = True
-            # Re-anchor the sampled initial ERROR onto the stored reference:
-            # x_0 was built as (sampled xref[0] + xe_0), so swapping in a
-            # different reference without this would silently change the initial
-            # error distribution — the one thing this option must NOT touch.
-            xe_0 = x_0 - xref_arr[:, 0]
             xref_arr = self._fixed_xref[env_ids]
             uref_arr = self._fixed_uref[env_ids]
-            x_0 = torch.clamp(self.wrap_angles(xref_arr[:, 0] + xe_0), self.X_MIN, self.X_MAX)
+            x_0 = self._fixed_x0[env_ids]
         self.xref[env_ids] = xref_arr
         self.uref[env_ids] = uref_arr
         self.x_t[env_ids] = x_0
