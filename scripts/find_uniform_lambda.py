@@ -23,15 +23,18 @@ realizable gain. Measured on the car at ``r_scaler=0.01``: lambda* >= 4 with the
 check off, 0.97 with it on.
 
 The two failure modes need OPPOSITE corrections, so they are distinguished and
-handled separately. An actuator violation DOUBLES ``r_scaler`` and retries
-(larger r shrinks K); an LMI infeasibility does not, since raising r removes
-control authority and only makes the LMI harder.
+handled separately. An actuator violation GROWS ``r_scaler`` by
+``--step-factor`` (default 1.5) and retries, since a larger r shrinks K; an LMI
+infeasibility does not, since raising r removes control authority and only makes
+the LMI harder.
 
-One consequence: feasibility is NOT monotone in lambda. ``solve_cm_metric``
-weights its objective by ``chi_weight = 1/lbd``, so a small lambda inflates that
-weight, yields a W with a larger gain, and can fail the actuator check that a
-larger lambda passes. Pure bisection would be unsound, so the search does a
-coarse scan first and bisects only inside the feasible band.
+lambda is searched on the mirror-image ladder, SHRINKING from ``--lbd-max`` by
+the same factor. It is not a plain bisection because feasibility is NOT monotone
+in lambda: ``solve_cm_metric`` weights its objective by ``chi_weight = 1/lbd``,
+so a small lambda inflates that weight, yields a W with a larger gain, and can
+fail the actuator check that a larger lambda passes (on the car at
+``r_scaler=0.01``: infeasible at 0.05, feasible at 0.97). The ladder finds the
+feasible band and a bisection then refines only its top edge.
 
 Two differences from ``build_cm_dataset`` are deliberate:
 
@@ -140,27 +143,29 @@ def feasible_everywhere(A, B, *, lbd, w_lb, w_ub, eps, solver, r_scaler,
     return True, -1, ""
 
 
-def feasible_with_r_backoff(A, B, *, lbd, r_scaler, max_doublings, log=print, **kw):
-    """Smallest ``r_scaler`` in ``{r, 2r, 4r, ...}`` making EVERY sample feasible.
+def feasible_with_r_backoff(A, B, *, lbd, r_scaler, max_r_steps, step_factor=1.5,
+                            log=print, **kw):
+    """Smallest ``r_scaler`` in ``{r, r*s, r*s^2, ...}`` making EVERY sample feasible.
 
     r must be uniform across the box (it defines one metric family), so this
     searches for a single r that works everywhere rather than letting each state
     pick its own. Returns ``(r_used, None)`` on success, ``(None, reason)`` on
-    failure. An SDP-infeasible verdict aborts immediately: doubling r only
+    failure. An SDP-infeasible verdict aborts immediately: growing r only
     removes control authority, so it cannot recover.
     """
     r = r_scaler
-    for k in range(max_doublings + 1):
+    for k in range(max_r_steps + 1):
         ok, bad, reason = feasible_everywhere(A, B, lbd=lbd, r_scaler=r, **kw)
         if ok:
             if k:
-                log(f"      r_scaler {r_scaler:g} -> {r:g} ({k} doubling(s)) to clear the actuator box")
+                log(f"      r_scaler {r_scaler:g} -> {r:g} "
+                    f"(x{step_factor:g} {k} time(s)) to clear the actuator box")
             return r, None
         if reason == SDP_INFEASIBLE:
             return None, f"SDP infeasible at sample {bad} (r={r:g}); raising r cannot help"
-        r *= 2.0
-    return None, (f"actuator box still saturated after {max_doublings} doublings "
-                  f"(r={r / 2:g})")
+        r *= step_factor
+    return None, (f"actuator box still saturated after {max_r_steps} x{step_factor:g} "
+                  f"steps (r={r / step_factor:g})")
 
 
 def main() -> int:
@@ -187,14 +192,16 @@ def main() -> int:
     p.add_argument("--rho", type=float, default=None,
                    help="error magnitude ‖e‖ at which the implied feedback K·e is "
                         "checked against the control box (default: ‖XE_MAX‖)")
-    p.add_argument("--max-r-doublings", "--max_r_doublings", type=int, default=8,
-                   help="on actuator saturation, double r_scaler up to this many times")
+    p.add_argument("--max-r-steps", "--max_r_steps", "--max-r-doublings",
+                   "--max_r_doublings", dest="max_r_steps", type=int, default=16,
+                   help="on actuator saturation, grow r_scaler by --step-factor up to "
+                        "this many times")
+    p.add_argument("--step-factor", "--step_factor", type=float, default=1.5,
+                   help="multiplicative ladder step: r_scaler GROWS by this on actuator "
+                        "saturation, lambda SHRINKS by it (default 1.5; 2.0 = doubling)")
     p.add_argument("--no-actuator-check", "--no_actuator_check", action="store_true",
                    help="skip the control-bound check (lambda* becomes optimistic)")
     p.add_argument("--lbd-max", "--lbd_max", type=float, default=4.0)
-    p.add_argument("--scan-points", "--scan_points", type=int, default=9,
-                   help="coarse-scan resolution before bisecting (feasibility is "
-                        "non-monotone in lambda once the actuator check is on)")
     p.add_argument("--tol", type=float, default=0.01, help="bisection tolerance on lambda")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
@@ -246,7 +253,8 @@ def main() -> int:
     if check_u:
         print(f"[uniform-lambda] actuator check ON: |K·e| must sit in "
               f"[{np.round(u_lo, 3)}, {np.round(u_hi, 3)}] at ‖e‖=rho={rho:.3f} "
-              f"(95% of directions); r_scaler doubles up to {args.max_r_doublings}x on violation")
+              f"(95% of directions); r_scaler grows x{args.step_factor:g} up to "
+              f"{args.max_r_steps} times on violation")
     else:
         print("[uniform-lambda] actuator check OFF (--no-actuator-check): lambda* will be "
               "optimistic — a feasible metric may still saturate the actuator")
@@ -259,7 +267,8 @@ def main() -> int:
     def _check(lbd):
         r, why = feasible_with_r_backoff(
             A, B, lbd=lbd, r_scaler=args.r_scaler,
-            max_doublings=(args.max_r_doublings if check_u else 0),
+            max_r_steps=(args.max_r_steps if check_u else 0),
+            step_factor=args.step_factor,
             log=lambda s: print(f"[uniform-lambda] {s}"), **common)
         if r is None:
             print(f"[uniform-lambda]   lambda={lbd:9.4f} -> infeasible ({why})")
@@ -278,24 +287,30 @@ def main() -> int:
     # therefore aborts on a spurious "envelope infeasible" verdict.
     LBD_FLOOR = 0.05
 
-    # COARSE SCAN before bisecting. Pure bisection assumes feasibility is
-    # monotone in lambda, and with the actuator check it is NOT: chi_weight
-    # defaults to 1/lbd, so a small lambda inflates that weight, the optimizer
-    # returns a W with a larger gain K=(1/r)B^T W^-1, and the control box is
-    # HARDER to satisfy. Measured on the car at r_scaler=0.01: infeasible at
-    # lambda=0.05, feasible at lambda=0.97. Probing a single low lambda as "the
-    # easy case" would have reported the envelope as unusable.
-    grid = list(np.linspace(LBD_FLOOR, args.lbd_max, args.scan_points))
-    print(f"[uniform-lambda] coarse scan over {len(grid)} lambdas in "
-          f"[{LBD_FLOOR:g}, {args.lbd_max:g}] ...")
-    ok_grid = [g for g in grid if _check(g)]
+    # LADDER, shrinking lambda by /step_factor from the ceiling, mirroring the
+    # r_scaler ladder that grows by *step_factor. A plain bisection would be
+    # unsound: it assumes feasibility is monotone in lambda, and with the
+    # actuator check it is NOT. chi_weight defaults to 1/lbd, so a small lambda
+    # inflates that weight, the optimizer returns a W with a larger gain
+    # K=(1/r)B^T W^-1, and the control box gets HARDER to satisfy. Measured on
+    # the car at r_scaler=0.01: infeasible at lambda=0.05, feasible at 0.97.
+    grid = []
+    g = args.lbd_max
+    while g > LBD_FLOOR:
+        grid.append(g)
+        g /= args.step_factor
+    grid.append(LBD_FLOOR)
+    grid.reverse()                                    # ascending, like the old scan
+    print(f"[uniform-lambda] lambda ladder: {len(grid)} values from {args.lbd_max:g} "
+          f"down to {LBD_FLOOR:g} by /{args.step_factor:g} ...")
+    ok_grid = [v for v in grid if _check(v)]
     if not ok_grid:
-        print("\n[uniform-lambda] RESULT: no feasible lambda anywhere on the scan.\n"
+        print("\n[uniform-lambda] RESULT: no feasible lambda anywhere on the ladder.\n"
               "  The {w_lb, w_ub, eps, r_scaler} envelope itself is infeasible over this\n"
               "  box. Widen w_ub / lower w_lb / lower cm_eps rather than lowering lambda."
-              + ("\n  If the failures above are the ACTUATOR box, raise --max-r-doublings:\n"
-                 "  a very small starting r_scaler needs many doublings to reach a gain\n"
-                 "  that fits (r=0.01 needed 6 to clear it on the car)."
+              + ("\n  If the failures above are the ACTUATOR box, raise --max-r-steps:\n"
+                 "  a very small starting r_scaler needs many steps to reach a gain\n"
+                 "  that fits (r=0.01 needed 6 doublings to clear it on the car)."
                  if check_u else ""))
         return 2
 
