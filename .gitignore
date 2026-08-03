@@ -109,3 +109,7 @@ tests/
 
 # MOSEK license (personal/academic — see README.md's Installation section)
 mosek.lic
+
+# CV-STEM synthesis artifacts are regenerable and ~11MB each. The few committed
+# under data/classic/ predate this; new ones should not be added by `git add -A`.
+data/classic/*/cm_data_*_wlb0.1_*.npz
