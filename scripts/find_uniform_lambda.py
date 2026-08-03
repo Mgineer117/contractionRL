@@ -67,7 +67,6 @@ Example::
 from __future__ import annotations
 
 import argparse
-import itertools
 import math
 import os
 import sys
@@ -137,6 +136,78 @@ def generalized_jacobians(env, x_np, u_np, device="cpu", mode="generalized"):
 
 SDP_INFEASIBLE = "sdp"
 ACTUATOR_INFEASIBLE = "actuator"
+
+
+def cvstem_control(W, B, e, uref, r_scaler):
+    """The control CV-STEM's own metric implies: ``u = uref - R^-1 B^T M e``.
+
+    ``M = W^-1`` is the metric and ``K = (1/r) B^T M`` the gain the SDP's Riccati
+    term was written for (see ncm_synthesis's module docstring: "M(x) = W(x)^-1
+    doubles as a state-dependent Riccati solution with gain K(x) = R^-1 B(x)^T
+    M(x)"). Using THIS control -- rather than a uniform draw -- makes the
+    (x, u, x_next) triple self-consistent: the successor state is where the
+    certified closed loop actually goes, and the actuator check becomes an exact
+    per-sample test on u instead of a Monte-Carlo bound on |K e|.
+    """
+    M = np.linalg.inv(W)
+    K = (1.0 / r_scaler) * B.T @ M
+    return uref - K @ e, K
+
+
+def feasible_everywhere_cvstem(A, B, xs, es, urefs, *, lbd, w_lb, w_ub, eps, solver,
+                               r_scaler, ctl_lo, ctl_hi, env, dt, use_wdot,
+                               jac_mode, check_u=True):
+    """Feasibility over ``(x, u_cvstem, x_next)`` triples.
+
+    Two batched passes, because ``x_next`` depends on ``u_cvstem``, which depends
+    on ``W(x)``, which is the SDP solution -- so the successor Jacobians cannot
+    be precomputed:
+
+      1. solve the SDP at every ``x``  -> ``W(x)``, ``W̄(x)``
+         then ``u = uref - (1/r) B^T W^-1 e`` and ``x_next = x + dt*(f + B u)``
+      2. batch the Jacobians at ``x_next`` and re-solve there, carrying
+         ``W̄(x)`` as ``W_prev_bar`` so the LMI includes ``-Ẇ``.
+
+    Returns ``(ok, first_failure_index, reason)``.
+    """
+    n = A.shape[0]
+    Ws, Wbars = [], []
+    for i in range(n):
+        got = solve_cm_metric(A[i], B[i], lbd=lbd, w_lb=w_lb, w_ub=w_ub, eps=eps,
+                              solver=solver, r_scaler=r_scaler, return_wbar=True)
+        W, Wbar = got if isinstance(got, tuple) else (got, None)
+        if W is None:
+            return False, i, SDP_INFEASIBLE
+        Ws.append(np.asarray(W, dtype=np.float64))
+        Wbars.append(Wbar)
+
+    # u_cvstem per sample, then the EXACT actuator test on the applied control.
+    us = np.empty((n, B.shape[2]), dtype=np.float64)
+    for i in range(n):
+        us[i], _ = cvstem_control(Ws[i], B[i], es[i], urefs[i], r_scaler)
+    if check_u:
+        bad = np.where(np.any((us < ctl_lo - 1e-9) | (us > ctl_hi + 1e-9), axis=1))[0]
+        if bad.size:
+            return False, int(bad[0]), ACTUATOR_INFEASIBLE
+    if not use_wdot:
+        return True, -1, ""
+
+    # x_next under the CERTIFIED control, then the Wdot-inclusive LMI there.
+    x_t = torch.as_tensor(xs, dtype=torch.float32)
+    u_t = torch.as_tensor(us, dtype=torch.float32)
+    with torch.no_grad():
+        f_t, B_t, _ = env.get_f_and_B(x_t)
+        xdot = f_t + torch.bmm(B_t, u_t.unsqueeze(-1)).squeeze(-1)
+    x_next = torch.clamp(env.wrap_angles(x_t + dt * xdot), env.X_MIN, env.X_MAX)
+    A_n, B_n = generalized_jacobians(env, x_next.numpy().astype(np.float64), us,
+                                     mode=jac_mode)
+    for i in range(n):
+        W2 = solve_cm_metric(A_n[i], B_n[i], lbd=lbd, w_lb=w_lb, w_ub=w_ub, eps=eps,
+                             solver=solver, r_scaler=r_scaler,
+                             W_prev_bar=Wbars[i], dt=dt)
+        if W2 is None:
+            return False, i, SDP_INFEASIBLE
+    return True, -1, ""
 
 
 def feasible_everywhere(A, B, *, lbd, w_lb, w_ub, eps, solver, r_scaler,
@@ -221,7 +292,7 @@ def feasible_with_r_backoff(A, B, *, lbd, r_scaler, max_r_steps, step_factor=1.5
                      for k in range(-max_r_steps, max_r_steps + 1)})
     saw_sdp = saw_act = False
     for r in ladder:
-        ok, bad, reason = feasible_everywhere(A, B, lbd=lbd, r_scaler=r, **kw)
+        ok, bad, reason = feasible_everywhere_cvstem(A, B, lbd=lbd, r_scaler=r, **kw)
         if ok:
             if r != r_scaler:
                 log(f"      r_scaler {r_scaler:g} -> {r:g} "
@@ -248,21 +319,13 @@ def main() -> int:
                    help="n: uniform STATE samples")
     p.add_argument("--num-controls", "--num_controls", dest="num_controls",
                    type=int, default=8,
-                   help="m: uniform CONTROL samples drawn independently PER state "
-                        "(--u-mode uniform); total LMI points = n*m")
+                   help="m: (xref, uref) reference draws per state, each giving one "
+                        "(x, u_cvstem, x_next) triple; total = n*m")
     p.add_argument("--w-lb", "--w_lb", type=float, default=0.1)
     p.add_argument("--w-ub", "--w_ub", type=float, default=10.0)
     p.add_argument("--cm-eps", "--cm_eps", type=float, default=0.1)
     p.add_argument("--r-scaler", "--r_scaler", type=float, default=1.0)
     p.add_argument("--solver", default="MOSEK")
-    p.add_argument("--u-mode", "--u_mode", choices=("uniform", "vertices"),
-                   default="uniform",
-                   help="uniform: m independent controls per state (n*m points). "
-                        "vertices: the 2^u_dim u-box corners per state — the "
-                        "worst case for a u-linear term, so it certifies the box")
-    p.add_argument("--rho", type=float, default=None,
-                   help="error magnitude ‖e‖ at which the implied feedback K·e is "
-                        "checked against the control box (default: ‖XE_MAX‖)")
     p.add_argument("--max-r-steps", "--max_r_steps", "--max-r-doublings",
                    "--max_r_doublings", dest="max_r_steps", type=int, default=16,
                    help="on actuator saturation, grow r_scaler by --step-factor up to "
@@ -303,108 +366,62 @@ def main() -> int:
     x_lo, x_hi, u_lo, u_hi = _boxes(env)
     x_dim, u_dim = int(env.num_dim_x), int(env.num_dim_control)
 
-    # n uniform states, and for EACH of them m controls -> n*m LMI points.
-    n = args.num_states
-    xs_u = rng.uniform(x_lo, x_hi, size=(n, x_dim))
-    if args.u_mode == "vertices":
-        # The u-box corners: identical set per state by construction, since a
-        # term linear in u attains its extremes there.
-        per_state = np.array(list(itertools.product(*zip(u_lo, u_hi))), dtype=np.float64)
-        m = per_state.shape[0]
-        us = np.tile(per_state, (n, 1))
-    else:
-        # INDEPENDENT draws per state, not one shared set tiled n times: reusing
-        # the same m controls everywhere would test a lattice of m control
-        # values rather than the control box.
-        m = args.num_controls
-        us = rng.uniform(u_lo, u_hi, size=(n, m, u_dim)).reshape(n * m, u_dim)
-    xs = np.repeat(xs_u, m, axis=0)
+    # DATA = (x, u_cvstem, x_next) triples. Instead of drawing u uniformly, the
+    # control is the one CV-STEM's own metric implies, u = uref - (1/r)B^T M e,
+    # so the triple lies on the CERTIFIED closed loop rather than on an arbitrary
+    # input. n states x m reference draws (xref, uref) -> n*m triples.
+    n, m = args.num_states, args.num_controls
+    xs = np.repeat(rng.uniform(x_lo, x_hi, size=(n, x_dim)), m, axis=0)
+    # Tracking error from the env's OWN initial-error box, not an arbitrary
+    # xref: e is what the deployed controller actually sees at reset.
+    xe_lo = env.XE_MIN.detach().cpu().numpy()
+    xe_hi = env.XE_MAX.detach().cpu().numpy()
+    es = rng.uniform(xe_lo, xe_hi, size=(n * m, x_dim))
+    ur_lo = env.UREF_MIN.detach().cpu().numpy()
+    ur_hi = env.UREF_MAX.detach().cpu().numpy()
+    urefs = rng.uniform(ur_lo, ur_hi, size=(n * m, u_dim))
 
     print(f"[uniform-lambda] task={args.task}  x_dim={x_dim} u_dim={u_dim}")
     print(f"[uniform-lambda] state box  lo={np.round(x_lo, 3)}  hi={np.round(x_hi, 3)}")
     print(f"[uniform-lambda] control box lo={np.round(u_lo, 3)} hi={np.round(u_hi, 3)}")
-    print(f"[uniform-lambda] n={n} states x m={m} controls ({args.u_mode}) "
-          f"= {xs.shape[0]} LMI points")
+    print(f"[uniform-lambda] n={n} states x m={m} (xref,uref) draws = {xs.shape[0]} "
+          f"(x, u_cvstem, x_next) triples")
     print(f"[uniform-lambda] w_lb={args.w_lb} w_ub={args.w_ub} eps={args.cm_eps} "
-          f"r_scaler={args.r_scaler} solver={args.solver}")
-
-    # (x, u, x_next) triples for the material derivative. x_next comes from the
-    # env's OWN one-step integration (env_base.step: x + dt*(f + B u)), so W is
-    # differenced between states that are genuinely consecutive under the
-    # dynamics rather than between unrelated samples.
-    xs_next = None
+          f"r_scaler={args.r_scaler} solver={args.solver} jacobian={args.jacobian}")
     if args.wdot:
-        x_t = torch.as_tensor(xs, dtype=torch.float32)
-        u_t = torch.as_tensor(us, dtype=torch.float32)
-        with torch.no_grad():
-            f_t, B_t, _ = env.get_f_and_B(x_t)
-            xdot = f_t + torch.bmm(B_t, u_t.unsqueeze(-1)).squeeze(-1)
-        xs_next = env.wrap_angles(x_t + float(env.dt) * xdot)
-        xs_next = torch.clamp(xs_next, env.X_MIN, env.X_MAX).numpy().astype(np.float64)
-        print(f"[uniform-lambda] Wdot ON: LMI at x_next includes "
-              f"-Wdot ~ (Wbar(x) - Wbar(x_next))/dt, dt={float(env.dt):g} "
-              f"(2 solves/sample)")
+        print(f"[uniform-lambda] Wdot ON: LMI at x_next carries "
+              f"-Wdot ~ (Wbar(x) - Wbar(x_next))/dt, dt={float(env.dt):g}")
     else:
-        print("[uniform-lambda] Wdot OFF (--no-wdot): static LMI, the material "
-              "derivative is dropped — lambda* will be optimistic")
+        print("[uniform-lambda] Wdot OFF (--no-wdot): static LMI at x only")
 
-    A, B = generalized_jacobians(env, xs, us, mode=args.jacobian)
-    A_next = B_next = None
-    if xs_next is not None:
-        A_next, B_next = generalized_jacobians(env, xs_next, us, mode=args.jacobian)
+    # u is not known until W is solved, so the Jacobian at x uses the reference
+    # control (it is ignored entirely under --jacobian drift, the default).
+    A, B = generalized_jacobians(env, xs, urefs, mode=args.jacobian)
 
-    # Actuator feasibility. The certified gain is K = (1/r)·B^T·W^-1 and the
-    # applied control is uref + K·e, so a metric is only usable if the FEEDBACK
-    # fits in what the control box leaves after uref. Without this, lambda can be
-    # pushed arbitrarily high by shrinking r — which is exactly the bang-bang
-    # saturation that made an earlier "best" (lbd=2, r=0.01) result meaningless.
-    rho = args.rho if args.rho is not None else float(np.linalg.norm(
-        env.XE_MAX.detach().cpu().numpy()))
+    # Actuator feasibility is now EXACT: u_cvstem = uref - (1/r)B^T M e is a
+    # concrete vector per sample, so it is tested against the control box
+    # directly. No Monte-Carlo over error directions and no rho, and no need to
+    # subtract uref into a "feedback budget" -- uref is already inside u.
     check_u = not args.no_actuator_check
-    if args.feedback_budget:
-        # The control box is the SIGN-AWARE 2x expansion of the reference box
-        # (see expand_2x). Derive it rather than trusting U_MIN/U_MAX, and warn
-        # if the env disagrees -- a mismatch means the budget below is wrong.
-        ur_lo = env.UREF_MIN.detach().cpu().numpy()
-        ur_hi = env.UREF_MAX.detach().cpu().numpy()
-        ctl_lo, ctl_hi = expand_2x(ur_lo, ur_hi)
-        if not (np.allclose(ctl_lo, u_lo, atol=1e-6) and np.allclose(ctl_hi, u_hi, atol=1e-6)):
-            print(f"[uniform-lambda] WARNING: env's control box "
-                  f"[{np.round(u_lo, 3)}, {np.round(u_hi, 3)}] != the 2x expansion of "
-                  f"UREF [{np.round(ctl_lo, 3)}, {np.round(ctl_hi, 3)}]; using the "
-                  f"expansion for the feedback budget.")
-        # u = uref + K·e must stay in the control box FOR EVERY uref, so the
-        # budget is the worst case over uref: lo = ctl_lo - UREF_MIN (uref at its
-        # smallest leaves the least room below), hi = ctl_hi - UREF_MAX.
-        fb_lo, fb_hi = ctl_lo - ur_lo, ctl_hi - ur_hi
-    else:
-        fb_lo, fb_hi = u_lo, u_hi
+    ctl_lo, ctl_hi = expand_2x(ur_lo, ur_hi)
+    if not (np.allclose(ctl_lo, u_lo, atol=1e-6) and np.allclose(ctl_hi, u_hi, atol=1e-6)):
+        print(f"[uniform-lambda] WARNING: env control box "
+              f"[{np.round(u_lo, 3)}, {np.round(u_hi, 3)}] != sign-aware 2x expansion of "
+              f"UREF [{np.round(ctl_lo, 3)}, {np.round(ctl_hi, 3)}]; using the expansion.")
     if check_u:
-        print(f"[uniform-lambda] actuator check ON: K·e must sit in "
-              f"[{np.round(fb_lo, 3)}, {np.round(fb_hi, 3)}] at ‖e‖=rho={rho:.3f} "
-              f"(95% of directions)"
-              + (" [feedback budget = U - UREF]" if args.feedback_budget
-                 else " [full control box]"))
-        if np.any(fb_hi <= fb_lo) or np.any((fb_lo >= 0) & (fb_hi > 0)):
-            print("[uniform-lambda] WARNING: the feedback budget does not straddle 0 on "
-                  "every channel.\n  A symmetric feedback K·e cannot stay inside a "
-                  "one-sided budget, so this env is\n  actuator-infeasible BY "
-                  "CONSTRUCTION (turtlebot's v channel is the known case).")
+        print(f"[uniform-lambda] actuator check ON (exact): u = uref - (1/r)B^T M e "
+              f"must lie in [{np.round(ctl_lo, 3)}, {np.round(ctl_hi, 3)}]")
     else:
-        print("[uniform-lambda] actuator check OFF (--no-actuator-check): lambda* will be "
-              "optimistic — a feasible metric may still saturate the actuator")
+        print("[uniform-lambda] actuator check OFF: lambda* will be optimistic")
 
     r_used = {"r": args.r_scaler}
     env_wlb = {"w_lb": args.w_lb, "w_ub": args.w_ub}
 
     def _check(lbd):
         common = dict(w_lb=env_wlb["w_lb"], w_ub=env_wlb["w_ub"], eps=args.cm_eps,
-                      solver=args.solver,
-                      u_lo=(fb_lo if check_u else None),
-                      u_hi=(fb_hi if check_u else None),
-                      rho=(rho if check_u else 0.0),
-                      A_next=A_next, B_next=B_next,
-                      dt=(float(env.dt) if A_next is not None else 0.0))
+                      solver=args.solver, ctl_lo=ctl_lo, ctl_hi=ctl_hi, env=env,
+                      dt=float(env.dt), use_wdot=args.wdot, jac_mode=args.jacobian,
+                      check_u=check_u, xs=xs, es=es, urefs=urefs)
         r, why = feasible_with_r_backoff(
             A, B, lbd=lbd, r_scaler=args.r_scaler,
             max_r_steps=(args.max_r_steps if check_u else 0),
@@ -495,11 +512,12 @@ def main() -> int:
     print(f"\n[uniform-lambda] RESULT: uniform contraction rate lambda* = {lo:.4f}"
           f"  at r_scaler = {r_used['r']:g}"
           f"  (w_lb={env_wlb['w_lb']:.4g}, w_ub={env_wlb['w_ub']:.4g}"
-          f"{', Wdot ON' if A_next is not None else ', Wdot OFF'})")
+          f"{', Wdot ON' if args.wdot else ', Wdot OFF'})")
     print(f"  Largest lambda feasible at EVERY sampled (x, u) with "
           f"w_lb={env_wlb['w_lb']:.4g}, w_ub={env_wlb['w_ub']:.4g}"
-          + (f", and whose gain K=(1/r)·B^T·W^-1 keeps |K·e| inside the control box "
-             f"at ‖e‖={rho:.3f}." if check_u else " (actuator check DISABLED)."))
+          + (", and whose CV-STEM control u = uref - (1/r)B^T M e stays inside the "
+             "control box at every sampled (x, e, uref)."
+             if check_u else " (actuator check DISABLED)."))
     print(f"  Set `lbd: {lo:.3f}`, `cvstem_r_scaler: {r_used['r']:g}`, "
           f"`w_lb: {env_wlb['w_lb']:.4g}`, `w_ub: {env_wlb['w_ub']:.4g}` to synthesize "
           f"with no per-state backoff.\n"
