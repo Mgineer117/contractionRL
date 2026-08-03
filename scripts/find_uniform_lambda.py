@@ -267,7 +267,62 @@ def feasible_everywhere(A, B, *, lbd, w_lb, w_ub, eps, solver, r_scaler,
     return True, -1, ""
 
 
-def feasible_with_r_backoff(A, B, *, lbd, r_scaler, max_r_steps, step_factor=1.5,
+def feasible_tube(env, *, lbd, w_lb, w_ub, eps, solver, r_scaler, ctl_lo, ctl_hi,
+                  horizon, use_wdot, jac_mode, check_u=True, seed=0):
+    """Feasibility along CLOSED-LOOP rollouts under the CV-STEM control.
+
+    ``n`` reference trajectories (the env's own), each rolled out from
+    ``x0 = xref0 + xe0`` with ``u_t = uref_t - (1/r) B^T M(x_t) e_t``, giving
+    ``n x horizon`` samples drawn from the TUBE the controller actually induces
+    rather than from the whole state box. A uniform claim over the full box is
+    far stronger than anything the closed loop needs, and for cartpole / segway /
+    quadrotor it is unachievable at any envelope (measured).
+
+    Consecutive states along a rollout are genuinely one ``dt`` apart, so the
+    ``W_prev_bar`` chaining is the real material derivative here -- unlike the
+    box sampler, where "x_next" had no trajectory to belong to.
+
+    Returns ``(ok, (traj, step) of first failure, reason)``.
+    """
+    torch.manual_seed(seed)
+    env.reset()
+    n, u_dim = env.num_envs, int(env.num_dim_control)
+    x = env.x_t.clone()
+    dt = float(env.dt)
+    Wbar_prev = [None] * n
+    horizon = min(int(horizon), int(env.max_episode_len) - 1)
+    for t in range(horizon):
+        xref_t = env.xref[:, t]
+        uref_t = env.uref[:, t]
+        A, B = generalized_jacobians(env, x.numpy().astype(np.float64),
+                                     uref_t.numpy().astype(np.float64), mode=jac_mode)
+        us = np.empty((n, u_dim), dtype=np.float64)
+        for i in range(n):
+            got = solve_cm_metric(
+                A[i], B[i], lbd=lbd, w_lb=w_lb, w_ub=w_ub, eps=eps, solver=solver,
+                r_scaler=r_scaler, return_wbar=True,
+                W_prev_bar=(Wbar_prev[i] if use_wdot else None),
+                dt=(dt if use_wdot else 0.0))
+            W, Wbar = got if isinstance(got, tuple) else (got, None)
+            if W is None:
+                return False, (i, t), SDP_INFEASIBLE
+            Wbar_prev[i] = Wbar
+            e = env.wrap_angles((x[i] - xref_t[i]).unsqueeze(0))[0].numpy().astype(np.float64)
+            u, _ = cvstem_control(np.asarray(W, dtype=np.float64), B[i], e,
+                                  uref_t[i].numpy().astype(np.float64), r_scaler)
+            if check_u and np.any((u < ctl_lo - 1e-9) | (u > ctl_hi + 1e-9)):
+                return False, (i, t), ACTUATOR_INFEASIBLE
+            us[i] = u
+        # Propagate with the env's own dynamics (mirrors env_base.step).
+        with torch.no_grad():
+            f_t, B_t, _ = env.get_f_and_B(x)
+            xdot = f_t + torch.bmm(B_t, torch.as_tensor(
+                us, dtype=torch.float32).unsqueeze(-1)).squeeze(-1)
+        x = torch.clamp(env.wrap_angles(x + dt * xdot), env.X_MIN, env.X_MAX)
+    return True, None, ""
+
+
+def feasible_with_r_backoff(_checker, *, lbd, r_scaler, max_r_steps, step_factor=1.5,
                             log=print, **kw):
     """An ``r_scaler`` on the ladder ``r0 * s^k``, k in [-N, N], feasible EVERYWHERE.
 
@@ -292,7 +347,7 @@ def feasible_with_r_backoff(A, B, *, lbd, r_scaler, max_r_steps, step_factor=1.5
                      for k in range(-max_r_steps, max_r_steps + 1)})
     saw_sdp = saw_act = False
     for r in ladder:
-        ok, bad, reason = feasible_everywhere_cvstem(A, B, lbd=lbd, r_scaler=r, **kw)
+        ok, bad, reason = _checker(lbd=lbd, r_scaler=r, **kw)
         if ok:
             if r != r_scaler:
                 log(f"      r_scaler {r_scaler:g} -> {r:g} "
@@ -346,6 +401,15 @@ def main() -> int:
                    help="if infeasible, widen the envelope (w_lb /= step, w_ub *= step) "
                         "up to --max-envelope-steps times until a lambda exists")
     p.add_argument("--max-envelope-steps", "--max_envelope_steps", type=int, default=6)
+    p.add_argument("--sampling", choices=("tube", "box"), default="tube",
+                   help="tube: n closed-loop rollouts under the CV-STEM control "
+                        "(n x horizon samples) -- certifies where the system actually "
+                        "operates. box: uniform over the whole state box -- a far "
+                        "stronger claim, unachievable on most envs")
+    p.add_argument("--num-trajs", "--num_trajs", type=int, default=4,
+                   help="tube mode: n reference trajectories rolled out")
+    p.add_argument("--horizon", type=int, default=60,
+                   help="tube mode: steps per rollout (n*horizon samples)")
     p.add_argument("--jacobian", choices=("drift", "generalized"), default="drift",
                    help="drift: A = df/dx, EXACTLY what build_cm_dataset solves, so the "
                         "answer transfers to synthesis (u does not enter the LMI). "
@@ -362,7 +426,8 @@ def main() -> int:
 
     import contractionRL.tasks.direct.classic  # noqa: F401  (registers the ids)
     import gymnasium as gym
-    env = gym.make(args.task, num_envs=1, device="cpu").unwrapped
+    _n_env = args.num_trajs if args.sampling == "tube" else 1
+    env = gym.make(args.task, num_envs=_n_env, device="cpu").unwrapped
     x_lo, x_hi, u_lo, u_hi = _boxes(env)
     x_dim, u_dim = int(env.num_dim_x), int(env.num_dim_control)
 
@@ -384,8 +449,15 @@ def main() -> int:
     print(f"[uniform-lambda] task={args.task}  x_dim={x_dim} u_dim={u_dim}")
     print(f"[uniform-lambda] state box  lo={np.round(x_lo, 3)}  hi={np.round(x_hi, 3)}")
     print(f"[uniform-lambda] control box lo={np.round(u_lo, 3)} hi={np.round(u_hi, 3)}")
-    print(f"[uniform-lambda] n={n} states x m={m} (xref,uref) draws = {xs.shape[0]} "
-          f"(x, u_cvstem, x_next) triples")
+    n_samples = (args.num_trajs * args.horizon if args.sampling == "tube"
+                 else xs.shape[0])
+    if args.sampling == "tube":
+        print(f"[uniform-lambda] TUBE: {args.num_trajs} reference trajectories x "
+              f"{args.horizon} steps = {n_samples} closed-loop samples "
+              f"(u = uref - (1/r)B^T M e at every step)")
+    else:
+        print(f"[uniform-lambda] BOX: n={n} states x m={m} (xref,uref) draws "
+              f"= {n_samples} (x, u_cvstem, x_next) triples")
     print(f"[uniform-lambda] w_lb={args.w_lb} w_ub={args.w_ub} eps={args.cm_eps} "
           f"r_scaler={args.r_scaler} solver={args.solver} jacobian={args.jacobian}")
     if args.wdot:
@@ -418,12 +490,20 @@ def main() -> int:
     env_wlb = {"w_lb": args.w_lb, "w_ub": args.w_ub}
 
     def _check(lbd):
-        common = dict(w_lb=env_wlb["w_lb"], w_ub=env_wlb["w_ub"], eps=args.cm_eps,
-                      solver=args.solver, ctl_lo=ctl_lo, ctl_hi=ctl_hi, env=env,
-                      dt=float(env.dt), use_wdot=args.wdot, jac_mode=args.jacobian,
-                      check_u=check_u, xs=xs, es=es, urefs=urefs)
+        if args.sampling == "tube":
+            common = dict(w_lb=env_wlb["w_lb"], w_ub=env_wlb["w_ub"], eps=args.cm_eps,
+                          solver=args.solver, ctl_lo=ctl_lo, ctl_hi=ctl_hi,
+                          horizon=args.horizon, use_wdot=args.wdot,
+                          jac_mode=args.jacobian, check_u=check_u, seed=args.seed)
+        else:
+            common = dict(w_lb=env_wlb["w_lb"], w_ub=env_wlb["w_ub"], eps=args.cm_eps,
+                          solver=args.solver, ctl_lo=ctl_lo, ctl_hi=ctl_hi, env=env,
+                          dt=float(env.dt), use_wdot=args.wdot, jac_mode=args.jacobian,
+                          check_u=check_u, xs=xs, es=es, urefs=urefs)
+        _checker = ((lambda **kw: feasible_tube(env, **kw)) if args.sampling == "tube"
+                    else (lambda **kw: feasible_everywhere_cvstem(A, B, **kw)))
         r, why = feasible_with_r_backoff(
-            A, B, lbd=lbd, r_scaler=args.r_scaler,
+            _checker, lbd=lbd, r_scaler=args.r_scaler,
             max_r_steps=(args.max_r_steps if check_u else 0),
             step_factor=args.step_factor,
             log=lambda s: print(f"[uniform-lambda] {s}"), **common)
@@ -432,7 +512,7 @@ def main() -> int:
             return False
         r_used["r"] = r
         print(f"[uniform-lambda]   lambda={lbd:9.4f} -> FEASIBLE everywhere "
-              f"(r_scaler={r:g}, {xs.shape[0]} samples)")
+              f"(r_scaler={r:g}, {n_samples} samples)")
         return True
 
     # Feasibility floor for the bisection's lower bound. NOT 1e-3, and not 0:
@@ -522,7 +602,9 @@ def main() -> int:
           f"`w_lb: {env_wlb['w_lb']:.4g}`, `w_ub: {env_wlb['w_ub']:.4g}` to synthesize "
           f"with no per-state backoff.\n"
           f"  NOTE: this is a sampled certificate, not a proof — it holds over the\n"
-          f"  {xs.shape[0]} points tested. Raise --num-states/--num-controls to tighten it.")
+          f"  {n_samples} points tested. Raise "
+          + ("--num-trajs/--horizon" if args.sampling == "tube"
+             else "--num-states/--num-controls") + " to tighten it.")
     return 0
 
 
