@@ -10,9 +10,10 @@ models:
     encoder_stride: 3
     clip_actions: false
     clip_log_std: true
-    # -6.9 = log(0.001), matching std_dev_annealing_kwargs.final_log_std below
-    # so the clamp never truncates the schedule. (nn_modules._MIN_LOG_STD is the
-    # same number but belongs to CLActor.anneal_stddev, a path C2RL never takes:
+    # -6.9 = log(0.001). A CLAMP FLOOR only, sitting well below the annealing
+    # target (std_dev_annealing_kwargs.final_log_std = -4.6, sigma 0.01), so it
+    # never truncates the schedule. (nn_modules._MIN_LOG_STD is the same number
+    # but belongs to CLActor.anneal_stddev, a path C2RL never takes:
     # train.py only installs it when the runner's agent exposes `.policy`, and
     # C2RLAgent does not.) Matters when std_dev_annealing is false: with a
     # LEARNED log_std and entropy_loss_scale 0.0, PPO shrinks sigma monotonically,
@@ -71,14 +72,15 @@ agent:
   learning_rate_scheduler: KLAdaptiveLR # matches the standalone PPO baseline for this env
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.008   # TARGET KL the scheduler steers toward (not the early-stop)
-    max_lr: 1.0e-3       # ceiling; learning_rate above is the floor it climbs from
+    max_lr: 1.0e-4       # ceiling the scheduler may climb to
+    min_lr: 1.0e-8       # floor it may fall to (learning_rate is the START)
   # false -> PPO LEARNS log_std through the policy loss (stock-PPO behavior) and
   # the schedule below is ignored; true -> log_std is frozen and driven by the
   # schedule. Override per-run with --std_dev_annealing false.
   std_dev_annealing: true
   std_dev_annealing_kwargs:
     schedule: exponential
-    final_log_std: -6.9
+    final_log_std: -4.6
     power: 2.0
   random_timesteps: 0
   learning_starts: 0
@@ -89,15 +91,18 @@ agent:
   value_loss_scale: 0.5  # Weight coefficient for the value function loss term
   # HARD early-stop: skrl's PPO breaks out of the epoch when a minibatch's KL
   # exceeds this (ppo.py: `if self.cfg.kl_threshold and kl_divergence > ...`).
-  # 2.5x the scheduler's TARGET (learning_rate_scheduler_kwargs.kl_threshold=0.008),
-  # so the scheduler has room to pull the LR down before the hard stop fires; it
-  # also coincides with KLAdaptiveLR's own decrease trigger (kl_factor=2).
-  kl_threshold: 0.02
+  # Only 1.25x the scheduler's TARGET
+  # (learning_rate_scheduler_kwargs.kl_threshold=0.008), so the epoch is
+  # abandoned almost as soon as KL passes the target — a deliberately tight
+  # trust region. KLAdaptiveLR does not start cutting the LR until KL > 0.016
+  # (kl_factor=2), i.e. ABOVE this stop, so the LR is now driven mainly by the
+  # increase branch (KL < 0.004) and the hard stop does the constraining.
+  kl_threshold: 0.01
   time_limit_bootstrap: true  # Bootstrap value at episode truncation instead of treating it as terminal
   residual_contraction_pretrain: false
   rewards_shaper_scale: 1.0
   use_state_norm: false  # OFF by default — see c2rl.py module docstring / rl_glue.make_base_rl_cfg
-  use_value_norm: true   # Same, but for the value function's output (PPO only)
+  use_value_norm: false   # Same, but for the value function's output (PPO only)
   use_reward_norm: false  # Non-biasing running-std reward normalizer (r/std, no centering) — tames the
                          # w_lb/w_ub-dependent Mahalanobis-reward scale/heavy-tail before GAE; see rl_glue.
 
@@ -141,11 +146,14 @@ cm:
   w_lb: 0.1  # Lower eigenvalue bound for the metric M(x)
   # Contraction rate λ — used by cmg_method's synthesis loss (CM SDP LMI for
   # "cvstem", CMG Cu/C1 loss for "ccm").
-  # 0.790 with cvstem_r_scaler 0.0878: measured by scripts/find_uniform_lambda.py
-  # under TUBE sampling -- 4 reference trajectories rolled out 50 steps under the
+  # 0.422 with cvstem_r_scaler 0.131687: measured by scripts/find_uniform_lambda.py
+  # under TUBE sampling -- 4 reference trajectories rolled out 100 steps under the
   # CV-STEM control u = uref - (1/r)B^T M e, requiring the LMI (with the real Wdot
   # from consecutive states) AND u inside the control box at every step.
-  lbd: 0.790
+  # The earlier 0.790 (r=0.0878) came from a 50-step horizon; doubling it to 100
+  # reaches harder states down the tube and cut the certifiable rate roughly in
+  # half, so 0.790 was optimistic. Re-measure if the horizon changes again.
+  lbd: 0.422
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled, already 0)
   # SDP contraction metric (cm_eps used by both cmg_method paths; cm_solver "cvstem" only)
@@ -170,7 +178,7 @@ cm:
   #              Control is penalized via this Riccati term, not bounded over an
   #              action range — see ncm_synthesis.py module docstring.
   cmg_method: cvstem
-  cvstem_r_scaler: 0.0878  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only
+  cvstem_r_scaler: 0.131687  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only
   # On SDP infeasibility AT A GIVEN STATE, retry that state alone with λ
   # halved, up to this many times, before giving up on it and dropping it from
   # the dataset — 0 disables this and reverts to dropping immediately. Warns
