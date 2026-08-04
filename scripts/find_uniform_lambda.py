@@ -1,4 +1,4 @@
-"""Largest contraction rate lambda that is feasible over the WHOLE state/control box.
+"""Largest contraction rate lambda feasible along the whole CLOSED-LOOP tube.
 
 ``build_cm_dataset`` solves the CV-STEM SDP per sampled state and, where a state
 is infeasible at the requested ``lbd``, HALVES lambda for that state
@@ -11,11 +11,21 @@ This utility answers the design question instead: what is the largest lambda
 such that the SDP is feasible at EVERY sampled ``(x, u)``? That is the rate a
 uniform certificate can actually claim.
 
+Samples come from ``n`` CLOSED-LOOP rollouts under the CV-STEM control itself
+(``--num-trajs`` x ``--horizon``), so lambda is certified where the controller
+actually operates and consecutive states are one real ``dt`` apart -- which is
+what makes the ``W_prev_bar`` chaining a true material derivative. Uniform
+sampling over the whole state box was tried and removed: it is a far stronger
+claim than the closed loop needs, it spends solves on physically unreachable
+corners, and it admitted no lambda at any envelope on cartpole / segway /
+turtlebot / quadrotor.
+
 Feasibility here means BOTH conditions, because either alone is misleading:
 
 1. the LMI solves, and
-2. the implied gain ``K = (1/r) B^T W^-1`` keeps the feedback ``K·e`` inside the
-   env's own control box at ``‖e‖ = rho`` (95% of directions).
+2. the control that gain implies, ``u = uref - (1/r) B^T W^-1 e``, lands inside
+   the env's own control box -- an exact per-sample test, since the tube gives a
+   concrete ``(x, e, uref)`` at every step.
 
 Without (2), lambda can be pushed arbitrarily high just by shrinking
 ``r_scaler`` — the resulting "certificate" is bang-bang saturation, not a
@@ -36,33 +46,18 @@ fail the actuator check that a larger lambda passes (on the car at
 ``r_scaler=0.01``: infeasible at 0.05, feasible at 0.97). The ladder finds the
 feasible band and a bisection then refines only its top edge.
 
-Two differences from ``build_cm_dataset`` are deliberate:
-
-* States and controls are drawn UNIFORMLY from the env's own ``[X_MIN, X_MAX]``
-  and ``[U_MIN, U_MAX]`` boxes, not from rollouts. A uniform claim has to be
-  tested on the whole box, not on the on-policy tube.
-* ``--jacobian`` selects which ``A`` enters the LMI. DEFAULT ``drift``
-  (``A = df/dx``) matches what ``build_cm_dataset`` actually solves and what
-  this repo's CV-STEM docstring specifies (control enters ONLY through the
-  Riccati penalty on ``B``), so the answer transfers to real synthesis. Note
-  that under ``drift`` the control does NOT enter the LMI, so the m control
-  samples per state have no effect on lambda*. ``generalized``
-  (``+ sum_k u_k dB_k/dx``) is the differential Jacobian a u-dependent rate
-  would need, but it is NOT the program this repo solves -- its lambda* does
-  not transfer.
-
-Sampling is ``n`` states x ``m`` controls = ``n*m`` LMI points.
-``--u-mode uniform`` (default) draws the ``m`` controls INDEPENDENTLY for each
-state, so the pairs cover the product box rather than a shared lattice of ``m``
-control values. ``--u-mode vertices`` instead evaluates the ``2^u_dim`` u-box
-CORNERS at every state: since the ``sum_k u_k dB_k/dx`` term is linear in ``u``
-it attains its extremes there, so that mode is the one that certifies the whole
-box, while ``uniform`` gives a cheaper interior estimate that can be optimistic.
+``--jacobian`` selects which ``A`` enters the LMI. DEFAULT ``drift``
+(``A = df/dx``) matches what ``build_cm_dataset`` actually solves and what this
+repo's CV-STEM docstring specifies (control enters ONLY through the Riccati
+penalty on ``B``), so the answer transfers to real synthesis. ``generalized``
+(``+ sum_k u_k dB_k/dx``) is the differential Jacobian a u-dependent rate would
+need, but it is NOT the program this repo solves -- its lambda* does not
+transfer.
 
 Example::
 
     python scripts/find_uniform_lambda.py --task classic-car-v0 \\
-        --w-lb 0.1 --w-ub 10 --num-states 300 --num-controls 8
+        --w-lb 0.1 --w-ub 10 --num-trajs 4 --horizon 100
 """
 from __future__ import annotations
 
@@ -154,133 +149,16 @@ def cvstem_control(W, B, e, uref, r_scaler):
     return uref - K @ e, K
 
 
-def feasible_everywhere_cvstem(A, B, xs, es, urefs, *, lbd, w_lb, w_ub, eps, solver,
-                               r_scaler, ctl_lo, ctl_hi, env, dt, use_wdot,
-                               jac_mode, check_u=True):
-    """Feasibility over ``(x, u_cvstem, x_next)`` triples.
-
-    Two batched passes, because ``x_next`` depends on ``u_cvstem``, which depends
-    on ``W(x)``, which is the SDP solution -- so the successor Jacobians cannot
-    be precomputed:
-
-      1. solve the SDP at every ``x``  -> ``W(x)``, ``W̄(x)``
-         then ``u = uref - (1/r) B^T W^-1 e`` and ``x_next = x + dt*(f + B u)``
-      2. batch the Jacobians at ``x_next`` and re-solve there, carrying
-         ``W̄(x)`` as ``W_prev_bar`` so the LMI includes ``-Ẇ``.
-
-    Returns ``(ok, first_failure_index, reason)``.
-    """
-    n = A.shape[0]
-    Ws, Wbars = [], []
-    for i in range(n):
-        got = solve_cm_metric(A[i], B[i], lbd=lbd, w_lb=w_lb, w_ub=w_ub, eps=eps,
-                              solver=solver, r_scaler=r_scaler, return_wbar=True)
-        W, Wbar = got if isinstance(got, tuple) else (got, None)
-        if W is None:
-            return False, i, SDP_INFEASIBLE
-        Ws.append(np.asarray(W, dtype=np.float64))
-        Wbars.append(Wbar)
-
-    # u_cvstem per sample, then the EXACT actuator test on the applied control.
-    us = np.empty((n, B.shape[2]), dtype=np.float64)
-    for i in range(n):
-        us[i], _ = cvstem_control(Ws[i], B[i], es[i], urefs[i], r_scaler)
-    if check_u:
-        bad = np.where(np.any((us < ctl_lo - 1e-9) | (us > ctl_hi + 1e-9), axis=1))[0]
-        if bad.size:
-            return False, int(bad[0]), ACTUATOR_INFEASIBLE
-    if not use_wdot:
-        return True, -1, ""
-
-    # x_next under the CERTIFIED control, then the Wdot-inclusive LMI there.
-    x_t = torch.as_tensor(xs, dtype=torch.float32)
-    u_t = torch.as_tensor(us, dtype=torch.float32)
-    with torch.no_grad():
-        f_t, B_t, _ = env.get_f_and_B(x_t)
-        xdot = f_t + torch.bmm(B_t, u_t.unsqueeze(-1)).squeeze(-1)
-    x_next = torch.clamp(env.wrap_angles(x_t + dt * xdot), env.X_MIN, env.X_MAX)
-    A_n, B_n = generalized_jacobians(env, x_next.numpy().astype(np.float64), us,
-                                     mode=jac_mode)
-    for i in range(n):
-        W2 = solve_cm_metric(A_n[i], B_n[i], lbd=lbd, w_lb=w_lb, w_ub=w_ub, eps=eps,
-                             solver=solver, r_scaler=r_scaler,
-                             W_prev_bar=Wbars[i], dt=dt)
-        if W2 is None:
-            return False, i, SDP_INFEASIBLE
-    return True, -1, ""
-
-
-def feasible_everywhere(A, B, *, lbd, w_lb, w_ub, eps, solver, r_scaler,
-                        u_lo=None, u_hi=None, rho=0.0,
-                        A_next=None, B_next=None, dt=0.0):
-    """Is every sample feasible at this ``(lambda, r_scaler)``?
-
-    Returns ``(ok, first_failure_index, reason)``. ``reason`` distinguishes the
-    two failure modes, which need OPPOSITE corrections:
-
-    * ``SDP_INFEASIBLE``      — the LMI itself has no solution. Raising r_scaler
-      SHRINKS the ``B R^-1 B^T`` term, i.e. removes control authority, so it
-      makes this strictly worse. Only a smaller lambda (or a wider envelope) helps.
-    * ``ACTUATOR_INFEASIBLE`` — the LMI solves but the implied gain
-      ``K = (1/r) B^T W^-1`` saturates the actuator box. Raising r_scaler shrinks
-      K, so THIS is the one r-doubling fixes.
-
-    With ``A_next``/``B_next``/``dt`` the check uses the (x, u, x_next) TRIPLE and
-    includes the material derivative: solve at x for W̄(x), then require the LMI
-    at x_next to hold WITH ``-Ẇ ≈ (W̄(x) - W̄(x_next))/dt`` folded in
-    (``_add_wdot_term``). Without it the static LMI omits Ẇ entirely, which is
-    not the contraction condition and is optimistic — Ẇ is a term the rest of
-    the LMI has to dominate.
-
-    Bails at the first failure: one is enough to disqualify the pair.
-    """
-    check_u = rho > 0 and u_lo is not None and u_hi is not None
-    use_wdot = A_next is not None and dt > 0
-    kw = dict(w_lb=w_lb, w_ub=w_ub, eps=eps, solver=solver, r_scaler=r_scaler)
-    for i in range(A.shape[0]):
-        if use_wdot:
-            # Step 1: metric at x. Needs W̄ (normalized) to difference against.
-            got = solve_cm_metric(A[i], B[i], lbd=lbd, return_wbar=True, **kw)
-            W_prev, Wbar_prev = got if isinstance(got, tuple) else (got, None)
-            if W_prev is None:
-                return False, i, SDP_INFEASIBLE
-            # Step 2: metric at x_next, with -Ẇ = (W̄_prev - W̄)/dt in the LMI.
-            W = solve_cm_metric(
-                A_next[i], B_next[i], lbd=lbd, W_prev_bar=Wbar_prev, dt=dt,
-                u_lo=u_lo, u_hi=u_hi, rho=(rho if check_u else 0.0), **kw)
-        else:
-            W = solve_cm_metric(
-                A[i], B[i], lbd=lbd,
-                u_lo=u_lo, u_hi=u_hi, rho=(rho if check_u else 0.0), **kw)
-        if W is not None:
-            continue
-        if not check_u:
-            return False, i, SDP_INFEASIBLE
-        # Re-solve WITHOUT the actuator check to tell the modes apart. Only on
-        # failure, so the common path still costs one solve.
-        if use_wdot:
-            W_plain = solve_cm_metric(A_next[i], B_next[i], lbd=lbd,
-                                      W_prev_bar=Wbar_prev, dt=dt, **kw)
-        else:
-            W_plain = solve_cm_metric(A[i], B[i], lbd=lbd, **kw)
-        return False, i, (ACTUATOR_INFEASIBLE if W_plain is not None else SDP_INFEASIBLE)
-    return True, -1, ""
-
-
 def feasible_tube(env, *, lbd, w_lb, w_ub, eps, solver, r_scaler, ctl_lo, ctl_hi,
                   horizon, use_wdot, jac_mode, check_u=True, seed=0):
     """Feasibility along CLOSED-LOOP rollouts under the CV-STEM control.
 
     ``n`` reference trajectories (the env's own), each rolled out from
     ``x0 = xref0 + xe0`` with ``u_t = uref_t - (1/r) B^T M(x_t) e_t``, giving
-    ``n x horizon`` samples drawn from the TUBE the controller actually induces
-    rather than from the whole state box. A uniform claim over the full box is
-    far stronger than anything the closed loop needs, and for cartpole / segway /
-    quadrotor it is unachievable at any envelope (measured).
+    ``n x horizon`` samples drawn from the TUBE the controller actually induces.
 
     Consecutive states along a rollout are genuinely one ``dt`` apart, so the
-    ``W_prev_bar`` chaining is the real material derivative here -- unlike the
-    box sampler, where "x_next" had no trajectory to belong to.
+    ``W_prev_bar`` chaining is the real material derivative here.
 
     Returns ``(ok, (traj, step) of first failure, reason)``.
     """
@@ -369,13 +247,6 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--task", default="classic-car-v0")
-    p.add_argument("--num-states", "--num_states", "--num-samples", "--num_samples",
-                   dest="num_states", type=int, default=300,
-                   help="n: uniform STATE samples")
-    p.add_argument("--num-controls", "--num_controls", dest="num_controls",
-                   type=int, default=8,
-                   help="m: (xref, uref) reference draws per state, each giving one "
-                        "(x, u_cvstem, x_next) triple; total = n*m")
     p.add_argument("--w-lb", "--w_lb", type=float, default=0.1)
     p.add_argument("--w-ub", "--w_ub", type=float, default=10.0)
     p.add_argument("--cm-eps", "--cm_eps", type=float, default=0.1)
@@ -390,10 +261,6 @@ def main() -> int:
                         "saturation, lambda SHRINKS by it (default 1.5; 2.0 = doubling)")
     p.add_argument("--no-actuator-check", "--no_actuator_check", action="store_true",
                    help="skip the control-bound check (lambda* becomes optimistic)")
-    p.add_argument("--no-feedback-budget", "--no_feedback_budget", dest="feedback_budget",
-                   action="store_false",
-                   help="check K.e against the FULL control box instead of the budget "
-                        "U-UREF that is actually left for feedback (u = uref + K.e)")
     p.add_argument("--no-wdot", "--no_wdot", dest="wdot", action="store_false",
                    help="drop the material derivative: solve the STATIC LMI instead of "
                         "the (x,u,x_next) form. Optimistic -- Wdot must be dominated")
@@ -401,15 +268,10 @@ def main() -> int:
                    help="if infeasible, widen the envelope (w_lb /= step, w_ub *= step) "
                         "up to --max-envelope-steps times until a lambda exists")
     p.add_argument("--max-envelope-steps", "--max_envelope_steps", type=int, default=6)
-    p.add_argument("--sampling", choices=("tube", "box"), default="tube",
-                   help="tube: n closed-loop rollouts under the CV-STEM control "
-                        "(n x horizon samples) -- certifies where the system actually "
-                        "operates. box: uniform over the whole state box -- a far "
-                        "stronger claim, unachievable on most envs")
     p.add_argument("--num-trajs", "--num_trajs", type=int, default=4,
-                   help="tube mode: n reference trajectories rolled out")
+                   help="n reference trajectories rolled out closed-loop")
     p.add_argument("--horizon", type=int, default=60,
-                   help="tube mode: steps per rollout (n*horizon samples)")
+                   help="steps per rollout (num_trajs*horizon samples)")
     p.add_argument("--jacobian", choices=("drift", "generalized"), default="drift",
                    help="drift: A = df/dx, EXACTLY what build_cm_dataset solves, so the "
                         "answer transfers to synthesis (u does not enter the LMI). "
@@ -422,42 +284,22 @@ def main() -> int:
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
-    rng = np.random.default_rng(args.seed)
 
     import contractionRL.tasks.direct.classic  # noqa: F401  (registers the ids)
     import gymnasium as gym
-    _n_env = args.num_trajs if args.sampling == "tube" else 1
-    env = gym.make(args.task, num_envs=_n_env, device="cpu").unwrapped
+    env = gym.make(args.task, num_envs=args.num_trajs, device="cpu").unwrapped
     x_lo, x_hi, u_lo, u_hi = _boxes(env)
     x_dim, u_dim = int(env.num_dim_x), int(env.num_dim_control)
-
-    # DATA = (x, u_cvstem, x_next) triples. Instead of drawing u uniformly, the
-    # control is the one CV-STEM's own metric implies, u = uref - (1/r)B^T M e,
-    # so the triple lies on the CERTIFIED closed loop rather than on an arbitrary
-    # input. n states x m reference draws (xref, uref) -> n*m triples.
-    n, m = args.num_states, args.num_controls
-    xs = np.repeat(rng.uniform(x_lo, x_hi, size=(n, x_dim)), m, axis=0)
-    # Tracking error from the env's OWN initial-error box, not an arbitrary
-    # xref: e is what the deployed controller actually sees at reset.
-    xe_lo = env.XE_MIN.detach().cpu().numpy()
-    xe_hi = env.XE_MAX.detach().cpu().numpy()
-    es = rng.uniform(xe_lo, xe_hi, size=(n * m, x_dim))
     ur_lo = env.UREF_MIN.detach().cpu().numpy()
     ur_hi = env.UREF_MAX.detach().cpu().numpy()
-    urefs = rng.uniform(ur_lo, ur_hi, size=(n * m, u_dim))
 
     print(f"[uniform-lambda] task={args.task}  x_dim={x_dim} u_dim={u_dim}")
     print(f"[uniform-lambda] state box  lo={np.round(x_lo, 3)}  hi={np.round(x_hi, 3)}")
     print(f"[uniform-lambda] control box lo={np.round(u_lo, 3)} hi={np.round(u_hi, 3)}")
-    n_samples = (args.num_trajs * args.horizon if args.sampling == "tube"
-                 else xs.shape[0])
-    if args.sampling == "tube":
-        print(f"[uniform-lambda] TUBE: {args.num_trajs} reference trajectories x "
-              f"{args.horizon} steps = {n_samples} closed-loop samples "
-              f"(u = uref - (1/r)B^T M e at every step)")
-    else:
-        print(f"[uniform-lambda] BOX: n={n} states x m={m} (xref,uref) draws "
-              f"= {n_samples} (x, u_cvstem, x_next) triples")
+    n_samples = args.num_trajs * args.horizon
+    print(f"[uniform-lambda] TUBE: {args.num_trajs} reference trajectories x "
+          f"{args.horizon} steps = {n_samples} closed-loop samples "
+          f"(u = uref - (1/r)B^T M e at every step)")
     print(f"[uniform-lambda] w_lb={args.w_lb} w_ub={args.w_ub} eps={args.cm_eps} "
           f"r_scaler={args.r_scaler} solver={args.solver} jacobian={args.jacobian}")
     if args.wdot:
@@ -466,11 +308,7 @@ def main() -> int:
     else:
         print("[uniform-lambda] Wdot OFF (--no-wdot): static LMI at x only")
 
-    # u is not known until W is solved, so the Jacobian at x uses the reference
-    # control (it is ignored entirely under --jacobian drift, the default).
-    A, B = generalized_jacobians(env, xs, urefs, mode=args.jacobian)
-
-    # Actuator feasibility is now EXACT: u_cvstem = uref - (1/r)B^T M e is a
+    # Actuator feasibility is EXACT: u_cvstem = uref - (1/r)B^T M e is a
     # concrete vector per sample, so it is tested against the control box
     # directly. No Monte-Carlo over error directions and no rho, and no need to
     # subtract uref into a "feedback budget" -- uref is already inside u.
@@ -490,20 +328,12 @@ def main() -> int:
     env_wlb = {"w_lb": args.w_lb, "w_ub": args.w_ub}
 
     def _check(lbd):
-        if args.sampling == "tube":
-            common = dict(w_lb=env_wlb["w_lb"], w_ub=env_wlb["w_ub"], eps=args.cm_eps,
-                          solver=args.solver, ctl_lo=ctl_lo, ctl_hi=ctl_hi,
-                          horizon=args.horizon, use_wdot=args.wdot,
-                          jac_mode=args.jacobian, check_u=check_u, seed=args.seed)
-        else:
-            common = dict(w_lb=env_wlb["w_lb"], w_ub=env_wlb["w_ub"], eps=args.cm_eps,
-                          solver=args.solver, ctl_lo=ctl_lo, ctl_hi=ctl_hi, env=env,
-                          dt=float(env.dt), use_wdot=args.wdot, jac_mode=args.jacobian,
-                          check_u=check_u, xs=xs, es=es, urefs=urefs)
-        _checker = ((lambda **kw: feasible_tube(env, **kw)) if args.sampling == "tube"
-                    else (lambda **kw: feasible_everywhere_cvstem(A, B, **kw)))
+        common = dict(w_lb=env_wlb["w_lb"], w_ub=env_wlb["w_ub"], eps=args.cm_eps,
+                      solver=args.solver, ctl_lo=ctl_lo, ctl_hi=ctl_hi,
+                      horizon=args.horizon, use_wdot=args.wdot,
+                      jac_mode=args.jacobian, check_u=check_u, seed=args.seed)
         r, why = feasible_with_r_backoff(
-            _checker, lbd=lbd, r_scaler=args.r_scaler,
+            lambda **kw: feasible_tube(env, **kw), lbd=lbd, r_scaler=args.r_scaler,
             max_r_steps=(args.max_r_steps if check_u else 0),
             step_factor=args.step_factor,
             log=lambda s: print(f"[uniform-lambda] {s}"), **common)
@@ -603,8 +433,7 @@ def main() -> int:
           f"with no per-state backoff.\n"
           f"  NOTE: this is a sampled certificate, not a proof — it holds over the\n"
           f"  {n_samples} points tested. Raise "
-          + ("--num-trajs/--horizon" if args.sampling == "tube"
-             else "--num-states/--num-controls") + " to tighten it.")
+          "--num-trajs/--horizon to tighten it.")
     return 0
 
 
