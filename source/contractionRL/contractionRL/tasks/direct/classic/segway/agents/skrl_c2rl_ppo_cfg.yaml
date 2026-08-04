@@ -61,9 +61,11 @@ agent:
   learning_rate_scheduler: KLAdaptiveLR # matches the standalone PPO baseline for this env
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.008
+    max_lr: 1.0e-4       # ceiling the scheduler may climb to
+    min_lr: 1.0e-8       # floor it may fall to (learning_rate is the START)
   std_dev_annealing_kwargs:
     schedule: exponential
-    final_log_std: -6.9
+    final_log_std: -4.6
     power: 2.0
   random_timesteps: 0
   learning_starts: 0
@@ -72,11 +74,11 @@ agent:
   value_clip: 0.0  # Clipping bound for the value function update
   entropy_loss_scale: 0.0 # Coefficient to encourage exploration by maximizing action entropy
   value_loss_scale: 0.5  # Weight coefficient for the value function loss term
-  kl_threshold: 0.02 # Early stopping threshold based on Kullback-Leibler divergence
+  kl_threshold: 0.01 # Early stopping threshold based on Kullback-Leibler divergence
   time_limit_bootstrap: true  # Bootstrap value at episode truncation instead of treating it as terminal
   rewards_shaper_scale: 1.0
   use_state_norm: false  # OFF by default — see c2rl.py module docstring / rl_glue.make_base_rl_cfg
-  use_value_norm: true   # Same, but for the value function's output (PPO only)
+  use_value_norm: false   # Same, but for the value function's output (PPO only)
   use_reward_norm: true  # Non-biasing running-std reward normalizer (r/std, no centering) — tames the
                          # w_lb/w_ub-dependent Mahalanobis-reward scale/heavy-tail before GAE; see rl_glue.
 
