@@ -36,10 +36,20 @@ def patch_kl_logging(agent) -> None:
     import skrl.resources.schedulers.torch as _sched
 
     scheduler = getattr(agent, "scheduler", None)
-    if not isinstance(scheduler, _sched.KLAdaptiveLR):
+    if isinstance(scheduler, _sched.KLAdaptiveLR):
+        pass
+    elif hasattr(agent, "scaler"):
+        # A PPO/SAC-family agent: it runs the update loop that computes the KL,
+        # so a missing KLAdaptiveLR really does cost the metric.
         print(f"[patch] WARNING: no KLAdaptiveLR on {type(agent).__name__} "
               f"(scheduler={type(scheduler).__name__ if scheduler else None}) — "
               f"'Policy / KL divergence' will NOT be logged for this run.")
+        return
+    else:
+        # A wrapper agent (C2RL's outer agent has no .policy/.scaler of its own)
+        # — it never computes a KL, so there is nothing to miss. Both train_utils
+        # and C2RL call this, the latter on the INNER sub-agent that does; warning
+        # here would fire on every C2RL run and train everyone to ignore the real one.
         return
 
     _orig_step = scheduler.step
