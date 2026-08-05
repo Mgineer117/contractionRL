@@ -68,12 +68,13 @@ agent:
   learning_epochs: 5  # Number of gradient descent passes over the collected batch
   mini_batches: 4  # Number of subsets to divide the batch into for stochastic optimization
   gae_lambda: 0.99  # Lambda parameter for Generalized Advantage Estimation (GAE)
-  learning_rate: 1.0e-6   # Global step size for neural network optimization
-  learning_rate_scheduler: KLAdaptiveLR # matches the standalone PPO baseline for this env
-  learning_rate_scheduler_kwargs:
-    kl_threshold: 0.008   # TARGET KL the scheduler steers toward (not the early-stop)
-    max_lr: 1.0e-4       # ceiling the scheduler may climb to
-    min_lr: 1.0e-8       # floor it may fall to (learning_rate is the START)
+  learning_rate: 1.0e-5   # Global step size, FIXED — no scheduler (see below)
+  # No KL-adaptive schedule: the LR is constant at learning_rate above.
+  # (KLAdaptiveLR was steering toward kl_threshold 0.008, but with the PPO
+  # early-stop at 0.01 its DECREASE branch could never fire — that needs
+  # mean KL > 0.016 (kl_factor=2), above the stop — so it only ratcheted the
+  # LR upward. A fixed LR is the honest version of that behavior.)
+  learning_rate_scheduler: null
   # false -> PPO LEARNS log_std through the policy loss (stock-PPO behavior) and
   # the schedule below is ignored; true -> log_std is frozen and driven by the
   # schedule. Override per-run with --std_dev_annealing false.
@@ -91,12 +92,9 @@ agent:
   value_loss_scale: 0.5  # Weight coefficient for the value function loss term
   # HARD early-stop: skrl's PPO breaks out of the epoch when a minibatch's KL
   # exceeds this (ppo.py: `if self.cfg.kl_threshold and kl_divergence > ...`).
-  # Only 1.25x the scheduler's TARGET
-  # (learning_rate_scheduler_kwargs.kl_threshold=0.008), so the epoch is
-  # abandoned almost as soon as KL passes the target — a deliberately tight
-  # trust region. KLAdaptiveLR does not start cutting the LR until KL > 0.016
-  # (kl_factor=2), i.e. ABOVE this stop, so the LR is now driven mainly by the
-  # increase branch (KL < 0.004) and the hard stop does the constraining.
+  # With the LR now FIXED (no scheduler), this is the ONLY trust-region control:
+  # a single minibatch exceeding it abandons the rest of the epoch. Note the stop
+  # is per-MINIBATCH, not on the epoch mean.
   kl_threshold: 0.01
   time_limit_bootstrap: true  # Bootstrap value at episode truncation instead of treating it as terminal
   residual_contraction_pretrain: false
@@ -141,19 +139,28 @@ cm:
   # "online" instead solves the CV-STEM SDP per env per step (what c2rl_sac
   # does) — impractical here at this num_envs. See c2rl.py's module docstring.
   metric_source: cmg
-  # Mahalanobis reward
-  w_ub: 10.0  # Upper eigenvalue bound for the metric M(x)
-  w_lb: 0.1  # Lower eigenvalue bound for the metric M(x)
+  # Mahalanobis reward + the CV-STEM envelope w_lb·I ⪯ W ⪯ w_ub·I. These are one
+  # measurement with lbd/cvstem_r_scaler below, not four independent knobs — the
+  # envelope caps ν ≤ 1/w_lb and hence the gain ‖K‖ ≤ ‖B‖/(r·w_lb), so changing
+  # either bound invalidates the rate. w_lb also sets the Mahalanobis reward's
+  # scale, so it is not reward-neutral.
+  w_ub: 100.0  # Upper eigenvalue bound for the metric M(x)
+  w_lb: 0.01  # Lower eigenvalue bound for the metric M(x)
   # Contraction rate λ — used by cmg_method's synthesis loss (CM SDP LMI for
   # "cvstem", CMG Cu/C1 loss for "ccm").
-  # 0.422 with cvstem_r_scaler 0.131687: measured by scripts/find_uniform_lambda.py
-  # under TUBE sampling -- 4 reference trajectories rolled out 100 steps under the
-  # CV-STEM control u = uref - (1/r)B^T M e, requiring the LMI (with the real Wdot
-  # from consecutive states) AND u inside the control box at every step.
-  # The earlier 0.790 (r=0.0878) came from a 50-step horizon; doubling it to 100
-  # reaches harder states down the tube and cut the certifiable rate roughly in
-  # half, so 0.790 was optimistic. Re-measure if the horizon changes again.
-  lbd: 0.422
+  # 0.3902 with cvstem_r_scaler 1.6 / w_lb 0.01 / w_ub 100: measured by
+  # scripts/find_uniform_lambda.py under UNIFORM state-box sampling — the joint
+  # CV-STEM SDP over 1000 uniform samples at cm_dt=1.0, stepping λ down by 1.5 on
+  # LMI infeasibility and r up by 2 whenever >5% of the generated controls
+  # u = uref - (1/r)BᵀM·e leave the 2x-expanded uref box. 3.73% land outside at
+  # this (λ, r); ν=4.233, χ=3.853, |u|max=2.645.
+  # That program is STRICTER than the one solved here: it carries Tsukamoto's
+  # (W̄-I)/dt term and one shared ν over all samples, whereas solve_cm_metric runs
+  # pointwise with cm_wdot_dt=0 (no Ẇ term) — so the rate certifies here too.
+  # The earlier 0.422 / r 0.131687 came from TUBE sampling along 4 rolled-out
+  # reference trajectories; uniform sampling reaches states no tube visits, which
+  # is why it lands at a lower rate and a much weaker gain.
+  lbd: 0.3902
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled, already 0)
   # SDP contraction metric (cm_eps used by both cmg_method paths; cm_solver "cvstem" only)
@@ -178,7 +185,7 @@ cm:
   #              Control is penalized via this Riccati term, not bounded over an
   #              action range — see ncm_synthesis.py module docstring.
   cmg_method: cvstem
-  cvstem_r_scaler: 0.131687  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only
+  cvstem_r_scaler: 1.6  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); measured with lbd/w_lb/w_ub above — "cvstem" only
   # On SDP infeasibility AT A GIVEN STATE, retry that state alone with λ
   # halved, up to this many times, before giving up on it and dropping it from
   # the dataset — 0 disables this and reverts to dropping immediately. Warns
@@ -200,14 +207,29 @@ cm:
 # network onto {x -> W*}. "ccm": train models.cmg directly with C1/C2 losses,
 # no SDP. Either way, freeze before Phase B.
 cmg:
-  cmg_memory_size: 131072
-  cmg_regress_epochs: 1000
+  # Tsukamoto's Nx, and the same count skrl_cvstem_lqr_cfg.yaml solves — the two
+  # algorithms' metrics are only comparable if they are fit to the same amount of
+  # SDP data. NOT a free knob: it sets the regression's dataset size, so the four
+  # settings below are sized against it.
+  cmg_memory_size: 1000
+  # regress_cmg does `iters = max(1, n_train // batch_size)`, so at 900 training
+  # points the old batch 1024 silently became ONE full-batch step per epoch —
+  # 1000 gradient steps total, deep in the starved regime (measured relative
+  # error on M: 0.55 at 0.5k steps, 0.23 at 5k, 0.03 at 100k). The `max(1, ...)`
+  # means this degrades quietly rather than erroring. 900 // 32 = 28 batches x
+  # 3000 epochs = ~84k steps, matching skrl_cvstem_lqr_cfg.yaml's budget.
+  cmg_regress_epochs: 3000
   cmg_regress_lr: 1.0e-3
   cmg_regress_lr_scheduler: "StepLR"  # built the same way as empirical_dynamics' scheduler
   cmg_regress_lr_scheduler_kwargs:
     step_size: 1  # anneal every epoch
-    gamma: 0.99
-  cmg_regress_batch_size: 1024
+    # gamma is per EPOCH and must be sized to the epoch count: 0.99^3000 = 1e-13
+    # would annihilate the lr by epoch ~500. 0.999^3000 lands at 5e-5.
+    gamma: 0.999
+  cmg_regress_batch_size: 32
+  # In EPOCHS. The dataclass default of 10 would stop after ~280 steps, i.e.
+  # before the fit has started.
+  cmg_early_stop_patience: 300
 
 # ── Dynamics — analytical env get_f_and_B by default; set use_empirical_dynamics
 #    true (classic envs only) to learn a NeuralDynamics instead. ─────────────── #
