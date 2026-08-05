@@ -138,7 +138,21 @@ class WandbPlotWrapper:
         # figures (same style/keys) that C3M/C2RL emit from their eval() — a
         # single source of truth for all tracking plots, backed by
         # StatManagerEnvWrapper's buffer (already normalized by e(0)).
-        from contractionRL.agents.skrl.contraction_metrics import log_tracking_plots
+        from contractionRL.agents.skrl.contraction_metrics import (
+            log_metric_distributions,
+            log_tracking_plots,
+        )
+
+        # Histograms of the per-env AUC / lambda / running lambda / peak
+        # overshoot behind the Stability scalars. Pushed BEFORE the early
+        # returns below: those guard on trajectory recording (traj_x), which is
+        # a separate buffer — the metric distributions are computed from
+        # _eval_buffer and are available whenever the StatManager has reduced,
+        # so gating them on trajectories would silently drop them.
+        log_metric_distributions(
+            self.env.distributions(), prefix="train",
+            step=self._total_steps, title="Train",
+        )
 
         traj_x, traj_xref, traj_err = self.env.trajectories()
         if not traj_err:

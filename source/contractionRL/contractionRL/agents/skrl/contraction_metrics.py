@@ -483,6 +483,22 @@ class StatManagerEnvWrapper:
             "peak_mean": peak_mean, "peak_median": peak_median, "peak_p95": peak_p95,
             "auc_median": auc_median, "auc_p05": auc_p05, "auc_p25": auc_p25,
             "auc_p75": auc_p75, "auc_p95": auc_p95, "auc_max": auc_max,
+            # The UNREDUCED per-env vectors behind the four scalars above, for
+            # log_metric_distributions. Every mean here is over a population
+            # whose spread is the actual finding — a healthy median under a
+            # thrashing mean is a rare-blow-up signature, and no scalar shows
+            # that. Underscored because this dict is the ONE float-valued
+            # contract in this module that now carries an array: it is read only
+            # by _compute_batched_metrics, which copies named scalars out, so it
+            # never reaches stability_summary() or the wandb scalar loggers.
+            # running_lambda is SHORTER than the others (contracting episodes
+            # only) and may be empty — the plotter guards on that.
+            "_dist": {
+                "auc": auc_np,
+                "lambda": lambda_vec.detach().cpu().numpy(),
+                "running_lambda": running_lambda_vec.detach().cpu().numpy(),
+                "peak": peaks_np,
+            },
         }
 
     def _compute_batched_metrics(self):
@@ -509,6 +525,7 @@ class StatManagerEnvWrapper:
         self._recent_auc_max = m["auc_max"]
         self._recent_peak_median = m["peak_median"]
         self._recent_peak_p95 = m["peak_p95"]
+        self._recent_distributions = m["_dist"]
 
         # Same reduction on the SQUARED Mahalanobis Lyapunov V(t)/V(0) =
         # ‖e(t)‖²_M/‖e(0)‖²_M — the quantity the CCM certificate contracts
@@ -945,6 +962,12 @@ class StatManagerEnvWrapper:
             "peak_p95": self._recent_maha_peak_p95,
         }
 
+    def distributions(self):
+        """Per-env vectors behind the Stability scalars: ``auc``, ``lambda``,
+        ``running_lambda``, ``peak``. Empty dict before the first buffer
+        completion. Consumed by :func:`log_metric_distributions`."""
+        return getattr(self, "_recent_distributions", None) or {}
+
     def trajectories(self):
         return self._recent_trajs
 
@@ -1069,6 +1092,97 @@ def log_raw_config(raw_cfg: dict | None) -> None:
     if run is None or not raw_cfg:
         return
     run.config.update({"raw_yaml": raw_cfg}, allow_val_change=True)
+
+
+def log_metric_distributions(
+    dists: dict,
+    *,
+    prefix: str = "train",
+    step: int | None = None,
+    title: str | None = None,
+    key: str = "metric_distributions",
+) -> None:
+    """Push ONE figure of per-env metric HISTOGRAMS to ``{prefix}/{key}``.
+
+    ``dists`` is :meth:`StatManagerEnvWrapper.distributions` — the unreduced
+    per-env vectors behind the ``Stability/*`` scalars. Four panels in a single
+    figure: AUC, contraction rate ``lambda``, running ``lambda``, peak
+    overshoot.
+
+    These exist because the scalars cannot express the shape that matters here.
+    A non-terminating env that diverges is pinned at the position bound while
+    its reference drives away, so its AUC grows without bound and ``auc_mean``
+    degenerates into a COUNT of blow-ups — a tight cluster plus two far-right
+    outliers and a uniformly-worse population produce the same mean. The
+    histogram separates them at a glance.
+
+    Each panel draws the mean (dashed) and median (dotted). AUC and peak
+    overshoot switch to a LOG x-axis when ``max/median > 20``, since one
+    diverged env otherwise compresses the entire population into the first bin.
+    ``running_lambda`` covers contracting episodes only, so its n is reported
+    separately and an empty vector renders as an explicit "no contracting
+    episodes" panel rather than an empty axis.
+
+    No-op when wandb is inactive or ``dists`` is empty.
+    """
+    if _wandb_run() is None or not dists:
+        return
+    import matplotlib.pyplot as plt
+    import wandb
+    from PIL import Image
+
+    PANELS = (
+        ("auc", "AUC", "∫ e(t)/e(0) dt"),
+        ("lambda", "contraction rate λ", "λ"),
+        ("running_lambda", "running λ (contracting episodes)", "λ"),
+        ("peak", "peak overshoot", "max_t e(t)/e(0)"),
+    )
+    if not any(np.asarray(dists.get(k, [])).size for k, _, _ in PANELS):
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(11.0, 7.0))
+    for ax, (name, panel_title, xlabel) in zip(axes.ravel(), PANELS):
+        v = np.asarray(dists.get(name, []), dtype=np.float64).ravel()
+        v = v[np.isfinite(v)]
+        if v.size == 0:
+            ax.text(0.5, 0.5, "no contracting episodes" if name == "running_lambda"
+                    else "no data", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(panel_title)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            continue
+
+        mean, median = float(np.mean(v)), float(np.median(v))
+        # A heavy right tail (one diverged env) would otherwise put the whole
+        # population in bin 0. Log bins need a strictly positive floor.
+        heavy = name in ("auc", "peak") and median > 0 and v.max() / median > 20.0
+        if heavy:
+            lo = max(float(v[v > 0].min()) if np.any(v > 0) else 1e-8, 1e-8)
+            bins = np.logspace(np.log10(lo), np.log10(max(float(v.max()), lo * 10)), 40)
+            ax.set_xscale("log")
+        else:
+            bins = min(40, max(10, int(np.sqrt(v.size)) * 2))
+
+        ax.hist(v, bins=bins, color="#4C72B0", alpha=0.8, edgecolor="white", linewidth=0.4)
+        ax.axvline(mean, color="#C44E52", ls="--", lw=1.5, label=f"mean {mean:.3g}")
+        ax.axvline(median, color="#55A868", ls=":", lw=1.8, label=f"median {median:.3g}")
+        ax.set_title(f"{panel_title}   (n={v.size})")
+        ax.set_xlabel(xlabel + ("  [log]" if heavy else ""))
+        ax.set_ylabel("envs")
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.25)
+
+    fig.suptitle(f"{title or prefix} — per-env metric distributions")
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    payload = {f"{prefix}/{key}": wandb.Image(Image.open(buf))}
+    if step is not None:
+        payload["global_step"] = step
+    wandb.log(payload)
 
 
 def log_tracking_plots(
