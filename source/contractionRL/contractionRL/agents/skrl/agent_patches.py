@@ -23,13 +23,23 @@ def patch_kl_logging(agent) -> None:
     skrl's PPO computes KL to drive KLAdaptiveLR but never records it, so
     kl_threshold early stops are invisible — even though they deflate that
     update's averaged losses (skrl divides by the full
-    learning_epochs*mini_batches regardless of where it broke). No-op without a
-    KLAdaptiveLR scheduler.
+    learning_epochs*mini_batches regardless of where it broke).
+
+    ``KLAdaptiveLR.step(kl)`` is the ONLY place the KL escapes skrl's
+    ``_update`` — it is a local there and nothing else reads it — so without
+    that scheduler there is no hook and the metric cannot exist. That made
+    setting ``learning_rate_scheduler: null`` silently drop the KL curve. It now
+    WARNS instead of vanishing; to keep a fixed LR and the metric, attach
+    KLAdaptiveLR with ``min_lr == max_lr == learning_rate`` (see
+    skrl_c2rl_ppo_cfg.yaml) rather than removing the scheduler.
     """
     import skrl.resources.schedulers.torch as _sched
 
     scheduler = getattr(agent, "scheduler", None)
     if not isinstance(scheduler, _sched.KLAdaptiveLR):
+        print(f"[patch] WARNING: no KLAdaptiveLR on {type(agent).__name__} "
+              f"(scheduler={type(scheduler).__name__ if scheduler else None}) — "
+              f"'Policy / KL divergence' will NOT be logged for this run.")
         return
 
     _orig_step = scheduler.step
