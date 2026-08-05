@@ -2,27 +2,11 @@ seed: 42  # Random seed for reproducibility
 
 # CV-STEM-LQR: Tsukamoto's CV-STEM contraction controller — analytical (no RL),
 # u = uref - K(x)(x-xref) with K(x) = R⁻¹B(x)ᵀM(x), M(x)=W(x)⁻¹ from the CV-STEM
-# metric SDP. See agents/skrl/cvstem_lqr.py.
-
-models:
-  separate: true
-  # Only built (and synthesized+frozen) when metric_source=pretrained; ignored
-  # for metric_source=online (which re-solves the SDP every step).
-  cmg:
-    class: CMG
-    network:
-    - name: net
-      input: OBSERVATIONS
-      layers: [128, 128]
-      activations: tanh
+# metric SDP (ONE joint program over uniform state-box samples, ν/χ shared
+# — Tsukamoto's classncm.cvstem0). See agents/skrl/cvstem_lqr.py.
 
 agent:
   class: CVSTEM-LQR
-  # "online" — solve the CV-STEM SDP fresh at every step (truest to the
-  #            certificate; needs an SDP solver at deploy; one solve per env/step).
-  # "pretrained" — synthesize+freeze a CMG once, then M(x) is a network forward
-  #                pass (fast, vectorized on-device; certificate = regression fit).
-  metric_source: online
   # R = r_scaler·I, used in BOTH the metric SDP's Riccati term AND the deployed
   # gain K = R⁻¹BᵀM — a single knob so K stays the CERTIFIED CV-STEM gain.
   r_scaler: 0.01
@@ -36,29 +20,38 @@ agent:
       project: contractionRL
       name:
 
-# ── Contraction metric SDP (both metric sources) ───────────────────────────── #
+# ── The joint CV-STEM SDP (Tsukamoto's classncm.cvstem0) ───────────────────── #
 cm:
-  w_ub: 10.0    # Upper eigenvalue bound for W (M ≥ 1/w_ub)
-  w_lb: 0.01    # Lower eigenvalue bound for W (M ≤ 1/w_lb)
-  lbd: 2.0      # Contraction rate λ
-  cm_eps: 0.1   # Strict-definiteness margin on the contraction LMI
+  # λ — the certified contraction rate. Comes from scripts/find_uniform_lambda.py
+  # (the λ-selection step; the reference's own linesearch is not run here).
+  lbd: 2.0
+  cm_eps: 0.1   # ε, strict-definiteness margin on the LMI (his epsilon)
+  # Tsukamoto's CV-STEM SAMPLING PERIOD, which is a synthesis hyperparameter and
+  # NOT the integrator step: his cart-pole notebook uses dt=1 while the sim runs
+  # at 0.1 and RK4-substeps at 0.01. Unset, this falls back to the env integrator
+  # step, a much harsher (W-I)/dt bound that inflates nu by the same factor.
+  cm_dt: 1.0
   cm_solver: MOSEK  # SCS (no license) | CLARABEL | MOSEK (tightest/fastest; see README)
-  max_lambda_reductions: 5  # per-state λ-backoff budget on SDP infeasibility
-  # ── metric_source=pretrained only ──
-  min_feasibility_rate: 0.5
-  cm_data_path: "data/classic/cartpole/cvstem_lqr_cm_data.npz"
+  # Uniform state-box samples in the ONE joint SDP (his Nx=1000). A SOLVER-SIZE
+  # knob: each sample adds an x_dim² PSD block plus two LMIs to a single problem.
+  cm_samples: 1000
+  cm_seed: 0
+  # Uncomment for HIS lambda selection instead (linesearch: walk lambda up from
+  # lo to hi in steps of da, take argmin J = chi/lambda + nu). It ignores `lbd`
+  # above and does not look at the actuator box.
+  # lbd_linesearch: [0.1, 3.0, 0.1]
 
-# ── Offline CMG synthesis (metric_source=pretrained only) ──────────────────── #
+# ── The metric network: x -> chol(M) (nn_modules.CholMetric) ──────────────── #
 cmg:
-  cmg_memory_size: 131072
-  cmg_regress_epochs: 10
+  # The reference's own architecture: a 3x100 ReLU MLP on the raw state.
+  cmg_hidden_dims: [100, 100, 100]
+  cmg_regress_epochs: 100
   cmg_regress_lr: 1.0e-3
+  cmg_regress_batch_size: 32
   cmg_regress_lr_scheduler: "StepLR"
   cmg_regress_lr_scheduler_kwargs:
     step_size: 1
     gamma: 0.99
-  cmg_regress_batch_size: 1024
-
 trainer:
   class: SequentialTrainer
   timesteps: 10000  # Total number of environment steps to evaluate for

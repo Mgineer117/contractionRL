@@ -159,9 +159,11 @@ class SDLQRAgent(Agent):
         cfg = self._cfg
         batch_size = obs.shape[0]
 
-        x    = obs[:, :x_dim].float().to(self._compute_device).requires_grad_()
-        xref = obs[:, x_dim : 2 * x_dim].float().to(self._compute_device)
-        uref = obs[:, 2 * x_dim : 2 * x_dim + u_dim].float().to(self._compute_device)
+        # RefWindow.split, never a hand-slice — see the note in cvstem_lqr.py.
+        x_w, xrefs, urefs = self._window.split(obs)
+        x    = x_w.float().to(self._compute_device).requires_grad_()
+        xref = xrefs[:, 0].float().to(self._compute_device)
+        uref = urefs[:, 0].float().to(self._compute_device)
 
         with torch.enable_grad():
             f, B, _ = self._get_f_and_B(x)
@@ -282,9 +284,11 @@ class LQRAgent(Agent):
         cfg = self._cfg
         batch_size = obs.shape[0]
 
-        x     = obs[:, :x_dim].float().to(self._compute_device)
-        xref  = obs[:, x_dim : 2 * x_dim].float().to(self._compute_device).requires_grad_()
-        uref  = obs[:, 2 * x_dim : 2 * x_dim + u_dim].float().to(self._compute_device)
+        # RefWindow.split, never a hand-slice — see the note in cvstem_lqr.py.
+        x_w, xrefs, urefs = self._window.split(obs)
+        x     = x_w.float().to(self._compute_device)
+        xref  = xrefs[:, 0].float().to(self._compute_device).requires_grad_()
+        uref  = urefs[:, 0].float().to(self._compute_device)
 
         with torch.enable_grad():
             f_xref, B_xref, _ = self._get_f_and_B(xref)

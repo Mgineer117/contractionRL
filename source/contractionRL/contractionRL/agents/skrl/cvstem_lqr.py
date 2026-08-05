@@ -1,67 +1,51 @@
-"""CV-STEM-LQR — Tsukamoto's CV-STEM contraction controller as a skrl Agent.
+"""CV-STEM-LQR — Tsukamoto's CV-STEM/NCM controller (``AstroHiro/ncm``, ``classncm``).
 
-Analytical (no learnable RL parameters — ``update()`` is a no-op), like
-``sdlqr.py``'s SD-LQR/LQR, but the feedback gain comes from a CV-STEM
-*contraction metric* instead of a per-state CARE (algebraic Riccati) solve. The
-control law is Tsukamoto's (Neural Contraction Metric work, his ``ncm.control``)::
+Analytical, no learnable RL parameters (``update()`` is a no-op), like
+``sdlqr.py``'s LQR/SD-LQR. The deployed law is his ``simulation``'s control
+branch::
 
     u = u_ref - K(x)·(x - x_ref),   K(x) = R⁻¹·B(x)ᵀ·M(x)
 
-evaluated at the CURRENT state ``x`` (the "SD" linearization point, matching his
-original), with the SAME ``R`` used in the metric's Riccati term (``r_scaler``)
-so ``K`` is the CERTIFIED CV-STEM gain — not an arbitrary LQR gain that happens
-to share the metric.
+with the same ``R = r_scaler·I`` the metric SDP's Riccati term uses, so ``K`` is
+the certified CV-STEM gain.
 
-Why this differs from SD-LQR
-----------------------------
-SD-LQR's ``K = R⁻¹BᵀP`` uses ``P`` from ``solve_continuous_are`` — a LOCAL
-optimal-control solution at the linearized ``(A, B)`` with only a
-stabilizability guarantee. Here ``M(x) = W(x)⁻¹`` is a CV-STEM contraction
-metric (``ncm_synthesis.solve_cm_metric``): the SDP that produced it enforced
+The pipeline, offline, once at construction — his ``train``:
 
-    A(x)·W + W·Aᵀ - 2·B R⁻¹ Bᵀ + 2λ·W ⪯ -ε·I,   w_lb·I ⪯ W ⪯ w_ub·I
+1. ``sample_state_box`` — ``cm_samples`` states i.i.d. uniform over the env's
+   state box (his ``xlims`` draw).
+2. ``cvstem_joint`` — ONE SDP over all of them: per-state ``W̄_k``, a SINGLE
+   shared ``ν`` and ``χ``, his ``(W̄-I)/dt`` term, objective ``J = χ/λ + ν``.
+3. ``M_to_cholvec`` + ``regress_cholm`` — labels ``chol(W_k⁻¹)``, MSE-fit
+   ``nn_modules.CholMetric``. That network is the metric from then on;
+   ``M = RᵀR`` is SPD by construction with no eigenvalue bound anywhere.
 
-whose ``-2·B R⁻¹ Bᵀ`` term is EXACTLY the closed loop ``A - B R⁻¹BᵀM`` carried
-through the ``W = M⁻¹`` congruence. So ``M`` doubles as a state-dependent
-Riccati solution and this ``K`` renders the system contracting at rate ``λ`` —
-a global incremental-stability certificate, not a local one. See
-``ncm_synthesis.py``'s module docstring.
+λ selection is his ``linesearch`` (walk λ up, take ``argmin J``) when
+``lbd_linesearch: [lo, hi, da]`` is set; otherwise the configured ``lbd`` is used
+directly, his ``cvstem0`` at a fixed α.
 
-Metric source (``metric_source`` config)
------------------------------------------
-* ``"online"`` (default): solve the CV-STEM SDP fresh at every step, per env,
-  for the current ``x`` (``_solve_cm_metric_with_backoff``). Truest to the
-  certificate — every deployed ``M`` is a verified feasible metric — but needs
-  cvxpy/an SDP solver at deploy time and runs one solve per env per step (a
-  Python loop on CPU, like SD-LQR's CARE loop). Infeasible states fall back to
-  zero feedback (``u = u_ref``), same as SD-LQR's non-stabilizable fallback —
-  unless ``abort_on_infeasible`` is set, which raises ``CVSTEMInfeasibleError``
-  on the first infeasible state in any env instead (used by the sweep, where a
-  silent part-open-loop rollout would be scored as a valid certificate).
-* ``"pretrained"``: synthesize a frozen CMG network ONCE at construction
-  (Tsukamoto NCM — ``build_cm_dataset`` per-state SDP + ``regress_cmg`` MSE fit,
-  cached to ``cm_data_path``), then ``M(x)`` is a cheap batched network forward
-  pass and the whole step is vectorized on-device. The certificate is then only
-  as tight as the regression fit, but rollouts are orders of magnitude faster
-  and need no solver at deploy time. This reuses C2RL's exact Phase-A synthesis.
+Nothing here deviates from the reference: the Ẇ term is always his ``(W̄-I)/dt``,
+the samples are always i.i.d. uniform over the box, and the network is fit to
+exactly the states the joint program certified. ``scripts/find_uniform_lambda.py``
+runs this same program at a smaller sample count to pick ``lbd``.
 
-Normalization: none, and none is meaningful — there are no learned RL weights
-whose input distribution could drift. ``"online"`` pins its compute to CPU
-(cvxpy is numpy/CPU-only); ``"pretrained"`` runs on the env's device.
+The one thing his code leaves implicit is that ``dt`` is the CV-STEM SAMPLING
+PERIOD, not the integrator step — his cart-pole notebook synthesizes at ``dt=1``
+while the simulation runs at ``0.1``. ``cm_dt`` is that knob here.
+
+An infeasible joint SDP aborts the run — there is no per-state λ-backoff and no
+partial-feasibility rate, because one program covers every sample.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-import numpy as np
 import torch
 from skrl.agents.torch.base import Agent, AgentCfg
 
 from .angle_utils import wrap_diff
-from .math_utils import bound_W, jacobian, spd_inverse
-from .ncm_synthesis import _solve_cm_metric_with_backoff
+from .nn_modules import CholMetric
 from .ref_window import RefWindow
 from .rl_glue import filter_cfg_fields
 
@@ -72,11 +56,10 @@ INFEASIBLE_MARKER = "CVSTEM-LQR INFEASIBLE"
 
 
 class CVSTEMInfeasibleError(RuntimeError):
-    """Raised when the online CV-STEM SDP is infeasible and abort_on_infeasible.
+    """Raised when the joint CV-STEM SDP has no solution at this (λ, ε).
 
-    Deliberately a distinct type rather than a bare RuntimeError so a caller can
-    tell "this (λ, ε, w_lb, w_ub) point is not solvable" apart from an ordinary
-    crash — the two mean very different things to a sweep.
+    A distinct type rather than a bare RuntimeError so a caller can tell "this
+    parameter point is not solvable" apart from an ordinary crash.
     """
 
 
@@ -86,64 +69,57 @@ class CVSTEMInfeasibleError(RuntimeError):
 
 @dataclass
 class CVSTEMLQRCfg(AgentCfg):
-    # "online" (per-step SDP solve) | "pretrained" (frozen CMG network). See
-    # module docstring.
-    metric_source: str = "online"
-
-    # R = r_scaler·I. Used in BOTH the metric SDP's Riccati term AND the deployed
-    # gain K = R⁻¹BᵀM — they MUST share the same R for K to be the certified
-    # CV-STEM gain. A single knob enforces that (mirrors sdlqr.py's R_scaler and
-    # ncm_synthesis' r_scaler, deliberately unified here). Strictly positive:
-    # r_scaler → 0 gives huge gains → discrete-dt divergence.
+    # R = r_scaler·I, in both the SDP's Riccati term and the deployed gain.
+    # INERT: ν is a free variable and the LMI sees only ν/r, so the solved ν
+    # absorbs r and K is unchanged (measured on the car: ν/r, χ and ‖K‖₂ all
+    # identical for r from 1e-2 to 1e4). λ, ε and cm_dt are the only knobs that
+    # move the gain — nu_weight/chi_weight are inert too (ν and χ come out
+    # jointly minimal, so the objective weights never activate a trade-off).
     r_scaler: float = 1.0
 
-    # ── CV-STEM SDP knobs (both metric sources — online solve AND the offline
-    #    dataset synthesis for "pretrained") — see ncm_synthesis.solve_cm_metric ──
-    lbd: float = 0.5              # contraction rate λ
-    w_lb: float = 0.1            # W eigenvalue lower bound (M ≤ 1/w_lb)
-    w_ub: float = 10.0           # W eigenvalue upper bound (M ≥ 1/w_ub)
-    cm_eps: float = 0.01         # strict-definiteness margin on the LMI
-    cm_solver: str = "SCS"       # cvxpy SDP solver (SCS | CLARABEL | MOSEK)
-    max_lambda_reductions: int = 5  # per-state λ-backoff budget on infeasibility
+    # ── The joint CV-STEM SDP (yaml `cm:` block) ───────────────────────────── #
+    lbd: float = 0.5              # contraction rate λ (his alpha)
+    cm_eps: float = 0.01          # strict-definiteness margin (his epsilon)
+    # The dt of his ``(W̄-I)/dt`` term — the CV-STEM SAMPLING PERIOD, which is a
+    # free hyperparameter of the synthesis and NOT the integrator step. His
+    # cart-pole notebook sets it to 1 while the simulation integrates at 0.1 and
+    # RK4-substeps at 0.01. ``None`` falls back to the env's dt, which is a 33x
+    # harsher Ẇ bound on the classic envs and inflates ν by the same factor.
+    cm_dt: float | None = None
+    # OPTIONAL deployment envelope w_lb·I ⪯ W ⪯ w_ub·I on the DEPLOYED W = W̄/ν,
+    # the two scalar caps solve_cm_metric applies: ν ≤ 1/w_lb, χ ≤ ν·w_ub. BOTH
+    # None (the default) is Tsukamoto's program exactly — ν and χ free, no
+    # envelope. w_lb is the direct gain cap, ‖K‖₂ ≤ ‖B‖₂/(r·w_lb), and is the
+    # knob r only imitates: ν absorbs r whenever χ is pinned, w_lb never is.
+    cm_w_lb: float | None = None
+    cm_w_ub: float | None = None
+    cm_solver: str = "MOSEK"      # cvxpy SDP solver (SCS | CLARABEL | MOSEK)
+    # Uniform state samples in the ONE joint program (his Nx=1000). A SOLVER-SIZE
+    # knob: each sample adds an x_dim² PSD block and two LMIs to one problem.
+    cm_samples: int = 1000
+    # J = chi_weight·χ + nu_weight·ν (his d₁b̄/α and d₂). None → 1/lbd.
+    chi_weight: float | None = None
+    nu_weight: float = 1.0
+    cm_seed: int = 0              # so a re-run certifies the same sample draw
+    # His ``linesearch``: [lbd_lo, lbd_hi, da]. Walks λ up and takes argmin J (the
+    # steady-state-error bound) — HIS λ selection. Absent (default) = use ``lbd``
+    # above directly, his cvstem0 at a fixed α. Neither criterion looks at the
+    # actuator box — whether the certified gain FITS is an empirical question the
+    # rollout answers, not one the SDP is asked.
+    lbd_linesearch: tuple | None = field(default=None)
 
-    # Actuator-feasibility check, evaluated on the REALIZED trajectory (not a
-    # per-state Monte Carlo prediction): every "online" step's actual
-    # controller output is compared against the env's own actuator box
-    # [u_lo, u_hi] (see ``u_lo``/``u_hi`` ctor args, derived from the env's
-    # UREF_MIN/UREF_MAX by ContractionRunner._setup_cvstem_lqr). Once the
-    # rollout ends, a channel fails if more than 5% of ITS ACTUAL executed
-    # samples fell outside its bound — same "95% must clear" threshold the old
-    # per-state check used, but measured from what the controller really did
-    # rather than a synthetic sample at an assumed tracking-error radius. See
-    # post_interaction() below. Subject to abort_on_infeasible, same as an LMI
-    # infeasibility. "online" only, no config knob needed.
-
-    # "online" only. False (default) keeps the historical behavior: an infeasible
-    # state falls back to zero feedback (u = u_ref) for that env and the rollout
-    # continues. True raises CVSTEMInfeasibleError on the FIRST infeasible state
-    # in ANY env instead.
-    #
-    # The fallback is the right default for a deploy-style rollout — one
-    # unsolvable state should not kill the episode — but it is exactly wrong for
-    # a sweep scoring THIS (λ, ε, w_lb, w_ub, r_scaler) point: the run finishes
-    # with a plausible AUC produced by a controller that was silently part
-    # open-loop, and the sweep credits the certificate for it. Set True by
-    # search/configs/cvstem-lqr.yaml so infeasibility becomes a recorded bad
-    # trial rather than an invisible one.
-    abort_on_infeasible: bool = False
-
-    # ── "pretrained" only: offline CMG synthesis (mirrors the yaml `cmg:` block
-    #    and C2RL's _synthesize_cmg_cvstem) ──────────────────────────────────── #
-    min_feasibility_rate: float = 0.5
-    cm_data_path: str = ""       # {x, W} dataset cache (skips the per-state solve)
-    cmg_memory_size: int = 131072
-    cmg_regress_epochs: int = 10
+    # ── The metric network (yaml `cmg:` block) ─────────────────────────────── #
+    cmg_hidden_dims: tuple = (100, 100, 100)   # his 3x100 ReLU MLP
+    # Sized for >=100k GRADIENT STEPS, which is what the fit actually needs:
+    # measured on the car, relative metric error 0.55 -> 0.23 -> 0.06 -> 0.03 at
+    # 0.5k/5k/25k/100k steps. The old 100 epochs x 32 batch was ~3k steps.
+    cmg_regress_epochs: int = 300
     cmg_regress_lr: float = 1.0e-3
-    cmg_regress_batch_size: int = 1024
+    cmg_regress_batch_size: int = 256
     cmg_regress_lr_scheduler: str = ""
-    cmg_regress_lr_scheduler_kwargs: dict | None = None
+    cmg_regress_lr_scheduler_kwargs: dict | None = field(default=None)
     cmg_val_frac: float = 0.1
-    cmg_early_stop_patience: int = 10
+    cmg_early_stop_patience: int = 30
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -151,47 +127,40 @@ class CVSTEMLQRCfg(AgentCfg):
 # ─────────────────────────────────────────────────────────────────────────── #
 
 class CVSTEMLQRAgent(Agent):
-    """CV-STEM contraction controller wrapped as a native skrl Agent.
+    """CV-STEM/NCM contraction controller wrapped as a native skrl Agent.
 
     Extra constructor kwargs:
       ``get_f_and_B``: ``(x) -> (f, B, Bbot)`` (analytical env dynamics or a
         loaded NeuralDynamics).
-      ``get_rollout``: only needed for ``metric_source="pretrained"`` state
-        sampling (same source C2RL/C3M use); may be ``None`` for ``"online"``.
-      ``models``: ``{"cmg": MetricModel}`` for ``"pretrained"`` (a
-        BoundedCCM_Generator, ``constrain_eigenvalues=True``); ``{}`` for
-        ``"online"``.
-      ``u_lo``/``u_hi``: SIGNED per-channel actuator bounds for the "online"
-        realized-trajectory actuator-feasibility check (post_interaction()) —
-        the CALLER (``ContractionRunner._setup_cvstem_lqr``) derives these
-        from the env's own ``UREF_MIN``/``UREF_MAX`` rather than a config
-        value, so they can never drift from the env's actual physical
-        actuator limits. ``None`` disables the check.
+      ``x_lo``/``x_hi``: the env's own state box — his ``xlims``. REQUIRED.
+      ``dt``: fallback for the SDP's ``Ẇ`` term when ``cfg.cm_dt`` is unset.
+        REQUIRED only in that case — see ``CVSTEMLQRCfg.cm_dt``, which is his
+        CV-STEM sampling period and takes precedence.
     """
 
     def __init__(
         self,
         *,
         cfg: CVSTEMLQRCfg | dict,
-        models: dict,
+        models: dict | None = None,
         memory=None,
         observation_space,
         state_space=None,
         action_space,
         device,
         get_f_and_B: Callable,
-        get_rollout: Callable | None = None,
+        x_lo=None,
+        x_hi=None,
+        dt: float | None = None,
         x_dim: int | None = None,
         u_dim: int | None = None,
         angle_idx: list | None = None,
-        u_lo: list | None = None,
-        u_hi: list | None = None,
     ) -> None:
         if isinstance(cfg, dict):
             cfg = CVSTEMLQRCfg(**filter_cfg_fields(cfg, CVSTEMLQRCfg, context="CVSTEMLQRAgent"))
         super().__init__(
             cfg=cfg,
-            models=models,
+            models=models or {},
             memory=memory,
             observation_space=observation_space,
             state_space=state_space,
@@ -200,114 +169,62 @@ class CVSTEMLQRAgent(Agent):
         )
 
         # The observation space DECLARES its layout ({x, xrefs, urefs}), so
-        # x_dim/u_dim are read, never guessed from obs_dim (the old
-        # (obs_dim - u_dim)//2 parity rule silently mis-split any other layout).
+        # x_dim/u_dim are read, never guessed from obs_dim.
         self._window = RefWindow.from_space(observation_space)
-
-
-        if u_dim is None:
-            u_dim = self._window.u_dim
-        if x_dim is None:
-            x_dim = self._window.x_dim
-
-        self._x_dim = x_dim
-        self._u_dim = u_dim
+        self._x_dim = self._window.x_dim if x_dim is None else x_dim
+        self._u_dim = self._window.u_dim if u_dim is None else u_dim
         self._angle_idx = angle_idx or []
         self._cfg = cfg
         self._get_f_and_B = get_f_and_B
-        self._get_rollout = get_rollout
-        self._u_lo = u_lo
-        self._u_hi = u_hi
-        # Realized-trajectory actuator-feasibility tally (see CVSTEMLQRCfg's
-        # comment and post_interaction() below) — per-channel within-bound
-        # counts accumulated as _compute_action_online actually runs, evaluated
-        # once the rollout ends. Also tracks transient-window violations to catch
-        # early-episode high-gain saturation that average-based checks miss.
-        if u_lo is not None and u_hi is not None:
-            self._bound_lo = torch.as_tensor(u_lo, dtype=torch.float32)
-            self._bound_hi = torch.as_tensor(u_hi, dtype=torch.float32)
-            self._u_within_count = torch.zeros(u_dim)
-            self._u_total_count = 0
-            # Transient-window tracking: early-episode violations concentrated
-            # in the first ~6% of steps (where error is largest, AUC-critical).
-            # See project_cvstem_car_best_params_invalid_2026-07-31 in memory.
-            self._u_within_count_transient = torch.zeros(u_dim)
-            self._u_total_count_transient = 0
-            self._transient_step = 0
-        else:
-            self._bound_lo = None
-
-        self._metric_source = str(cfg.metric_source).lower()
-        if self._metric_source not in ("online", "pretrained"):
+        # cfg.cm_dt WINS over the env's dt: his dt is the CV-STEM sampling period,
+        # a synthesis hyperparameter, not the integrator step (see CVSTEMLQRCfg).
+        # The env's dt is only the fallback for configs that don't state one.
+        dt = cfg.cm_dt if cfg.cm_dt is not None else dt
+        # The box is a property of the ENV and has no sane default — a guessed
+        # box certifies the wrong region — and a missing dt silently rescales Ẇ.
+        if x_lo is None or x_hi is None or dt is None:
             raise ValueError(
-                f"CVSTEMLQRAgent: metric_source must be 'online' or 'pretrained', "
-                f"got {cfg.metric_source!r}."
+                "CVSTEMLQRAgent needs the env's state box (x_lo/x_hi) and a dt: the "
+                "joint CV-STEM SDP samples uniformly over that box and its (W̄-I)/dt "
+                "term is scaled by that dt. Set `cm_dt` in the yaml's cm: block, or "
+                "pass dt= to fall back to the env step."
             )
+        self._x_lo, self._x_hi, self._dt = x_lo, x_hi, float(dt)
 
-        if self._metric_source == "online":
-            # cvxpy is numpy/CPU-only — the per-env SDP solve loop runs on CPU
-            # regardless of the env's device (same reason sdlqr.py pins CPU for
-            # scipy's CARE). The metric is re-solved every step, so there is no
-            # network to build.
-            self._compute_device = "cpu"
-            self._ccm_gen = None
-        else:  # "pretrained"
-            self._compute_device = device
-            cmg_model = models.get("cmg")
-            if cmg_model is None:
-                raise ValueError(
-                    "CVSTEMLQRAgent: metric_source='pretrained' requires a 'cmg' model "
-                    "(MetricModel) in `models`."
-                )
-            self._ccm_gen = cmg_model.ccm_gen
-            self._synthesize_pretrained_cmg()
+        self._metric = CholMetric(self._x_dim, list(cfg.cmg_hidden_dims)).to(device)
+        self._synthesize()
 
-    # ── pretrained-CMG synthesis (Phase A, once at construction) ───────────── #
+    # ── Phase A: his train(), once at construction ─────────────────────────── #
 
-    def _synthesize_pretrained_cmg(self) -> None:
-        """Solve the CV-STEM SDP over sampled states and MSE-regress the frozen
-        CMG onto ``{x → W*}`` — the exact ``build_cm_dataset`` + ``regress_cmg``
-        pipeline C2RL uses for ``cmg_method='cvstem'`` (see
-        ``ncm_synthesis.py``), cached to ``cm_data_path``. Runs once, then the
-        CMG is frozen for the whole rollout."""
-        from pathlib import Path
-
-        from .ncm_synthesis import (
-            build_cm_dataset,
-            load_cached_cm_dataset,
-            regress_cmg,
-            save_cm_dataset,
-        )
+    def _synthesize(self) -> None:
+        """Uniform samples → ONE joint SDP → MSE-fit ``CholMetric``, then freeze."""
+        from .ncm_synthesis import cvstem_metric_dataset, regress_cholm
 
         cfg = self._cfg
         tag = "[CVSTEM-LQR]"
-        cache_path = Path(cfg.cm_data_path) if cfg.cm_data_path else None
-        # Cache-identity knobs — must match load/save so a config change re-solves
-        # rather than silently reusing stale W* targets (see load_cached_cm_dataset).
-        cache_kwargs = dict(
-            lbd=cfg.lbd, w_lb=cfg.w_lb, w_ub=cfg.w_ub, eps=cfg.cm_eps,
-            solver=cfg.cm_solver, num_samples=cfg.cmg_memory_size, tag=tag,
-            r_scaler=cfg.r_scaler, chi_weight=None, nu_weight=1.0,
-            wdot_dt=0.0, random_ratio=0.0, wdot_trajectory=False, temporal_dt=0.0,
+        dataset = cvstem_metric_dataset(
+            self._get_f_and_B, self._x_lo, self._x_hi,
+            n_samples=cfg.cm_samples, lbd=cfg.lbd, eps=cfg.cm_eps, dt=self._dt,
+            solver=cfg.cm_solver, r_scaler=cfg.r_scaler,
+            chi_weight=cfg.chi_weight, nu_weight=cfg.nu_weight,
+            w_lb=cfg.cm_w_lb, w_ub=cfg.cm_w_ub,
+            seed=cfg.cm_seed, device=self.device, tag=tag,
+            linesearch=(tuple(cfg.lbd_linesearch) if cfg.lbd_linesearch else None),
         )
-
-        dataset = load_cached_cm_dataset(cache_path, **cache_kwargs) if cache_path else None
         if dataset is None:
-            dataset = build_cm_dataset(
-                self._get_rollout, self._get_f_and_B,
-                x_dim=self._x_dim, lbd=cfg.lbd, w_lb=cfg.w_lb, w_ub=cfg.w_ub,
-                eps=cfg.cm_eps, num_samples=cfg.cmg_memory_size, solver=cfg.cm_solver,
-                device=self.device, tag=tag,
-                min_feasibility_rate=cfg.min_feasibility_rate,
-                r_scaler=cfg.r_scaler, max_lambda_reductions=cfg.max_lambda_reductions,
+            # No metric at all — every downstream number would describe an
+            # uncertified controller, so this is fatal rather than a fallback.
+            msg = (
+                f"{INFEASIBLE_MARKER}: the joint CV-STEM SDP over {cfg.cm_samples} "
+                f"uniform state-box samples is infeasible at lbd={cfg.lbd}, "
+                f"cm_eps={cfg.cm_eps}, dt={self._dt}. LOWER lbd — "
+                f"scripts/find_uniform_lambda.py reports the largest rate this "
+                f"same program certifies."
             )
-            if cache_path is not None:
-                save_cm_dataset(cache_path, dataset, **cache_kwargs)
-
-        bounded = getattr(self._ccm_gen, "bounded", False)
-        regress_cmg(
-            self._ccm_gen, dataset,
-            w_lb=cfg.w_lb, x_dim=self._x_dim, bounded=bounded,
+            print(msg, flush=True)
+            raise CVSTEMInfeasibleError(msg)
+        regress_cholm(
+            self._metric, dataset,
             epochs=cfg.cmg_regress_epochs, lr=cfg.cmg_regress_lr,
             batch_size=cfg.cmg_regress_batch_size,
             lr_scheduler=cfg.cmg_regress_lr_scheduler,
@@ -315,120 +232,46 @@ class CVSTEMLQRAgent(Agent):
             device=self.device, tag=tag,
             val_frac=cfg.cmg_val_frac, early_stop_patience=cfg.cmg_early_stop_patience,
         )
-        for p in self._ccm_gen.parameters():
+        # W̄ ∈ [I, χI] and W = W̄/ν, so the deployed metric's eigenvalues are
+        # M ∈ [ν/χ, ν] — the envelope the SDP CHOSE. Read by the runner for the
+        # PathTracking contraction certificate.
+        self.metric_nu = float(dataset["nu"])
+        self.metric_chi = float(dataset["chi"])
+        for p in self._metric.parameters():
             p.requires_grad_(False)
-        self._ccm_gen.eval()
-        print(f"{tag} Phase A complete — CMG frozen "
-              f"(feasibility_rate={dataset['feasibility_rate']:.1%}).")
+        self._metric.eval()
+        # lbd from the dataset, not from cfg — the linesearch may have chosen it.
+        self.metric_lbd = float(dataset["lbd"])
+        print(f"{tag} Phase A complete — metric frozen (nu={self.metric_nu:.4g}, "
+              f"chi={self.metric_chi:.4g}, J={dataset['J']:.4g}, lbd={self.metric_lbd:.4g}).")
 
     # ── action computation ─────────────────────────────────────────────────── #
 
-    def _split_obs(self, obs: torch.Tensor):
-        x_dim, u_dim = self._x_dim, self._u_dim
-        x = obs[:, :x_dim]
-        xref = obs[:, x_dim : 2 * x_dim]
-        uref = obs[:, 2 * x_dim : 2 * x_dim + u_dim]
-        return x, xref, uref
+    def _compute_action(self, obs: torch.Tensor) -> torch.Tensor:
+        """``M(x) = RᵀR`` from the frozen network, ``K = R⁻¹BᵀM``, ``u = uref - K·e``.
 
-    def _compute_action_pretrained(self, obs: torch.Tensor) -> torch.Tensor:
-        """Vectorized on-device gain from the frozen CMG:
-        M(x) = spd_inverse(bound_W(CMG(x))), K = R⁻¹BᵀM, u = uref - K·e."""
-        cfg = self._cfg
-        r = cfg.r_scaler + 1e-5  # strictly positive — mirrors sdlqr.py's guard
-        x, xref, uref = self._split_obs(obs.to(self._compute_device))
+        No metric inverse at deploy: the SDP's ``W`` was inverted once, offline,
+        to build the labels, and the network predicts ``M`` directly.
+        """
+        r = self._cfg.r_scaler + 1e-5  # strictly positive — mirrors sdlqr.py's guard
+        obs = obs.to(self.device)
+        # RefWindow.split, never a hand-slice. skrl flattens the Dict observation
+        # in sorted-key order — [urefs | x | xrefs], NOT [x | xref | uref] — and
+        # the two have the SAME total width at ref_length=1, so a hand-slice
+        # mis-reads every block without ever tripping a shape check.
+        x, xrefs, urefs = self._window.split(obs)
+        x, xref, uref = x.float(), xrefs[:, 0].float(), urefs[:, 0].float()
 
         with torch.no_grad():
-            _f, B, _Bbot = self._get_f_and_B(x)          # B: (b, x_dim, u_dim)
-            B = B.to(torch.float32)
-            raw_W, _ = self._ccm_gen(x)
-            W = bound_W(raw_W, cfg.w_lb, self._x_dim, getattr(self._ccm_gen, "bounded", False))
-            M = spd_inverse(W)                            # (b, x_dim, x_dim)
-            K = (1.0 / r) * torch.bmm(B.transpose(1, 2), M)  # (b, u_dim, x_dim)
-            e = wrap_diff(x - xref, self._angle_idx).unsqueeze(-1)  # (b, x_dim, 1)
-            u = uref - torch.bmm(K, e).squeeze(-1)        # (b, u_dim)
-        return u
-
-    def _compute_action_online(self, obs: torch.Tensor) -> torch.Tensor:
-        """Per-env CV-STEM SDP solve at the current state, then K = R⁻¹BᵀM.
-
-        Uses the DRIFT Jacobian A(x) = ∂f/∂x (not SD-LQR's generalized
-        A = ∂f/∂x + Σ uref·∂B/∂x) — that is exactly what solve_cm_metric's LMI
-        expects, with control entering only through the Riccati term."""
-        cfg = self._cfg
-        r = cfg.r_scaler + 1e-5
-        x_dim, u_dim = self._x_dim, self._u_dim
-        batch_size = obs.shape[0]
-
-        x = obs[:, :x_dim].float().to(self._compute_device).requires_grad_()
-        xref = obs[:, x_dim : 2 * x_dim].float().to(self._compute_device)
-        uref = obs[:, 2 * x_dim : 2 * x_dim + u_dim].float().to(self._compute_device)
-
-        with torch.enable_grad():
-            f, B, _ = self._get_f_and_B(x)
-        f = f.float().to(self._compute_device)
-        B = B.float().to(self._compute_device)
-        DfDx = jacobian(f, x, create_graph=False)         # (b, x, x) — drift Jacobian
-        B = B.detach()
-
-        DfDx_np = DfDx.detach().cpu().numpy()
-        B_np = B.detach().cpu().numpy()
-
-        actions = torch.zeros(batch_size, u_dim, device=self._compute_device)
-        e_batch = wrap_diff(x.detach() - xref, self._angle_idx)
-        for i in range(batch_size):
-            W, _lbd_used, _red = _solve_cm_metric_with_backoff(
-                DfDx_np[i], B_np[i],
-                lbd=cfg.lbd, w_lb=cfg.w_lb, w_ub=cfg.w_ub, eps=cfg.cm_eps,
-                solver=cfg.cm_solver, r_scaler=cfg.r_scaler,
-                max_lambda_reductions=cfg.max_lambda_reductions,
-            )
-            if W is None:
-                # Infeasible at this state even after λ-backoff.
-                if cfg.abort_on_infeasible:
-                    # Abort the WHOLE rollout on the first miss in any env — one
-                    # unsolvable state means this parameter point does not
-                    # certify, and continuing would score a part-open-loop
-                    # controller as if it did. See the cfg field's comment.
-                    msg = (
-                        f"{INFEASIBLE_MARKER}: env {i}/{batch_size} has no feasible "
-                        f"CV-STEM metric at lbd={cfg.lbd}, cm_eps={cfg.cm_eps}, "
-                        f"w_lb={cfg.w_lb}, w_ub={cfg.w_ub}, r_scaler={cfg.r_scaler} "
-                        f"(max_lambda_reductions={cfg.max_lambda_reductions})."
-                    )
-                    print(msg, flush=True)
-                    raise CVSTEMInfeasibleError(msg)
-                # Otherwise: zero feedback (u = uref) rather than aborting the
-                # batch. Same policy as SD-LQR's non-stabilizable CARE fallback.
-                actions[i] = uref[i]
-                continue
-            M = np.linalg.inv(W.astype(np.float64))       # W = M⁻¹ → M
-            K = (1.0 / r) * (B_np[i].T @ M)               # (u, x)
-            K_t = torch.as_tensor(K, dtype=torch.float32, device=self._compute_device)
-            actions[i] = uref[i] - K_t @ e_batch[i]
-        # Tally this step's REALIZED (pre-clamp) controls against the env's
-        # actual actuator box — see CVSTEMLQRCfg's comment and
-        # post_interaction() below. "online" only: this is where actions are
-        # actually computed from a fresh SDP solve each step.
-        if self._bound_lo is not None:
-            within = (actions.detach().cpu() >= self._bound_lo) & (actions.detach().cpu() <= self._bound_hi)
-            self._u_within_count += within.sum(dim=0).float()
-            self._u_total_count += actions.shape[0]
-            # Also tally transient phase (first ~6% of episode, ~30 steps for 500-step)
-            # to catch early violations concentrated when error is largest.
-            if self._transient_step < 30:
-                self._u_within_count_transient += within.sum(dim=0).float()
-                self._u_total_count_transient += actions.shape[0]
-                self._transient_step += 1
-        return actions
+            _f, B, _Bbot = self._get_f_and_B(x)
+            M = self._metric(x)                                    # (b, x, x)
+            K = (1.0 / r) * torch.bmm(B.to(torch.float32).transpose(1, 2), M)
+            e = wrap_diff(x - xref, self._angle_idx).unsqueeze(-1)
+            return uref - torch.bmm(K, e).squeeze(-1)               # (b, u_dim)
 
     def act(self, observations, states, *, timestep: int, timesteps: int):
         orig_device = observations.device
-        if self._metric_source == "pretrained":
-            actions = self._compute_action_pretrained(observations)
-        else:
-            with torch.enable_grad():  # Jacobian needs grad; cvxpy solve is non-diff
-                actions = self._compute_action_online(observations)
-        actions = actions.detach().to(orig_device)
+        actions = self._compute_action(observations).detach().to(orig_device)
         log_prob = torch.zeros(actions.shape[0], 1, device=orig_device)
         return actions, {"log_prob": log_prob}
 
@@ -448,49 +291,6 @@ class CVSTEMLQRAgent(Agent):
 
     def post_interaction(self, *, timestep: int, timesteps: int) -> None:
         super().post_interaction(timestep=timestep, timesteps=timesteps)
-        # Realized-trajectory actuator-feasibility check, evaluated once the
-        # whole rollout is in: a channel fails if more than 5% of its ACTUAL
-        # executed samples fell outside the env's own actuator box. Also checks
-        # the TRANSIENT phase (first ~6% of steps) separately to catch early
-        # high-gain saturation that average-based checks miss (see
-        # project_cvstem_car_best_params_invalid_2026-07-31).
-        if (
-            self._bound_lo is not None
-            and timestep == timesteps - 1
-            and self._u_total_count > 0
-        ):
-            # Whole-episode check
-            violation_rate = 1.0 - (self._u_within_count / self._u_total_count)
-            whole_episode_failed = torch.any(violation_rate > 0.05)
-
-            # Transient-phase check (if enough transient samples exist)
-            transient_failed = False
-            transient_violation_rate = None
-            if self._u_total_count_transient > 0:
-                transient_violation_rate = 1.0 - (self._u_within_count_transient / self._u_total_count_transient)
-                # Lower threshold for transient (10% vs 5% for whole episode) since
-                # early error is AUC-critical and transient violations concentrate there
-                transient_failed = torch.any(transient_violation_rate > 0.10)
-
-            if whole_episode_failed or transient_failed:
-                if transient_failed:
-                    msg = (
-                        f"{INFEASIBLE_MARKER}: transient-phase control bound violation rate "
-                        f"{transient_violation_rate.max().item():.1%} exceeds 10% over the "
-                        f"early episode ({self._u_total_count_transient} transient samples), "
-                        f"u_lo={self._u_lo}, u_hi={self._u_hi}."
-                    )
-                else:
-                    msg = (
-                        f"{INFEASIBLE_MARKER}: executed-control bound violation rate "
-                        f"{violation_rate.max().item():.1%} exceeds 5% over the "
-                        f"realized trajectory ({self._u_total_count} samples), "
-                        f"u_lo={self._u_lo}, u_hi={self._u_hi}."
-                    )
-                if self._cfg.abort_on_infeasible:
-                    print(msg, flush=True)
-                    raise CVSTEMInfeasibleError(msg)
-                print(f"[CVSTEM-LQR] WARNING: {msg}", flush=True)
 
     def update(self, *, timestep: int, timesteps: int) -> None:
         pass  # analytical — no gradient updates

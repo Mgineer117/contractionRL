@@ -1369,3 +1369,463 @@ class OnlineCVSTEMMetric:
             self.num_lambda_reduced += int(reductions > 0)
 
         return torch.as_tensor(W_out, device=device), None
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# ORIGINAL CV-STEM (AstroHiro/ncm, ``classncm``) — one joint SDP over uniform
+# samples, then a network regressed onto chol(M)
+# ─────────────────────────────────────────────────────────────────────────── #
+#
+# The reference pipeline, in its own order (``classncm.train`` →
+# ``cvstem`` → ``M2cholM`` → keras ``fit``):
+#
+#   1. draw ``Nx`` states i.i.d. UNIFORM over the state box (``xlims``);
+#   2. solve ONE ``cp.Problem`` over all of them, per-state ``W̄_k`` but a
+#      SINGLE shared ``ν`` and ``χ``, minimizing ``J = d₁b̄·χ/α + d₂·ν``;
+#   3. label ``M_k = W_k⁻¹``, take ``chol(M_k)ᵀ`` and vectorize it;
+#   4. MSE-regress a plain MLP ``x ↦ chol(M)`` — that network IS the metric;
+#   5. deploy ``K = R⁻¹BᵀM(x)``, ``M = RᵀR`` SPD by construction.
+#
+# Differences from ``solve_cm_metric`` above, which is the SAME LMI solved
+# POINTWISE (each state getting its own ν/χ) and is what C2RL consumes:
+#
+# * ``ν``/``χ`` shared. Pointwise feasibility at every state is a strictly
+#   WEAKER claim than one metric family covering them all, and pointwise
+#   ``W_k = W̄_k/ν_k`` are not even on a common scale.
+# * NO deployment envelope. ``solve_cm_metric`` adds ``ν ≤ 1/w_lb`` and
+#   ``χ ≤ ν·w_ub`` so the regressed ``W`` stays inside ``bound_W``'s range; the
+#   reference leaves ``ν`` free and merely penalizes it, which is why its
+#   network regresses an UNBOUNDED ``chol(M)`` instead of a bounded ``W``.
+# * ``Ẇ`` is always present as ``(W̄ - I)/dt``. It is not a derivative estimate:
+#   ``W̄`` is the decision variable, ``I`` a constant, ``dt`` the env step, and
+#   the samples are unordered so no predecessor exists. Since ``W̄ ⪰ I`` is
+#   enforced the term is PSD, so it only TIGHTENS the LMI: feasibility with it
+#   implies feasibility of the static (``Ẇ=0``) LMI, and it certifies the
+#   deployed state-varying metric exactly when ``-Ẇ ⪯ (W̄-I)/dt`` along the real
+#   trajectory — an assumption box sampling cannot check.
+# * No per-state λ-backoff. There is nothing per-state left to back off; the
+#   joint program either certifies λ everywhere or fails.
+#
+# ``r_scaler`` NOTE (only true once ν is free): the LMI sees ν and r solely
+# through the ratio ``ν/r``, and so does the deployed gain
+# ``K = (ν/r)·B̄ᵀW̄⁻¹``. So r cannot make the program feasible or infeasible — it
+# enters ONLY as the weight ``nu_weight·r`` on control authority in ``J``.
+# Raising r therefore shrinks ‖K‖ by making the optimizer buy less authority,
+# which is exactly (up to scale) what raising ``nu_weight`` does. That is why
+# an over-bound control is answered by raising r while an infeasible LMI is
+# answered by lowering λ — the two knobs act on different parts of the program.
+
+def cvstem_joint(
+    A: np.ndarray,
+    B: np.ndarray,
+    *,
+    lbd: float,
+    eps: float,
+    dt: float,
+    solver: str = "MOSEK",
+    r_scaler: float = 1.0,
+    chi_weight: float | None = None,
+    nu_weight: float = 1.0,
+    pairs: list | None = None,
+    w_lb: float | None = None,
+    w_ub: float | None = None,
+) -> dict | None:
+    """Tsukamoto's ``cvstem0``: ONE SDP over all ``n`` samples, ν/χ SHARED.
+
+    Args:
+        A: drift Jacobians ``∂f/∂x``, ``(n, x_dim, x_dim)``.
+        B: control matrices, ``(n, x_dim, u_dim)``.
+        lbd: contraction rate λ (the reference's ``alpha``).
+        eps: strict-definiteness margin (the reference's ``epsilon``).
+        dt: env step, for the ``Ẇ`` term. ``0`` is rejected rather than silently
+            solving the different (static) program.
+        pairs: optional ``[(i, j), ...]`` meaning "sample ``j`` is one ``dt`` after
+            sample ``i``" — from ``(x, u, x_next)`` transitions. When given, sample
+            ``i``'s LMI carries the REAL backward difference
+            ``-Ẇ = (W̄_i - W̄_j)/dt`` (both endpoints are variables of this one
+            program, so no sequential chaining and no solve-order dependence), and
+            samples that start no pair carry no ``Ẇ`` term at all. When ``None``,
+            EVERY sample carries Tsukamoto's ``(W̄ - I)/dt`` proxy instead.
+
+            REQUIRED with ``pairs``: every ``j`` must ALSO be in the sample set, so
+            it carries its own contraction LMI and its own ``W̄ ⪯ χI``. Otherwise
+            ``W̄_j`` is not a metric, it is a free slack variable, and since
+            ``-Ẇ`` rewards ``W̄_j > W̄_i`` the solver inflates it to manufacture
+            margin: measured on the car at λ=0.5, dt=0.03, a 3.5% inflation buys
+            ~1300 of LMI slack and the "certificate" comes back with
+            ``ν = 1.4e-11``, ``‖K‖₂ = 1.3e-11`` — feasible, and open loop.
+            With the endpoint constrained, the same run gives ν=2.96, ‖K‖₂=2.17
+            and residual inflation 1.6% (≈2% optimistic on the gain, bounded by
+            ``(χ-1)·growth/dt``). ``growth_med``/``growth_max`` in the result
+            report it, so the residual is visible rather than assumed away.
+        r_scaler: ``R = r_scaler·I``, shared with the deployed gain.
+        chi_weight/nu_weight: ``J = chi_weight·χ + nu_weight·ν``; ``None`` →
+            ``1/lbd`` (the reference's ``d₁b̄·χ/α`` with ``d₁b̄ = 1``).
+        w_lb/w_ub: OPTIONAL deployment envelope ``w_lb·I ⪯ W ⪯ w_ub·I`` on the
+            DEPLOYED ``W = W̄/ν``, the same two scalar caps ``solve_cm_metric``
+            applies: ``ν ≤ 1/w_lb`` and ``χ ≤ ν·w_ub``. ``None`` (both, the
+            default) leaves ν and χ free, which is Tsukamoto's program exactly —
+            pass neither and this function is byte-identical to before.
+
+            ``w_lb`` is the direct gain cap: ``‖M‖₂ ≤ ν ≤ 1/w_lb``, so
+            ``‖K‖₂ ≤ ‖B‖₂/(r·w_lb)``. That is the knob ``r`` only *looks* like
+            (ν absorbs ``r`` whenever χ is pinned). ``w_ub`` caps the condition
+            number relative to the scale and mostly buys or costs feasibility.
+
+    Returns:
+        ``{"W": (n,x,x), "nu", "chi", "J"}`` with ``W_k = W̄_k/ν`` — all on the
+        SAME scale, which is what the shared ν buys — or ``None`` if the joint
+        program is infeasible or the solver errors.
+    """
+    cp = _require_cvxpy()
+    if not dt > 0:
+        raise ValueError(
+            "cvstem_joint: dt must be > 0 — the (W̄-I)/dt term is part of the "
+            "reference program, and dt=0 would silently solve the static LMI instead."
+        )
+    A = np.asarray(A, dtype=np.float64)
+    B = np.asarray(B, dtype=np.float64)
+    n, x_dim = A.shape[0], A.shape[1]
+    r = r_scaler + 1e-5
+    eye = np.eye(x_dim)
+
+    Wbars = [cp.Variable((x_dim, x_dim), PSD=True) for _ in range(n)]
+    nu = cp.Variable(nonneg=True)
+    chi = cp.Variable(nonneg=True)
+    successor = {}
+    for i, j in (pairs or []):
+        if not 0 <= j < n:
+            raise ValueError(
+                f"cvstem_joint: pair ({i}, {j}) points outside the sample set — every "
+                f"x_next must itself be a sample, or W̄_{j} is a free slack variable "
+                f"the solver inflates to fake margin (see the `pairs` docstring)."
+            )
+        successor[i] = j
+    cons = []
+    # Deployment envelope on W = W̄/ν, as two scalar caps on the SHARED nu/chi —
+    # global, not per-sample. Absent by default: that is the reference program.
+    if w_lb is not None:
+        cons.append(nu <= 1.0 / w_lb)
+    if w_ub is not None:
+        cons.append(chi <= nu * w_ub)
+    for k in range(n):
+        Wb = Wbars[k]
+        cons += [Wb >> eye, Wb << chi * eye]
+        if pairs is None:
+            wdot = (Wb - eye) / dt                    # Tsukamoto's proxy
+        elif k in successor:
+            wdot = (Wb - Wbars[successor[k]]) / dt    # -Ẇ from the real transition
+        else:
+            wdot = 0.0                                # endpoint: no successor sampled
+        S = (wdot + A[k] @ Wb + Wb @ A[k].T + 2.0 * lbd * Wb
+             - nu * ((2.0 / r) * (B[k] @ B[k].T)))
+        cons.append(_sym(S) << -eps * eye)
+    cw = (1.0 / lbd) if chi_weight is None else chi_weight
+    prob = cp.Problem(cp.Minimize(cw * chi + nu_weight * nu), cons)
+    try:
+        prob.solve(solver=solver)
+    except Exception as e:  # noqa: BLE001 — a solver blow-up is an infeasible point
+        _warn_once_if_license_error(solver, e)
+        return None
+    if prob.status not in ("optimal", "optimal_inaccurate") or nu.value is None:
+        return None
+    scale = float(nu.value)
+    if not np.isfinite(scale) or scale <= 0:
+        return None
+    W = np.empty((n, x_dim, x_dim), dtype=np.float64)
+    for k, Wb in enumerate(Wbars):
+        if Wb.value is None or not np.all(np.isfinite(Wb.value)):
+            return None
+        W[k] = 0.5 * (Wb.value + Wb.value.T) / scale
+    out = {"W": W, "nu": scale, "chi": float(chi.value), "J": float(prob.value)}
+    if successor:
+        # How much the metric GREW along each transition. 1.0 = no inflation, so
+        # no margin was manufactured; well above 1 means the certificate is
+        # leaning on -Ẇ instead of on control authority.
+        g = [float(np.linalg.eigvalsh(W[j])[-1] / np.linalg.eigvalsh(W[i])[-1])
+             for i, j in successor.items()]
+        out["growth_med"], out["growth_max"] = float(np.median(g)), float(np.max(g))
+    return out
+
+
+def _as_np(v) -> np.ndarray:
+    """Array-like OR a torch tensor (possibly on the GPU) -> float64 numpy.
+
+    The env's boxes (``X_MIN``/``U_MIN``/...) are tensors on the ENV's device, and
+    cvxpy is numpy/CPU-only, so every box entering this module goes through here.
+    ``np.asarray`` alone raises on a CUDA tensor.
+    """
+    if hasattr(v, "detach"):
+        return v.detach().cpu().numpy().astype(np.float64)
+    return np.asarray(v, dtype=np.float64)
+
+
+def sample_state_box(x_lo, x_hi, *, n: int, seed: int | None = None) -> np.ndarray:
+    """``np.random.uniform(xlims[0], xlims[1], (n, x_dim))`` — the reference's draw.
+
+    Not the rollout/tube sampling ``_sample_cm_states`` does: the reference
+    covers the whole declared state box, which is a stronger claim (the metric
+    must certify unreachable corners too) and the reason its ``W`` regression
+    generalizes off-trajectory.
+    """
+    rng = np.random.default_rng(seed)
+    x_lo, x_hi = _as_np(x_lo).ravel(), _as_np(x_hi).ravel()
+    return rng.uniform(x_lo, x_hi, size=(int(n), x_lo.size)).astype(np.float32)
+
+
+def drift_jacobians(get_f_and_B, x_np: np.ndarray, device="cpu"):
+    """``(A = ∂f/∂x, B)`` for a batch of states, as float64 numpy.
+
+    The reference's ``Afun`` is a user-supplied SDC matrix; every solver in this
+    repo (``build_cm_dataset``, ``cvstem_lqr``) feeds the DRIFT Jacobian, so this
+    is the one place that choice is made for the joint path too.
+    """
+    x = torch.as_tensor(x_np, dtype=torch.float32, device=device).requires_grad_()
+    with torch.enable_grad():
+        f, B, _ = get_f_and_B(x)
+    A = jacobian(f.to(torch.float32), x, create_graph=False)
+    return (A.detach().cpu().numpy().astype(np.float64),
+            B.detach().cpu().numpy().astype(np.float64))
+
+
+def M_to_cholvec(W: np.ndarray) -> np.ndarray:
+    """Regression labels: ``M = W⁻¹``, ``R = chol(M)ᵀ`` (upper), vectorized.
+
+    ``(n, x, x) -> (n, x(x+1)/2)`` in row-major upper-triangular order.
+    Tsukamoto's ``M2cholM`` walks the diagonals instead; the ordering is a
+    bijection either way and only matters if you compare raw weights with his.
+    Mirrors ``nn_modules.CholMetric``, which must use the SAME order.
+    """
+    W = np.asarray(W, dtype=np.float64)
+    x_dim = W.shape[-1]
+    iu = np.triu_indices(x_dim)
+    out = np.empty((W.shape[0], iu[0].size), dtype=np.float32)
+    for k in range(W.shape[0]):
+        R = np.linalg.cholesky(np.linalg.inv(W[k])).T   # upper, M = RᵀR
+        out[k] = R[iu]
+    return out
+
+
+def cvstem_linesearch(
+    A: np.ndarray,
+    B: np.ndarray,
+    *,
+    lbd_lo: float,
+    lbd_hi: float,
+    da: float,
+    eps: float,
+    dt: float,
+    solver: str = "MOSEK",
+    r_scaler: float = 1.0,
+    chi_weight: float | None = None,
+    nu_weight: float = 1.0,
+    pairs: list | None = None,
+    tag: str = "[CVSTEM-LQR]",
+    w_lb: float | None = None,
+    w_ub: float | None = None,
+) -> tuple[float, dict | None]:
+    """Tsukamoto's ``linesearch``: walk λ up, stop when ``J`` stops improving.
+
+    His exact loop — λ from ``lbd_lo`` in steps of ``da``, solve the joint SDP at
+    each, and the first time ``J`` fails to improve, back off one ``da`` and take
+    that λ. ``J`` is the steady-state-error bound ``d₁b̄·χ/λ + d₂·ν``, so this is a
+    rate-vs-error trade-off, NOT the largest feasible rate: a faster λ costs a
+    worse bound. (``find_uniform_lambda.py`` answers the other question — the
+    largest λ whose implied control still fits the actuator.)
+
+    Infeasibility ends the walk the same way a rising ``J`` does: λ has gone past
+    what this sample set admits, so the previous λ stands.
+
+    Returns ``(lbd_opt, solution_at_lbd_opt)``; the solution is ``None`` only if
+    even ``lbd_lo`` is infeasible.
+    """
+    lbd = lbd_lo
+    best_lbd, best_sol, best_J = lbd_lo, None, float("inf")
+    while lbd <= lbd_hi + 1e-12:
+        sol = cvstem_joint(A, B, lbd=lbd, eps=eps, dt=dt, solver=solver,
+                           r_scaler=r_scaler, chi_weight=chi_weight,
+                           nu_weight=nu_weight, pairs=pairs, w_lb=w_lb, w_ub=w_ub)
+        if sol is None:
+            print(f"{tag} linesearch: lbd={lbd:.4g} infeasible — stopping")
+            break
+        print(f"{tag} linesearch: lbd={lbd:.4g}  J={sol['J']:.6g} "
+              f"(chi={sol['chi']:.4g}, nu={sol['nu']:.4g})")
+        if sol["J"] >= best_J:
+            break
+        best_lbd, best_sol, best_J = lbd, sol, sol["J"]
+        lbd += da
+    print(f"{tag} linesearch: optimal lbd = {best_lbd:.4g} (J={best_J:.6g})")
+    return best_lbd, best_sol
+
+
+
+def cvstem_metric_dataset(
+    get_f_and_B,
+    x_lo,
+    x_hi,
+    *,
+    n_samples: int,
+    lbd: float,
+    eps: float,
+    dt: float,
+    solver: str = "MOSEK",
+    r_scaler: float = 1.0,
+    chi_weight: float | None = None,
+    nu_weight: float = 1.0,
+    seed: int | None = None,
+    device="cpu",
+    tag: str = "[CVSTEM-LQR]",
+    linesearch: tuple | None = None,
+    wdot: str = "proxy",
+    u_lo=None,
+    u_hi=None,
+    w_lb: float | None = None,
+    w_ub: float | None = None,
+) -> dict | None:
+    """Steps 1-3 of the reference pipeline: sample the box, ONE joint SDP, label.
+
+    Returns ``{"x", "W", "cholM", "nu", "chi", "J"}`` — regression inputs, the
+    certified metrics, and the ``chol(M)`` labels ``CholMetric`` is fit to — or
+    ``None`` if the joint SDP is infeasible at this λ.
+
+    There is no partial success and no feasibility RATE: one program covers every
+    sample, so it either certifies λ over the whole draw or it does not.
+
+    ``linesearch=(lo, hi, da)`` runs ``cvstem_linesearch`` over the SAME samples
+    first and uses its ``argmin J`` λ instead of ``lbd`` — his own λ selection.
+    The returned dict carries the λ actually used under ``"lbd"``.
+
+    ``wdot`` picks the ``Ẇ`` term (see ``cvstem_joint``):
+
+    * ``"proxy"`` (default, the reference): ``+(W̄-I)/dt`` at every sample.
+    * ``"transition"``: propagate each sample one ``dt`` under a uniformly random
+      ``u ∈ [u_lo, u_hi]`` (the env's actuator box, REQUIRED for this mode) and
+      use the real difference ``-Ẇ = (W̄(x) - W̄(x_next))/dt``, with both endpoints
+      as constrained samples of the same program. Doubles the program size and
+      makes ``W`` a metric at ``2·n_samples`` states, of which the first
+      ``n_samples`` are the ones the regression is fit to.
+
+    The regression set IS the joint program's sample set — the reference fits its
+    network to exactly the states it certified, so scaling the training data means
+    raising ``n_samples``, not labelling extra states after the fact.
+    """
+    x_np = sample_state_box(x_lo, x_hi, n=n_samples, seed=seed)
+    pairs = None
+    if wdot == "transition":
+        if u_lo is None or u_hi is None:
+            raise ValueError(
+                "cvstem_metric_dataset: wdot='transition' needs the env's actuator box "
+                "(u_lo/u_hi) — the Ẇ term is measured along transitions driven by a "
+                "uniformly random control drawn from it."
+            )
+        rng = np.random.default_rng(seed)
+        xt = torch.as_tensor(x_np, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            f, B_t, _ = get_f_and_B(xt)
+            u = torch.as_tensor(
+                rng.uniform(_as_np(u_lo).ravel(), _as_np(u_hi).ravel(),
+                            size=(n_samples, B_t.shape[-1])),
+                dtype=torch.float32, device=device)
+            xn = xt + float(dt) * (f + torch.bmm(B_t, u.unsqueeze(-1)).squeeze(-1))
+            xn = torch.clamp(
+                xn,
+                torch.as_tensor(_as_np(x_lo), dtype=torch.float32, device=device),
+                torch.as_tensor(_as_np(x_hi), dtype=torch.float32, device=device))
+        # ONE sample set: [x | x_next]. x_next must carry its own LMI or the -Ẇ
+        # term degenerates into free slack (see cvstem_joint's `pairs` docstring).
+        x_all = np.concatenate([x_np, xn.cpu().numpy().astype(np.float32)], axis=0)
+        pairs = [(k, n_samples + k) for k in range(n_samples)]
+    else:
+        x_all = x_np
+    A, B = drift_jacobians(get_f_and_B, x_all, device=device)
+    print(f"{tag} CV-STEM joint SDP: {n_samples} uniform samples over the state box "
+          f"(wdot={wdot}, {len(x_all)} states in the program), "
+          f"lbd={lbd}, eps={eps}, r_scaler={r_scaler}, dt={dt}, solver={solver} ...",
+          flush=True)
+    if linesearch is not None:
+        lo, hi, da = (float(v) for v in linesearch)
+        lbd, sol = cvstem_linesearch(A, B, lbd_lo=lo, lbd_hi=hi, da=da, eps=eps, dt=dt,
+                                     solver=solver, r_scaler=r_scaler,
+                                     chi_weight=chi_weight, nu_weight=nu_weight,
+                                     pairs=pairs, tag=tag, w_lb=w_lb, w_ub=w_ub)
+    else:
+        sol = cvstem_joint(A, B, lbd=lbd, eps=eps, dt=dt, solver=solver,
+                           r_scaler=r_scaler, chi_weight=chi_weight,
+                           nu_weight=nu_weight, pairs=pairs, w_lb=w_lb, w_ub=w_ub)
+    if sol is None:
+        return None
+    print(f"{tag} CV-STEM joint SDP feasible: nu={sol['nu']:.4g} (metric scale, "
+          f"max eig M), chi={sol['chi']:.4g} (condition number), J={sol['J']:.4g}.")
+    W_fit = sol["W"][:len(x_np)]     # x_next entered to pin Ẇ, not to be regressed
+    return {"x": x_np, "W": W_fit.astype(np.float32),
+            "cholM": M_to_cholvec(W_fit),
+            "nu": sol["nu"], "chi": sol["chi"], "J": sol["J"], "lbd": lbd}
+
+
+def regress_cholm(
+    net,
+    dataset: dict,
+    *,
+    epochs: int,
+    lr: float,
+    batch_size: int,
+    lr_scheduler: str = "",
+    lr_scheduler_kwargs: dict | None = None,
+    device="cpu",
+    tag: str = "[CVSTEM-LQR]",
+    val_frac: float = 0.1,
+    early_stop_patience: int = 10,
+) -> dict:
+    """MSE-fit ``CholMetric`` to the ``chol(M)`` labels — the reference's ``model.fit``.
+
+    Loss is on the CHOLESKY VECTOR, not on ``M``: that is what the reference
+    regresses, and it keeps the objective linear in the network output (no
+    ``eigh``/inverse in the loop, unlike ``regress_cmg``'s bounded-``W`` fit).
+    """
+    x = torch.as_tensor(dataset["x"]).to(torch.float32)
+    y = torch.as_tensor(dataset["cholM"]).to(torch.float32)
+    n = x.shape[0]
+    train_idx, val_idx = train_val_split(n, val_frac, device="cpu")
+    n_train = train_idx.shape[0]
+    x_val, y_val = x[val_idx].to(device), y[val_idx].to(device)
+    stopper = EarlyStopper(patience=early_stop_patience if val_idx.shape[0] > 0 else 0)
+
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    scheduler = build_lr_scheduler(opt, lr_scheduler, lr_scheduler_kwargs)
+    net.train()
+    losses: list[float] = []
+    pbar = _tqdm.tqdm(range(epochs), desc=f"{tag} chol(M) regression", file=sys.stdout)
+    for epoch in pbar:
+        perm = train_idx[torch.randperm(n_train)]
+        iters = max(1, n_train // batch_size)
+        total = 0.0
+        for b in range(iters):
+            idx = perm[b * batch_size : (b + 1) * batch_size]
+            loss = F.mse_loss(net.net(x[idx].to(device)), y[idx].to(device))
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            total += loss.item()
+        losses.append(total / iters)
+        if scheduler is not None:
+            scheduler.step()
+        postfix = {"mse": f"{losses[-1]:.4g}"}
+        stop_val = False
+        if val_idx.shape[0] > 0:
+            net.eval()
+            with torch.no_grad():
+                val_loss = F.mse_loss(net.net(x_val), y_val).item()
+            net.train()
+            postfix["val"] = f"{val_loss:.4g}"
+            stop_val = stopper.step(val_loss, net, epoch)
+        pbar.set_postfix(**postfix)
+        if stop_val:
+            print(f"{tag} chol(M) regression early-stopped at epoch {epoch + 1}/{epochs} "
+                  f"(best val MSE {stopper.best:.4g}).")
+            break
+    pbar.close()
+    if val_idx.shape[0] > 0:
+        stopper.restore_best(net)
+    net.eval()
+    return {"loss_history": losses, "final_loss": losses[-1] if losses else float("nan"),
+            "final_val_loss": stopper.best if val_idx.shape[0] > 0 else float("nan")}

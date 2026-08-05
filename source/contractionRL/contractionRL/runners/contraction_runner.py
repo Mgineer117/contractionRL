@@ -657,32 +657,20 @@ class ContractionRunner:
                               agent_cfg, trainer_cfg, models_cfg, get_f_and_B, lqr=(algo == "lqr"), x_dim=x_dim, u_dim=u_dim, angle_idx=angle_idx, sym=sym,
                               raw_cfg_snapshot=raw_cfg_snapshot)
         elif algo in ("cvstem-lqr",):
-            # CV-STEM-LQR reads the same `cm:`/`cmg:` blocks C2RL does (contraction
-            # metric + offline CMG synthesis knobs), merged into agent_cfg — the
-            # "pretrained" metric_source builds+freezes a CMG here, "online"
-            # solves the SDP per step and needs no network.
+            # CV-STEM-LQR reads the same `cm:`/`cmg:` blocks C2RL does (joint SDP
+            # + metric-network knobs), merged into agent_cfg. The agent builds and
+            # freezes its own CholMetric — no model comes from `models:`.
             #
-            # The actuator-feasibility bound (u_lo/u_hi) comes from the env's
-            # OWN uref_min/uref_max, never from a config value — a hardcoded
-            # yaml bound silently drifts out of sync with the env (and was
-            # wrong-signed for asymmetric boxes like turtlebot's [0, 0.22]
-            # linear-velocity channel). U_MIN/U_MAX (2x the uref box, matching
-            # env_base.py's own physical actuator clamp) are the env's real
-            # bounds if exposed; else fall back to computing them here.
-            uref_min, uref_max, u_min, u_max = _env_attrs(
-                raw_env, "UREF_MIN", "UREF_MAX", "U_MIN", "U_MAX"
-            )
-            if u_min is None and uref_min is not None:
-                u_min = 2.0 * uref_min
-            if u_max is None and uref_max is not None:
-                u_max = 2.0 * uref_max
-            u_lo = u_min.tolist() if hasattr(u_min, "tolist") else u_min
-            u_hi = u_max.tolist() if hasattr(u_max, "tolist") else u_max
+            # The joint SDP samples uniformly over the env's OWN state box and
+            # differences W̄ against I over its OWN dt — both read from the env,
+            # never configured (see CVSTEMLQRAgent).
+            x_min, x_max, env_dt = _env_attrs(raw_env, "X_MIN", "X_MAX", "dt")
             self._setup_cvstem_lqr(skrl_env, device, obs_space, state_space, act_space,
                                    agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B,
                                    x_dim=x_dim, u_dim=u_dim, angle_idx=angle_idx, sym=sym,
                                    raw_cfg_snapshot=raw_cfg_snapshot,
-                                   cm_cfg=cm_cfg, cmg_cfg=cmg_cfg, u_lo=u_lo, u_hi=u_hi)
+                                   cm_cfg=cm_cfg, cmg_cfg=cmg_cfg,
+                                   x_lo=x_min, x_hi=x_max, dt=env_dt)
         elif algo in ("c2rl-ppo", "c2rl-sac"):
             # base_algorithm is derived from the algo string itself (i.e. which
             # entry point / yaml you used), not a config toggle — see
@@ -788,16 +776,15 @@ class ContractionRunner:
     def _setup_cvstem_lqr(self, env, device, obs_space, state_space, act_space,
                           agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B,
                           x_dim=None, u_dim=None, angle_idx=None, sym=None, raw_cfg_snapshot=None,
-                          cm_cfg=None, cmg_cfg=None, u_lo=None, u_hi=None):
-        """Build a CVSTEMLQRAgent — Tsukamoto's CV-STEM contraction controller.
+                          cm_cfg=None, cmg_cfg=None, x_lo=None, x_hi=None, dt=None):
+        """Build a CVSTEMLQRAgent — Tsukamoto's CV-STEM/NCM contraction controller.
 
         Analytical (like SD-LQR), so a SequentialTrainer / no gradient updates.
-        The `cm:`/`cmg:` yaml blocks (contraction-metric + offline CMG-synthesis
-        knobs, kept out of `agent:` exactly as for C2RL) are merged into
-        agent_cfg so CVSTEMLQRCfg sees them as one flat namespace. For
-        metric_source='pretrained' a frozen CMG (MetricModel, BoundedCCM,
-        constrain_eigenvalues=True) is built and synthesized inside the agent;
-        'online' needs no network."""
+        The `cm:`/`cmg:` yaml blocks (joint-SDP + metric-network knobs, kept out
+        of `agent:` exactly as for C2RL) are merged into agent_cfg so
+        CVSTEMLQRCfg sees them as one flat namespace. The agent owns its metric
+        network (nn_modules.CholMetric, regressed onto chol(M)), so nothing is
+        built from `models:` here."""
         import dataclasses
 
         from skrl.trainers.torch import SequentialTrainer
@@ -808,35 +795,21 @@ class ContractionRunner:
         # agent_cfg LAST so CLI overrides survive — see _setup_c2rl's identical merge.
         agent_cfg = {**(cm_cfg or {}), **(cmg_cfg or {}), **agent_cfg}
         angle_idx = list(angle_idx or [])
-        w_lb = agent_cfg.get("w_lb", 0.1)
-        w_ub = agent_cfg.get("w_ub", 10.0)
-
-        models = {}
-        if str(agent_cfg.get("metric_source", "online")).lower() == "pretrained":
-            from contractionRL.agents.skrl.models import MetricModel
-            cmg_net = models_cfg.get("cmg", {}).get("network", [{}])
-            cmg_hd = cmg_net[0].get("layers", [256, 256]) if cmg_net else [256, 256]
-            cmg_act = cmg_net[0].get("activations", "tanh") if cmg_net else "tanh"
-            models["cmg"] = MetricModel(
-                obs_space, act_space, device, hidden_dim=cmg_hd, activation=cmg_act,
-                x_dim=x_dim, angle_idx=angle_idx, sym=_cmg_symmetry(sym), constrain_eigenvalues=True,
-                w_lb=w_lb, w_ub=w_ub,
-            )
 
         agent = CVSTEMLQRAgent(
             cfg=CVSTEMLQRCfg(**_filter_cfg_fields(agent_cfg, CVSTEMLQRCfg, context="ContractionRunner agent")),
-            models=models,
+            models={},
             observation_space=obs_space,
             state_space=state_space,
             action_space=act_space,
             device=device,
             get_f_and_B=get_f_and_B,
-            get_rollout=get_rollout,
+            x_lo=x_lo,
+            x_hi=x_hi,
+            dt=dt,
             x_dim=x_dim,
             u_dim=u_dim,
             angle_idx=angle_idx,
-            u_lo=u_lo,
-            u_hi=u_hi,
         )
         # Same fix as _setup_lqr_sdlqr above — pass trainer_cfg through in
         # full so `headless` (train.py) isn't silently dropped.
@@ -854,17 +827,15 @@ class ContractionRunner:
         self._mode = "cvstem-lqr"
 
         # Certificate for the PathTracking plot — like C3M, this is a hard
-        # per-step contraction controller (no discounting). 'pretrained' exposes
-        # per-state CMG bounds; 'online' has no persistent net, so static bounds.
+        # per-step contraction controller (no discounting). The metric envelope
+        # is not configured here: the joint SDP leaves ν free and returns it, and
+        # W̄ ∈ [I, χI] with W = W̄/ν gives M ∈ [ν/χ, ν] exactly.
         if hasattr(env, "set_contraction_certificate"):
-            cmg_bounds_fn = (
-                _make_cmg_bounds_fn(models["cmg"], w_lb) if "cmg" in models else None
-            )
             env.set_contraction_certificate(
-                agent_cfg.get("lbd"),
+                agent.metric_lbd,       # the linesearch may have chosen it, not the yaml
                 discount_factor=None,
-                static_metric_bounds=(1.0 / w_lb, 1.0 / w_ub),
-                cmg_bounds_fn=cmg_bounds_fn,
+                static_metric_bounds=(agent.metric_nu, agent.metric_nu / agent.metric_chi),
+                cmg_bounds_fn=None,
             )
 
     def _setup_c2rl(self, env, device, obs_space, state_space, act_space,

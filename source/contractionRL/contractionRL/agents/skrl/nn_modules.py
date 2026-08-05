@@ -140,6 +140,59 @@ class CCM_Generator(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
+# CholMetric — the ORIGINAL NCM network: x -> chol(M), M = RᵀR
+# ─────────────────────────────────────────────────────────────────────────── #
+
+class CholMetric(nn.Module):
+    """Tsukamoto's NCM network (``classncm.train`` + ``ncm``/``cholM2M``).
+
+    A plain MLP ``x ↦ vec(R)`` with ``R`` upper-triangular and ``M = RᵀR``, so
+    the deployed metric is SPD by CONSTRUCTION at every state — including ones
+    the SDP never sampled — with no eigenvalue clamp anywhere. That is the whole
+    reason the reference regresses ``chol(M)`` rather than ``W``: ``ν`` is free in
+    its SDP, so no ``[w_lb, w_ub]`` envelope exists to clamp to, and clamping a
+    regressed ``W`` would silently deploy a metric the SDP never certified.
+
+    Deliberately NOT ``CCM_Generator``: that one outputs ``W`` and relies on
+    ``bound_W`` for definiteness, which is the repo's envelope-bearing variant
+    (still what C2RL uses). This one is only for CV-STEM-LQR.
+
+    Raw ``x`` in, no feature map and no angle embedding — the reference feeds the
+    state vector directly. Angles therefore enter unwrapped; a state box that
+    spans ±π has a discontinuity the network must fit through, which is the
+    reference's behaviour, not an oversight here.
+
+    Output layer is plain linear, so ``R``'s diagonal may be zero or negative and
+    ``M`` is PSD rather than strictly PD. Nothing downstream inverts ``M`` (the
+    gain is ``K = R⁻¹BᵀM``), so a singular ``M`` degrades feedback smoothly
+    instead of raising.
+    """
+
+    def __init__(self, x_dim: int, hidden_dims: Sequence[int] = (128, 128),
+                 activation: nn.Module | None = None) -> None:
+        super().__init__()
+        self.x_dim = int(x_dim)
+        self.n_out = self.x_dim * (self.x_dim + 1) // 2
+        self.net = MLP(self.x_dim, list(hidden_dims), self.n_out,
+                       activation=activation if activation is not None else nn.ReLU())
+        iu = torch.triu_indices(self.x_dim, self.x_dim)
+        # Same row-major upper-triangular order as ncm_synthesis.M_to_cholvec —
+        # the labels and the reconstruction MUST agree on it.
+        self.register_buffer("_iu", iu, persistent=False)
+
+    def chol(self, x: torch.Tensor) -> torch.Tensor:
+        """Upper-triangular ``R`` with ``M = RᵀR``, ``(b, x_dim, x_dim)``."""
+        vec = self.net(x)
+        R = x.new_zeros(x.shape[0], self.x_dim, self.x_dim)
+        R[:, self._iu[0], self._iu[1]] = vec
+        return R
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        R = self.chol(x)
+        return torch.bmm(R.transpose(1, 2), R)
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
 # CVSTEMLQRBase — analytic contraction controller as a residual-RL baseline
 # ─────────────────────────────────────────────────────────────────────────── #
 
