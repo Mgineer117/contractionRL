@@ -514,6 +514,56 @@ class C2RLTrainerCfg(TrainerCfg):
                              # phase (Phase A) runs once before this loop
 
 
+def cm_dataset_target(cfg) -> tuple[Path | None, dict]:
+    """Where this config's offline ``{x → W*(x)}`` dataset lives, and its key.
+
+    The single source of truth for both sides of the contract: the agent
+    (``_synthesize_cmg_cvstem``) LOADS from here, and
+    ``scripts/build_cm_dataset.py`` WRITES here. Deriving the path or the
+    ``cache_kwargs`` twice is how a generator silently produces a file the agent
+    then key-misses and refuses — the two must be computed by one function.
+
+    Returns ``(path, cache_kwargs)``; ``path`` is None when the config names no
+    dataset location at all, which the caller must treat as an error.
+    """
+    from .ncm_synthesis import cm_dataset_cache_path, cm_dataset_filename
+
+    data_path = getattr(cfg, "dynamics_pretrain_data_path", "") or None
+    explicit_cache_path = getattr(cfg, "cm_data_path", "") or None
+    # cm_wdot_trajectory (see C2RLPPOCfg's docstring): real Ẇ from OFFLINE
+    # REFERENCE TRAJECTORIES instead of dropping it or Tsukamoto's static
+    # cm_wdot_dt proxy. random_ratio is meaningless there (the whole point is
+    # NOT mixing in i.i.d. states) so it is forced to 0 in the cache key too.
+    wdot_trajectory = bool(getattr(cfg, "cm_wdot_trajectory", False))
+    temporal_dt = cfg.cm_temporal_dt if wdot_trajectory else 0.0
+    random_ratio = 0.0 if wdot_trajectory else getattr(cfg, "cmg_random_ratio", 0.0)
+
+    if explicit_cache_path:
+        # An explicit cm_data_path is treated as a BASE name: the swept SDP
+        # knobs are appended (cm_dataset_filename) so different lbd/w_lb/w_ub
+        # runs never clobber or wrongly reuse each other's cache.
+        base = Path(explicit_cache_path)
+        cache_path = base.with_name(cm_dataset_filename(
+            cfg.lbd, cfg.w_lb, cfg.w_ub, cfg.cvstem_r_scaler, stem=base.stem))
+    elif data_path:
+        cache_path = cm_dataset_cache_path(
+            data_path, lbd=cfg.lbd, w_lb=cfg.w_lb, w_ub=cfg.w_ub,
+            r_scaler=cfg.cvstem_r_scaler)
+    else:
+        cache_path = None
+
+    cache_kwargs = dict(
+        lbd=cfg.lbd, w_lb=cfg.w_lb, w_ub=cfg.w_ub, eps=cfg.cm_eps,
+        solver=cfg.cm_solver, num_samples=cfg.cmg_memory_size, tag="[C2RL]",
+        r_scaler=cfg.cvstem_r_scaler,
+        chi_weight=cfg.cm_chi_weight,
+        nu_weight=cfg.cm_nu_weight, wdot_dt=cfg.cm_wdot_dt,
+        random_ratio=random_ratio,
+        wdot_trajectory=wdot_trajectory, temporal_dt=temporal_dt,
+    )
+    return cache_path, cache_kwargs
+
+
 # ─────────────────────────────────────────────────────────────────────────── #
 # Agent
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -1515,74 +1565,48 @@ class C2RLAgent(Agent):
         }
 
     def _synthesize_cmg_cvstem(self, *, timesteps: int = 0) -> dict:
-        """CV-STEM path: convex SDP per state + MSE regression (original pipeline)."""
-        from .ncm_synthesis import (
-            build_cm_dataset,
-            cm_dataset_cache_path,
-            cm_dataset_filename,
-            load_cached_cm_dataset,
-            regress_cmg,
-            save_cm_dataset,
-        )
+        """CV-STEM path: LOAD the offline ``{x → W*(x)}`` dataset, then MSE-regress.
+
+        The per-state SDP is NOT solved here. C2RL consumes a dataset generated
+        ahead of time by ``scripts/build_cm_dataset.py`` and committed under
+        ``data/``; a missing cache raises instead of silently re-solving.
+
+        Solving at agent construction meant every seed, every gamma and every
+        sweep worker paid for the same 100k-state solve and raced to write the
+        same file — 14 minutes each, multiplied by the whole grid, for a dataset
+        that depends on none of the things being swept (the cache key is
+        lbd/w_lb/w_ub/r/eps/solver/N, and gamma and seed appear in none of them).
+        Generating it once offline also makes the metric an INPUT to the
+        experiment rather than a per-run artifact, so two runs cannot disagree
+        about what W they were certified against.
+        """
+        from .ncm_synthesis import load_cached_cm_dataset, regress_cmg
         cfg = self._cfg
-        data_path = getattr(cfg, "dynamics_pretrain_data_path", "") or None
-        explicit_cache_path = getattr(cfg, "cm_data_path", "") or None
-        # cm_wdot_trajectory (see C2RLPPOCfg's docstring): real Ẇ from OFFLINE
-        # REFERENCE TRAJECTORIES instead of dropping it or Tsukamoto's static
-        # cm_wdot_dt proxy — validated at __init__ time (requires
-        # dynamics_pretrain_data_path); random_ratio is meaningless here (the
-        # whole point is NOT mixing in i.i.d. states) so it's forced to 0 for
-        # both the cache key and the (unused, in this mode) x_samples pool.
-        wdot_trajectory = bool(getattr(cfg, "cm_wdot_trajectory", False))
-        temporal_dt = cfg.cm_temporal_dt if wdot_trajectory else 0.0
-        random_ratio = 0.0 if wdot_trajectory else getattr(cfg, "cmg_random_ratio", 0.0)
-        traj_x = traj_lengths = None
-        if wdot_trajectory:
-            from .dynamics_pretrain import load_offline_trajectories
-            traj_data = load_offline_trajectories(data_path, tag="[C2RL]")
-            traj_x, traj_lengths = traj_data["x"], traj_data["lengths"]
-        if explicit_cache_path:
-            # An explicit cm_data_path is treated as a BASE name: the swept SDP
-            # knobs are appended (cm_dataset_filename) so different lbd/w_lb/w_ub
-            # runs never clobber or wrongly reuse each other's cache.
-            base = Path(explicit_cache_path)
-            cache_path = base.with_name(
-                cm_dataset_filename(cfg.lbd, cfg.w_lb, cfg.w_ub, cfg.cvstem_r_scaler, stem=base.stem))
-        elif data_path:
-            cache_path = cm_dataset_cache_path(
-                data_path, lbd=cfg.lbd, w_lb=cfg.w_lb, w_ub=cfg.w_ub, r_scaler=cfg.cvstem_r_scaler)
-        else:
-            cache_path = None
-        cache_kwargs = dict(
-            lbd=cfg.lbd, w_lb=cfg.w_lb, w_ub=cfg.w_ub, eps=cfg.cm_eps,
-            solver=cfg.cm_solver, num_samples=cfg.cmg_memory_size, tag="[C2RL]",
-            r_scaler=cfg.cvstem_r_scaler,
-            chi_weight=cfg.cm_chi_weight,
-            nu_weight=cfg.cm_nu_weight, wdot_dt=cfg.cm_wdot_dt,
-            random_ratio=random_ratio,
-            wdot_trajectory=wdot_trajectory, temporal_dt=temporal_dt,
-        )
-        dataset = load_cached_cm_dataset(cache_path, **cache_kwargs) if cache_path else None
-        if dataset is None:
-            dataset = build_cm_dataset(
-                self._get_rollout, self._get_f_and_B,
-                x_dim=self._x_dim,
-                lbd=cfg.lbd, w_lb=cfg.w_lb, w_ub=cfg.w_ub, eps=cfg.cm_eps,
-                num_samples=cfg.cmg_memory_size, solver=cfg.cm_solver,
-                device=self._device, tag="[C2RL]",
-                x_samples=self._sample_cmg_x() if not wdot_trajectory else None,
-                random_ratio=random_ratio,
-                min_feasibility_rate=cfg.min_feasibility_rate,
-                r_scaler=cfg.cvstem_r_scaler,
-                max_lambda_reductions=cfg.max_lambda_reductions,
-                chi_weight=cfg.cm_chi_weight,
-                nu_weight=cfg.cm_nu_weight, wdot_dt=cfg.cm_wdot_dt,
-                traj_x=traj_x, traj_lengths=traj_lengths, temporal_dt=temporal_dt,
+        cache_path, cache_kwargs = cm_dataset_target(cfg)
+        if cache_path is None:
+            raise RuntimeError(
+                "[C2RL] cmg_method='cvstem' needs an offline {x -> W*(x)} dataset, but "
+                "neither cm_data_path nor dynamics_pretrain_data_path is set, so there "
+                "is nowhere to load one from. Set cm.cm_data_path in the agent yaml "
+                "(e.g. 'data/classic/cartpole/cm_data.npz') and generate it with "
+                "scripts/build_cm_dataset.py."
             )
-            save_path = cache_path or (
-                Path(self.experiment_dir) / "checkpoints"
-                / cm_dataset_filename(cfg.lbd, cfg.w_lb, cfg.w_ub, cfg.cvstem_r_scaler))
-            save_cm_dataset(save_path, dataset, **cache_kwargs)
+        dataset = load_cached_cm_dataset(cache_path, **cache_kwargs)
+        if dataset is None:
+            # Either the file is absent or one of the cache_kwargs disagrees with
+            # it. Both mean the same thing here: the metric this run is
+            # configured for has not been generated. Re-solving inline would hide
+            # a config/dataset mismatch behind a 14-minute pause.
+            raise FileNotFoundError(
+                f"[C2RL] no offline CM dataset at {cache_path} matching this config "
+                f"(lbd={cfg.lbd}, w_lb={cfg.w_lb}, w_ub={cfg.w_ub}, "
+                f"r={cfg.cvstem_r_scaler}, eps={cfg.cm_eps}, solver={cfg.cm_solver}, "
+                f"N={cfg.cmg_memory_size}).\nGenerate it first:\n"
+                f"  python scripts/build_cm_dataset.py --task <task> --algorithm "
+                f"<c2rl-ppo|c2rl-sac>\n"
+                f"The SDP is no longer solved at agent construction — see "
+                f"_synthesize_cmg_cvstem."
+            )
         # Kept for the optional residual distillation (cvstem_residual_distill):
         # the per-state SDP solutions W_online(x) are the EXACT online CV-STEM-LQR
         # metric the frozen CMG only approximates. See _distill_residual_from_online.

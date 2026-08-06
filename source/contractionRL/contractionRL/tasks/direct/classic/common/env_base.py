@@ -25,6 +25,21 @@ class BaseEnv(gym.Env):
         self.XREF_INIT_MAX = torch.tensor(env_config["xref_init_max"], device=self.device, dtype=torch.float32).flatten()
         self.XE_INIT_MIN = torch.tensor(env_config["xe_init_min"], device=self.device, dtype=torch.float32).flatten()
         self.XE_INIT_MAX = torch.tensor(env_config["xe_init_max"], device=self.device, dtype=torch.float32).flatten()
+        # Dims on which xref_0 is drawn BIMODALLY: the [MIN,MAX] box is sampled
+        # as usual, then ONE global sign per env flips all of them together, so
+        # the distribution is the box plus its exact mirror image.
+        #
+        # Needed because a low-lbd region is generally not a box. lbd is slow
+        # where |pitch| is LARGE -- two lobes straddling zero -- and any single
+        # box covering both contains the fast center between them. Worse, the
+        # lobes lie on a DIAGONAL (segway is slow only when pitch and pitch_rate
+        # have opposite signs), so flipping each dim independently would land
+        # half the mass on the fast diagonal. One shared sign maps the box to
+        # the correct opposite lobe and keeps the distribution symmetric, which
+        # a one-sided box would not be.
+        #
+        # Empty (the default) reproduces the previous behavior exactly.
+        self.XREF_INIT_SIGN_DIMS = list(env_config.get("xref_init_sign_dims", []) or [])
         self.XE_MIN = torch.tensor(env_config["xe_min"], device=self.device, dtype=torch.float32).flatten()
         self.XE_MAX = torch.tensor(env_config["xe_max"], device=self.device, dtype=torch.float32).flatten()
         self.UREF_MIN = torch.tensor(env_config["uref_min"], device=self.device, dtype=torch.float32).flatten()
@@ -196,6 +211,15 @@ class BaseEnv(gym.Env):
         n = len(env_ids)
         rand_xref = torch.rand(n, self.num_dim_x, device=self.device, dtype=torch.float32)
         xref_0 = self.XREF_INIT_MIN + rand_xref * (self.XREF_INIT_MAX - self.XREF_INIT_MIN)
+        if self.XREF_INIT_SIGN_DIMS:
+            # ONE sign per env, shared across the listed dims -- see
+            # XREF_INIT_SIGN_DIMS. Per-dim signs would break the diagonal.
+            s = torch.where(
+                torch.rand(n, 1, device=self.device) < 0.5, -1.0, 1.0
+            ).to(torch.float32)
+            idx = torch.as_tensor(self.XREF_INIT_SIGN_DIMS, device=self.device,
+                                  dtype=torch.long)
+            xref_0[:, idx] = xref_0[:, idx] * s
 
         rand_xe = torch.rand(n, self.num_dim_x, device=self.device, dtype=torch.float32)
         xe_0 = self.XE_INIT_MIN + rand_xe * (self.XE_INIT_MAX - self.XE_INIT_MIN)
