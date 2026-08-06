@@ -162,8 +162,8 @@ cm:
   # envelope caps ν ≤ 1/w_lb and hence the gain ‖K‖ ≤ ‖B‖/(r·w_lb), so changing
   # either bound invalidates the rate. w_lb also sets the Mahalanobis reward's
   # scale, so it is not reward-neutral.
-  w_ub: 100.0  # Upper eigenvalue bound for the metric M(x)
-  w_lb: 0.01  # Lower eigenvalue bound for the metric M(x)
+  w_ub: 1000.0
+  w_lb: 0.001
   # Contraction rate λ — used by cmg_method's synthesis loss (CM SDP LMI for
   # "cvstem", CMG Cu/C1 loss for "ccm").
   # 0.3902 with cvstem_r_scaler 1.6 / w_lb 0.01 / w_ub 100: measured by
@@ -182,7 +182,7 @@ cm:
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled, already 0)
   # SDP contraction metric (cm_eps used by both cmg_method paths; cm_solver "cvstem" only)
-  cm_eps: 0.1   # Strict-definiteness margin on the contraction LMI
+  cm_eps: 0.01
   cm_solver: MOSEK  # cvxpy SDP solver: SCS (default, no license) | CLARABEL (no license, tighter/slower) | MOSEK (commercial license, tightest/fastest — see README.md Installation)
   # cmg_method selects the training pipeline (see c2rl.py module docstring):
   #   "ccm"    — trains the CMG directly via C1/C2 loss minimization
@@ -203,7 +203,7 @@ cm:
   #              Control is penalized via this Riccati term, not bounded over an
   #              action range — see ncm_synthesis.py module docstring.
   cmg_method: cvstem
-  cvstem_r_scaler: 1.6  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); measured with lbd/w_lb/w_ub above — "cvstem" only
+  cvstem_r_scaler: 1.6
   # On SDP infeasibility AT A GIVEN STATE, retry that state alone with λ
   # halved, up to this many times, before giving up on it and dropping it from
   # the dataset — 0 disables this and reverts to dropping immediately. Warns
@@ -229,13 +229,15 @@ cmg:
   # algorithms' metrics are only comparable if they are fit to the same amount of
   # SDP data. NOT a free knob: it sets the regression's dataset size, so the four
   # settings below are sized against it.
-  cmg_memory_size: 1000
+  cmg_memory_size: 100000
   # regress_cmg does `iters = max(1, n_train // batch_size)`, so at 900 training
   # points the old batch 1024 silently became ONE full-batch step per epoch —
   # 1000 gradient steps total, deep in the starved regime (measured relative
   # error on M: 0.55 at 0.5k steps, 0.23 at 5k, 0.03 at 100k). The `max(1, ...)`
-  # means this degrades quietly rather than erroring. 900 // 32 = 28 batches x
-  # 3000 epochs = ~84k steps, matching skrl_cvstem_lqr_cfg.yaml's budget.
+  # means this degrades quietly rather than erroring. At cmg_memory_size 10000
+  # the split is 9000 train, so 9000 // 320 = 28 batches x 3000 epochs = ~84k
+  # steps — the SAME budget as N=1000/batch-32, scaled by BATCH rather than by
+  # epochs so cmg_early_stop_patience keeps meaning the same thing in epochs.
   cmg_regress_epochs: 3000
   cmg_regress_lr: 1.0e-3
   cmg_regress_lr_scheduler: "StepLR"  # built the same way as empirical_dynamics' scheduler
@@ -244,7 +246,7 @@ cmg:
     # gamma is per EPOCH and must be sized to the epoch count: 0.99^3000 = 1e-13
     # would annihilate the lr by epoch ~500. 0.999^3000 lands at 5e-5.
     gamma: 0.999
-  cmg_regress_batch_size: 32
+  cmg_regress_batch_size: 3200
   # In EPOCHS. The dataclass default of 10 would stop after ~280 steps, i.e.
   # before the fit has started.
   cmg_early_stop_patience: 300
@@ -262,10 +264,10 @@ empirical_dynamics:
   dynamics_lr_scheduler: "StepLR"
   dynamics_lr_scheduler_kwargs:
     step_size: 1  # anneal every epoch
-    gamma: 0.99
+    gamma: 0.999
   dynamics_batch_size: 4096
   dynamics_pretrain_epochs: 100  # offline-data epochs, or online rollouts when no data path
 
 trainer:
   class: C2RLSkrlTrainer
-  timesteps: 30000   # Total number of environment steps to train for
+  timesteps: 100000  # Total number of environment steps to train for

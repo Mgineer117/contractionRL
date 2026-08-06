@@ -61,7 +61,7 @@ agent:
     checkpoint_interval: auto
   gae_lambda: 0.95
   use_state_norm: false
-  use_value_norm: true
+  use_value_norm: false
 trainer:
   class: SequentialTrainer
   timesteps: 50000

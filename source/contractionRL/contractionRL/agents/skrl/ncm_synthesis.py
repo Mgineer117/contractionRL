@@ -1762,6 +1762,70 @@ def cvstem_metric_dataset(
             "nu": sol["nu"], "chi": sol["chi"], "J": sol["J"], "lbd": lbd}
 
 
+def cvstem_cache_path(data_path: str, *, lbd: float, r_scaler: float, w_lb, w_ub,
+                      eps: float, dt: float, n_samples: int) -> Path:
+    """Where ``cvstem_metric_dataset``'s result is cached.
+
+    Separate from ``cm_dataset_cache_path`` because these are DIFFERENT programs:
+    this one is the single joint SDP (shared ν/χ, ``Ẇ`` proxy at ``dt``) and its
+    result carries ``nu``/``chi``/``J``/``cholM``, none of which the pointwise
+    cache stores. Sharing a filename would let one silently load the other's
+    metric. The knobs most often swept go in the NAME so configs cache
+    side-by-side; the rest are verified at load time.
+    """
+    w = f"{'none' if w_lb is None else f'{w_lb:g}'}_{'none' if w_ub is None else f'{w_ub:g}'}"
+    stem = (f"cvstem_joint_lbd{lbd:g}_rs{r_scaler:g}_w{w}"
+            f"_eps{eps:g}_dt{dt:g}_n{n_samples}.npz")
+    return Path(data_path).with_name(stem)
+
+
+def save_cvstem_dataset(cache_path: Path, dataset: dict, **cfg) -> None:
+    """Persist a joint-SDP solve alongside the config it was solved under.
+
+    Config keys are stored under a ``cfg_`` prefix: ``lbd`` is BOTH an input and
+    a result here (``lbd_linesearch`` makes the solve pick its own), and an
+    unprefixed collision would silently overwrite one with the other.
+    """
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(cache_path, x=dataset["x"], W=dataset["W"], cholM=dataset["cholM"],
+             nu=dataset["nu"], chi=dataset["chi"], J=dataset["J"], lbd=dataset["lbd"],
+             **{f"cfg_{k}": ("none" if v is None else v) for k, v in cfg.items()})
+    print(f"[CVSTEM-LQR] Cached joint SDP ({dataset['x'].shape[0]} states) → {cache_path}")
+
+
+def load_cvstem_dataset(cache_path: Path, *, tag: str = "[CVSTEM-LQR]", **cfg) -> dict | None:
+    """Reload a cached joint solve, or None if it is missing or was solved under
+    a different config. Every knob that enters the program is checked — a stale
+    hit here would deploy a metric certifying a DIFFERENT rate than the yaml
+    claims, which no downstream check would catch."""
+    cache_path = Path(cache_path)
+    if not cache_path.is_file():
+        return None
+    try:
+        d = np.load(cache_path, allow_pickle=False)
+    except Exception as e:  # noqa: BLE001 — a corrupt cache must re-solve, not crash
+        print(f"{tag} Ignoring unreadable cache {cache_path}: {type(e).__name__}: {e}")
+        return None
+    for key, want in cfg.items():
+        stored = f"cfg_{key}"
+        if stored not in d.files:
+            print(f"{tag} Cache {cache_path.name} predates '{key}' — re-solving.")
+            return None
+        got = d[stored].item() if d[stored].ndim == 0 else d[stored]
+        want_c = "none" if want is None else want
+        same = (got == want_c) if isinstance(want_c, str) else np.allclose(
+            float(got), float(want_c), rtol=1e-9, atol=0.0)
+        if not same:
+            print(f"{tag} Cache {cache_path.name} has {key}={got} but config wants "
+                  f"{want_c} — re-solving.")
+            return None
+    print(f"{tag} Loaded cached joint SDP ({d['x'].shape[0]} states) from {cache_path} "
+          f"— skipping the solve.")
+    return {"x": d["x"], "W": d["W"], "cholM": d["cholM"],
+            "nu": float(d["nu"]), "chi": float(d["chi"]),
+            "J": float(d["J"]), "lbd": float(d["lbd"])}
+
+
 def regress_cholm(
     net,
     dataset: dict,

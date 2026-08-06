@@ -38,9 +38,15 @@ lim = 1.0
 XE_MIN = [-lim, -lim, -lim, -lim]
 XE_MAX = [lim, lim, lim, lim]
 
-# reference control bounds
-UREF_MIN = [-3.0]
-UREF_MAX = [3.0]
+# reference control bounds. u is a FORCE on the cart (N); the APPLIED box is 2x
+# this (env_base.py:37). Statically holding the pole at tilt theta needs
+# u = (mc+mp)*g*tan(theta) = 19.62*tan(theta), so the old +-6 applied could not
+# hold even the XE_INIT pitch of 0.3 rad (19.62*tan(0.3) = 6.07 N) -- reset could
+# place the pole past what ANY gain could recover, making the actuator check
+# infeasible by arithmetic, not by the SDP. +-12 N applied holds 0.55 rad and
+# matches real hardware (Gym cartpole uses 10 N, Quanser's linear pendulum ~15).
+UREF_MIN = [-6.0]
+UREF_MAX = [6.0]
 
 ENV_CONFIG = {
     "x_min": X_MIN,

@@ -50,12 +50,13 @@ agent:
   learning_epochs: 5  # Number of gradient descent passes over the collected batch
   mini_batches: 4  # Number of subsets to divide the batch into for stochastic optimization
   gae_lambda: 0.95  # Lambda parameter for Generalized Advantage Estimation (GAE)
-  learning_rate: 1.0e-6   # Global step size for neural network optimization
-  learning_rate_scheduler: KLAdaptiveLR # matches the standalone PPO baseline for this env
-  learning_rate_scheduler_kwargs:
-    kl_threshold: 0.008
-    max_lr: 1.0e-4       # ceiling the scheduler may climb to
-    min_lr: 1.0e-8       # floor it may fall to (learning_rate is the START)
+  learning_rate: 1.0e-5   # Global step size, FIXED — no scheduler (see below)
+  # No KL-adaptive schedule: the LR is constant at learning_rate above.
+  # (KLAdaptiveLR was steering toward kl_threshold 0.008, but with the PPO
+  # early-stop at 0.01 its DECREASE branch could never fire — that needs
+  # mean KL > 0.016 (kl_factor=2), above the stop — so it only ratcheted the
+  # LR upward. A fixed LR is the honest version of that behavior.)
+  learning_rate_scheduler: null
   std_dev_annealing_kwargs:
     schedule: exponential
     final_log_std: -4.6
@@ -72,7 +73,7 @@ agent:
   rewards_shaper_scale: 1.0
   use_state_norm: false  # OFF by default — see c2rl.py module docstring / rl_glue.make_base_rl_cfg
   use_value_norm: false   # Same, but for the value function's output (PPO only)
-  use_reward_norm: true  # Non-biasing running-std reward normalizer (r/std, no centering) — tames the
+  use_reward_norm: false  # Non-biasing running-std reward normalizer (r/std, no centering) — tames the
                          # w_lb/w_ub-dependent Mahalanobis-reward scale/heavy-tail before GAE; see rl_glue.
 
   # ── CAPS action smoothness (Mysore et al. 2021) ─────────────────────────── #

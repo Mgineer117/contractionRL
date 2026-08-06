@@ -107,6 +107,15 @@ class CVSTEMLQRCfg(AgentCfg):
     # actuator box — whether the certified gain FITS is an empirical question the
     # rollout answers, not one the SDP is asked.
     lbd_linesearch: tuple | None = field(default=None)
+    # Cache the joint solve here. Unlike C2RL — which has always cached — this
+    # agent re-solved from scratch on EVERY run, so cm_samples was capped by what
+    # was tolerable per run rather than by what the metric fit needs: at
+    # cm_samples=10000 the program takes ~13 h (measured T ∝ N^1.95), which is a
+    # fine one-time offline cost and an impossible per-run one. Keyed on every
+    # knob that enters the program (see ncm_synthesis.cvstem_cache_path /
+    # load_cvstem_dataset), so a config change re-solves instead of silently
+    # deploying a metric certifying a different rate. Empty string disables it.
+    cm_data_path: str = ""
 
     # ── The metric network (yaml `cmg:` block) ─────────────────────────────── #
     cmg_hidden_dims: tuple = (100, 100, 100)   # his 3x100 ReLU MLP
@@ -198,19 +207,45 @@ class CVSTEMLQRAgent(Agent):
 
     def _synthesize(self) -> None:
         """Uniform samples → ONE joint SDP → MSE-fit ``CholMetric``, then freeze."""
-        from .ncm_synthesis import cvstem_metric_dataset, regress_cholm
+        from .ncm_synthesis import (
+            cvstem_cache_path,
+            cvstem_metric_dataset,
+            load_cvstem_dataset,
+            regress_cholm,
+            save_cvstem_dataset,
+        )
 
         cfg = self._cfg
         tag = "[CVSTEM-LQR]"
-        dataset = cvstem_metric_dataset(
-            self._get_f_and_B, self._x_lo, self._x_hi,
-            n_samples=cfg.cm_samples, lbd=cfg.lbd, eps=cfg.cm_eps, dt=self._dt,
-            solver=cfg.cm_solver, r_scaler=cfg.r_scaler,
-            chi_weight=cfg.chi_weight, nu_weight=cfg.nu_weight,
-            w_lb=cfg.cm_w_lb, w_ub=cfg.cm_w_ub,
-            seed=cfg.cm_seed, device=self.device, tag=tag,
-            linesearch=(tuple(cfg.lbd_linesearch) if cfg.lbd_linesearch else None),
+        # Cache key = every knob the joint program reads. lbd_linesearch is in it
+        # because it OVERRIDES lbd (the solve picks its own λ), so two configs
+        # differing only there must not share a file.
+        cache_cfg = dict(
+            lbd=cfg.lbd, r_scaler=cfg.r_scaler, w_lb=cfg.cm_w_lb, w_ub=cfg.cm_w_ub,
+            eps=cfg.cm_eps, dt=self._dt, n_samples=cfg.cm_samples,
+            solver=cfg.cm_solver, seed=cfg.cm_seed, nu_weight=cfg.nu_weight,
+            chi_weight=cfg.chi_weight,
+            linesearch=("none" if not cfg.lbd_linesearch
+                        else ",".join(f"{float(v):g}" for v in cfg.lbd_linesearch)),
         )
+        cache = cvstem_cache_path(
+            cfg.cm_data_path, lbd=cfg.lbd, r_scaler=cfg.r_scaler, w_lb=cfg.cm_w_lb,
+            w_ub=cfg.cm_w_ub, eps=cfg.cm_eps, dt=self._dt, n_samples=cfg.cm_samples,
+        ) if cfg.cm_data_path else None
+
+        dataset = load_cvstem_dataset(cache, tag=tag, **cache_cfg) if cache else None
+        if dataset is None:
+            dataset = cvstem_metric_dataset(
+                self._get_f_and_B, self._x_lo, self._x_hi,
+                n_samples=cfg.cm_samples, lbd=cfg.lbd, eps=cfg.cm_eps, dt=self._dt,
+                solver=cfg.cm_solver, r_scaler=cfg.r_scaler,
+                chi_weight=cfg.chi_weight, nu_weight=cfg.nu_weight,
+                w_lb=cfg.cm_w_lb, w_ub=cfg.cm_w_ub,
+                seed=cfg.cm_seed, device=self.device, tag=tag,
+                linesearch=(tuple(cfg.lbd_linesearch) if cfg.lbd_linesearch else None),
+            )
+            if cache is not None and dataset is not None:
+                save_cvstem_dataset(cache, dataset, **cache_cfg)
         if dataset is None:
             # No metric at all — every downstream number would describe an
             # uncertified controller, so this is fatal rather than a fallback.

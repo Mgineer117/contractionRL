@@ -9,7 +9,7 @@ agent:
   class: CVSTEM-LQR
   # R = r_scaler·I, used in BOTH the metric SDP's Riccati term AND the deployed
   # gain K = R⁻¹BᵀM — a single knob so K stays the CERTIFIED CV-STEM gain.
-  r_scaler: 1.0
+  r_scaler: 6.4
   experiment:
     directory: "segway_cvstem_lqr"
     experiment_name: ""
@@ -24,18 +24,27 @@ agent:
 cm:
   # λ — the certified contraction rate. Comes from scripts/find_uniform_lambda.py
   # (the λ-selection step; the reference's own linesearch is not run here).
-  lbd: 0.1
-  cm_eps: 0.01   # ε, strict-definiteness margin on the LMI (his epsilon)
+  lbd: 0.0152
+  cm_eps: 0.01
   # Tsukamoto's CV-STEM SAMPLING PERIOD, which is a synthesis hyperparameter and
   # NOT the integrator step: his cart-pole notebook uses dt=1 while the sim runs
   # at 0.1 and RK4-substeps at 0.01. Unset, this falls back to the env integrator
   # step, a much harsher (W-I)/dt bound that inflates nu by the same factor.
   cm_dt: 1.0
+  # Deployment envelope. Segway shipped WITHOUT one (the reference
+  # program); added so nu is bounded and the gain cap
+  # ||K|| <= ||B||/(r*w_lb) exists. Same envelope as the other envs.
+  cm_w_lb: 0.001
+  cm_w_ub: 1000.0
   cm_solver: MOSEK  # SCS (no license) | CLARABEL | MOSEK (tightest/fastest; see README)
   # Uniform state-box samples in the ONE joint SDP (his Nx=1000). A SOLVER-SIZE
   # knob: each sample adds an x_dim² PSD block plus two LMIs to a single problem.
-  cm_samples: 1000
+  cm_samples: 10000
   cm_seed: 0
+  # Cache the joint solve (see CVSTEMLQRCfg.cm_data_path). Keyed on every
+  # knob that enters the program, so a config change re-solves rather than
+  # loading a metric certifying a different rate.
+  cm_data_path: "data/classic/segway/cvstem.npz"
   # Uncomment for HIS lambda selection instead (linesearch: walk lambda up from
   # lo to hi in steps of da, take argmin J = chi/lambda + nu). It ignores `lbd`
   # above and does not look at the actuator box.

@@ -41,7 +41,6 @@ state or aborted. Strictness is a per-algorithm choice made in the config:
     cm.max_lambda_reductions: 0      # strict offline: a miss can't be rescued,
                                      #   the state drops and the ratio/rate fires
     cm.min_feasibility_rate:  1.0    # offline: child raises if ANY state is dropped
-    cm.abort_on_infeasible:   true   # online (cvstem-lqr): raise on the FIRST miss
 
 C2RL offline runs the OPPOSITE way on purpose: ``max_lambda_reductions: 10`` lets
 a per-state λ-backoff rescue a miss, and ``min_feasibility_rate: 0.95`` tolerates
@@ -51,8 +50,10 @@ signal (see ``_HARD_MARKERS``). Only a state the child could not rescue (dropped
 reaches the wrapper, via the ratio/rate paths.
 
 Detection signals:
-  * ``CVSTEM-LQR INFEASIBLE``                            — the online abort
-    (``cvstem_lqr.INFEASIBLE_MARKER``; the two must stay in sync)
+  * ``CVSTEM-LQR INFEASIBLE``                            — cvstem-lqr's joint SDP
+    has no solution at this (λ, ε) (``cvstem_lqr.INFEASIBLE_MARKER``; the two
+    must stay in sync). Raised at construction, before any rollout: one program
+    covers every sample, so there is nothing per-state to rescue.
   * tqdm postfix ``feasible=<k>/<i>`` with ``k < i``     — earliest offline signal,
     fires within the first 128 states (a DROPPED, not rescued, state)
   * ``NCM synthesis: <k>/<n> states feasible`` with k<n  — end-of-solve summary

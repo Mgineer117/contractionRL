@@ -57,12 +57,13 @@ agent:
   learning_epochs: 5  # Number of gradient descent passes over the collected batch
   mini_batches: 4  # Number of subsets to divide the batch into for stochastic optimization
   gae_lambda: 0.95  # Lambda parameter for Generalized Advantage Estimation (GAE)
-  learning_rate: 1.0e-6   # Global step size for neural network optimization
-  learning_rate_scheduler: KLAdaptiveLR # matches the standalone PPO baseline for this env
-  learning_rate_scheduler_kwargs:
-    kl_threshold: 0.008
-    max_lr: 1.0e-4       # ceiling the scheduler may climb to
-    min_lr: 1.0e-8       # floor it may fall to (learning_rate is the START)
+  learning_rate: 1.0e-5   # Global step size, FIXED — no scheduler (see below)
+  # No KL-adaptive schedule: the LR is constant at learning_rate above.
+  # (KLAdaptiveLR was steering toward kl_threshold 0.008, but with the PPO
+  # early-stop at 0.01 its DECREASE branch could never fire — that needs
+  # mean KL > 0.016 (kl_factor=2), above the stop — so it only ratcheted the
+  # LR upward. A fixed LR is the honest version of that behavior.)
+  learning_rate_scheduler: null
   std_dev_annealing_kwargs:
     schedule: exponential
     final_log_std: -4.6
@@ -79,7 +80,7 @@ agent:
   rewards_shaper_scale: 1.0
   use_state_norm: false  # OFF by default — see c2rl.py module docstring / rl_glue.make_base_rl_cfg
   use_value_norm: false   # Same, but for the value function's output (PPO only)
-  use_reward_norm: true  # Non-biasing running-std reward normalizer (r/std, no centering) — tames the
+  use_reward_norm: false  # Non-biasing running-std reward normalizer (r/std, no centering) — tames the
                          # w_lb/w_ub-dependent Mahalanobis-reward scale/heavy-tail before GAE; see rl_glue.
 
   # ── CAPS action smoothness (Mysore et al. 2021) ─────────────────────────── #
@@ -119,14 +120,19 @@ cm:
   # does) — impractical here at this num_envs. See c2rl.py's module docstring.
   metric_source: cmg
   # Mahalanobis reward
-  w_ub: 10.0  # Upper eigenvalue bound for the metric M(x)
-  w_lb: 0.01  # Lower eigenvalue bound for the metric M(x)
-  lbd: 2.0    # Contraction rate λ — used by cmg_method's synthesis loss (CM SDP LMI for
+  w_ub: 1000.0
+  w_lb: 0.001
+  # From scripts/find_uniform_lambda.py's uniform state-box search (the joint
+  # CV-STEM SDP at cm_dt=1.0, lbd down by 1.5 on LMI infeasibility, r up by 2
+  # when >5% of generated u = uref - (1/r)B^T M e leave the 2x-expanded uref
+  # box). Measured together with w_lb/w_ub above and cvstem_r_scaler below —
+  # one solution of one program, not independent knobs. Pointwise feasibility measured 100%% at N=200.
+  lbd: 0.3902
               # "cvstem", CMG Cu/C1 loss for "ccm")
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled)
   # SDP contraction metric (cm_eps used by both cmg_method paths; cm_solver "cvstem" only)
-  cm_eps: 0.1   # Strict-definiteness margin on the contraction LMI
+  cm_eps: 0.01
   cm_solver: MOSEK  # cvxpy SDP solver: SCS (default, no license) | CLARABEL (no license, tighter/slower) | MOSEK (commercial license, tightest/fastest — see README.md Installation)
   # cmg_method selects the training pipeline (see c2rl.py module docstring):
   #   "ccm"    — trains the CMG directly via C1/C2 loss minimization
@@ -147,7 +153,7 @@ cm:
   #              Control is penalized via this Riccati term, not bounded over an
   #              action range — see ncm_synthesis.py module docstring.
   cmg_method: cvstem
-  cvstem_r_scaler: 0.01  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only
+  cvstem_r_scaler: 3.2
   # On SDP infeasibility AT A GIVEN STATE, retry that state alone with λ
   # halved, up to this many times, before giving up on it and dropping it from
   # the dataset — 0 disables this and reverts to dropping immediately. Warns
@@ -169,14 +175,16 @@ cm:
 # network onto {x -> W*}. "ccm": train models.cmg directly with C1/C2 losses,
 # no SDP. Either way, freeze before Phase B.
 cmg:
-  cmg_memory_size: 131072
-  cmg_regress_epochs: 50
+  cmg_memory_size: 100000
+  cmg_regress_epochs: 3000
   cmg_regress_lr: 1.0e-3
   cmg_regress_lr_scheduler: "StepLR"  # built the same way as empirical_dynamics' scheduler
   cmg_regress_lr_scheduler_kwargs:
     step_size: 1  # anneal every epoch
-    gamma: 0.99
-  cmg_regress_batch_size: 1024
+    gamma: 0.999
+  cmg_regress_batch_size: 3200
+  # In EPOCHS. The dataclass default of 10 would stop before the fit starts.
+  cmg_early_stop_patience: 300
 
 # ── Dynamics — analytical env get_f_and_B by default; set use_empirical_dynamics
 #    true (classic envs only) to learn a NeuralDynamics instead. ─────────────── #
@@ -191,10 +199,10 @@ empirical_dynamics:
   dynamics_lr_scheduler: "StepLR"
   dynamics_lr_scheduler_kwargs:
     step_size: 1  # anneal every epoch
-    gamma: 0.99
+    gamma: 0.999
   dynamics_batch_size: 4096
   dynamics_pretrain_epochs: 100  # offline-data epochs, or online rollouts when no data path
 
 trainer:
   class: C2RLSkrlTrainer
-  timesteps: 50000   # Total number of environment steps to train for
+  timesteps: 100000  # Total number of environment steps to train for

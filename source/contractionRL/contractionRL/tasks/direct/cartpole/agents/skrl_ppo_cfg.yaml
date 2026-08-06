@@ -65,7 +65,7 @@ agent:
     final_log_std: -4.6
     power: 2.0
   use_state_norm: false
-  use_value_norm: true
+  use_value_norm: false
 trainer:
   class: SequentialTrainer
   timesteps: 50000

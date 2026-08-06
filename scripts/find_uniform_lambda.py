@@ -26,8 +26,10 @@ same draw ``cvstem_lqr`` synthesizes over.
 THE CONTROL CHECK — A 5% BUDGET, NOT A VETO
 --------------------------------------------
 Uniform state samples carry no reference, so the error is drawn from the env's own
-initial-error box ``[XE_MIN, XE_MAX]`` and the feedforward from ``[UREF_MIN,
-UREF_MAX]``. At every sampled state, ``--n-draws`` of each are pushed through the
+RESET perturbation box ``[XE_INIT_MIN, XE_INIT_MAX]`` and the feedforward from
+``[UREF_MIN, UREF_MAX]``. (Not ``XE_MIN``/``XE_MAX`` -- that is C3M's flat +-1
+training-perturbation box, not the tracking error an episode presents; see the
+comment at the ``e_lo, e_hi`` assignment.) At every sampled state, ``--n-draws`` of each are pushed through the
 control the agent would really apply, ``u = uref - K(x)·e`` with ``K = (1/r)BᵀM``,
 and the check fails only when MORE than ``--viol-frac`` (5%) of that population
 lands outside the control box.
@@ -204,8 +206,12 @@ def main() -> int:
                         "moves it. If nothing certifies inside it, that is the answer.")
     p.add_argument("--w-ub", "--w_ub", type=float, default=100.0,
                    help="Deployment envelope upper bound, FIXED.")
-    p.add_argument("--cm-eps", "--cm_eps", type=float, default=0.01,
-                   help="ε, the strict-definiteness margin (his epsilon, which is 0).")
+    p.add_argument("--cm-eps", "--cm_eps", type=float, default=0.1,
+                   help="ε, the strict-definiteness margin (his epsilon, which is 0). "
+                        "MUST match the cm_eps the configs synthesize at, or the λ this "
+                        "reports is certified under a looser LMI than the one that runs: "
+                        "the 0.01 default shipped a cartpole λ=0.0514 that is infeasible "
+                        "at the config's own 0.1 (measured max there is 0.0441).")
     p.add_argument("--cm-dt", "--cm_dt", type=float, default=None,
                    help="The LMI's dt = the agent's cm_dt (his CV-STEM sampling "
                         "period, NOT the integrator step). Default: the env's dt.")
@@ -226,7 +232,22 @@ def main() -> int:
 
     lmi_dt = float(env.dt) if args.cm_dt is None else float(args.cm_dt)
     uref_lo, uref_hi = _np(env.UREF_MIN), _np(env.UREF_MAX)
-    e_lo, e_hi = _np(env.XE_MIN), _np(env.XE_MAX)
+    # XE_INIT, not XE_MIN/XE_MAX. The check asks "of the controls this metric
+    # generates, what fraction is unrealizable?", so the error draws have to be
+    # the errors an episode actually presents -- XE_INIT is exactly what reset()
+    # perturbs by, and it is sized per env (quadrotor's is per-dimension, from
+    # measured budget consumption along the CV-STEM tube).
+    #
+    # XE_MIN/XE_MAX is C3M's TRAINING-perturbation box: a flat +-1 on every dim,
+    # identical across all four envs, sampled by get_rollout(., "c3m") for the
+    # contraction loss. It was never sized to represent tracking error, and on
+    # segway it is 6.7x wider in pitch than reset ever produces -- a 1 rad (57
+    # deg) tilt error, which the env's own comment calls "mid-fall, not a
+    # tracking error". Measured at a FIXED metric (lbd=0.0101, r=6.4), swapping
+    # only this box moves the violation rate 35.20% -> 0.61%, i.e. it alone was
+    # the difference between segway certifying and returning INFEASIBLE at every
+    # (lbd, r, envelope) tried. Cartpole is insensitive: 3.01% -> 0.00%.
+    e_lo, e_hi = _np(env.XE_INIT_MIN), _np(env.XE_INIT_MAX)
     # The control box IS the uref box widened by --u-expansion, which is how every
     # env defines it (env_base.py: "the APPLIED box is 2x this"). Derived rather
     # than read off U_MIN/U_MAX so the check states the relationship it relies on.

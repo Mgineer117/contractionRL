@@ -22,18 +22,31 @@ X_MAX = [5.0, math.pi / 3, 1.0, math.pi]
 XREF_INIT_MIN = [0.0, 0, 0.0, 0]
 XREF_INIT_MAX = [0.0, 0, 0.0, 0]
 
-# Initial perturbation to the reference state
-XE_INIT_MIN = [-1.0, -math.pi / 3, -0.5, -math.pi]
-XE_INIT_MAX = [1.0, math.pi / 3, 0.5, math.pi]
+# Initial perturbation to the reference state.
+# pitch and pitch_rate USED to span the ENTIRE state box (+-pi/3 and +-pi, i.e.
+# X_MIN/X_MAX exactly), so reset could place the segway at a 60-degree tilt
+# spinning at pi rad/s -- mid-fall, not a tracking error. Recovering 60 degrees
+# alone needs |u|=4.17 of the +-6 available, and along the CV-STEM tube
+# pitch_rate accounted for ~49% of the feedback demand and pitch ~19%, with the
+# peak demand 5.3x over budget. Tightened to a genuine perturbation.
+XE_INIT_MIN = [-1.0, -0.15, -0.15, -0.5]
+XE_INIT_MAX = [1.0, 0.15, 0.15, 0.5]
 
 # initial reference state perturbation bounds for c3m
 lim = 1.0
 XE_MIN = [-lim, -lim, -lim, -lim]
 XE_MAX = [lim, lim, lim, lim]
 
-# reference control bounds
-UREF_MIN = [-3.0]
-UREF_MAX = [3.0]
+# reference control bounds. The APPLIED box is 2x this (env_base.py:37). u is a
+# normalized wheel torque with no direct hardware unit, so anchor it through its
+# effect: B[2,0] = (-1.8 cos(th) - 10.9)/(cos(th) - 24.7) ~ 0.54 maps u to the
+# body-frame acceleration v_dot, so +-12 applied is +-6.4 m/s^2 of wheel accel --
+# in range for a two-wheel balancer (peak ~5-10 m/s^2), where the old +-6 applied
+# capped it at 3.2 m/s^2. For scale, statically holding the XE_INIT pitch of
+# 0.15 rad needs only |u| = 0.65 and a 60-degree tilt needs 4.17; the box has to
+# cover the pitch_rate term too, which is what actually saturated it.
+UREF_MIN = [-6.0]
+UREF_MAX = [6.0]
 
 ENV_CONFIG = {
     "x_min": X_MIN,

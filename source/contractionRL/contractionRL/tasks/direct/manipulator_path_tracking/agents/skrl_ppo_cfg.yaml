@@ -67,7 +67,7 @@ agent:
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.01
   use_state_norm: false
-  use_value_norm: true
+  use_value_norm: false
   random_timesteps: 0
   learning_starts: 0
   grad_norm_clip: 0.5

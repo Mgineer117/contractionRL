@@ -52,8 +52,14 @@ XE_INIT_MAX = [1.0, 1.0, 1.0, 1.0]
 lim = 1.0
 XE_MIN = [-lim, -lim, -lim, -lim]
 XE_MAX = [lim, lim, lim, lim]
-UREF_MIN = [-3.0, -3.0]
-UREF_MAX = [3.0, 3.0]
+# u = [omega (rad/s), a (m/s^2)]; the APPLIED box is 2x this (env_base.py:37).
+# omega: an RC-car-scale platform (wheelbase L=0.3 m, max steer 30 deg) at the
+# reference speed v=1.5 gives omega_max = v*tan(30)/L = 2.9 rad/s, so +-3 applied.
+# The old +-6 applied meant a 0.25 m turn radius at 1.5 m/s -- not a car.
+# a: passenger-car forward accel maxes near 3 m/s^2 (braking is larger, but the
+# box is symmetric), so +-3 applied.
+UREF_MIN = [-1.5, -1.5]
+UREF_MAX = [1.5, 1.5]
 
 ENV_CONFIG = {
     "x_min": X_MIN, "x_max": X_MAX,

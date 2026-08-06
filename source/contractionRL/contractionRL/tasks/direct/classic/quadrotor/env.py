@@ -34,15 +34,31 @@ X_MAX = [30.0, 30.0, 30.0, _X4_LIM, _X5_LIM, _X6_LIM, _X7_HIGH, _X8_LIM, _X9_LIM
 XREF_INIT_MIN = [-5.0, -5.0, -5.0, -1.0, -1.0, -1.0, G, 0.0, 0.0, 0.0]
 XREF_INIT_MAX = [5.0, 5.0, 5.0, 1.0, 1.0, 1.0, G, 0.0, 0.0, 0.0]
 
-XE_INIT_MIN = [-0.5] * 10
-XE_INIT_MAX = [0.5] * 10
+# Per-dimension, sized by how much of the +-6 actuator budget each dim's error
+# consumes through K = (1/r)B^T M (measured along the CV-STEM tube: horizontal
+# position/velocity and roll/pitch together account for ~80%, while pos_z /
+# vel_z / thrust are cheap because thrust acts on them almost directly, and yaw
+# is ~3%). u reaches control B only via u -> {thrust, roll, pitch} -> accel ->
+# vel -> pos, so the relative-degree-3 horizontal chain is what saturates first;
+# a uniform +-0.5 spent its budget there and left none for a usable lambda.
+XE_INIT_MIN = [-0.15, -0.15, -0.3, -0.15, -0.2, -0.3, -0.3, -0.15, -0.15, -0.5]
+XE_INIT_MAX = [0.15, 0.15, 0.3, 0.15, 0.2, 0.3, 0.3, 0.15, 0.15, 0.5]
 
 _lim = 1.0
 XE_MIN = [-_lim] * 10
 XE_MAX = [_lim] * 10
 
-UREF_MIN = [-1.0, -1.0, -1.0, -1.0]
-UREF_MAX = [1.0, 1.0, 1.0, 1.0]
+# u = [d(thrust)/dt (m/s^3), roll/pitch/yaw rate (rad/s)] -- B puts ones on rows
+# 6..9, so u drives the RATES of thrust and attitude, not forces. The APPLIED box
+# is 2x this (env_base.py:37).
+# thrust rate: thrust spans _X7_LOW..._X7_HIGH = 0.5g..2g = 4.9..19.6 m/s^2; at
+# the old +-6 applied, traversing that range took 2.4 s, while a real quadrotor
+# does it in ~0.1 s (~150 m/s^3). +-60 applied crosses it in 0.25 s.
+# body rates: +-10 applied = 570 deg/s, between a gentle vehicle (~2-3 rad/s) and
+# acro (~14 rad/s). The old +-6 was fine on its own, but paired with the crippled
+# thrust rate the relative-degree-3 horizontal chain had no authority left.
+UREF_MIN = [-30.0, -5.0, -5.0, -5.0]
+UREF_MAX = [30.0, 5.0, 5.0, 5.0]
 
 ENV_CONFIG = {
     "x_min": X_MIN, "x_max": X_MAX,

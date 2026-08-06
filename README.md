@@ -451,10 +451,13 @@ the trial on the first infeasibility and writes a poison AUC (`1e3` for `cvstem-
 and a metric-less run is silently ignored by bayes bookkeeping, so the same dead corner
 gets resampled forever.
 
-`cvstem-lqr` is evaluated online: `metric_source=online` re-solves the SDP every step
-(no offline CMG regression standing between the certificate and the deployed gain), over
-64 envs for exactly one episode, with `cm.abort_on_infeasible` so a single infeasible
-state in any env aborts the trial instead of silently falling back to `u = u_ref`.
+`cvstem-lqr` is the ORIGINAL CV-STEM pipeline (`AstroHiro/ncm`): ONE joint SDP over
+uniform state-box samples with `nu`/`chi` shared, then a `chol(M)` network — solved once
+at construction, no per-step solve and no per-state lambda backoff. An infeasible joint
+program aborts immediately, before any rollout — there is no partial feasibility to
+record. Note `agent.r_scaler` is INERT for this agent: with `nu` free the solved
+`nu` scales with `r` and the gain is unchanged, so only `cm.lbd`/`cm.cm_eps` move the
+certificate (measured — see `scripts/find_uniform_lambda.py`'s docstring).
 
 **PPO/SAC — Isaac locomotion pre-training** uses the same entry point, via
 `search/configs/{ppo,sac}.yaml`. Those two optimize plain `Reward / Total reward (mean)`

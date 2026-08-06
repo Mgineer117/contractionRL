@@ -6,6 +6,12 @@ seed: 42  # Random seed for reproducibility
 # — Tsukamoto's classncm.cvstem0). See agents/skrl/cvstem_lqr.py.
 
 agent:
+  # lbd/r_scaler/w_lb/w_ub come from scripts/find_uniform_lambda.py run at
+  # N=100 with --cm-eps 0.1 --cm-dt 1.0 --w-lb 0.001 --w-ub 1000, and are then
+  # CERTIFIED by the N=10000 synthesis below at cm_eps 0.01. The two eps values
+  # are deliberate, not a mismatch: eps buys a covering radius eps/L around each
+  # sample, so a 100-sample search needs the larger margin and a 10000-sample
+  # solve does not. See docs/subset_lambda_procedure.md sections 7 and 8d.
   class: CVSTEM-LQR
   # R = r_scaler·I, used in BOTH the metric SDP's Riccati term AND the deployed
   # gain K = R⁻¹BᵀM — a single knob so K stays the CERTIFIED CV-STEM gain.
@@ -31,14 +37,16 @@ cm:
   # 2 whenever >5% of the generated u = uref - (1/r)BᵀM·e leave the 2x-expanded
   # uref box. At λ=0.3902 / r=1.6 / w=[0.01,100]: 3.73% outside, ν=4.233,
   # χ=3.853, J=14.11, |u|max=2.645, AUC 2.034.
-  # Matches cm.lbd / cvstem_r_scaler / w_lb / w_ub in skrl_c2rl_ppo_cfg.yaml, so
-  # both algorithms certify the same rate under the same envelope. (Their cm_eps
-  # still differs — 0.01 here, 0.1 there — and the two solve DIFFERENT programs:
-  # joint-with-Ẇ here, pointwise-without there. See ncm_synthesis.py.)
+  # Matches cm.lbd / cvstem_r_scaler / w_lb / w_ub / cm_eps in
+  # skrl_c2rl_ppo_cfg.yaml, so both algorithms certify the same rate under the
+  # same envelope. They still solve DIFFERENT programs — joint-with-Ẇ here,
+  # pointwise-without there — so equal settings do not mean equal metrics.
+  # See ncm_synthesis.py.
   lbd: 0.3902
-  # ε, strict-definiteness margin on the LMI (his epsilon). This is the value the
-  # λ above was certified at (find_uniform_lambda's --cm-eps default) — raising it
-  # invalidates the pair.
+  # ε, strict-definiteness margin on the LMI (his epsilon). NOTE λ above was
+  # searched at find_uniform_lambda's --cm-eps DEFAULT of 0.01; 0.1 is the
+  # stricter margin, aligned with the c2rl configs so the two share one setting.
+  # Re-check feasibility here if λ or the envelope moves.
   cm_eps: 0.01
   # Tsukamoto's CV-STEM SAMPLING PERIOD, which is a synthesis hyperparameter and
   # NOT the integrator step: his cart-pole notebook uses dt=1 while the sim runs
@@ -49,13 +57,17 @@ cm:
   # and χ ≤ ν·w_ub on the joint program's SHARED ν/χ. Absent, this is the
   # reference program (no envelope at all) — but then nothing bounds the gain
   # ‖K‖ ≤ ‖B‖/(r·w_lb), and λ above was certified WITH these caps in place.
-  cm_w_lb: 0.01
-  cm_w_ub: 100.0
+  cm_w_lb: 0.001
+  cm_w_ub: 1000.0
   cm_solver: MOSEK  # SCS (no license) | CLARABEL | MOSEK (tightest/fastest; see README)
   # Uniform state-box samples in the ONE joint SDP (his Nx=1000). A SOLVER-SIZE
   # knob: each sample adds an x_dim² PSD block plus two LMIs to a single problem.
-  cm_samples: 1000
+  cm_samples: 10000
   cm_seed: 0
+  # Cache the joint solve (see CVSTEMLQRCfg.cm_data_path). Keyed on every
+  # knob that enters the program, so a config change re-solves rather than
+  # loading a metric certifying a different rate.
+  cm_data_path: "data/classic/car/cvstem.npz"
   # Uncomment for HIS lambda selection instead (linesearch: walk lambda up from
   # lo to hi in steps of da, take argmin J = chi/lambda + nu). It ignores `lbd`
   # above and does not look at the actuator box.
@@ -65,19 +77,19 @@ cm:
 cmg:
   # The reference's own architecture: a 3x100 ReLU MLP on the raw state.
   cmg_hidden_dims: [100, 100, 100]
-  # ~84k GRADIENT STEPS (cm_samples=1000 x 0.9 train // 32 per batch = 28 batches
-  # per epoch, x 3000 epochs). That count, not the sample count, is what the fit
-  # is starved of: measured relative error on M is 0.55 / 0.23 / 0.06 / 0.03 at
-  # 0.5k / 5k / 25k / 100k steps.
+  # ~84k GRADIENT STEPS (cm_samples=10000 x 0.9 train // 320 per batch = 28
+  # batches per epoch, x 3000 epochs). That count, not the sample count, is what
+  # the fit is starved of: measured relative error on M is 0.55 / 0.23 / 0.06 /
+  # 0.03 at 0.5k / 5k / 25k / 100k steps.
   cmg_regress_epochs: 3000
   cmg_regress_lr: 1.0e-3
-  # Tsukamoto's Nbatch, and what every other cvstem-lqr config here already uses.
-  # regress_cholm does `iters = n_train // batch_size`, so on 900 training points
-  # batch 256 is THREE steps per epoch, not 35 — the old value's comment did its
-  # arithmetic against cm_samples=10000, which this file does not set. Measured
-  # at N=400: 16.8% median relative error on M at batch 256 vs 3.0% at 32, same
-  # epoch count.
-  cmg_regress_batch_size: 32
+  # regress_cholm does `iters = n_train // batch_size`, so the batch must scale
+  # WITH cm_samples or the step budget silently moves: at N=1000 the right value
+  # was 32 (measured at N=400: 16.8% median relative error on M at batch 256 vs
+  # 3.0% at 32, same epoch count), and 320 is that same 28-batches-per-epoch
+  # ratio at N=10000. Scaling the batch rather than the epochs keeps
+  # cmg_early_stop_patience meaning the same thing.
+  cmg_regress_batch_size: 320
   # gamma per EPOCH, so it must be sized to the epoch count: 0.99^3000 would
   # annihilate the lr by epoch ~500. 0.999^3000 lands at 5e-5.
   cmg_regress_lr_scheduler: "StepLR"
