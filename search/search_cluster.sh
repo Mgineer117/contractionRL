@@ -722,6 +722,15 @@ for gpu in "\${JOB_GPUS[@]}"; do
                 [[ -f "\$STOP_FILE" ]] && break
                 echo "[\$(date '+%F %T')] gpu \$gpu agent \$a: (re)starting wandb agent"
                 CUDA_VISIBLE_DEVICES=\$gpu timeout "\$PER_RUN_TIMEOUT" wandb agent --count 1 "\$SWEEP_ID"
+                # Reap the local run cache. A c2rl-ppo trial leaves ~1 GB in
+                # wandb/run-*, so an 80-trial grid alone is ~80 GB and a 103 GB
+                # home quota fills before the sweep finishes — at which point
+                # every worker dies writing checkpoints, and the failure looks
+                # like a training bug rather than a full disk. Only run-* is
+                # removed (already streamed to the server); offline-run-* is
+                # left alone because for those the local copy IS the data.
+                find "$REPO_DIR/wandb" -maxdepth 1 -name 'run-*' -type d \\
+                    -mmin +1 -exec rm -rf {} + 2>/dev/null || true
                 run_count=\$(( run_count + 1 ))
                 if [[ "\$RUNS_PER_AGENT" -gt 0 && "\$run_count" -ge "\$RUNS_PER_AGENT" ]]; then
                     echo "[\$(date '+%F %T')] gpu \$gpu agent \$a: reached \$RUNS_PER_AGENT runs — stopping."
