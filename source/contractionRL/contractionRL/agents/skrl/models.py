@@ -225,8 +225,14 @@ class MetricModel(Model):
                       device=str(device) if not isinstance(device, str) else device,
                       angle_idx=list(angle_idx or []), sym=sym)
         if kwargs.get("constrain_eigenvalues", False):
+            # outputs_metric: cmg_method="cvstem" emits M directly (its SDP
+            # targets can be inverted once offline, and the reward wants M), so
+            # every env step drops a batched SPD inverse. "ccm" emits W, since
+            # its C1/C2 losses are written in W and there is no dataset to
+            # pre-invert. See BoundedCCM_Generator.
             self.ccm_gen = BoundedCCM_Generator(
-                w_lb=kwargs.get("w_lb", 0.1), w_ub=kwargs.get("w_ub", 10.0), **common)
+                w_lb=kwargs.get("w_lb", 0.1), w_ub=kwargs.get("w_ub", 10.0),
+                outputs_metric=bool(kwargs.get("outputs_metric", False)), **common)
         else:
             self.ccm_gen = CCM_Generator(**common)
 

@@ -927,6 +927,17 @@ def regress_cmg(
     # batch. Pinning makes the per-batch H2D copy async-capable.
     x = torch.as_tensor(dataset["x"]).to(torch.float32)
     W_target = torch.as_tensor(dataset["W"]).to(torch.float32)
+    if getattr(ccm_gen, "outputs_metric", False):
+        # The head emits M, so invert the SDP's W* ONCE here rather than
+        # inverting the network's output on every env step. Done in float64:
+        # W* spans [w_lb, w_ub] with a ratio up to 1e3, and inverting the small
+        # end in float32 is where the fit would lose the stiff, weakly-actuated
+        # states the certificate is tightest at.
+        W_target = torch.linalg.inv(W_target.to(torch.float64)).to(torch.float32)
+        W_target = 0.5 * (W_target + W_target.transpose(-1, -2))   # kill drift
+        print(f"[CMG] regressing M = W^-1 directly ({tuple(W_target.shape)}); "
+              f"eig(M) in [{float(torch.linalg.eigvalsh(W_target).min()):.4g}, "
+              f"{float(torch.linalg.eigvalsh(W_target).max()):.4g}]")
     if torch.device(device).type == "cuda":
         x, W_target = x.pin_memory(), W_target.pin_memory()
     n = x.shape[0]

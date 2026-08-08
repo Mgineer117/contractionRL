@@ -223,6 +223,24 @@ class PathTrackingBase(DirectRLEnv):
         """Inject a NeuralDynamics model for get_f_and_B (required for Isaac envs)."""
         self._dynamics_model = model
 
+    def _metric_from_cmg(self, x):
+        """M(x) from the CMG, inverting ONLY when the head emits W.
+
+        Mirrors classic env_base._metric_from_cmg exactly — see
+        tests/test_isaac_parity.py, which requires both families to convert the
+        CMG output the same way or their Mahalanobis rewards stop being
+        comparable. cmg_method="cvstem" builds the CMG with outputs_metric=True
+        and its forward already returns M (so this is a pass-through and the
+        per-step SPD inverse disappears); "ccm" emits W and is inverted here.
+        """
+        from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
+        raw, _ = self.ccm_gen(x)
+        out = bound_W(raw, self.w_lb, x.shape[-1],
+                      getattr(self.ccm_gen, "bounded", False))
+        if getattr(self.ccm_gen, "outputs_metric", False):
+            return out
+        return spd_inverse(out)
+
     def set_ccm(self, ccm_gen, w_lb, device, tracking_scaler=None, control_scaler=None,
                 reward_euclidean=False, reward_level=False,
                 residual_anchor_scale=0.0, cvstem_r_scaler=1.0) -> None:
@@ -666,11 +684,8 @@ class PathTrackingBase(DirectRLEnv):
             # error vector + metric are cached explicitly in
             # _prev_error/_prev_M (seeded at _reset_idx) rather than
             # recomputed from a stored trajectory.
-            from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
             with torch.no_grad():
-                next_W_raw, _ = self.ccm_gen(x)
-                next_W = bound_W(next_W_raw, self.w_lb, error.shape[-1], getattr(self.ccm_gen, "bounded", False))
-                next_M = spd_inverse(next_W)
+                next_M = self._metric_from_cmg(x)
 
                 prev_err_t = self._prev_error.unsqueeze(-1)
                 next_err_t = error.unsqueeze(-1)
@@ -809,7 +824,6 @@ class PathTrackingBase(DirectRLEnv):
         # meaningful V rather than a stale value from the env's previous
         # episode — mirrors classic env_base.py's reset_idx M-seeding.
         if self.ccm_gen is not None:
-            from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
             if not hasattr(self, "_prev_M"):
                 state_dim = self._traj_buf.state_dim
                 self._prev_error = torch.zeros(self.num_envs, state_dim, device=self.device)
@@ -817,7 +831,5 @@ class PathTrackingBase(DirectRLEnv):
             with torch.no_grad():
                 x0 = self._get_physical_state()[env_ids]
                 error0 = wrap_diff(x0 - x_ref_init, self.angle_idx)
-                W0_raw, _ = self.ccm_gen(x0)
-                W0 = bound_W(W0_raw, self.w_lb, x0.shape[-1], getattr(self.ccm_gen, "bounded", False))
                 self._prev_error[env_ids] = error0
-                self._prev_M[env_ids] = spd_inverse(W0)
+                self._prev_M[env_ids] = self._metric_from_cmg(x0)

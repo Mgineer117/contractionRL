@@ -40,6 +40,34 @@ class BaseEnv(gym.Env):
         #
         # Empty (the default) reproduces the previous behavior exactly.
         self.XREF_INIT_SIGN_DIMS = list(env_config.get("xref_init_sign_dims", []) or [])
+        # ── Direct initial-state box (optional) ──────────────────────────── #
+        # When set, x_0 is drawn from [X_INIT_MIN, X_INIT_MAX] DIRECTLY and the
+        # perturbation is back-solved as xe_0 = x_0 - xref_0, instead of x_0
+        # being composed as xref_0 + xe_0. Saying "start in region R" is then
+        # one box, rather than an XE_INIT box that has to be eroded by
+        # XREF_INIT and re-checked against X_MIN/X_MAX to land where you meant.
+        #
+        # xe_0 is still derived (not dropped) because e(0) = x_0 - xref_0
+        # anchors every normalized metric -- AUC = sum(e)/e0 divides by it.
+        #
+        # X_INIT_SIGN_DIMS applies the same shared-sign mirroring as
+        # XREF_INIT_SIGN_DIMS, for the same reason: a low-lbd region is two
+        # lobes on a diagonal, which no single box can cover without also
+        # covering the fast center between them.
+        #
+        # None (the default) keeps the xref_0 + xe_0 composition exactly.
+        _xi_lo = env_config.get("x_init_min")
+        _xi_hi = env_config.get("x_init_max")
+        self.X_INIT_MIN = (None if _xi_lo is None else torch.tensor(
+            _xi_lo, device=self.device, dtype=torch.float32).flatten())
+        self.X_INIT_MAX = (None if _xi_hi is None else torch.tensor(
+            _xi_hi, device=self.device, dtype=torch.float32).flatten())
+        if (self.X_INIT_MIN is None) != (self.X_INIT_MAX is None):
+            raise ValueError(
+                "[BaseEnv] x_init_min and x_init_max must be set together — "
+                "one without the other silently falls back to xref_0 + xe_0."
+            )
+        self.X_INIT_SIGN_DIMS = list(env_config.get("x_init_sign_dims", []) or [])
         self.XE_MIN = torch.tensor(env_config["xe_min"], device=self.device, dtype=torch.float32).flatten()
         self.XE_MAX = torch.tensor(env_config["xe_max"], device=self.device, dtype=torch.float32).flatten()
         self.UREF_MIN = torch.tensor(env_config["uref_min"], device=self.device, dtype=torch.float32).flatten()
@@ -207,19 +235,34 @@ class BaseEnv(gym.Env):
         scale = max(1e-3, min(scale, 1.0))
         return round(1 - (1 / (scale * self.max_episode_len)), 3)
 
+    def _apply_shared_sign(self, v: torch.Tensor, dims: list[int]) -> torch.Tensor:
+        """Mirror ``v`` on ``dims`` with ONE sign per row (not one per dim).
+
+        A per-dim sign would scatter the samples across all sign combinations;
+        the slow region lies on a single diagonal, so only the shared sign maps
+        the box onto the correct opposite lobe. See XREF_INIT_SIGN_DIMS.
+        """
+        if not dims:
+            return v
+        s = torch.where(torch.rand(v.shape[0], 1, device=self.device) < 0.5,
+                        -1.0, 1.0).to(torch.float32)
+        idx = torch.as_tensor(dims, device=self.device, dtype=torch.long)
+        v[:, idx] = v[:, idx] * s
+        return v
+
     def define_initial_state(self, env_ids: torch.Tensor):
         n = len(env_ids)
         rand_xref = torch.rand(n, self.num_dim_x, device=self.device, dtype=torch.float32)
         xref_0 = self.XREF_INIT_MIN + rand_xref * (self.XREF_INIT_MAX - self.XREF_INIT_MIN)
-        if self.XREF_INIT_SIGN_DIMS:
-            # ONE sign per env, shared across the listed dims -- see
-            # XREF_INIT_SIGN_DIMS. Per-dim signs would break the diagonal.
-            s = torch.where(
-                torch.rand(n, 1, device=self.device) < 0.5, -1.0, 1.0
-            ).to(torch.float32)
-            idx = torch.as_tensor(self.XREF_INIT_SIGN_DIMS, device=self.device,
-                                  dtype=torch.long)
-            xref_0[:, idx] = xref_0[:, idx] * s
+        xref_0 = self._apply_shared_sign(xref_0, self.XREF_INIT_SIGN_DIMS)
+
+        if self.X_INIT_MIN is not None:
+            # Direct initial-state box: x_0 is the primary object and xe_0 is
+            # back-solved, so e(0) stays exactly x_0 - xref_0. See X_INIT_MIN.
+            rand_x = torch.rand(n, self.num_dim_x, device=self.device, dtype=torch.float32)
+            x_0 = self.X_INIT_MIN + rand_x * (self.X_INIT_MAX - self.X_INIT_MIN)
+            x_0 = self._apply_shared_sign(x_0, self.X_INIT_SIGN_DIMS)
+            return xref_0, x_0 - xref_0, x_0
 
         rand_xe = torch.rand(n, self.num_dim_x, device=self.device, dtype=torch.float32)
         xe_0 = self.XE_INIT_MIN + rand_xe * (self.XE_INIT_MAX - self.XE_INIT_MIN)
@@ -236,7 +279,16 @@ class BaseEnv(gym.Env):
         uref_list = []
 
         for i, _t in enumerate(self.t):
-            uref_t = self.sample_reference_controls(freqs, weights, _t, {"xref_0": xref_0})
+            # "xref_t" is the CURRENT reference state, not just the initial one.
+            # A gravity-loaded plant (ball_and_beam, two_link_arm, pvtol) needs a
+            # state-dependent TRIM in uref -- hold the ball, hold the arm up,
+            # hover -- or the reference free-falls into the state box, gets
+            # clamped, and the stored (xref, uref) stops being a trajectory of
+            # the plant. Every u = uref + feedback controller then chases an
+            # unreachable reference: two_link_arm saturated 75-100% of the time
+            # and settled at a fixed error no matter how small e(0) was.
+            uref_t = self.sample_reference_controls(
+                freqs, weights, _t, {"xref_0": xref_0, "xref_t": xref_list[-1]})
             xref_prev = xref_list[-1]
             f_x, B_x, _ = self.get_f_and_B(xref_prev)
             x_dot = f_x + torch.bmm(B_x, uref_t.unsqueeze(-1)).squeeze(-1)
@@ -254,6 +306,22 @@ class BaseEnv(gym.Env):
     @abstractmethod
     def system_reset(self, env_ids: torch.Tensor):
         ...
+
+    def _metric_from_cmg(self, x):
+        """M(x) from the CMG, inverting ONLY when the head emits W.
+
+        cmg_method="cvstem" builds the CMG with outputs_metric=True, so its
+        forward already returns M and this is a pass-through — which removes a
+        batched SPD inverse from every env step. cmg_method="ccm" emits W (its
+        C1/C2 losses are written in W), so M = W^-1 is formed here.
+        """
+        from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
+        raw, _ = self.ccm_gen(x)
+        out = bound_W(raw, self.w_lb, self.num_dim_x,
+                      getattr(self.ccm_gen, "bounded", False))
+        if getattr(self.ccm_gen, "outputs_metric", False):
+            return out
+        return spd_inverse(out)
 
     def set_ccm(self, ccm_gen, w_lb, device, tracking_scaler=None, control_scaler=None,
                 reward_euclidean=False, reward_level=False,
@@ -350,14 +418,11 @@ class BaseEnv(gym.Env):
                     - self.control_scaler * control_effort
             maha_tracking_error = None
         elif getattr(self, "ccm_gen", None) is not None:
-            from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
             with torch.no_grad():
                 if not hasattr(self, "M"):
                     self.M = torch.zeros(self.num_envs, self.num_dim_x, self.num_dim_x, device=self.device)
                 M = self.M[env_ids]
-                next_W_raw, _ = self.ccm_gen(next_x)
-                next_W = bound_W(next_W_raw, self.w_lb, self.num_dim_x, getattr(self.ccm_gen, "bounded", False))
-                next_M = spd_inverse(next_W)
+                next_M = self._metric_from_cmg(next_x)
                 self.M[env_ids] = next_M
 
                 M = self._apply_eig_reshape(M)
@@ -398,14 +463,12 @@ class BaseEnv(gym.Env):
         # the decrement reward), so this keeps the policy at the base unless a
         # deviation strictly helps tracking. See set_ccm / CVSTEMLQRBase.
         if getattr(self, "residual_anchor_scale", 0.0) > 0 and getattr(self, "ccm_gen", None) is not None:
-            from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
             with torch.no_grad():
                 r = self.cvstem_r + 1e-5
                 uref_curr = self.uref[env_ids, torch.clamp(t_idx, max=self.max_episode_len - 1)]
                 _f, B, _ = self.get_f_and_B(x)
-                Wb = bound_W(self.ccm_gen(x)[0], self.w_lb, self.num_dim_x,
-                             getattr(self.ccm_gen, "bounded", False))
-                Kb = (1.0 / r) * torch.bmm(B.transpose(1, 2).to(torch.float32), spd_inverse(Wb))
+                Mb = self._metric_from_cmg(x)
+                Kb = (1.0 / r) * torch.bmm(B.transpose(1, 2).to(torch.float32), Mb)
                 e_b = self.wrap_angles(x - xref_curr).unsqueeze(-1)
                 u_base = uref_curr - torch.bmm(Kb, e_b).squeeze(-1)
                 # ``u`` reaching get_rewards has ALREADY been clamped to
@@ -478,11 +541,8 @@ class BaseEnv(gym.Env):
                 self.M = torch.zeros(self.num_envs, self.num_dim_x, self.num_dim_x, device=self.device)
             if not hasattr(self, "init_maha_error"):
                 self.init_maha_error = torch.zeros(self.num_envs, device=self.device)
-            from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
             with torch.no_grad():
-                W_raw, _ = self.ccm_gen(x_0)
-                W = bound_W(W_raw, self.w_lb, self.num_dim_x, getattr(self.ccm_gen, "bounded", False))
-                M0 = spd_inverse(W)
+                M0 = self._metric_from_cmg(x_0)
                 self.M[env_ids] = M0
                 # Squared Mahalanobis error e0ᵀM(x0)e0 for e0/e(0) normalization
                 # of the maha error curve — mirrors init_tracking_error above,

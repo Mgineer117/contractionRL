@@ -896,9 +896,15 @@ class ContractionRunner:
         cmg_net = models_cfg.get("cmg", {}).get("network", [{}])
         cmg_hd = cmg_net[0].get("layers", [256, 256]) if cmg_net else [256, 256]
         cmg_act = cmg_net[0].get("activations", "tanh") if cmg_net else "tanh"
+        # cmg_method decides WHICH matrix the head emits: "cvstem" -> M
+        # directly (its SDP targets invert once offline, and the reward wants
+        # M, so every env step drops a batched SPD inverse); "ccm" -> W, whose
+        # C1/C2 losses are written in W. See BoundedCCM_Generator.
+        _cmg_method = str(agent_cfg.get("cmg_method", "cvstem")).lower()
         cmg_model = MetricModel(
             obs_space, act_space, device, hidden_dim=cmg_hd, activation=cmg_act,
             x_dim=x_dim, angle_idx=angle_idx, sym=_cmg_symmetry(sym), constrain_eigenvalues=True, w_lb=w_lb, w_ub=w_ub,
+            outputs_metric=(_cmg_method == "cvstem"),
         )
         models["cmg"] = cmg_model
 

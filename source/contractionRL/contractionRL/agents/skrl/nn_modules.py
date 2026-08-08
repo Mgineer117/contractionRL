@@ -797,7 +797,25 @@ class NeuralDynamics(nn.Module):
         return result
 
 class BoundedCCM_Generator(nn.Module):
-    """CMG with hard eigenvalue bounds baked into the forward pass."""
+    """CMG with hard eigenvalue bounds baked into the forward pass.
+
+    ``outputs_metric`` selects WHICH of the two mutually-inverse matrices the
+    forward pass produces, and it is set from ``cmg_method``:
+
+      * ``cvstem`` -> ``outputs_metric=True``: the head emits ``M`` DIRECTLY,
+        with eigenvalues squashed into ``[1/w_ub, 1/w_lb]``. The reward needs
+        ``e^T M e``, so emitting ``M`` removes a batched SPD inverse from every
+        env step (env_base.get_rewards used to call ``spd_inverse(W)`` per step
+        per env, on top of the eigh this forward already does). The regression
+        target is inverted ONCE offline instead.
+      * ``ccm`` -> ``outputs_metric=False``: the head emits ``W``, because the
+        C1/C2 contraction losses are written in ``W`` and there is no SDP
+        dataset to pre-invert. The reward inverts per step, as before.
+
+    Fitting ``M`` directly is also better aligned with its use: inverting a
+    fitted ``W`` amplifies relative error exactly where ``W`` is smallest, which
+    is the stiff, weakly-actuated region the certificate cares most about.
+    """
     bounded = True
 
     def __init__(
@@ -811,6 +829,7 @@ class BoundedCCM_Generator(nn.Module):
         device: str = "cpu",
         angle_idx: Sequence[int] = (),
         sym: StateSymmetry | None = None,
+        outputs_metric: bool = False,
     ):
         super().__init__()
 
@@ -819,6 +838,11 @@ class BoundedCCM_Generator(nn.Module):
         self.device = device
         self.w_lb = w_lb
         self.w_ub = w_ub
+        self.outputs_metric = bool(outputs_metric)
+        # The eigenvalue box the forward pass squashes into. For M the envelope
+        # simply inverts: w_lb <= eig(W) <= w_ub  <=>  1/w_ub <= eig(M) <= 1/w_lb.
+        self._eig_lo = (1.0 / w_ub) if self.outputs_metric else w_lb
+        self._eig_hi = (1.0 / w_lb) if self.outputs_metric else w_ub
         self.angle_idx = list(angle_idx)
         self.sym = sym
 
@@ -845,8 +869,8 @@ class BoundedCCM_Generator(nn.Module):
         S_raw = flat.view(n, self.x_dim, self.x_dim)
         S = 0.5 * (S_raw + S_raw.mT)           # symmetric; eigenvalues span ℝ
         lam, V = self._robust_eigh(S)
-        lam = self.w_lb + (self.w_ub - self.w_lb) * torch.sigmoid(lam)
-        return V @ torch.diag_embed(lam) @ V.mT  # SPD, λ ∈ (w_lb, w_ub)
+        lam = self._eig_lo + (self._eig_hi - self._eig_lo) * torch.sigmoid(lam)
+        return V @ torch.diag_embed(lam) @ V.mT  # SPD, λ ∈ (_eig_lo, _eig_hi)
 
     @staticmethod
     def _robust_eigh(S: torch.Tensor):
