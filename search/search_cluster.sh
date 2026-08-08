@@ -678,6 +678,7 @@ ${ACTIVATE:+$ACTIVATE}
 STOP_FILE="$LOG_DIR/STOP"
 SWEEP_ID="$SWEEP_ID"
 AGENTS_PER_GPU=$AGENTS_PER_GPU
+export PYTORCH_CUDA_ALLOC_CONF=\${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 PER_RUN_TIMEOUT="$PER_RUN_TIMEOUT"
 RUNS_PER_AGENT=$RUNS_PER_AGENT
 # Free VRAM a worker demands before it will claim a trial. ~2.1 GiB steady
@@ -722,6 +723,7 @@ for gpu in "\${JOB_GPUS[@]}"; do
     for (( a=0; a<AGENTS_PER_GPU; a++ )); do
         (
             run_count=0
+            probe_fail=0
             while true; do
                 [[ -f "\$STOP_FILE" ]] && break
                 # Preflight the GPU before asking for a trial. On scavenger the
@@ -731,12 +733,32 @@ for gpu in "\${JOB_GPUS[@]}"; do
                 # cell, which is then spent. A worker in that state respawns
                 # every ~20 s and can eat a whole 80-cell grid in minutes, so
                 # waiting for room is strictly cheaper than starting blind.
-                free_mb=\$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits \\
-                          -i "\$gpu" 2>/dev/null | head -1)
-                if [[ -n "\$free_mb" && "\$free_mb" =~ ^[0-9]+\$ && "\$free_mb" -lt "\$MIN_FREE_MB" ]]; then
+                # Asked through torch, not nvidia-smi: on a MIG node \$gpu is a
+                # UUID ("MIG-08963485-..."), which nvidia-smi -i rejects — the
+                # query then returns empty and a "-n" test skips the guard
+                # silently, which is how it read as working while doing nothing.
+                # mem_get_info() reports the device CUDA will actually open,
+                # index or MIG UUID alike.
+                free_mb=\$(CUDA_VISIBLE_DEVICES=\$gpu python -c \\
+                    'import torch;print(torch.cuda.mem_get_info()[0]//1048576)' 2>/dev/null | tail -1)
+                if [[ ! "\$free_mb" =~ ^[0-9]+\$ ]]; then
+                    # Unreadable is NOT a pass. Wait instead, but give up after a
+                    # few tries so a broken probe idles the pool loudly rather
+                    # than deadlocking it forever.
+                    probe_fail=\$(( probe_fail + 1 ))
+                    if [[ "\$probe_fail" -lt 5 ]]; then
+                        echo "[\$(date '+%F %T')] gpu \$gpu agent \$a: VRAM probe unreadable (\$probe_fail/5) — waiting"
+                        sleep 60
+                        continue
+                    fi
+                    echo "[\$(date '+%F %T')] gpu \$gpu agent \$a: VRAM probe still unreadable — PROCEEDING BLIND"
+                elif [[ "\$free_mb" -lt "\$MIN_FREE_MB" ]]; then
+                    probe_fail=0
                     echo "[\$(date '+%F %T')] gpu \$gpu agent \$a: \${free_mb} MiB free < \$MIN_FREE_MB — waiting, NOT taking a cell"
                     sleep 120
                     continue
+                else
+                    probe_fail=0
                 fi
                 echo "[\$(date '+%F %T')] gpu \$gpu agent \$a: (re)starting wandb agent"
                 CUDA_VISIBLE_DEVICES=\$gpu timeout "\$PER_RUN_TIMEOUT" wandb agent --count 1 "\$SWEEP_ID"
