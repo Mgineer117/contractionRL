@@ -76,7 +76,14 @@ for attempt in 1 2 3; do
     rc=$?
     # Reap the local run cache regardless of outcome: ~1 GB per trial against a
     # 103 GB home quota, and a full disk kills every OTHER job on the node too.
-    find "$REPO/wandb" -maxdepth 1 -name 'run-*' -type d -mmin +1 -exec rm -rf {} + 2>/dev/null
+    # BOTH locations: train.py defaults WANDB_DIR to ~/scratch/wandb (so runs
+    # land in ~/scratch/wandb/wandb/run-*), but a caller that pre-sets WANDB_DIR
+    # -- as `wandb agent` does -- puts them in $REPO/wandb instead. ~/scratch is
+    # on the SAME /u quota, so cleaning only one of the two still fills the disk.
+    for d in "$REPO/wandb" "$HOME/scratch/wandb/wandb"; do
+        [[ -d "$d" ]] && find "$d" -maxdepth 1 -name 'run-*' -type d -mmin +1 \
+            -exec rm -rf {} + 2>/dev/null
+    done
     [[ "$rc" -eq 0 ]] && { echo "[$(date '+%F %T')] $NAME: done"; exit 0; }
     echo "[$(date '+%F %T')] $NAME: exit $rc — retrying"
     sleep 60
