@@ -101,6 +101,31 @@ from contractionRL.agents.skrl.ncm_synthesis import (  # noqa: E402
 )
 
 
+def eps_for_n(n: int) -> float:
+    """The LMI margin ε to use at ``n`` uniform samples.
+
+        N <=   100 -> 0.10
+        N <=  1000 -> 0.05
+        N >   1000 -> 0.01
+
+    ε is a COVERING RADIUS, not a stability requirement. Tsukamoto's own program
+    (AstroHiro classncm.py:189) uses epsilon = 0, so the LMI need only be
+    negative semidefinite AT THE SAMPLED STATES; ε > 0 is what buys the states
+    in BETWEEN, since a margin ε at each sample still holds nearby when the
+    field is Lipschitz. The sparser the draw, the wider the gaps, and the more
+    margin each sample has to carry.
+
+    Holding ε fixed while N grows is therefore stricter than necessary, and it
+    is what made ball_and_beam and two_link_arm certify at N=100 and then fail
+    the N=1000 synthesis: not a stability failure, a margin one.
+    """
+    if n <= 100:
+        return 0.1
+    if n <= 1000:
+        return 0.05
+    return 0.01
+
+
 def expand_box(lo, hi, factor=2.0):
     """Widen a box outward by ``factor``, per-component and sign-aware.
 
@@ -176,12 +201,14 @@ def main() -> int:
                         "Tsukamoto's Nls=100. Cost is superlinear — each sample adds "
                         "an x_dim^2 PSD block plus two LMIs to one program, so N=1000 "
                         "is ~550s per solve against ~6s at N=100.")
-    p.add_argument("--eval-samples", "--eval_samples", type=int, default=1000,
-                   help="Samples for the FINAL synthesis that gets rolled out — "
-                        "Tsukamoto's Nx=1000, and cvstem_lqr's shipped cm_samples. "
-                        "Searching at Nls and synthesizing at Nx is his own split: "
-                        "the reported AUC is then the metric the agent would deploy, "
-                        "without paying N=1000 on every step of the search.")
+    p.add_argument("--eval-samples", "--eval_samples", type=int, default=10000,
+                   help="Samples for the FINAL synthesis that gets rolled out. MUST match the "
+                        "env config's cm_samples (10000 everywhere here) or the check is "
+                        "vacuous: it verifies a program that never ships. The default was "
+                        "1000 and that is exactly how ball_and_beam and two_link_arm passed "
+                        "verification and then failed at deploy N. Pair with eps_for_n, which "
+                        "loosens eps as N grows, so the denser program is not also held to a "
+                        "sparser draw's margin. Use --no-eval for a search-only run.")
     p.add_argument("--lbd0", type=float, default=10.0, help="Starting lbd.")
     p.add_argument("--r0", type=float, default=0.1, help="Starting r_scaler.")
     p.add_argument("--lbd-factor", "--lbd_factor", type=float, default=1.5,
@@ -206,12 +233,11 @@ def main() -> int:
                         "moves it. If nothing certifies inside it, that is the answer.")
     p.add_argument("--w-ub", "--w_ub", type=float, default=100.0,
                    help="Deployment envelope upper bound, FIXED.")
-    p.add_argument("--cm-eps", "--cm_eps", type=float, default=0.1,
-                   help="ε, the strict-definiteness margin (his epsilon, which is 0). "
-                        "MUST match the cm_eps the configs synthesize at, or the λ this "
-                        "reports is certified under a looser LMI than the one that runs: "
-                        "the 0.01 default shipped a cartpole λ=0.0514 that is infeasible "
-                        "at the config's own 0.1 (measured max there is 0.0441).")
+    p.add_argument("--cm-eps", "--cm_eps", type=float, default=None,
+                   help="ε, the strict-definiteness margin (Tsukamoto's epsilon, which "
+                        "is 0 — see eps_for_n). Default AUTO: scheduled from the sample "
+                        "count, 0.1 at N<=100, 0.05 at N<=1000, 0.01 beyond. Pass a "
+                        "float to pin BOTH phases to it.")
     p.add_argument("--cm-dt", "--cm_dt", type=float, default=None,
                    help="The LMI's dt = the agent's cm_dt (his CV-STEM sampling "
                         "period, NOT the integrator step). Default: the env's dt.")
@@ -258,11 +284,26 @@ def main() -> int:
               f"[{_np(env.U_MIN).round(3)}, {_np(env.U_MAX).round(3)}] — using the "
               f"derived one, which is what --u-expansion asks for.")
 
+    # ε per PHASE, scheduled from that phase's own sample count (eps_for_n).
+    # The search and the final synthesis run at different N, so pinning one ε to
+    # both makes the denser program strictly harder than the margin it needs.
+    pinned = args.cm_eps is not None
+    eps_search = args.cm_eps if pinned else eps_for_n(args.num_samples)
+    eps_eval = args.cm_eps if pinned else eps_for_n(args.eval_samples)
+
     print(f"[uniform-lambda] task={args.task}  x_dim={int(env.num_dim_x)} "
           f"u_dim={int(env.num_dim_control)}  env dt={float(env.dt):g}")
     print(f"[uniform-lambda] {args.num_samples} states i.i.d. uniform over the box; "
           f"ONE joint SDP, nu/chi shared, (W-I)/dt at cm_dt={lmi_dt:g}, "
-          f"eps={args.cm_eps}, solver={args.solver}")
+          f"eps={eps_search:g}, solver={args.solver}")
+    if pinned:
+        print(f"[uniform-lambda] cm_eps PINNED to {args.cm_eps:g} for both phases "
+              f"(AUTO would give search {eps_for_n(args.num_samples):g} / "
+              f"eval {eps_for_n(args.eval_samples):g}).")
+    else:
+        print(f"[uniform-lambda] cm_eps AUTO: search {eps_search:g} at N="
+              f"{args.num_samples}, eval {eps_eval:g} at N={args.eval_samples} "
+              f"(eps is a covering radius — denser draw, less margin needed).")
     print(f"[uniform-lambda] control check: {args.n_draws} draws per state of "
           f"u = uref - K*e, e ~ U[{e_lo.round(3)}, {e_hi.round(3)}], uref ~ "
           f"U[{uref_lo.round(3)}, {uref_hi.round(3)}]; FAILS when more than "
@@ -289,7 +330,7 @@ def main() -> int:
                   f"control in box down to lbd={args.lbd_min:g} inside the fixed "
                   f"envelope w_lb={w_lb:g}, w_ub={w_ub:g}.")
             return 2
-        sol = cvstem_joint(A, B, lbd=lbd, eps=args.cm_eps, dt=lmi_dt,
+        sol = cvstem_joint(A, B, lbd=lbd, eps=eps_search, dt=lmi_dt,
                            solver=args.solver, r_scaler=r, w_lb=w_lb, w_ub=w_ub)
         state = f"lbd={lbd:8.4f} r={r:9.4g}"
         if sol is None:
@@ -320,7 +361,7 @@ def main() -> int:
     print(f"\n  Set in the env's skrl_cvstem_lqr_cfg.yaml:\n"
           f"      agent: r_scaler: {r:g}\n"
           f"      cm:    lbd: {lbd:.3f}\n"
-          f"             cm_eps: {args.cm_eps:g}\n"
+          f"             cm_eps: {eps_search:g}  (search; the config synthesizes at {eps_eval:g})\n"
           f"             cm_dt: {lmi_dt:g}\n"
           f"             cm_w_lb: {w_lb:g}\n"
           f"             cm_w_ub: {w_ub:g}")
@@ -334,7 +375,7 @@ def main() -> int:
               f"against the {args.num_samples} the search certified — strictly harder, "
               f"so it can come back infeasible even though the search cleared.")
     agent = CVSTEMLQRAgent(
-        cfg={"lbd": lbd, "r_scaler": r, "cm_eps": args.cm_eps, "cm_dt": lmi_dt,
+        cfg={"lbd": lbd, "r_scaler": r, "cm_eps": eps_eval, "cm_dt": lmi_dt,
              "cm_w_lb": w_lb, "cm_w_ub": w_ub,
              "cm_solver": args.solver, "cm_samples": args.eval_samples,
              "cm_seed": args.seed, "cmg_hidden_dims": [100, 100, 100],
