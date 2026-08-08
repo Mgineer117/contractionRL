@@ -26,6 +26,13 @@ runner:
   bad_value: 100.0
 
 extra_flags:
+  # 200k, not the yaml's 1M. This grid exists to measure a FAILURE RATE,
+  # and the divergence it is counting was fully developed by gs 75k
+  # (auc 22 vs 3, overshoot 21 vs 4) — so 200k carries 2.7x margin while
+  # taking ~1 day per arm instead of ~4. Raise it back for anything that
+  # asks about late-training behaviour.
+  - "--num_timesteps"
+  - "200000"
   # Stride only. ref_length is deliberately NOT fixed — see the note on
   # discount_factor below.
   - "--ref_offset"

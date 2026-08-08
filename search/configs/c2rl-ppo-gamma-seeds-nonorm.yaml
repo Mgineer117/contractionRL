@@ -26,6 +26,13 @@ runner:
   bad_value: 100.0
 
 extra_flags:
+  # 200k, not the yaml's 1M. This grid exists to measure a FAILURE RATE,
+  # and the divergence it is counting was fully developed by gs 75k
+  # (auc 22 vs 3, overshoot 21 vs 4) — so 200k carries 2.7x margin while
+  # taking ~1 day per arm instead of ~4. Raise it back for anything that
+  # asks about late-training behaviour.
+  - "--num_timesteps"
+  - "200000"
   # THE CONTROL ARM. Identical to c2rl-ppo-gamma-seeds.yaml in every other
   # respect; the yaml default is now ON (see the cartpole cfg), so the
   # pre-fix behaviour has to be asked for explicitly. Run BOTH arms on the
