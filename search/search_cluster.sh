@@ -680,6 +680,10 @@ SWEEP_ID="$SWEEP_ID"
 AGENTS_PER_GPU=$AGENTS_PER_GPU
 PER_RUN_TIMEOUT="$PER_RUN_TIMEOUT"
 RUNS_PER_AGENT=$RUNS_PER_AGENT
+# Free VRAM a worker demands before it will claim a trial. ~2.1 GiB steady
+# plus the CMG regression's 840 MiB peak, rounded up. Override with
+# MIN_FREE_MB in the environment for a heavier task.
+MIN_FREE_MB=\${MIN_FREE_MB:-3500}
 # Every worker in every job resolves to this exact sweep (same entity/project).
 ${WB_ENTITY:+export WANDB_ENTITY="$WB_ENTITY"}
 ${WB_PROJECT:+export WANDB_PROJECT="$WB_PROJECT"}
@@ -720,6 +724,20 @@ for gpu in "\${JOB_GPUS[@]}"; do
             run_count=0
             while true; do
                 [[ -f "\$STOP_FILE" ]] && break
+                # Preflight the GPU before asking for a trial. On scavenger the
+                # card is shared with jobs SLURM does not account for, and one
+                # that is already full makes the trial die inside the CMG
+                # regression's eigh (840 MiB) — AFTER wandb has handed it a grid
+                # cell, which is then spent. A worker in that state respawns
+                # every ~20 s and can eat a whole 80-cell grid in minutes, so
+                # waiting for room is strictly cheaper than starting blind.
+                free_mb=\$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits \\
+                          -i "\$gpu" 2>/dev/null | head -1)
+                if [[ -n "\$free_mb" && "\$free_mb" =~ ^[0-9]+\$ && "\$free_mb" -lt "\$MIN_FREE_MB" ]]; then
+                    echo "[\$(date '+%F %T')] gpu \$gpu agent \$a: \${free_mb} MiB free < \$MIN_FREE_MB — waiting, NOT taking a cell"
+                    sleep 120
+                    continue
+                fi
                 echo "[\$(date '+%F %T')] gpu \$gpu agent \$a: (re)starting wandb agent"
                 CUDA_VISIBLE_DEVICES=\$gpu timeout "\$PER_RUN_TIMEOUT" wandb agent --count 1 "\$SWEEP_ID"
                 # Reap the local run cache. A c2rl-ppo trial leaves ~1 GB in
