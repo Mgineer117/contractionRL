@@ -213,6 +213,12 @@ _ov.add_argument("--use_state_norm", "--use-state-norm", "--ppo_use_state_norm",
                  "--ppo-use-state-norm", type=str, default=None)
 _ov.add_argument("--use_value_norm", "--use-value-norm", "--ppo_use_value_norm",
                  "--ppo-use-value-norm", type=str, default=None)
+# Its partner knob (rl_glue installs them through DIFFERENT hooks:
+# value_preprocessor vs rewards_shaper), so an A/B on the reward normalizer
+# needs its own flag — without one the only way to toggle it is editing the
+# yaml, which is shared by every concurrently-running sweep worker.
+_ov.add_argument("--use_reward_norm", "--use-reward-norm", "--ppo_use_reward_norm",
+                 "--ppo-use-reward-norm", type=str, default=None)
 # "false" makes PPO LEARN log_std through the policy loss instead of following
 # the fixed std_dev_annealing_kwargs schedule (C2RL-PPO only; see C2RLPPOCfg).
 _ov.add_argument("--std_dev_annealing", "--std-dev-annealing", type=str, default=None)
@@ -426,7 +432,7 @@ def _apply_agent_overrides(agent_cfg, args):
     if args.gae_lambda is not None:
         a["lambda"] = args.gae_lambda      # skrl PPO's GAE key
         a["gae_lambda"] = args.gae_lambda  # yaml's own spelling
-    for key in ("use_state_norm", "use_value_norm", "std_dev_annealing"):
+    for key in ("use_state_norm", "use_value_norm", "use_reward_norm", "std_dev_annealing"):
         val = getattr(args, key, None)
         if val is not None:
             a[key] = (str(val).lower() == "true")
