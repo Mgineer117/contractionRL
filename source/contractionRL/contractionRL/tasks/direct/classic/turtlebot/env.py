@@ -18,12 +18,16 @@ STATE_NAMES = ("pos_x", "pos_y", "yaw")
 # which dims wrap, which translate, and which co-rotate under a yaw rotation.
 
 # X bounds
-X_MIN = [-10.0, -10.0, 0]
-X_MAX = [10.0, 10.0, 2 * math.pi]
+# yaw spans [-pi, pi) to MATCH wrap_angles, which maps into that range
+# before step()/_rollout_reference clamp to this box. With [0, 2*pi] every
+# negative heading was clamped to exactly 0.0 -- measured 18% of reference
+# steps pinned there, and only 0.1% above pi where ~50% was expected.
+X_MIN = [-10.0, -10.0, -math.pi]
+X_MAX = [10.0, 10.0, math.pi]
 
 # Initial reference state bounds
-XREF_INIT_MIN = [-1.0, -1.0, (1 / 2) * math.pi]
-XREF_INIT_MAX = [1.0, 1.0, (3 / 2) * math.pi]
+XREF_INIT_MIN = [-1.0, -1.0, -(1 / 2) * math.pi]
+XREF_INIT_MAX = [1.0, 1.0, (1 / 2) * math.pi]
 
 # Initial reference state perturbation bounds
 XE_INIT_MIN = [-0.5, -0.5, -(1 / 4) * math.pi]

@@ -26,12 +26,21 @@ def patch_kl_logging(agent) -> None:
     learning_epochs*mini_batches regardless of where it broke).
 
     ``KLAdaptiveLR.step(kl)`` is the ONLY place the KL escapes skrl's
-    ``_update`` — it is a local there and nothing else reads it — so without
-    that scheduler there is no hook and the metric cannot exist. That made
-    setting ``learning_rate_scheduler: null`` silently drop the KL curve. It now
-    WARNS instead of vanishing; to keep a fixed LR and the metric, attach
-    KLAdaptiveLR with ``min_lr == max_lr == learning_rate`` (see
-    skrl_c2rl_ppo_cfg.yaml) rather than removing the scheduler.
+    ``_update`` — it is a local there and nothing else reads it (see skrl
+    ppo.py: ``kl_divergences`` is built in the minibatch loop and consumed only
+    under ``isinstance(self.scheduler, KLAdaptiveLR)``). So the metric exists
+    only if that scheduler is attached.
+
+    Rather than warn and drop the curve, this now ATTACHES a KLAdaptiveLR that
+    CANNOT MOVE THE LEARNING RATE — ``min_lr = max_lr = the optimizer's current
+    lr`` — whenever a PPO-family agent has none. The scheduler clamps its own
+    output to [min_lr, max_lr], so training is numerically identical to running
+    without a scheduler while the KL hook fires every update.
+
+    This is deliberately done in code rather than per-yaml: the metric is a
+    diagnostic every PPO/C2RL-PPO run should have, and making it depend on
+    remembering a config key is how it went missing in the first place
+    (``learning_rate_scheduler: null`` silently dropped it).
     """
     import skrl.resources.schedulers.torch as _sched
 
@@ -39,12 +48,26 @@ def patch_kl_logging(agent) -> None:
     if isinstance(scheduler, _sched.KLAdaptiveLR):
         pass
     elif hasattr(agent, "scaler"):
-        # A PPO/SAC-family agent: it runs the update loop that computes the KL,
-        # so a missing KLAdaptiveLR really does cost the metric.
-        print(f"[patch] WARNING: no KLAdaptiveLR on {type(agent).__name__} "
-              f"(scheduler={type(scheduler).__name__ if scheduler else None}) — "
-              f"'Policy / KL divergence' will NOT be logged for this run.")
-        return
+        # A PPO/SAC-family agent: it runs the update loop that computes the KL.
+        # Attach a pinned KLAdaptiveLR so the hook exists. SAC-family agents have
+        # no `optimizer` of this shape and never build kl_divergences, so they
+        # fall through to the no-op below rather than getting a dead scheduler.
+        opt = getattr(agent, "optimizer", None)
+        if opt is None or not getattr(opt, "param_groups", None):
+            return
+        lr = float(opt.param_groups[0]["lr"])
+        try:
+            scheduler = _sched.KLAdaptiveLR(opt, min_lr=lr, max_lr=lr,
+                                            kl_threshold=getattr(agent.cfg, "kl_threshold", 0.008) or 0.008)
+        except Exception as exc:  # noqa: BLE001 — never break training for a metric
+            print(f"[patch] could not attach a pinned KLAdaptiveLR to "
+                  f"{type(agent).__name__} ({exc}); 'Policy / KL divergence' "
+                  f"will not be logged.")
+            return
+        agent.scheduler = scheduler
+        print(f"[patch] {type(agent).__name__}: attached a PINNED KLAdaptiveLR "
+              f"(min_lr = max_lr = {lr:g}) purely so 'Policy / KL divergence' is "
+              f"logged; the learning rate cannot move.")
     else:
         # A wrapper agent (C2RL's outer agent has no .policy/.scaler of its own)
         # — it never computes a KL, so there is nothing to miss. Both train_utils

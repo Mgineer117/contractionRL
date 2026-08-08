@@ -131,7 +131,12 @@ class C2RLPPOCfg(AgentCfg):
     # False: PPO learns log_std through the policy loss, as in stock PPO. The
     # schedule then does not apply, and entropy_loss_scale is left as configured
     # (the annealing patch zeroes it, since a bonus would fight the schedule).
-    std_dev_annealing: bool = True
+    # OFF: PPO LEARNS log_std (the False branch in __init__ flips requires_grad
+    # so it is a real parameter, not a frozen constant). Annealing drives sigma
+    # down a fixed schedule regardless of what the policy needs, which fights
+    # the exploration a swept discount factor requires -- a gamma=0.999 run and
+    # a gamma=0.01 run want very different exploration at the same step count.
+    std_dev_annealing: bool = False
     # CAPS action-smoothness regularization on the POLICY LOSS (both 0 = off).
     # Not a reward term: it leaves the MDP, the observation and the dynamics
     # untouched, so the offline CV-STEM synthesis stays valid. See

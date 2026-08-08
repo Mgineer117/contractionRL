@@ -129,6 +129,11 @@ class QuadrotorEnv(BaseEnv):
         freqs = list(range(1, 11))
         n = len(env_ids)
         weights = torch.randn(n, len(freqs), len(UREF_MIN), device=self.device)
-        weights = 0.1 * weights / torch.sqrt((weights ** 2).sum(dim=1, keepdim=True))
+        # 0.1, from scripts sizing the excitation against the box: at the old
+# amplitude the reference clamped 47% of steps (vel_x_w/vel_y_w) and the
+# stored (xref, uref) stopped being a trajectory of the plant.
+        # excitation sized against the box: at 0.1 the reference clamped 47% of steps on
+        # vel_x_w/vel_y_w, so (xref, uref) stopped being a trajectory.
+        weights = 0.01 * weights / torch.sqrt((weights ** 2).sum(dim=1, keepdim=True))
         xref_arr, uref_arr, length = self._rollout_reference(xref_0, freqs, weights)
         return x_0, xref_arr, uref_arr, length

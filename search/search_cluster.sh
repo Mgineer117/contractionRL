@@ -43,6 +43,11 @@
 #   --env NAME           car|cartpole|segway|turtlebot|quadrotor, an Isaac Lab
 #                        task id, or 'all' for every classic env
 #   --method M           bayes (default) | grid | random
+#   --project NAME       W&B project for the sweep (default: build_sweep.py's
+#                        contractionRL-Search). Use the MAIN project for a fixed
+#                        factorial design -- a gamma x seed grid is an experiment
+#                        whose runs belong beside the other results, not a
+#                        hyperparameter search to be kept apart from them.
 #   --partition NAME     SLURM partition (default: recommended by discovery)
 #   --num-jobs N         independent sbatch jobs to submit (default: prompted)
 #   --gpus-per-job N     GPUs each job requests via --gres=gpu:N (default 1)
@@ -141,6 +146,7 @@ while [[ $# -gt 0 ]]; do
         --algorithm|--algo) ALGORITHM="$2"; shift 2 ;;
         --env) ENV_ARG="$2"; shift 2 ;;
         --method) METHOD="$2"; shift 2 ;;
+        --project) WANDB_PROJECT_OVERRIDE="$2"; shift 2 ;;
         --partition) PARTITION="$2"; shift 2 ;;
         --num-jobs) NUM_JOBS="$2"; shift 2 ;;
         --gpus-per-job) GPUS_PER_JOB="$2"; shift 2 ;;
@@ -474,7 +480,8 @@ for ENV in "${ENVS[@]}"; do
     mkdir -p "$LOG_DIR"
     SWEEP_YAML="$LOG_DIR/sweep.yaml"
     if ! python search/build_sweep.py --algorithm "$ALGORITHM" --env "$ENV" \
-            --method "$METHOD" --out "$SWEEP_YAML" > /dev/null; then
+            --method "$METHOD" --out "$SWEEP_YAML" \
+            ${WANDB_PROJECT_OVERRIDE:+--project "$WANDB_PROJECT_OVERRIDE"} > /dev/null; then
         _error "Failed to build sweep yaml for $ENV — skipping."; continue
     fi
     SWEEP_INIT_OUTPUT=$(wandb sweep "$SWEEP_YAML" 2>&1) || true
@@ -744,6 +751,6 @@ EOF
 done
 
 _header "All jobs submitted"
-_info "Monitor:  ${C_BOLD}squeue --me${C_RESET}   |   W&B dashboard (project contractionRL-Search)"
+_info "Monitor:  ${C_BOLD}squeue --me${C_RESET}   |   W&B dashboard (project ${WANDB_PROJECT_OVERRIDE:-contractionRL-Search})"
 _info "Each job self-resubmits ~3 min before its wall-time; --stop halts the whole pool."
 echo "" >&2
