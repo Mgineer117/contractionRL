@@ -14,12 +14,15 @@ answer is a GUARANTEE rather than a search outcome. See
   envelope ``w_lb = 1/max_x lmax(P)``, ``w_ub = 1/min_x lmin(P)``. So the program
   is feasible whenever every ``(A(x)+lbd'I, B(x))`` is stabilizable, and the
   envelope is an OUTPUT, not a searched input.
-* **Proposition 2 (necessary).** With ``sig = sigma_min([A(x) - sI, B(x)])`` at any
-  ``s`` with ``Re s >= -lbd``, feasibility forces
-  ``2*(Re s + lbd) + eps <= 2*sig*chi + (2*nu/r)*sig^2``. So ``sig = 0`` (an
-  uncontrollable mode at or above the rate) is infeasible at EVERY envelope, and
-  a small ``sig`` drives ``nu`` up like ``1/sig^2`` -- at every OTHER state too,
-  since ``nu`` is shared.
+* **Class III is the HAUTUS (PBH) LEMMA**, cited not derived: if
+  ``(A(x) + lbd*I, B(x))`` is unstabilizable at any x -- equivalently
+  ``rank[A(x) - sI, B(x)] < n`` for some ``Re s >= -lbd`` -- no envelope, r or dt
+  can certify it. ``hautus_margin`` evaluates it as ``sigma_min``, which is the
+  numerically usable form of that rank test.
+* **Proposition 2 (quantitative)** refines the yes/no test into a price:
+  ``2*(Re s + lbd) + eps <= 2*sig*chi + (2*nu/r)*sig^2``, so a SMALL ``sig``
+  drives ``nu`` up like ``1/sig^2`` -- at every OTHER state too, since ``nu`` is
+  shared. That is what the rank test cannot tell you.
 
 ``rho(x) = lmax(P(x))`` is the per-state metric scale the plant demands. The
 classes are DEFINED by lambda*(x) (constant / varying / infeasible), and rho is
@@ -221,8 +224,9 @@ def main() -> int:
     print("\ncls I = rho(x) constant over the box (no subset can raise lbd)")
     print("cls II = rho(x) varies (a subset that drops the argmax raises lbd)")
     print("cls III = some state is not lbd-stabilizable (infeasible at EVERY envelope)")
-    print("hautus = min_x min_s sigma_min([A-sI, B]) over Re s >= -lbd (Prop 2); "
-          "0 => class III.")
+    print("hautus = min_x min_s sigma_min([A-sI, B]) over Re s >= -lbd -- the Hautus "
+          "(PBH) test;\n0 => not lbd-stabilizable => class III. Small => nu ~ 1/sigma^2 "
+          "(Prop 2).")
     print("nu/w_lb/w_ub are OUTPUTS of Prop 3 -- the envelope this plant NEEDS, "
           "not one imposed on it.")
     print("||K||max is reported only -- the control box is NOT part of contraction "

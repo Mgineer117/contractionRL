@@ -11,6 +11,12 @@ the cost stays visible, never tested.
 Implementation: `scripts/feasibility_certificate.py`. Program under test:
 `cvstem_joint` in `agents/skrl/ncm_synthesis.py`.
 
+**Standard results used, not reproved.** The Hautus (Popov–Belevitch–Hautus)
+lemma for controllability/stabilizability; the LQR `α`-shift for a prescribed
+decay rate (Anderson & Moore); existence and uniqueness of the stabilizing CARE
+solution under stabilizability plus observability. Class III is exactly
+"not λ-stabilizable somewhere on the box" and is a citation, not a contribution.
+
 **Setup.** Plant `ẋ = f(x) + B(x)u` on a compact box `X ⊂ Rⁿ`, `A(x) = ∂f/∂x`.
 For a sample set `S ⊂ X` and parameters `(λ, ε, dt, r, w_lb, w_ub)`, the program
 `P(S)` asks for `W̄ₖ ⪰ 0` and shared `ν, χ ≥ 0` with
@@ -47,26 +53,38 @@ Everything else in §1 is a **checkable condition implying one of these**, becau
 the definitions themselves are not directly checkable: `λ*(x)` costs an SDP
 bisection per state, and class III quantifies over every envelope.
 
-## Sufficient condition for class III — structural infeasibility
+## Sufficient condition for class III — the Hautus test
 
-> **If** there is a state `x ∈ X` and a scalar `s` with `Re s ≥ −λ` such that
+> **If** `(A(x) + λI, B(x))` is not stabilizable for some `x ∈ X` — equivalently,
+> by the **Hautus (PBH) lemma**, if
 > ```
-> σ_min([ A(x) − sI ,  B(x) ]) = 0
+> rank[ A(x) − sI ,  B(x) ] < n     for some s with Re s ≥ −λ
 > ```
 > **then** the plant is **class III** on `X`: `P({x})` is infeasible for *every*
 > `ν, χ, r, dt, w_lb, w_ub`.
 
-The plant has an uncontrollable mode that does not already decay faster than `λ`.
-Nothing in the certificate reaches it, so no envelope, no `r`, and no `dt` helps;
-only a method that sees Lie brackets does (`cmg_method: ccm`).
+**This is standard and is cited, not proved here.** `(C1)` is a state-feedback
+synthesis LMI in disguise; no such condition is satisfiable for an unstabilizable
+pair, and shifting `A ↦ A + λI` to demand a prescribed decay rate `λ` rather than
+mere stability is the classical `α`-shift of LQR (Anderson & Moore). "Class III"
+is therefore just a name for *"not λ-stabilizable somewhere on the box"*.
 
-*Checking it* costs one eigendecomposition plus one SVD per sample, and it is
-**exact**: uncontrollable modes can only sit at eigenvalues of `A`, so testing
-`s ∈ spec(A) ∩ {Re s ≥ −λ}` misses nothing. Use the SVD, never eigenvectors — a
-defective `A` (pvtol's uncontrollable block is nilpotent) returns a near-parallel
-eigenbasis and any authority read off it is meaningless.
+What is worth saying beyond the citation is only how to *evaluate* it:
 
-Proved in §3.2 (Corollary 2.1).
+* **The test is finite.** Uncontrollable modes sit only at eigenvalues of `A`, so
+  testing `s ∈ spec(A) ∩ {Re s ≥ −λ}` misses nothing.
+* **Use `σ_min`, not `rank`.** Numerically the useful form is
+  `σ_min([A(x) − sI, B(x)]) = 0`, since rank is not a continuous function of the
+  data and a tolerance on it is arbitrary, while `σ_min` degrades smoothly and
+  doubles as the quantitative margin Corollary 2.2 needs.
+* **Use the SVD, never eigenvectors.** A defective `A` (pvtol's uncontrollable
+  block is nilpotent) returns a near-parallel eigenbasis, and any modal authority
+  read off it is meaningless — measured, this reported `1e-2` where the true
+  margin is `1e-19`.
+
+The only non-standard part of §3.2 is the *quantitative* statement
+(Corollary 2.2): what a nearly-uncontrollable mode costs under **this program's
+envelope**, rather than whether it is fatal.
 
 ## Sufficient condition for class I — an orthogonal gauge
 
@@ -199,7 +217,7 @@ objection to §1. Stated plainly, so the ones that are scaffolding can be skippe
 | result | what breaks without it |
 |---|---|
 | **Proposition 1** (decoupling) | The class definitions are statements about *one state*. Without decoupling they say nothing about `P(S)`, which is the program actually solved. This is what turns "`ρ` is constant" into "**no subset** can raise λ". |
-| **Proposition 2** (Hautus) | class III has no checkable condition, and the taxonomy is not decidable — pvtol and turtlebot get no class. Also supplies the `ν ≳ 1/σ²` cost that the class-II certificate test uses. |
+| **Proposition 2** (quantitative Hautus) | Class III itself is the **Hautus lemma**, cited not proved. Prop 2 earns its place only for Corollary 2.2 — the `ν ≳ 1/σ²` price of a *nearly* uncontrollable mode, which a yes/no rank test cannot give and which the class-II certificate test uses. |
 | **Proposition 3** (CARE) | `ρ(x)` is not known to be finite or computable, so the cheap class-II screen does not exist — and this *is* the feasibility guarantee. |
 | Proposition 4 | proves the class-I sufficient condition. |
 | Proposition 5 | one *mechanism* behind class II. Not a sufficient condition — see §3.5. |
@@ -246,6 +264,15 @@ govern. On one draw, both sides at `w=[1e-3,1e3]`, `ε=0.1`, N=8, tol 0.5%:
 
 ## 3.2 Proposition 2 — one inequality per mode
 
+**The qualitative content of this section is the Hautus lemma and is cited, not
+proved.** `(A(x) + λI, B(x))` unstabilizable at some `x` ⟹ class III, because
+`(C1)` is a state-feedback synthesis LMI and no such LMI is satisfiable for an
+unstabilizable pair; the `A ↦ A + λI` shift demanding a prescribed decay rate is
+LQR's classical `α`-shift (Anderson & Moore). Proposition 2 exists for the
+*quantitative* refinement in Corollary 2.2 — what a **nearly** uncontrollable
+mode costs under this program's envelope — which the Hautus lemma, being a
+yes/no rank test, does not give.
+
 **Proposition 2.** *Let `P({x})` be feasible with `(W̄, ν, χ)`, let `s ∈ C`, let
 `w ∈ Cⁿ` be a unit vector, and set `δ* := w*(A − sI)`. If `Re s + λ > 0` then*
 
@@ -276,17 +303,15 @@ by `‖W̄‖ ≤ χ`. Collect the `β` terms with `c := 1/dt + 2Re(s) + 2λ`:
 `Re s + λ > 0` gives `c > 0`, so `β ≥ 1` implies `c ≤ βc`. Substituting `c` and
 cancelling `1/dt` — the `dt` terms drop out exactly — gives (★). ∎
 
-**Corollary 2.1 (the class-III condition).** *If `σ_min([A(x) − sI, B(x)]) = 0` for some
-`Re s ≥ −λ`, then `P({x})` is infeasible for every `(ν, χ, r, dt, w_lb, w_ub)`
-whenever `ε > 0`.*
+**Corollary 2.1 (class III — the Hautus test, recovered).** *If
+`σ_min([A(x) − sI, B(x)]) = 0` for some `Re s ≥ −λ`, then `P({x})` is infeasible
+for every `(ν, χ, r, dt, w_lb, w_ub)` whenever `ε > 0`.*
 
-*Proof.* Let `w` be the left singular vector for the zero singular value, so
-`w*[A − sI, B] = 0`, i.e. `δ = 0` and `Bᵀw = 0`. Then (★) reads
-`2(Re s + λ) + ε ≤ 0`, contradicting `Re s ≥ −λ`, `ε > 0`. (At `Re s = −λ`
-exactly, `c > 0` may fail; run the same computation directly — the left side of
-(C1) is then `⪰ 0` on `span(w)` while the right side is `−ε < 0`.) ∎
-
-This is PBH λ-stabilizability.
+This is the Hautus lemma; it is stated here only to confirm that (★) degrades to
+it, so the quantitative bound and the standard qualitative test are consistent.
+Take `w` the left singular vector for the zero singular value, so
+`w*[A − sI, B] = 0`, i.e. `δ = 0` and `Bᵀw = 0`; then (★) reads
+`2(Re s + λ) + ε ≤ 0`, contradicting `Re s ≥ −λ` with `ε > 0`.
 
 **Corollary 2.2 (the price of a weak mode).** *With `σ := σ_min([A − sI, B])` at
 some `Re s ≥ −λ`,*
