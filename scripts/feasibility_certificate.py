@@ -6,24 +6,27 @@
 No SDP, no bisection. For each sampled state this solves one continuous-time
 algebraic Riccati equation and reads the certificate off it, which is why the
 answer is a GUARANTEE rather than a search outcome. See
-``docs/dynamics_taxonomy.md`` for the theorems; the short version:
+``docs/dynamics_taxonomy.md`` for the definitions and proofs; the short version:
 
-* **Theorem B (sufficient).** With ``lbd' = lbd + 1/(2*cm_dt)``, let ``P(x) > 0``
+* **Proposition 3 (sufficient).** With ``lbd' = lbd + 1/(2*cm_dt)``, let ``P(x) > 0``
   solve ``(A+lbd'I)^T P + P(A+lbd'I) - (2/r) P B B^T P + q I = 0``. Then
   ``W(x) = P(x)^-1`` satisfies the CV-STEM LMI with margin ``q*w_lb`` under the
   envelope ``w_lb = 1/max_x lmax(P)``, ``w_ub = 1/min_x lmin(P)``. So the program
   is feasible whenever every ``(A(x)+lbd'I, B(x))`` is stabilizable, and the
   envelope is an OUTPUT, not a searched input.
-* **Theorem A (necessary).** With ``sig = sigma_min([A(x) - sI, B(x)])`` at any
+* **Proposition 2 (necessary).** With ``sig = sigma_min([A(x) - sI, B(x)])`` at any
   ``s`` with ``Re s >= -lbd``, feasibility forces
   ``2*(Re s + lbd) + eps <= 2*sig*chi + (2*nu/r)*sig^2``. So ``sig = 0`` (an
   uncontrollable mode at or above the rate) is infeasible at EVERY envelope, and
   a small ``sig`` drives ``nu`` up like ``1/sig^2`` -- at every OTHER state too,
   since ``nu`` is shared.
 
-``rho(x) = lmax(P(x))`` is the per-state metric scale the plant demands; it is
-the taxonomy's coordinate. ``rho`` constant over the box = class I, ``rho``
-varying = class II, ``rho`` infinite (unstabilizable) = class III.
+``rho(x) = lmax(P(x))`` is the per-state metric scale the plant demands. The
+classes are DEFINED by lambda*(x) (constant / varying / infeasible), and rho is
+the cheap SCREEN for them: rho is only an UPPER bound on what a state demands, so
+rho varying is evidence, not proof, that lambda* varies. It agreed with the exact
+per-state SDP test on all 9 feasible envs here, but disagrees wildly on
+magnitude, so classify with it and never quantify with it.
 
 The control box plays NO part in any of this. Feasibility here is contraction
 feasibility only: whether the LMI admits a metric. ``||K||`` is reported so the
@@ -59,7 +62,7 @@ def classic_tasks() -> list[str]:
 
 
 def hautus_margin(A: np.ndarray, B: np.ndarray, lbd: float):
-    """Theorem A, computable form: ``min sigma_min([A - sI, B])`` over eigenvalues
+    """Proposition 2, computable form: ``min sigma_min([A - sI, B])`` over eigenvalues
     ``s`` of ``A`` with ``Re s >= -lbd``.
 
     Testing the LMI with the left singular vector ``w`` of the Hautus matrix
@@ -90,7 +93,7 @@ def hautus_margin(A: np.ndarray, B: np.ndarray, lbd: float):
 
 
 def certify(A: np.ndarray, B: np.ndarray, lbd: float, r: float, dt: float, q: float):
-    """Theorem B: the CARE certificate at one state, or ``None`` if unstabilizable."""
+    """Proposition 3: the CARE certificate at one state, or ``None`` if unstabilizable."""
     n = A.shape[0]
     Abar = A + (lbd + 0.5 / dt) * np.eye(n)
     try:
@@ -188,7 +191,7 @@ def main() -> int:
     else:
         ap.error("pass --task or --all")
 
-    hdr = (f"{'env':16s} {'cls':>4s} {'hautus(ThmA)':>13s} {'nu(ThmB)':>10s} "
+    hdr = (f"{'env':16s} {'cls':>4s} {'hautus(Prop2)':>13s} {'nu(Prop3)':>10s} "
            f"{'w_lb':>10s} {'w_ub':>10s} {'rho spread':>11s} {'||K||max':>9s}  note")
     print(f"lbd={args.lbd}  r={args.r}  cm_dt={args.cm_dt}  q={args.q}  N={args.n}\n")
     print(hdr)
@@ -218,13 +221,13 @@ def main() -> int:
     print("\ncls I = rho(x) constant over the box (no subset can raise lbd)")
     print("cls II = rho(x) varies (a subset that drops the argmax raises lbd)")
     print("cls III = some state is not lbd-stabilizable (infeasible at EVERY envelope)")
-    print("hautus = min_x min_s sigma_min([A-sI, B]) over Re s >= -lbd (Theorem A); "
+    print("hautus = min_x min_s sigma_min([A-sI, B]) over Re s >= -lbd (Prop 2); "
           "0 => class III.")
-    print("nu/w_lb/w_ub are OUTPUTS of Theorem B -- the envelope this plant NEEDS, "
+    print("nu/w_lb/w_ub are OUTPUTS of Prop 3 -- the envelope this plant NEEDS, "
           "not one imposed on it.")
     print("||K||max is reported only -- the control box is NOT part of contraction "
           "feasibility here.")
-    # --verify is the runnable check on Theorem 3: a certificate that does not
+    # --verify is the runnable check on Proposition 3: a certificate that does not
     # satisfy the repo's own (C1) expression at its claimed margin is a bug in
     # the proof or in the construction, so fail loudly rather than printing it.
     bad = [r["task"] for r in rows if "verified" in r and not r["verified"]]

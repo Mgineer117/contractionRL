@@ -1,8 +1,8 @@
 # A taxonomy of dynamics for state-dependent contraction rate
 
-**§1 is the taxonomy: three if-then criteria on the dynamics.** §2 measures them.
-§3 proves them and says which supporting results are load-bearing and why. §4 is
-what is not claimed.
+**§1 is the taxonomy: one definition of the three classes, plus checkable
+sufficient conditions for membership.** §2 measures them. §3 proves them and says
+which supporting results are load-bearing and why. §4 is what is not claimed.
 
 **Scope.** Contraction feasibility only. The control box plays no part: no plant
 is called infeasible because its certified gain is large. `‖K‖` is reported so
@@ -28,10 +28,26 @@ Write `λ*(x) = sup{λ : P({x}) feasible}` and `λ*(S)` likewise, and `λ' := λ
 
 # 1. The taxonomy
 
-Check the criteria in this order. Each is an if-then on `(A(x), B(x))` over the
-box; the third is the default when neither of the first two fires.
+The classes are **defined** by what `λ*(·)` does on the box; the two structural
+conditions below are *sufficient conditions for membership*, which is a different
+kind of statement and is labelled as such.
 
-## Criterion III — structurally infeasible
+**Definition 1 (the three classes).** *A plant on a box `X`, at fixed
+`(λ, ε, dt, r, w_lb, w_ub)`, is*
+
+```
+class III  if  P({x}) is infeasible at some x ∈ X for every ν, χ, r, dt, envelope
+class I    if  it is not class III and λ*(x) is constant on X
+class II   if  it is not class III and λ*(x) is non-constant on X
+```
+
+*The three are mutually exclusive and exhaustive by construction.*
+
+Everything else in §1 is a **checkable condition implying one of these**, because
+the definitions themselves are not directly checkable: `λ*(x)` costs an SDP
+bisection per state, and class III quantifies over every envelope.
+
+## Sufficient condition for class III — structural infeasibility
 
 > **If** there is a state `x ∈ X` and a scalar `s` with `Re s ≥ −λ` such that
 > ```
@@ -52,7 +68,7 @@ eigenbasis and any authority read off it is meaningless.
 
 Proved in §3.2 (Corollary 2.1).
 
-## Criterion I — rate-homogeneous
+## Sufficient condition for class I — an orthogonal gauge
 
 > **If** there is a map `T : X → O(n)` into the **orthogonal** group with
 > ```
@@ -70,22 +86,19 @@ The car: `T(θ) = blockdiag(R(θ)ᵀ, I₂)`. Writing `A = [[0₂ₓ₂, M],[0, 
 [0,0]]`, free of `θ`; and `B` is supported on the `(yaw, vel)` block where `T` is
 the identity, so `TB = B`.
 
-Proved in §3.4 (Theorem 4).
+Proved in §3.4 (Proposition 4).
 
-## Criterion II — rate-heterogeneous
+## Deciding class II — no structural condition, only tests
 
-> **If** `λ*(x₁) ≠ λ*(x₂)` for some `x₁, x₂ ∈ X`
-> **then** the plant is **class II** on `X`: the certified rate over `X` is
-> `min_x λ*(x)`, and **the subset that drops every minimiser strictly raises it.**
-
-This is the definition rather than a structural condition, because — see §3.5 —
-no clean structural condition covers it: on this repo's plants, `B(x)` variation
-explains it on some and not on others. Three ways to establish it, in increasing
-cost and increasing rigour:
+There is **no** structural sufficient condition for class II here, and that is a
+finding rather than an omission: §3.5 shows `B(x)` variation explains it on some
+of this repo's plants and not on others. So class II is settled by Definition 1
+directly — `λ*(x₁) ≠ λ*(x₂)` — and the practical question is only how to
+establish that. Three ways, in increasing cost and rigour:
 
 | test | cost | status |
 |---|---|---|
-| **Screen.** `ρ(x) = λ_max(P(x))` from the CARE of Theorem 3 takes two different values. | 1 CARE solve/sample, no SDP | **Evidence only.** `ρ` is an *upper* bound on what a state demands, so `ρ` varying does not prove `λ*` does. Agreed with the exact test on 9 of 9 plants here. |
+| **Screen.** `ρ(x) = λ_max(P(x))` from the CARE of Proposition 3 takes two different values. | 1 CARE solve/sample, no SDP | **Evidence only.** `ρ` is an *upper* bound on what a state demands, so `ρ` varying does not prove `λ*` does. Agreed with the exact test on 9 of 9 plants here. |
 | **Certificate.** Corollary 2.2's floor at `x₂` exceeds `ρ(x₁)`. | same, plus one SVD | **Rigorous** when it fires. Fired on 1 of 9 (auv). |
 | **Exact.** `λ*(x)` by one-sample SDP at two states. | 2 SDP bisections | **Rigorous, always decisive.** |
 
@@ -118,7 +131,7 @@ tol 0.5%.
 python scripts/feasibility_certificate.py --all --lbd 0.3 --verify -n 200
 ```
 
-| env | class | Hautus margin (Crit. III) | exact `λ*(x)` spread | `ρ` spread (screen) | `ν` | `w_lb` | `w_ub` | ‖K‖max |
+| env | class | Hautus margin (class III) | exact `λ*(x)` spread | `ρ` spread (screen) | `ν` | `w_lb` | `w_ub` | ‖K‖max |
 |---|---|---|---|---|---|---|---|---|
 | car | **I** | 1.000 | **1.0000** | 1.0000 | 9.54 | 1.05e-1 | 9.53e-1 | 2.86 |
 | quadrotor | **I** | 1.000 | **1.0000** | 1.0000 | 55.5 | 1.80e-2 | 5.15 | 7.27 |
@@ -133,7 +146,7 @@ python scripts/feasibility_certificate.py --all --lbd 0.3 --verify -n 200
 | **turtlebot** | **III** | 0.00e+00 | — | — | ∞ | — | — | — |
 
 **Feasibility, guaranteed: 9 of 11**, each with the envelope shown and a verified
-LMI margin `q·w_lb + 1/dt` (Theorem 3). pvtol and turtlebot are class III with an
+LMI margin `q·w_lb + 1/dt` (Proposition 3). pvtol and turtlebot are class III with an
 uncontrollable mode at `s = 0` — turtlebot's margin is exactly zero because
 `f ≡ 0` makes `A ≡ 0`; pvtol's `1e-19` is a numerically-zero nilpotent block,
 matching the `A₂₂` with `eig = {0,0}` extracted independently in
@@ -185,15 +198,15 @@ objection to §1. Stated plainly, so the ones that are scaffolding can be skippe
 
 | result | what breaks without it |
 |---|---|
-| **Theorem 1** (decoupling) | Criteria I and II are statements about *one state*. Without decoupling they say nothing about `P(S)`, which is the program actually solved. This is what turns "`ρ` is constant" into "**no subset** can raise λ". |
-| **Theorem 2** (Hautus) | Criterion III has no proof, and the taxonomy is not exhaustive — pvtol and turtlebot get no class. Also supplies the `ν ≳ 1/σ²` cost that Criterion II's certificate test uses. |
-| **Theorem 3** (CARE) | `ρ(x)` is not known to be finite or computable, so Criterion II's cheap screen does not exist — and this *is* the feasibility guarantee. |
-| Theorem 4 | proves Criterion I. |
-| Theorem 5 | one *mechanism* behind Criterion II. Not a criterion — see §3.5. |
+| **Proposition 1** (decoupling) | The class definitions are statements about *one state*. Without decoupling they say nothing about `P(S)`, which is the program actually solved. This is what turns "`ρ` is constant" into "**no subset** can raise λ". |
+| **Proposition 2** (Hautus) | class III has no checkable condition, and the taxonomy is not decidable — pvtol and turtlebot get no class. Also supplies the `ν ≳ 1/σ²` cost that the class-II certificate test uses. |
+| **Proposition 3** (CARE) | `ρ(x)` is not known to be finite or computable, so the cheap class-II screen does not exist — and this *is* the feasibility guarantee. |
+| Proposition 4 | proves the class-I sufficient condition. |
+| Proposition 5 | one *mechanism* behind class II. Not a sufficient condition — see §3.5. |
 
-## 3.1 Theorem 1 — the joint program decouples
+## 3.1 Proposition 1 — the joint program decouples
 
-**Theorem 1.** *At fixed `(λ, ε, dt, r, w_lb, w_ub)` with `w_lb > 0`, `P(S)` is
+**Proposition 1.** *At fixed `(λ, ε, dt, r, w_lb, w_ub)` with `w_lb > 0`, `P(S)` is
 feasible **iff** `P({xₖ})` is feasible for every `k`; the shared scalars may be
 fixed a priori at `ν = 1/w_lb`, `χ = w_ub/w_lb`.*
 
@@ -210,7 +223,7 @@ common `ν = 1/w_lb`, `χ = w_ub/w_lb`. That collection is a feasible point of
 **Corollary 1.1.** `λ*(S) = min_k λ*(xₖ)`.
 
 *Proof.* Feasibility is downward-closed in `λ`, since `λ` enters (C1) only via
-`+2λW̄ₖ` with `W̄ₖ ⪰ I ≻ 0`. By Theorem 1 the feasible `λ`-set of `P(S)` is the
+`+2λW̄ₖ` with `W̄ₖ ⪰ I ≻ 0`. By Proposition 1 the feasible `λ`-set of `P(S)` is the
 intersection of the per-state ones, and the supremum of an intersection of
 downward-closed intervals is the min of their suprema. `S` finite ⟹ attained. ∎
 
@@ -231,9 +244,9 @@ govern. On one draw, both sides at `w=[1e-3,1e3]`, `ε=0.1`, N=8, tol 0.5%:
 | car | 5.0203 | 5.0203 | 0.00% |
 | segway | 0.7456 | 0.7505 | 0.65% (= bisection tol + solver) |
 
-## 3.2 Theorem 2 — one inequality per mode
+## 3.2 Proposition 2 — one inequality per mode
 
-**Theorem 2.** *Let `P({x})` be feasible with `(W̄, ν, χ)`, let `s ∈ C`, let
+**Proposition 2.** *Let `P({x})` be feasible with `(W̄, ν, χ)`, let `s ∈ C`, let
 `w ∈ Cⁿ` be a unit vector, and set `δ* := w*(A − sI)`. If `Re s + λ > 0` then*
 
 ```
@@ -263,7 +276,7 @@ by `‖W̄‖ ≤ χ`. Collect the `β` terms with `c := 1/dt + 2Re(s) + 2λ`:
 `Re s + λ > 0` gives `c > 0`, so `β ≥ 1` implies `c ≤ βc`. Substituting `c` and
 cancelling `1/dt` — the `dt` terms drop out exactly — gives (★). ∎
 
-**Corollary 2.1 (Criterion III).** *If `σ_min([A(x) − sI, B(x)]) = 0` for some
+**Corollary 2.1 (the class-III condition).** *If `σ_min([A(x) − sI, B(x)]) = 0` for some
 `Re s ≥ −λ`, then `P({x})` is infeasible for every `(ν, χ, r, dt, w_lb, w_ub)`
 whenever `ε > 0`.*
 
@@ -286,13 +299,13 @@ some `Re s ≥ −λ`,*
 *Proof.* Apply (★) at the left singular vector, where `‖δ‖ ≤ σ` and
 `w*BBᵀw ≤ σ²`, then substitute `χ ≤ ν·w_ub` (first) or hold `χ` fixed (second). ∎
 
-Since Theorem 1 saturates `ν = 1/w_lb` and `ν` is shared, a small `σ` at **one**
+Since Proposition 1 saturates `ν = 1/w_lb` and `ν` is shared, a small `σ` at **one**
 state raises the gain bound `‖K‖ ≤ ‖B‖/(r·w_lb)` at **every** state. That is the
 precise sense in which one weak state is expensive everywhere.
 
-## 3.3 Theorem 3 — the feasibility guarantee
+## 3.3 Proposition 3 — the feasibility guarantee
 
-**Theorem 3.** *Fix `λ, r, dt > 0, q > 0`, `λ' = λ + 1/(2dt)`. If
+**Proposition 3.** *Fix `λ, r, dt > 0, q > 0`, `λ' = λ + 1/(2dt)`. If
 `(A(x) + λ'I, B(x))` is stabilizable for every `x ∈ S`, then the CARE*
 
 ```
@@ -336,14 +349,14 @@ certifies. Step (iv) also isolates what Tsukamoto's `(W̄ − I)/dt` proxy does:
 `−I/dt` half is an **exact free margin**, independent of plant and of `ν` — which
 is why every verified residual comes out at `−1` for `dt = 1`.
 
-**Definition.** `ρ(x) := λ_max(P(x))`, the metric scale state `x` demands under
+**Definition 2.** `ρ(x) := λ_max(P(x))`, the metric scale state `x` demands under
 *this* metric choice. `ν = max_S ρ`. `ρ` is an upper bound on what `x` truly
 demands, because the CARE picks one metric rather than the best one — hence
-Criterion II's screen is evidence, not proof.
+the class-II screen is evidence, not proof.
 
-## 3.4 Theorem 4 — proof of Criterion I
+## 3.4 Proposition 4 — the class-I sufficient condition
 
-**Theorem 4.** *If `T : X → O(n)` satisfies `T(x)A(x)T(x)ᵀ = A₀` and
+**Proposition 4.** *If `T : X → O(n)` satisfies `T(x)A(x)T(x)ᵀ = A₀` and
 `T(x)B(x)B(x)ᵀT(x)ᵀ = B₀B₀ᵀ`, then `λ*(x) ≡ λ*₀` and `ρ(x) ≡ λ_max(P₀)`.*
 
 *Proof.* The congruence `W̄ ↦ T(x)ᵀW̄₀T(x)` maps feasible points of `P({x₀})` to
@@ -359,12 +372,12 @@ stabilizing property, so by uniqueness `P(x) = T(x)ᵀP₀T(x)`, whose spectrum 
 that of `P₀`. ∎
 
 **Orthogonality is load-bearing.** A general similarity preserves (C1) but not
-(C2), so it can move `ρ` and the envelope. Criterion I is a statement about the
+(C2), so it can move `ρ` and the envelope. The class-I condition is a statement about the
 metric-normalised problem, not about `(A, B)` up to arbitrary coordinates.
 
-## 3.5 Theorem 5 — a mechanism for Criterion II, not a criterion
+## 3.5 Proposition 5 — a mechanism for class II, not a sufficient condition
 
-**Theorem 5.** *If `A(x₁) = A(x₂)` and `B₁B₁ᵀ ⪰ B₂B₂ᵀ`, then every certificate
+**Proposition 5.** *If `A(x₁) = A(x₂)` and `B₁B₁ᵀ ⪰ B₂B₂ᵀ`, then every certificate
 feasible at `x₂` is feasible at `x₁` with the same `(ν, χ)`; hence
 `λ*(x₁) ≥ λ*(x₂)` and `ρ(x₁) ≤ ρ(x₂)`.*
 
@@ -373,7 +386,7 @@ feasible at `x₂` is feasible at `x₁` with the same `(ν, χ)`; hence
 not involve `B`. For `ρ`, the stabilizing CARE solution is monotone
 non-increasing in `BR⁻¹Bᵀ`, so `P₁ ⪯ P₂`. ∎
 
-**Why this is not Criterion II.** The hypothesis `A(x₁) = A(x₂)` almost never
+**Why this is not a sufficient condition for class II.** The hypothesis `A(x₁) = A(x₂)` almost never
 holds between two states of a real plant, and the data says authority is not even
 the dominant mechanism. Spearman rank correlation between the per-state Hautus
 margin `σ(x)` and `ρ(x)`, 200 samples:
@@ -390,10 +403,10 @@ margin `σ(x)` and `ρ(x)`, 200 samples:
 | car / quadrotor | 1.000 | 1.000 | n/a (both constant) | n/a — class I |
 
 So segway and aircraft are class II with essentially **no** authority variation:
-their `ρ` varies through `A(x)` instead. Corollary 5.1 below is therefore a
+their `ρ` varies through `A(x)` instead. Remark 5.1 below is therefore a
 statement about *feasibility of the optimal metric*, not about `ρ`.
 
-**Corollary 5.1 (why `σ(B)` predicts and `σ(A)` does not, and its limit).** In
+**Remark 5.1 (why `σ(B)` predicts and `σ(A)` does not, and its limit).** In
 (C1) the metric enters the drift term `AW̄ + W̄Aᵀ` linearly and the control term
 `−ν(2/r)BBᵀ` not at all. `W̄` is a free per-state variable, so it can absorb
 `A(x)` up to the invariant content Corollary 2.1 isolates, but it cannot
@@ -407,13 +420,13 @@ is exactly why segway and aircraft show `ρ` variation with `σ` flat.
 
 * **Sampled, not box-wide.** Every statement is over the finite `S`. Extending to
   all of `X` needs the covering argument of `subset_lambda_procedure.md` §7 —
-  Theorem 3's margin `q·w_lb + 1/dt` is what feeds it, but the Lipschitz constant
+  Proposition 3's margin `q·w_lb + 1/dt` is what feeds it, but the Lipschitz constant
   is not computed here.
 * **Feasibility, not performance.** `λ*` is a certified rate, not a measured AUC.
-  Theorem 3 certifies with a *particular* metric, so its `ν` is an upper bound on
+  Proposition 3 certifies with a *particular* metric, so its `ν` is an upper bound on
   what the SDP would find — 20× on the car (9.54 against a Corollary-2.2 floor of
   0.49).
-* **Criterion II has no cheap rigorous form here.** The screen is evidence; the
+* **Class II has no cheap rigorous test here.** The screen is evidence; the
   Corollary-2.2 certificate fired on 1 of 9 plants. Tightening that bound so it
   decides class II without an SDP is open.
 * **Subset claims still owe an invariance argument.** `λ*(S')` certifies
