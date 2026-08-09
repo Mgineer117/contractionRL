@@ -1,194 +1,309 @@
 # A taxonomy of dynamics for state-dependent contraction rate
 
-Six theorems, their proofs, and the class each classic plant lands in. Two
-questions are answered separately and must not be conflated:
+**§1 is the taxonomy: three if-then criteria on the dynamics.** §2 measures them.
+§3 proves them and says which supporting results are load-bearing and why. §4 is
+what is not claimed.
 
-1. **Is the plant contraction-feasible at rate λ, guaranteed?** Theorems 2 and 3
-   settle this constructively — a CARE solve per state, no SDP and no bisection.
-2. **What makes the rate state-dependent?** Theorems 4 and 5 give the two
-   mechanisms, and Theorem 1 is what makes a per-state answer meaningful at all.
+**Scope.** Contraction feasibility only. The control box plays no part: no plant
+is called infeasible because its certified gain is large. `‖K‖` is reported so
+the cost stays visible, never tested.
 
-**Scope.** Everything here is about the *contraction* LMI. The control box plays
-no part: no plant is called infeasible because its certified gain is large. ‖K‖
-is reported so the deployment cost is visible, never tested.
-
-Implementation: `scripts/feasibility_certificate.py`. Synthesis under test:
+Implementation: `scripts/feasibility_certificate.py`. Program under test:
 `cvstem_joint` in `agents/skrl/ncm_synthesis.py`.
 
----
-
-## 0. Setup
-
-Plant `ẋ = f(x) + B(x)u` on a compact box `X ⊂ Rⁿ`, `A(x) = ∂f/∂x`. For a finite
-sample set `S = {x₁..x_N} ⊂ X` and parameters `(λ, ε, dt, r, w_lb, w_ub)`, the
-program `P(S)` asks for `W̄ₖ ⪰ 0` and shared scalars `ν, χ ≥ 0` with
+**Setup.** Plant `ẋ = f(x) + B(x)u` on a compact box `X ⊂ Rⁿ`, `A(x) = ∂f/∂x`.
+For a sample set `S ⊂ X` and parameters `(λ, ε, dt, r, w_lb, w_ub)`, the program
+`P(S)` asks for `W̄ₖ ⪰ 0` and shared `ν, χ ≥ 0` with
 
 ```
-(C1)  (W̄ₖ − I)/dt + AₖW̄ₖ + W̄ₖAₖᵀ + 2λW̄ₖ − ν(2/r)BₖBₖᵀ  ⪯  −εI      for all k
-(C2)  I ⪯ W̄ₖ ⪯ χI                                                   for all k
-(C3)  ν ≤ 1/w_lb,     χ ≤ ν·w_ub
+(C1)  (W̄ₖ − I)/dt + AₖW̄ₖ + W̄ₖAₖᵀ + 2λW̄ₖ − ν(2/r)BₖBₖᵀ  ⪯  −εI
+(C2)  I ⪯ W̄ₖ ⪯ χI
+(C3)  ν ≤ 1/w_lb,   χ ≤ ν·w_ub
 ```
 
-Deployed: `Wₖ = W̄ₖ/ν`, `Mₖ = Wₖ⁻¹`, `Kₖ = (1/r)BₖᵀMₖ`. Write
-
-```
-λ*(x) = sup { λ : P({x}) is feasible },      λ*(S) = sup { λ : P(S) is feasible }
-```
-
-Throughout, `dt > 0`, `w_lb > 0`, `q > 0`, and `λ' := λ + 1/(2·dt)`.
+Write `λ*(x) = sup{λ : P({x}) feasible}` and `λ*(S)` likewise, and `λ' := λ +
+1/(2dt)`.
 
 ---
 
-## 1. The joint program decouples
+# 1. The taxonomy
 
-Everything downstream is a statement about a single state, so the first thing to
-establish is that a single state is the right unit of analysis.
+Check the criteria in this order. Each is an if-then on `(A(x), B(x))` over the
+box; the third is the default when neither of the first two fires.
 
-**Lemma 1 (monotone saturation).** *The feasible set of (C1)–(C3) is monotone in
-the shared scalars: if `(W̄, ν, χ)` is feasible and `ν ≤ ν' ≤ 1/w_lb`,
-`χ ≤ χ' ≤ ν'·w_ub`, then `(W̄, ν', χ')` is feasible.*
+## Criterion III — structurally infeasible
 
-*Proof.* `ν` enters (C1) only through `−ν(2/r)BBᵀ` with `BBᵀ ⪰ 0`, so raising `ν`
-moves the left side down in the PSD order. `χ` enters (C2) only as an upper
-bound, which raising `χ` relaxes. (C3) holds by hypothesis. ∎
+> **If** there is a state `x ∈ X` and a scalar `s` with `Re s ≥ −λ` such that
+> ```
+> σ_min([ A(x) − sI ,  B(x) ]) = 0
+> ```
+> **then** the plant is **class III** on `X`: `P({x})` is infeasible for *every*
+> `ν, χ, r, dt, w_lb, w_ub`.
 
-**Theorem 1 (decoupling).** *At fixed `(λ, ε, dt, r, w_lb, w_ub)`, `P(S)` is
-feasible **iff** `P({xₖ})` is feasible for every `k`. Moreover the shared scalars
-may be fixed a priori at `ν = 1/w_lb`, `χ = w_ub/w_lb`, with no loss.*
+The plant has an uncontrollable mode that does not already decay faster than `λ`.
+Nothing in the certificate reaches it, so no envelope, no `r`, and no `dt` helps;
+only a method that sees Lie brackets does (`cmg_method: ccm`).
 
-*Proof.* (⟹) Restricting a feasible point to one index satisfies that index's
-constraints. (⟸) Let `(W̄ₖ, νₖ, χₖ)` be feasible for `{xₖ}`. Each `χₖ ≤ νₖ·w_ub ≤
-w_ub/w_lb`, so Lemma 1 applies with `ν' = 1/w_lb`, `χ' = w_ub/w_lb`, and every
-`W̄ₖ` remains feasible at those common values. That collection is a feasible point
-of `P(S)`. ∎
+*Checking it* costs one eigendecomposition plus one SVD per sample, and it is
+**exact**: uncontrollable modes can only sit at eigenvalues of `A`, so testing
+`s ∈ spec(A) ∩ {Re s ≥ −λ}` misses nothing. Use the SVD, never eigenvectors — a
+defective `A` (pvtol's uncontrollable block is nilpotent) returns a near-parallel
+eigenbasis and any authority read off it is meaningless.
 
-**Corollary 1.1.** `λ*(S) = min_{k} λ*(xₖ)`.
+Proved in §3.2 (Corollary 2.1).
 
-*Proof.* Feasibility at `λ` is downward-closed in `λ`, because `λ` enters (C1)
-only through `+2λW̄ₖ` with `W̄ₖ ⪰ I ≻ 0`, so lowering `λ` relaxes it. By Theorem 1
-the feasible `λ`-set of `P(S)` is the intersection of the per-state ones, and the
-intersection of downward-closed intervals has supremum equal to the minimum of
-the suprema. `S` is finite, so the min is attained. ∎
+## Criterion I — rate-homogeneous
 
-**There is no shared-`ν` penalty.** The coupling between states is exactly "the
-worst state's demand", never an extra cost on top of it. This corrects
-`subset_lambda_procedure.md` §8c, which attributed segway's joint/pointwise gap
-to "the cost of one shared ν/χ across heterogeneous states": that gap was
-measured across *different draws* (N=100 joint against a separate N=40 pointwise
-draw), which Corollary 1.1 does not govern.
+> **If** there is a map `T : X → O(n)` into the **orthogonal** group with
+> ```
+> T(x) A(x) T(x)ᵀ = A₀     and     T(x) B(x)B(x)ᵀ T(x)ᵀ = B₀B₀ᵀ      for all x ∈ X
+> ```
+> **then** the plant is **class I** on `X`: `λ*(x)` is the same at every state,
+> and **no subset of `X` certifies a faster rate.**
 
-Measured on one draw, both sides at `w=[1e-3,1e3]`, `ε=0.1`, `dt=1`, `r=1.6`,
-N=8, bisection tol 0.5%:
+The dynamics is one `(A₀, B₀)` seen from a rotating frame. Every state is exactly
+as hard as every other, so there is nothing for a subset to remove.
 
-| plant | `λ*(S)` joint | `min_k λ*(xₖ)` | relative gap |
-|---|---|---|---|
-| cartpole | 0.7895 | 0.7895 | 0.00% |
-| car | 5.0203 | 5.0203 | 0.00% |
-| segway | 0.7456 | 0.7505 | 0.65% (= bisection tol + solver) |
+*Checking it* means exhibiting `T`, which is analytic work, not a computation.
+The car: `T(θ) = blockdiag(R(θ)ᵀ, I₂)`. Writing `A = [[0₂ₓ₂, M],[0, 0]]` with
+`M = R(θ)·[[0, 1],[v, 0]]`, the congruence gives `TAT ᵀ = [[0₂ₓ₂, [[0,1],[v,0]]],
+[0,0]]`, free of `θ`; and `B` is supported on the `(yaw, vel)` block where `T` is
+the identity, so `TB = B`.
+
+Proved in §3.4 (Theorem 4).
+
+## Criterion II — rate-heterogeneous
+
+> **If** `λ*(x₁) ≠ λ*(x₂)` for some `x₁, x₂ ∈ X`
+> **then** the plant is **class II** on `X`: the certified rate over `X` is
+> `min_x λ*(x)`, and **the subset that drops every minimiser strictly raises it.**
+
+This is the definition rather than a structural condition, because — see §3.5 —
+no clean structural condition covers it: on this repo's plants, `B(x)` variation
+explains it on some and not on others. Three ways to establish it, in increasing
+cost and increasing rigour:
+
+| test | cost | status |
+|---|---|---|
+| **Screen.** `ρ(x) = λ_max(P(x))` from the CARE of Theorem 3 takes two different values. | 1 CARE solve/sample, no SDP | **Evidence only.** `ρ` is an *upper* bound on what a state demands, so `ρ` varying does not prove `λ*` does. Agreed with the exact test on 9 of 9 plants here. |
+| **Certificate.** Corollary 2.2's floor at `x₂` exceeds `ρ(x₁)`. | same, plus one SVD | **Rigorous** when it fires. Fired on 1 of 9 (auv). |
+| **Exact.** `λ*(x)` by one-sample SDP at two states. | 2 SDP bisections | **Rigorous, always decisive.** |
+
+Mechanisms are discussed in §3.5; the honest summary is that weak control
+authority is *a* cause, not *the* cause.
+
+## The decision procedure
+
+```
+σ_min([A−sI, B]) = 0 somewhere, Re s ≥ −λ ?  ──yes──>  class III  (infeasible, any envelope)
+                    │no
+an orthogonal gauge T reduces (A, BBᵀ) to a constant pair ?  ──yes──>  class I  (subsets buy nothing)
+                    │no
+λ*(x) varies ?  ──yes──>  class II  (subsets buy rate; the worst state governs)
+```
+
+**Class membership belongs to the pair (plant, box), never the plant alone** —
+see §2's car row. Shrinking a box can only raise the rate (§3.1, Remark), so
+plants move *up* this list as the box shrinks and *down* as it grows.
 
 ---
 
-## 2. The necessary condition: one inequality per mode
+# 2. Measured
 
-**Theorem 2 (Hautus–envelope inequality).** *Let `P({x})` be feasible with
-`(W̄, ν, χ)`. Let `s ∈ C`, let `w ∈ Cⁿ` be a unit vector, and set
-`δ* := w*(A − sI)`. If `Re s + λ > 0` then*
-
-```
-2(Re s + λ) + ε  ≤  2‖δ‖·χ  +  (2ν/r)·w*BBᵀw                            (★)
-```
-
-*Proof.* Take the Hermitian form of (C1) against `w`, and write `β := w*W̄w`,
-which is real and `≥ 1` because `W̄ ⪰ I` and `‖w‖ = 1`:
+`λ = 0.3`, `r = 1.6`, `cm_dt = 1.0`, `q = 1` for the CARE screen; the exact test
+uses one-sample SDPs at `w = [1e-3, 1e3]`, `ε = 0.1`, 6 states, bisection
+tol 0.5%.
 
 ```
-(β − 1)/dt + w*(AW̄ + W̄Aᵀ)w + 2λβ − ν(2/r)·w*BBᵀw  ≤  −ε
+python scripts/feasibility_certificate.py --all --lbd 0.3 --verify -n 200
 ```
 
-From `w*A = s·w* + δ*` we get `w*AW̄w = sβ + δ*W̄w`, and `w*W̄Aᵀw` is its complex
-conjugate, so
+| env | class | Hautus margin (Crit. III) | exact `λ*(x)` spread | `ρ` spread (screen) | `ν` | `w_lb` | `w_ub` | ‖K‖max |
+|---|---|---|---|---|---|---|---|---|
+| car | **I** | 1.000 | **1.0000** | 1.0000 | 9.54 | 1.05e-1 | 9.53e-1 | 2.86 |
+| quadrotor | **I** | 1.000 | **1.0000** | 1.0000 | 55.5 | 1.80e-2 | 5.15 | 7.27 |
+| ball_and_beam | II | 3.22e-1 | 1.373 | 58.6 | 389 | 2.57e-3 | 55.2 | 26.4 |
+| segway | II | 1.47e-1 | 1.755 | 2.20 | 759 | 1.32e-3 | 8.95 | 31.0 |
+| two_link_arm | II | 1.24e-1 | 1.927 | 43.2 | 425 | 2.35e-3 | 19.8 | 29.6 |
+| cartpole | II | 1.94e-1 | 2.092 | 7.26 | 573 | 1.74e-3 | 8.26e-1 | 27.1 |
+| aircraft | II | 9.76e-2 | 2.400 | 3.26 | 2 196 | 4.55e-4 | 26.3 | 32.9 |
+| tora | II | 9.71e-3 | 3.652 | 1 152 | 3.26e+5 | 3.07e-6 | 7.98e-1 | 448 |
+| auv | II | 6.66e-3 | 5.184 | 5 618 | 8.57e+4 | 1.17e-5 | 3.71e-1 | 251 |
+| **pvtol** | **III** | 1.05e-19 | — | — | ∞ | — | — | — |
+| **turtlebot** | **III** | 0.00e+00 | — | — | ∞ | — | — | — |
 
-```
-w*(AW̄ + W̄Aᵀ)w = 2Re(s)·β + 2Re(δ*W̄w) ≥ 2Re(s)·β − 2‖δ‖·‖W̄‖ ≥ 2Re(s)·β − 2‖δ‖·χ
-```
+**Feasibility, guaranteed: 9 of 11**, each with the envelope shown and a verified
+LMI margin `q·w_lb + 1/dt` (Theorem 3). pvtol and turtlebot are class III with an
+uncontrollable mode at `s = 0` — turtlebot's margin is exactly zero because
+`f ≡ 0` makes `A ≡ 0`; pvtol's `1e-19` is a numerically-zero nilpotent block,
+matching the `A₂₂` with `eig = {0,0}` extracted independently in
+`cvstem_feasibility_theory.md` §1.3.
 
-using `‖W̄‖ ≤ χ` from (C2). Substituting and collecting the `β` terms with
-`c := 1/dt + 2Re(s) + 2λ`:
+Notes on the table:
 
-```
-β·c  ≤  1/dt + 2‖δ‖·χ + (2ν/r)·w*BBᵀw − ε
-```
+* **The cheap screen was right every time.** `ρ` spread and the exact `λ*(x)`
+  spread agree on the class for all 9 feasible plants, though they disagree
+  wildly on *magnitude* (ball_and_beam: `ρ` 58.6 against `λ*` 1.37). Use `ρ` to
+  classify, never to quantify.
+* **auv has a state with `λ*(x) = 0`** at this envelope — no positive rate
+  certifies there — which is why its `ν` is `8.6e4` and its `w_lb` `1.2e-5`.
+* **The classes are stable in λ.** Re-running the screen at `λ = 1.0` reproduces
+  every assignment; only `ν` moves, upward (car 9.5 → 31.3, cartpole 573 → 4 452,
+  tora 3.3e5 → 7.0e6), as Corollary 2.2 requires.
+* **Hautus margin orders the whole table**: class I at 1.0, class II from `7e-3`
+  to `3e-1`, class III at 0.
 
-`Re s + λ > 0` gives `c > 0`, so `β ≥ 1` implies `c ≤ β·c`. Substituting `c` and
-cancelling `1/dt` — the `dt` terms drop out exactly — yields (★). ∎
-
-**Corollary 2.1 (class III: exact structural obstruction).** *If for some `x`
-there is an `s` with `Re s ≥ −λ` and `σ_min([A(x) − sI, B(x)]) = 0`, then `P({x})`
-is infeasible for **every** `(ν, χ, r, dt, w_lb, w_ub)` whenever `ε > 0`.*
-
-*Proof.* Let `w` be the left singular vector of the Hautus matrix for the zero
-singular value: `w*[A − sI, B] = 0`, i.e. `δ = 0` and `Bᵀw = 0`. Then (★) reads
-`2(Re s + λ) + ε ≤ 0`, contradicting `Re s ≥ −λ` and `ε > 0`. (For `Re s = −λ`
-exactly, `Re s + λ > 0` fails; run the same computation directly and the
-conclusion still holds, since the left side of (C1) is then `⪰ 0` on `span(w)`
-while the right side is `−ε < 0`.) ∎
-
-This is PBH λ-stabilizability, and it is a *finite* check: uncontrollable modes
-can only sit at eigenvalues of `A`, so evaluating `σ_min([A − sI, B])` at
-`spec(A) ∩ {Re s ≥ −λ}` is exact.
-
-*Use the SVD, not eigenvectors.* pvtol's uncontrollable block is nilpotent, so
-`np.linalg.eig` returns a nearly parallel basis and any modal authority computed
-from it is meaningless — an earlier version of the script reported pvtol's
-authority as `1e-2` when the true Hautus margin is `1e-19`.
-
-**Corollary 2.2 (how expensive a weak mode is).** *With `σ := σ_min([A − sI, B])`
-at some `Re s ≥ −λ`, feasibility forces*
-
-```
-ν  ≥  [2(Re s + λ) + ε] / (2σ·(w_ub + σ/r))       and, at fixed χ,
-ν  ≥  r·[2(Re s + λ) + ε] / (2σ²)
-```
-
-*Proof.* Apply (★) at the left singular vector, where `‖δ‖ ≤ σ` and
-`w*BBᵀw ≤ σ²`, then substitute `χ ≤ ν·w_ub` (first form) or hold `χ` fixed
-(second). ∎
-
-So a small `σ` at ONE state forces a large `ν`, and by Theorem 1's saturation
-`ν = 1/w_lb` is shared — which is the precise sense in which one weak state is
-expensive everywhere, via `‖M‖ ≤ ν` and `‖K‖ ≤ ‖B‖/(r·w_lb)`.
-
-**Measured, and the 1/σ² branch is exact in the limit.** The car's Hautus matrix
-at `s = 0` (after the yaw gauge of Theorem 4) has mutually orthogonal rows of
-norms `1, v, 1, 1`, so `σ = min(1, v)`. Against `ρ(v) = λ_max(P(v))`:
+**The car is class I only because its box excludes `v ≈ 0`.** Its Hautus matrix
+at `s = 0` has mutually orthogonal rows of norms `1, v, 1, 1`, so
+`σ = min(1, v)`, and:
 
 | `v` | 0.01 | 0.1 | 1 | 1.5 | 2 | 10 | 1000 |
 |---|---|---|---|---|---|---|---|
 | `σ = min(1,v)` | 0.01 | 0.1 | 1 | 1 | 1 | 1 | 1 |
 | `ρ(v)` | 60542.7 | 608.75 | 9.536 | 9.536 | 9.536 | 9.536 | 39.15 |
 
-`ρ` rises by 99.5× per decade of `v` below 1 — the `1/σ²` branch, to 0.5% — and
-is exactly flat wherever `σ` is flat. Note `ρ` climbs again at `v = 1000`
-*without* `σ` moving: Corollary 2.2 is a lower bound driven by weak authority and
-does not capture growth driven by `‖A‖` itself.
+`ρ` rises 99.5× per decade of `v` below 1 — Corollary 2.2's `1/σ²` branch, to
+0.5% — and is exactly flat wherever `σ` is. So the shipped box `v ∈ [1,2]` is
+class I, any box reaching `v < 1` is class II, and `v = 0` (where `f ≡ 0`, the
+turtlebot) is class III. One plant, three classes, selected by the box. (`ρ`
+climbs again at `v = 1000` with `σ` unmoved: Corollary 2.2 is a lower bound
+driven by weak authority and does not capture growth driven by `‖A‖`.)
+
+**Reconciliation with `find_uniform_lambda`'s "segway INFEASIBLE".** At `λ = 0.3`
+segway needs `w_lb = 1.32e-3`, which fits the shipped `[1e-3, 1e3]`; at `λ = 1.0`
+it needs `3.5e-4`, which does not. Segway is contraction-feasible at the shipped
+envelope for small enough λ; the INFEASIBLE verdict comes from the *actuator*
+branch driving `r` up until `ν` hits its cap, exactly as
+`subset_lambda_procedure.md` §8d describes. Different questions, no conflict.
 
 ---
 
-## 3. The sufficient condition: a certificate, not a search
+# 3. Why these are the criteria
 
-**Theorem 3 (constructive feasibility).** *Fix `λ, r, dt > 0, q > 0` and let
-`λ' = λ + 1/(2dt)`. Suppose `(A(x) + λ'I, B(x))` is stabilizable for every
-`x ∈ S`. Then the CARE*
+Only three supporting results carry weight, and each answers a specific
+objection to §1. Stated plainly, so the ones that are scaffolding can be skipped:
+
+| result | what breaks without it |
+|---|---|
+| **Theorem 1** (decoupling) | Criteria I and II are statements about *one state*. Without decoupling they say nothing about `P(S)`, which is the program actually solved. This is what turns "`ρ` is constant" into "**no subset** can raise λ". |
+| **Theorem 2** (Hautus) | Criterion III has no proof, and the taxonomy is not exhaustive — pvtol and turtlebot get no class. Also supplies the `ν ≳ 1/σ²` cost that Criterion II's certificate test uses. |
+| **Theorem 3** (CARE) | `ρ(x)` is not known to be finite or computable, so Criterion II's cheap screen does not exist — and this *is* the feasibility guarantee. |
+| Theorem 4 | proves Criterion I. |
+| Theorem 5 | one *mechanism* behind Criterion II. Not a criterion — see §3.5. |
+
+## 3.1 Theorem 1 — the joint program decouples
+
+**Theorem 1.** *At fixed `(λ, ε, dt, r, w_lb, w_ub)` with `w_lb > 0`, `P(S)` is
+feasible **iff** `P({xₖ})` is feasible for every `k`; the shared scalars may be
+fixed a priori at `ν = 1/w_lb`, `χ = w_ub/w_lb`.*
+
+*Proof.* First, the feasible set is monotone in `(ν, χ)`: `ν` enters (C1) only
+through `−ν(2/r)BBᵀ` with `BBᵀ ⪰ 0`, so raising `ν` moves the left side down in
+the PSD order, and `χ` enters (C2) only as an upper bound, which raising relaxes.
+
+(⟹) Restricting a feasible point to one index satisfies that index's
+constraints. (⟸) Let `(W̄ₖ, νₖ, χₖ)` be feasible for `{xₖ}`. Each
+`χₖ ≤ νₖ·w_ub ≤ w_ub/w_lb`, so by monotonicity every `W̄ₖ` stays feasible at the
+common `ν = 1/w_lb`, `χ = w_ub/w_lb`. That collection is a feasible point of
+`P(S)`. ∎
+
+**Corollary 1.1.** `λ*(S) = min_k λ*(xₖ)`.
+
+*Proof.* Feasibility is downward-closed in `λ`, since `λ` enters (C1) only via
+`+2λW̄ₖ` with `W̄ₖ ⪰ I ≻ 0`. By Theorem 1 the feasible `λ`-set of `P(S)` is the
+intersection of the per-state ones, and the supremum of an intersection of
+downward-closed intervals is the min of their suprema. `S` finite ⟹ attained. ∎
+
+**Remark (box monotonicity).** For `S' ⊆ S`, `λ*(S') ≥ λ*(S)` — immediate, a min
+over a smaller set cannot be smaller. This is the whole content of "class
+membership belongs to (plant, box)".
+
+**There is no shared-`ν` penalty.** The coupling between states is exactly "the
+worst state's demand", never an extra cost on top. This corrects
+`subset_lambda_procedure.md` §8c, which attributed segway's joint/pointwise gap
+to "the cost of one shared ν/χ": that gap was measured across *different draws*
+(N=100 joint against a separate N=40 pointwise), which Corollary 1.1 does not
+govern. On one draw, both sides at `w=[1e-3,1e3]`, `ε=0.1`, N=8, tol 0.5%:
+
+| plant | `λ*(S)` joint | `min_k λ*(xₖ)` | gap |
+|---|---|---|---|
+| cartpole | 0.7895 | 0.7895 | 0.00% |
+| car | 5.0203 | 5.0203 | 0.00% |
+| segway | 0.7456 | 0.7505 | 0.65% (= bisection tol + solver) |
+
+## 3.2 Theorem 2 — one inequality per mode
+
+**Theorem 2.** *Let `P({x})` be feasible with `(W̄, ν, χ)`, let `s ∈ C`, let
+`w ∈ Cⁿ` be a unit vector, and set `δ* := w*(A − sI)`. If `Re s + λ > 0` then*
+
+```
+2(Re s + λ) + ε  ≤  2‖δ‖·χ  +  (2ν/r)·w*BBᵀw                            (★)
+```
+
+*Proof.* Take the Hermitian form of (C1) against `w`; write `β := w*W̄w`, real and
+`≥ 1` since `W̄ ⪰ I`, `‖w‖ = 1`:
+
+```
+(β − 1)/dt + w*(AW̄ + W̄Aᵀ)w + 2λβ − ν(2/r)·w*BBᵀw  ≤  −ε
+```
+
+From `w*A = s·w* + δ*` we get `w*AW̄w = sβ + δ*W̄w`, and `w*W̄Aᵀw` is its
+conjugate, so
+
+```
+w*(AW̄ + W̄Aᵀ)w = 2Re(s)β + 2Re(δ*W̄w) ≥ 2Re(s)β − 2‖δ‖·‖W̄‖ ≥ 2Re(s)β − 2‖δ‖·χ
+```
+
+by `‖W̄‖ ≤ χ`. Collect the `β` terms with `c := 1/dt + 2Re(s) + 2λ`:
+
+```
+β·c  ≤  1/dt + 2‖δ‖·χ + (2ν/r)·w*BBᵀw − ε
+```
+
+`Re s + λ > 0` gives `c > 0`, so `β ≥ 1` implies `c ≤ βc`. Substituting `c` and
+cancelling `1/dt` — the `dt` terms drop out exactly — gives (★). ∎
+
+**Corollary 2.1 (Criterion III).** *If `σ_min([A(x) − sI, B(x)]) = 0` for some
+`Re s ≥ −λ`, then `P({x})` is infeasible for every `(ν, χ, r, dt, w_lb, w_ub)`
+whenever `ε > 0`.*
+
+*Proof.* Let `w` be the left singular vector for the zero singular value, so
+`w*[A − sI, B] = 0`, i.e. `δ = 0` and `Bᵀw = 0`. Then (★) reads
+`2(Re s + λ) + ε ≤ 0`, contradicting `Re s ≥ −λ`, `ε > 0`. (At `Re s = −λ`
+exactly, `c > 0` may fail; run the same computation directly — the left side of
+(C1) is then `⪰ 0` on `span(w)` while the right side is `−ε < 0`.) ∎
+
+This is PBH λ-stabilizability.
+
+**Corollary 2.2 (the price of a weak mode).** *With `σ := σ_min([A − sI, B])` at
+some `Re s ≥ −λ`,*
+
+```
+ν  ≥  [2(Re s + λ) + ε] / (2σ·(w_ub + σ/r))        and, at fixed χ,
+ν  ≥  r·[2(Re s + λ) + ε] / (2σ²)
+```
+
+*Proof.* Apply (★) at the left singular vector, where `‖δ‖ ≤ σ` and
+`w*BBᵀw ≤ σ²`, then substitute `χ ≤ ν·w_ub` (first) or hold `χ` fixed (second). ∎
+
+Since Theorem 1 saturates `ν = 1/w_lb` and `ν` is shared, a small `σ` at **one**
+state raises the gain bound `‖K‖ ≤ ‖B‖/(r·w_lb)` at **every** state. That is the
+precise sense in which one weak state is expensive everywhere.
+
+## 3.3 Theorem 3 — the feasibility guarantee
+
+**Theorem 3.** *Fix `λ, r, dt > 0, q > 0`, `λ' = λ + 1/(2dt)`. If
+`(A(x) + λ'I, B(x))` is stabilizable for every `x ∈ S`, then the CARE*
 
 ```
 (A + λ'I)ᵀP + P(A + λ'I) − (2/r)·P B Bᵀ P + qI = 0
 ```
 
-*has a unique stabilizing solution `P(x) ≻ 0` at each `x`, and*
+*has a unique stabilizing `P(x) ≻ 0`, and*
 
 ```
-W(x) = P(x)⁻¹,   ν = max_x λ_max(P(x)),   w_lb = 1/ν,
-w_ub = 1/min_x λ_min(P(x)),   χ = ν·w_ub,   W̄(x) = ν·W(x)
+W(x) = P(x)⁻¹,  ν = max_x λ_max(P(x)),  w_lb = 1/ν,
+w_ub = 1/min_x λ_min(P(x)),  χ = ν·w_ub,  W̄(x) = ν·W(x)
 ```
 
 *is a feasible point of `P(S)` for every `ε ≤ q·w_lb + 1/dt`.*
@@ -199,206 +314,112 @@ w_ub = 1/min_x λ_min(P(x)),   χ = ν·w_ub,   W̄(x) = ν·W(x)
 **(ii)** Multiply the CARE left and right by `W = P⁻¹`:
 
 ```
-W(A + λ'I)ᵀ + (A + λ'I)W − (2/r)BBᵀ + qW² = 0
-⟹  (A + λ'I)W + W(A + λ'I)ᵀ − (2/r)BBᵀ = −qW²
+(A + λ'I)W + W(A + λ'I)ᵀ − (2/r)BBᵀ = −qW²
 ```
 
-**(iii) Envelope.** `λ_min(W) = 1/λ_max(P) ≥ 1/ν`, so `W̄ = νW ⪰ I`. And
-`λ_max(W) = 1/λ_min(P) ≤ w_ub`, so `W̄ ⪯ ν·w_ub·I = χI`. (C2) holds, and (C3)
-holds with equality by construction.
+**(iii) Envelope.** `λ_min(W) = 1/λ_max(P) ≥ 1/ν`, so `W̄ = νW ⪰ I`; and
+`λ_max(W) = 1/λ_min(P) ≤ w_ub`, so `W̄ ⪯ χI`. (C3) holds with equality.
 
-**(iv) LMI.** Expand (C1) at `W̄ = νW`, splitting the proxy term
-`(W̄ − I)/dt = νW/dt − I/dt` and absorbing `νW/dt` into the rate:
+**(iv) LMI.** Split the proxy term `(W̄ − I)/dt = νW/dt − I/dt` and absorb `νW/dt`
+into the rate:
 
 ```
 (νW − I)/dt + ν[AW + WAᵀ + 2λW] − ν(2/r)BBᵀ
-  = ν[(A + λ'I)W + W(A + λ'I)ᵀ − (2/r)BBᵀ]  −  I/dt
+  = ν[(A + λ'I)W + W(A + λ'I)ᵀ − (2/r)BBᵀ] − I/dt
   = ν(−qW²) − I/dt
-  ⪯ −(ν·q·λ_min(W)² + 1/dt)·I
-  ⪯ −(q/ν + 1/dt)·I   =   −(q·w_lb + 1/dt)·I
+  ⪯ −(ν·q·λ_min(W)² + 1/dt)·I  ⪯  −(q·w_lb + 1/dt)·I    ∎
 ```
 
-using `λ_min(W) ≥ 1/ν` in the last step. ∎
+The envelope is an **output** of the plant, not a knob tuned until something
+certifies. Step (iv) also isolates what Tsukamoto's `(W̄ − I)/dt` proxy does: the
+`+νW/dt` half is a **rate penalty** (build the certificate at `λ'`, not `λ`), the
+`−I/dt` half is an **exact free margin**, independent of plant and of `ν` — which
+is why every verified residual comes out at `−1` for `dt = 1`.
 
-Two things fall out of step (iv) that are worth naming, because they are the
-whole role of Tsukamoto's `(W̄ − I)/dt` proxy:
+**Definition.** `ρ(x) := λ_max(P(x))`, the metric scale state `x` demands under
+*this* metric choice. `ν = max_S ρ`. `ρ` is an upper bound on what `x` truly
+demands, because the CARE picks one metric rather than the best one — hence
+Criterion II's screen is evidence, not proof.
 
-* the `+νW/dt` half is a **rate penalty** — it is why the certificate must be
-  built at `λ' = λ + 1/(2dt)`, not at `λ`;
-* the `−I/dt` half is an **exact free margin**, independent of the plant and of
-  `ν`. It is why every verified residual below comes out at `−1` for `dt = 1`.
+## 3.4 Theorem 4 — proof of Criterion I
 
-**Corollary 3.1 (the guarantee).** *Pointwise λ'-stabilizability on the box is
-sufficient for CV-STEM feasibility at rate λ, with an explicit envelope, an
-explicit margin, and no search.* The envelope is an **output** of the plant, not
-an input to be tuned until something certifies.
+**Theorem 4.** *If `T : X → O(n)` satisfies `T(x)A(x)T(x)ᵀ = A₀` and
+`T(x)B(x)B(x)ᵀT(x)ᵀ = B₀B₀ᵀ`, then `λ*(x) ≡ λ*₀` and `ρ(x) ≡ λ_max(P₀)`.*
 
-**Corollary 3.2 (sandwich).** The metric scale the plant demands at `x` obeys
+*Proof.* The congruence `W̄ ↦ T(x)ᵀW̄₀T(x)` maps feasible points of `P({x₀})` to
+feasible points of `P({x})` bijectively: it leaves (C1) invariant because
+`T` is a similarity on `A` and a congruence on `BBᵀ` simultaneously, and it
+leaves (C2) invariant because **orthogonal** congruence preserves eigenvalues —
+so `I ⪯ W̄ ⪯ χI` is preserved exactly. (C3) involves no state. Hence the feasible
+`λ`-sets coincide and `λ*(x) = λ*₀`.
 
-```
-[2(Re s + λ) + ε] / (2σ(w_ub + σ/r))   ≤   ν_req(x)   ≤   λ_max(P(x))
-```
+For `ρ`: substituting `P = TᵀP₀T` into the CARE at `(A(x), B(x))` reproduces the
+`(A₀, B₀)` CARE conjugated by `T`, since `Tᵀ(qI)T = qI`. Similarity preserves the
+stabilizing property, so by uniqueness `P(x) = T(x)ᵀP₀T(x)`, whose spectrum is
+that of `P₀`. ∎
 
-the left from Corollary 2.2 and the right from Theorem 3.
+**Orthogonality is load-bearing.** A general similarity preserves (C1) but not
+(C2), so it can move `ρ` and the envelope. Criterion I is a statement about the
+metric-normalised problem, not about `(A, B)` up to arbitrary coordinates.
 
----
+## 3.5 Theorem 5 — a mechanism for Criterion II, not a criterion
 
-## 4. The taxonomy coordinate
-
-**Definition.** `ρ(x) := λ_max(P(x)) ∈ (0, ∞]`, the metric scale state `x`
-demands. By Theorem 3, `ν = max_{x∈S} ρ(x)` and `w_lb = 1/max_S ρ`; by
-Corollary 1.1 the certified rate is set by the worst state alone.
-
-| class | definition | consequence |
-|---|---|---|
-| **I** | `ρ` constant on `X` | every state equally hard; **no subset can raise λ** |
-| **II** | `ρ` non-constant on `X` | a subset dropping every argmax strictly raises λ |
-| **III** | `ρ = ∞` at some `x` (Cor 2.1) | infeasible at **every** envelope |
-
-Class membership is decided by two cheap computations — one eigen-decomposition
-plus one SVD for class III, one CARE solve per sample for I vs II.
-
----
-
-## 5. What makes `ρ` flat, and what makes it vary
-
-**Theorem 4 (class I by orthogonal gauge).** *Suppose there is
-`T : X → O(n)` with `T(x)A(x)T(x)ᵀ = A₀` and `T(x)B(x)B(x)ᵀT(x)ᵀ = B₀B₀ᵀ` for all
-`x`. Then `ρ(x) ≡ λ_max(P₀)` and `λ*(x) ≡ λ*₀`, so `X` is class I.*
-
-*Proof.* Let `P₀` be the stabilizing CARE solution for `(A₀, B₀)`. Substituting
-`P = TᵀP₀T` into the CARE for `(A(x), B(x))` and using `TᵀT = I` reproduces the
-`(A₀, B₀)` CARE conjugated by `T`, because both weights are congruence-invariant
-under orthogonal `T`: `Tᵀ(qI)T = qI`. Similarity preserves the stabilizing
-property, so by uniqueness `P(x) = T(x)ᵀP₀T(x)`, whose spectrum equals that of
-`P₀`. The same congruence `W̄ ↦ TᵀW̄₀T` maps feasible points of `P({x})` to
-feasible points bijectively and preserves (C2) exactly, since orthogonal
-congruence preserves eigenvalues. ∎
-
-*Orthogonality is load-bearing.* A general similarity preserves the LMI but not
-(C2), so it can move `ρ` and the envelope. This is why the classification is a
-statement about the *metric-normalized* problem, not about `(A, B)` up to
-arbitrary coordinates.
-
-The car satisfies Theorem 4 in yaw with `T(θ) = blockdiag(R(θ)ᵀ, I₂)`: writing
-`A = [[0₂ₓ₂, M],[0, 0]]` with `M = R(θ)·[[0, 1],[v, 0]]`, the congruence gives
-`TAT ᵀ = [[0₂ₓ₂, [[0,1],[v,0]]],[0,0]]`, free of `θ`; and `B` is supported on the
-`(yaw, vel)` block where `T` acts as the identity, so `TB = B`. Measured: `ρ`
-constant to 6 digits across yaw and across both positions.
-
-**Theorem 5 (class II by control authority).** *Suppose `A(x₁) = A(x₂)` and
-`B₁B₁ᵀ ⪰ B₂B₂ᵀ`. Then every certificate feasible at `x₂` is feasible at `x₁` with
-the same `(ν, χ)`; hence `λ*(x₁) ≥ λ*(x₂)` and `ρ(x₁) ≤ ρ(x₂)`.*
+**Theorem 5.** *If `A(x₁) = A(x₂)` and `B₁B₁ᵀ ⪰ B₂B₂ᵀ`, then every certificate
+feasible at `x₂` is feasible at `x₁` with the same `(ν, χ)`; hence
+`λ*(x₁) ≥ λ*(x₂)` and `ρ(x₁) ≤ ρ(x₂)`.*
 
 *Proof.* The left side of (C1) at `x₁` equals that at `x₂` minus
-`ν(2/r)(B₁B₁ᵀ − B₂B₂ᵀ) ⪯ 0`, so it is `⪯ −εI` whenever `x₂`'s is; (C2) and (C3)
-do not involve `B`. For `ρ`, the stabilizing CARE solution is monotone
-non-increasing in `BR⁻¹Bᵀ`, giving `P₁ ⪯ P₂` and hence `ρ(x₁) ≤ ρ(x₂)`. ∎
+`ν(2/r)(B₁B₁ᵀ − B₂B₂ᵀ) ⪯ 0`, so it is `⪯ −εI` whenever `x₂`'s is; (C2)/(C3) do
+not involve `B`. For `ρ`, the stabilizing CARE solution is monotone
+non-increasing in `BR⁻¹Bᵀ`, so `P₁ ⪯ P₂`. ∎
 
-**Corollary 5.1 (why `σ(B)` predicts and `σ(A)` does not).** Under (C1) the
-metric enters the drift term `AW̄ + W̄Aᵀ` linearly and the control term
-`−ν(2/r)BBᵀ` not at all — `W̄` is a free per-state variable, so it can absorb
+**Why this is not Criterion II.** The hypothesis `A(x₁) = A(x₂)` almost never
+holds between two states of a real plant, and the data says authority is not even
+the dominant mechanism. Spearman rank correlation between the per-state Hautus
+margin `σ(x)` and `ρ(x)`, 200 samples:
+
+| plant | `σ` spread | `ρ` spread | corr(`σ`, `ρ`) | authority-driven? |
+|---|---|---|---|---|
+| auv | 86.6 | 5 618 | **−1.000** | yes |
+| tora | 38.1 | 1 152 | **−0.993** | yes |
+| two_link_arm | 13.4 | 43.2 | −0.747 | mostly |
+| cartpole | 2.88 | 7.26 | −0.722 | mostly |
+| ball_and_beam | 7.92 | 58.6 | −0.582 | partly |
+| **segway** | **1.06** | 2.20 | **+0.169** | **no** |
+| **aircraft** | 1.87 | 3.26 | **−0.121** | **no** |
+| car / quadrotor | 1.000 | 1.000 | n/a (both constant) | n/a — class I |
+
+So segway and aircraft are class II with essentially **no** authority variation:
+their `ρ` varies through `A(x)` instead. Corollary 5.1 below is therefore a
+statement about *feasibility of the optimal metric*, not about `ρ`.
+
+**Corollary 5.1 (why `σ(B)` predicts and `σ(A)` does not, and its limit).** In
+(C1) the metric enters the drift term `AW̄ + W̄Aᵀ` linearly and the control term
+`−ν(2/r)BBᵀ` not at all. `W̄` is a free per-state variable, so it can absorb
 `A(x)` up to the invariant content Corollary 2.1 isolates, but it cannot
-manufacture authority. Theorem 5 is the monotone form of that asymmetry, and
-Theorem 4 the exact form of "absorbed".
+manufacture authority. **The limit:** this argument is about the *optimal* `W̄`.
+`ρ(x)` comes from one fixed metric (the CARE's), which does not absorb `A`, which
+is exactly why segway and aircraft show `ρ` variation with `σ` flat.
 
 ---
 
-## 6. Class membership is a property of (plant, box)
-
-**Theorem 6 (box-dependence).** *For `S' ⊆ S`, `λ*(S') ≥ λ*(S)` and
-`max_{S'} ρ ≤ max_S ρ`. Consequently a class-II plant becomes class I on any box
-where `ρ` is flat, and a class-I plant becomes class II on any box that reaches
-states of different `ρ`.*
-
-*Proof.* Immediate from Corollary 1.1: a min over a smaller set cannot be
-smaller. ∎
-
-This is not a technicality; it is the correct reading of the car:
-
-* on its shipped box `v ∈ [1, 2]`, `σ ≡ 1` and `ρ ≡ 9.536` — **class I**;
-* on any box reaching `v < 1`, `σ = v` and `ρ ∝ 1/v²` — **class II**, by
-  Corollary 2.2 with the measured table of §2;
-* at `v = 0` exactly, `f ≡ 0` and the plant *is* the driftless turtlebot —
-  **class III**, by Corollary 2.1.
-
-One plant, three classes, selected by the box. So "the car is class I" is only
-ever shorthand for "the car on `v ∈ [1,2]` is class I", and the same caution
-applies to every row of the table below.
-
----
-
-## 7. Measured: every classic env
-
-`λ = 0.3`, `r = 1.6`, `cm_dt = 1.0`, `q = 1`, `N = 200` uniform box samples,
-seed 0. `--verify` re-evaluates the repo's exact (C1) expression at the
-constructed certificate; all feasible rows pass.
-
-```
-python scripts/feasibility_certificate.py --all --lbd 0.3 --verify -n 200
-```
-
-| env | class | Hautus margin | `ν` (Thm 3) | `w_lb` | `w_ub` | `ρ` spread | ‖K‖max |
-|---|---|---|---|---|---|---|---|
-| car | **I** | 1.000 | 9.536 | 1.049e-01 | 9.525e-01 | 1.0000 | 2.86 |
-| quadrotor | **I** | 1.000 | 55.53 | 1.801e-02 | 5.153e+00 | 1.0000 | 7.27 |
-| aircraft | II | 9.76e-02 | 2 196 | 4.553e-04 | 2.633e+01 | 3.26 | 32.9 |
-| segway | II | 1.47e-01 | 758.8 | 1.318e-03 | 8.952e+00 | 2.20 | 31.0 |
-| cartpole | II | 1.94e-01 | 573.3 | 1.744e-03 | 8.264e-01 | 7.26 | 27.1 |
-| two_link_arm | II | 1.24e-01 | 424.8 | 2.354e-03 | 1.984e+01 | 43.2 | 29.6 |
-| ball_and_beam | II | 3.22e-01 | 388.5 | 2.574e-03 | 5.524e+01 | 58.6 | 26.4 |
-| auv | II | 6.66e-03 | 8.57e+04 | 1.167e-05 | 3.709e-01 | 5 618 | 251 |
-| tora | II | 9.71e-03 | 3.26e+05 | 3.070e-06 | 7.978e-01 | 1 152 | 448 |
-| **pvtol** | **III** | 1.05e-19 | ∞ | — | — | — | — |
-| **turtlebot** | **III** | 0.00e+00 | ∞ | — | — | — | — |
-
-**Answer to "are these environments contraction-feasible, guaranteed?"** — 9 of
-11, yes, with the envelope in the table and a verified LMI margin of
-`q·w_lb + 1/dt`. The two exceptions are not tuning failures and cannot be fixed
-by any envelope, `r`, `dt` or `λ`: both have an uncontrollable mode at `s = 0`
-(Corollary 2.1). turtlebot's margin is exactly zero because `f ≡ 0` makes
-`A ≡ 0`; pvtol's `1e-19` is a numerically-zero nilpotent block, matching the
-independently-extracted `A₂₂` with `eig = {0,0}` in
-`cvstem_feasibility_theory.md` §1.3. For both, the fix is a method that sees Lie
-brackets — `cmg_method: ccm` — not a different envelope.
-
-The Hautus margin orders the whole table: class I sits at 1.0, class II between
-`7e-3` and `3e-1`, class III at 0. It costs one eigendecomposition and one SVD
-per sample and needs no SDP, which makes it the cheapest classifier available.
-
-**The classes are stable in λ.** Re-running at `λ = 1.0` reproduces the
-assignment exactly, env for env; only `ν` moves, and upward, as Corollary 2.2
-requires (car 9.5 → 31.3, cartpole 573 → 4 452, tora 3.3e5 → 7.0e6). The Hautus
-margins are unchanged to three digits, since raising λ only widens the set of
-eigenvalues tested.
-
-**Reconciliation with `find_uniform_lambda`'s "segway INFEASIBLE".** At `λ = 0.3`
-segway needs `w_lb = 1.318e-3`, which *fits* the shipped envelope `[1e-3, 1e3]`;
-at `λ = 1.0` it needs `3.5e-4`, which does not. So segway is contraction-feasible
-at the shipped envelope for small enough λ, and the repo's INFEASIBLE verdict
-comes from the *actuator* branch driving `r` up until `ν` hits its cap — exactly
-the mechanism `subset_lambda_procedure.md` §8d describes. The two results do not
-conflict; they answer different questions, which is why the control box is kept
-out of this document.
-
----
-
-## 8. What is not claimed
+# 4. What is not claimed
 
 * **Sampled, not box-wide.** Every statement is over the finite `S`. Extending to
-  all of `X` needs the covering argument of `subset_lambda_procedure.md` §7: an
-  `ε` margin buys radius `ε/L` for an `L`-Lipschitz `x ↦ S(x)`. Theorem 3's
-  margin `q·w_lb + 1/dt` is what feeds that argument, but the Lipschitz constant
+  all of `X` needs the covering argument of `subset_lambda_procedure.md` §7 —
+  Theorem 3's margin `q·w_lb + 1/dt` is what feeds it, but the Lipschitz constant
   is not computed here.
 * **Feasibility, not performance.** `λ*` is a certified rate, not a measured AUC.
-  Theorem 3 chooses a *particular* metric (the CARE one); it certifies but does
-  not optimize, so its `ν` is an upper bound on what the SDP would find — the
-  gap is 20× on the car (9.54 against a Corollary-2.2 floor of 0.49).
-* **Invariance is still owed for subset claims.** `λ*(S')` certifies contraction
-  while the trajectory stays in `S'`. Theorem 6 says shrinking the box raises the
-  rate; it says nothing about whether the closed loop remains in the smaller box.
-* **The control box is out of scope by construction.** A plant with `ν = 3e5`
-  (tora) is contraction-feasible in exactly the same sense as one with `ν = 9.5`
-  (car). Whether its gain fits an actuator is a separate question, answered by
-  `find_uniform_lambda.py`, and it is deliberately not allowed to influence any
-  class here.
+  Theorem 3 certifies with a *particular* metric, so its `ν` is an upper bound on
+  what the SDP would find — 20× on the car (9.54 against a Corollary-2.2 floor of
+  0.49).
+* **Criterion II has no cheap rigorous form here.** The screen is evidence; the
+  Corollary-2.2 certificate fired on 1 of 9 plants. Tightening that bound so it
+  decides class II without an SDP is open.
+* **Subset claims still owe an invariance argument.** `λ*(S')` certifies
+  contraction *while the trajectory stays in `S'`*. The Remark in §3.1 says
+  shrinking the box raises the rate; it says nothing about staying inside it.
+* **The control box is out of scope by construction.** A plant needing `ν = 3e5`
+  (tora) is contraction-feasible in the same sense as one needing `9.5` (car).
+  Whether the gain fits an actuator is a separate question, answered by
+  `find_uniform_lambda.py`, and deliberately not allowed to influence any class.
