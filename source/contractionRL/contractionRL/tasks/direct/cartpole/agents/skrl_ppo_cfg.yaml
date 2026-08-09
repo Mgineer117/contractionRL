@@ -65,6 +65,13 @@ agent:
     final_log_std: -4.6
     power: 2.0
   use_state_norm: false
+  # OFF, measured 2026-08-08. Turning these ON to tame the Mahalanobis
+  # reward was REFUTED by the 4-gamma x 20-seed grid: paired on gamma AND
+  # seed (n=38), normalization was WORSE in 26/38 (median AUC +0.215), and
+  # every auc>8 outlier in the whole grid was a normalized run (4/53 vs
+  # 0/44). r/std keeps rescaling as the frozen-CMG reward drifts, and the
+  # value preprocessor's +-5 sigma clamp truncates exactly the large-error
+  # states the metric exists to weight.
   use_value_norm: false
 trainer:
   class: SequentialTrainer

@@ -82,14 +82,15 @@ agent:
   time_limit_bootstrap: true  # Bootstrap value at episode truncation instead of treating it as terminal
   rewards_shaper_scale: 1.0
   use_state_norm: false  # OFF by default — see c2rl.py module docstring / rl_glue.make_base_rl_cfg
-  # ON since 2026-08-07: the Mahalanobis reward is the UNNORMALIZED quadratic
-  # decrement e'Me - e''M'e'', so one diverging episode drove the raw return to
-  # -289 and the value loss from 1e-6 to 6e3 (cartpole g=0.9 seed 16) — a critic
-  # at lr 1e-5 cannot fit targets spanning that range, and it never recovered.
-  # reward_norm tames the w_lb/w_ub-dependent scale BEFORE GAE; value_norm bounds
-  # what the critic has to represent. Both are needed: see preprocessors.py.
-  use_value_norm: true    # Same, but for the value function's output (PPO only)
-  use_reward_norm: true   # Non-biasing running-std reward normalizer (r/std, no centering) — tames the
+  # OFF, measured 2026-08-08. Turning these ON to tame the Mahalanobis
+  # reward was REFUTED by the 4-gamma x 20-seed grid: paired on gamma AND
+  # seed (n=38), normalization was WORSE in 26/38 (median AUC +0.215), and
+  # every auc>8 outlier in the whole grid was a normalized run (4/53 vs
+  # 0/44). r/std keeps rescaling as the frozen-CMG reward drifts, and the
+  # value preprocessor's +-5 sigma clamp truncates exactly the large-error
+  # states the metric exists to weight.
+  use_value_norm: false    # Same, but for the value function's output (PPO only)
+  use_reward_norm: false   # Non-biasing running-std reward normalizer (r/std, no centering) — tames the
                          # w_lb/w_ub-dependent Mahalanobis-reward scale/heavy-tail before GAE; see rl_glue.
 
   # ── CAPS action smoothness (Mysore et al. 2021) ─────────────────────────── #

@@ -19,5 +19,6 @@ from . import two_link_arm  # noqa: F401  registers classic-two_link_arm-v0
 from . import aircraft  # noqa: F401  registers classic-aircraft-v0
 from . import auv  # noqa: F401  registers classic-auv-v0
 from . import pvtol  # noqa: F401  registers classic-pvtol-v0
+from . import tora  # noqa: F401  registers classic-tora-v0
 
-__all__ = ["car", "cartpole", "turtlebot", "segway", "quadrotor", "ball_and_beam", "two_link_arm", "aircraft", "auv", "pvtol"]
+__all__ = ["car", "cartpole", "turtlebot", "segway", "quadrotor", "ball_and_beam", "two_link_arm", "aircraft", "auv", "pvtol", "tora"]

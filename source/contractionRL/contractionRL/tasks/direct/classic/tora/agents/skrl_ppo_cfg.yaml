@@ -52,7 +52,7 @@ agent:
   value_loss_scale: 0.5
   kl_threshold: 0.02
   experiment:
-    directory: two_link_arm_ppo
+    directory: tora_ppo
     experiment_name: ''
     write_interval: "auto"  # Logging frequency for tensorboard/W&B (in epochs/steps)
     checkpoint_interval: auto
