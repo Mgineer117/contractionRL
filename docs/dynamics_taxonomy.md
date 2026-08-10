@@ -53,7 +53,7 @@ give a constructive Riccati certificate that returns feasibility together with t
 metric envelope the plant demands, replacing SDP search (Proposition 5); and we
 classify dynamics by whether `λ*(x)` is constant or varies over the operating box,
 isolating which states bind the certificate and what a nearly-uncontrollable mode
-costs the shared metric scale (Corollary 4.2). The question is thus **diagnostic
+costs the shared metric scale (Corollary 3). The question is thus **diagnostic
 rather than prescriptive** — not "what rate shall we impose?" but "does this plant
 admit a uniform rate at all, and if not, why not?"
 
@@ -72,16 +72,23 @@ admit a uniform rate at all, and if not, why not?"
 
 # 1. The taxonomy
 
-**Definition 1 (the three classes).** *A plant on a box `X`, at fixed
-`(λ, ε, dt, r, w_lb, w_ub)`, is*
+**Definition 1 (the three classes).** *A plant on a box `X` is*
 
 ```
-class I    if  P({x}) is infeasible at some x ∈ X, for every ν, χ, r, dt, envelope
-class II   if  it is not class I and λ*(x) is CONSTANT on X
-class III  if  it is not class I and λ*(x) is NON-CONSTANT on X
+class I    at rate λ, if  P({x}) is infeasible at some x ∈ X
+                          for EVERY (ν, χ, r, dt, w_lb, w_ub)
+class II   at (ε, dt, r, w_lb, w_ub), if it is not class I and λ*(x) is CONSTANT on X
+class III  at (ε, dt, r, w_lb, w_ub), if it is not class I and λ*(x) is NON-CONSTANT on X
 ```
 
 *The three are mutually exclusive and exhaustive by construction.*
+
+**Note the two different quantifications, which is not an oversight.** Class I is
+a statement *at a rate `λ`* and *robust to every envelope* — nothing can be
+bought by retuning. Classes II/III are statements *at a fixed envelope* and carry
+no `λ`, because `λ*(x)` is itself a supremum over `λ`. Writing both under one
+"fixed `(λ, ε, dt, r, w_lb, w_ub)`" would be a contradiction: class I quantifies
+over exactly the parameters such a preamble fixes.
 
 All three are properties of the **program** `P` — hence of the pair
 (plant, box) *and* of the modelling choice `A = ∂f/∂x` that `P` is fed. §4 draws
@@ -109,7 +116,7 @@ rank[ A(x) − sI ,  B(x) ] < n     for some s with Re s ≥ −λ
 state-feedback synthesis LMI in disguise, and no such condition is satisfiable
 for an unstabilizable pair; demanding a prescribed decay rate `λ` rather than
 mere stability is the substitution `A ↦ A + λI`, the classical `α`-shift of LQR
-(Anderson & Moore). Corollary 4.1 rederives it from this document's quantitative
+(Anderson & Moore). Corollary 2 rederives it from this document's quantitative
 inequality, purely as a consistency check. ∎
 
 Class I is therefore a name for *"not λ-stabilizable somewhere on the box,
@@ -128,7 +135,7 @@ What is worth adding is only how to **evaluate** the test:
 * **Use `σ_min`, not `rank`.** The usable form is
   `σ_min([A(x) − sI, B(x)]) = 0`: rank is discontinuous in the data and its
   tolerance is arbitrary, while `σ_min` degrades smoothly and doubles as the
-  quantitative margin of Corollary 4.2.
+  quantitative margin of Corollary 3.
 * **Use the SVD, never eigenvectors.** A defective `A` (pvtol's uncontrollable
   block is nilpotent) returns a near-parallel eigenbasis, and modal authority
   read off it is meaningless — measured, that route reported `1e-2` where the
@@ -144,7 +151,7 @@ T(x) A(x) T(x)ᵀ = A₀     and     T(x) B(x)B(x)ᵀ T(x)ᵀ = B₀B₀ᵀ     
 ```
 
 *for a single pair `(A₀, B₀)`. Then `λ*(x) ≡ λ*₀` on `X`, so the plant is class II
-(given it is not class I), and by Corollary 3.1 no subset of `X` certifies a
+(given it is not class I), and by Corollary 1 no subset of `X` certifies a
 faster rate.*
 
 *Proof.* Fix `x` and let `T = T(x)`. The map `W̄ ↦ TᵀW̄T` sends feasible points of
@@ -188,10 +195,12 @@ Class III is the default: not class I, and `λ*` not constant. There is **no**
 proven structural condition for it here. What there *is* — and this is the cheap
 thing to look at — is a screen that reads straight off `B(x)`:
 
-> **Screen.** Compute the singular values of `B(x)` over the box. If they
-> **vary**, the plant is class III. If they are **constant**, class II is
-> *suspected* but NOT implied — see "Constant `B` does not give a constant rate"
-> below.
+> **Screen (empirical, both directions).** Compute the singular values of `B(x)`
+> over the box. If they **vary**, class III is *indicated*. If they are
+> **constant**, class II is *suspected*. **Neither direction is proved**: the
+> constant direction is outright false (see "Constant `B` does not give a
+> constant rate" below), and the varying direction is an observation on nine
+> plants with no proof offered here.
 
 One SVD per sample, no CARE and no SDP. Measured against the exact per-state
 `λ*(x)` (one-sample SDPs), it separates all nine feasible plants:
@@ -207,6 +216,13 @@ One SVD per sample, no CARE and no SDP. Measured against the exact per-state
 | two_link_arm | III | 5.035 | 1.927 |
 | aircraft | III | 16.936 | 2.400 |
 | auv | III | 42.214 | 5.184 |
+
+(two_link_arm is omitted from this table only: its `sv(B)` spread is `5.035` and
+its exact `λ*` spread `1.927`, both consistent with the rest. It appears in every
+other table. **The `sv(B)` column here is a different draw from §2.3's** — 40
+samples against 200 — so the two differ in the third digit, e.g. auv `42.214` vs
+`41.433`. Nothing in either argument turns on the digit; the separation from
+`1.000` is three orders of magnitude wider than the draw-to-draw spread.)
 
 Exactly `1.000` for both class-II plants — whose `B` is in fact literally
 constant — and `> 1` for all seven class-III plants, the tightest margin being
@@ -314,8 +330,17 @@ comparable to the true spread instead of being off by orders of magnitude:
 | cartpole | 2.092 | **2.81** | 7.26 |
 | ball_and_beam | 1.373 | 3.69 | 58.6 |
 | aircraft | 2.400 | **10.0** | 3.26 |
+| two_link_arm | 1.927 | 15.3 | 43.2 |
 | tora | 3.652 | 125 | 1 152 |
 | auv | 5.184 | **30.3** | 5 618 |
+
+`λ_C` gets the **class** right on all nine and the spread's **magnitude** right
+on the five in bold; on ball_and_beam, two_link_arm and tora it overshoots by
+3–34×. That is not a contradiction: `λ_C(x) ≤ λ*(x)` holds *pointwise*, and a
+pointwise lower bound constrains neither the ratio `max λ_C / min λ_C` nor its
+relation to `max λ* / min λ*`. So use `λ_C` for the yes/no and, when the
+overshoot is loose, for an order of magnitude — never as a substitute for the
+per-state SDP when the size of the spread is the claim.
 
 **Failed — the identity-metric probe.** Setting `W̄ = I` makes the proxy term
 `(W̄ − I)/dt` vanish *exactly*, giving the closed form
@@ -353,7 +378,7 @@ plants whose `A` varies, which is all of them.
 ```
 σ_min([A−sI, B]) = 0 somewhere, Re s ≥ −λ ?  ──yes──>  class I    (infeasible, any envelope)
                     │no
-sv(B(x)) varies over the box ?               ──yes──>  class III  (subsets buy rate)
+sv(B(x)) varies over the box ?               ──yes──>  class III INDICATED (not proved)
                     │no
                           SUSPECT class II -- verify, do not conclude
 ```
@@ -412,7 +437,7 @@ drift Jacobian discards (pvtol 39×, turtlebot everything).
   `8.6e4` and its `w_lb` `1.2e-5`.
 * **The classes are stable in λ.** Re-running at `λ = 1.0` reproduces every
   assignment; only `ν` moves, upward (car 9.5 → 31.3, cartpole 573 → 4 452,
-  tora 3.3e5 → 7.0e6), as Corollary 4.2 requires.
+  tora 3.3e5 → 7.0e6), as Corollary 3 requires.
 
 ## 2.2 Class membership belongs to (plant, box)
 
@@ -425,11 +450,11 @@ orthogonal rows of norms `1, v, 1, 1`, so `σ = min(1, v)`. Against
 | `σ = min(1,v)` | 0.01 | 0.1 | 1 | 1 | 1 | 1 | 1 |
 | `ρ(v)` | 60542.7 | 608.75 | 9.536 | 9.536 | 9.536 | 9.536 | 39.15 |
 
-`ρ` rises 99.5× per decade of `v` below 1 — Corollary 4.2's `1/σ²` branch, to
+`ρ` rises 99.5× per decade of `v` below 1 — Corollary 3's `1/σ²` branch, to
 0.5% — and is flat wherever `σ` is. So the shipped box `v ∈ [1,2]` is class II,
 any box reaching `v < 1` is class III, and `v = 0` (where `f ≡ 0`, the turtlebot)
 is class I. One plant, three classes, selected by the box. (`ρ` climbs again at
-`v = 1000` with `σ` unmoved: Corollary 4.2 is a lower bound driven by weak
+`v = 1000` with `σ` unmoved: Corollary 3 is a lower bound driven by weak
 authority, and does not capture growth driven by `‖A‖`.)
 
 ## 2.3 Why the obvious proof of the class-III screen fails
@@ -474,7 +499,7 @@ Two consequences, both corrections to earlier drafts of this document:
 | result | what breaks without it |
 |---|---|
 | **Proposition 3** (decoupling) | Definition 1 and Propositions 1–2 are statements about *one state*. Without decoupling they say nothing about `P(S)`, the program actually solved. This is what turns "`λ*` is constant" into "**no subset** can raise λ". |
-| **Proposition 4** (quantitative Hautus) | Class I itself is the Hautus lemma, cited. Prop 4 earns its place only for Corollary 4.2 — the `ν ≳ 1/σ²` price of a *nearly* uncontrollable mode, which a yes/no rank test cannot give. |
+| **Proposition 4** (quantitative Hautus) | Class I itself is the Hautus lemma, cited. Prop 4 earns its place only for Corollary 3 — the `ν ≳ 1/σ²` price of a *nearly* uncontrollable mode, which a yes/no rank test cannot give. |
 | **Proposition 5** (CARE) | `ρ(x)` is not known to be finite or computable, so the cheap class-III evidence test does not exist — and this *is* the feasibility guarantee. |
 | Proposition 6 | one *mechanism* behind class III. Not a sufficient condition — see §3.5. |
 
@@ -494,7 +519,7 @@ constraints. (⟸) Let `(W̄ₖ, νₖ, χₖ)` be feasible for `{xₖ}`. Each
 common `ν = 1/w_lb`, `χ = w_ub/w_lb`. That collection is a feasible point of
 `P(S)`. ∎
 
-**Corollary 3.1.** `λ*(S) = min_k λ*(xₖ)`.
+**Corollary 1.** `λ*(S) = min_k λ*(xₖ)`.
 
 *Proof.* Feasibility is downward-closed in `λ`, since `λ` enters (C1) only via
 `+2λW̄ₖ` with `W̄ₖ ⪰ I ≻ 0`. By Proposition 3 the feasible `λ`-set of `P(S)` is the
@@ -509,7 +534,7 @@ belongs to (plant, box)".
 worst state's demand", never an extra cost on top. This corrects
 `subset_lambda_procedure.md` §8c, which attributed segway's joint/pointwise gap
 to "the cost of one shared ν/χ": that gap was measured across *different draws*
-(N=100 joint against a separate N=40 pointwise), which Corollary 3.1 does not
+(N=100 joint against a separate N=40 pointwise), which Corollary 1 does not
 govern. On one draw, both sides at `w=[1e-3,1e3]`, `ε=0.1`, N=8, tol 0.5%:
 
 | plant | `λ*(S)` joint | `min_k λ*(xₖ)` | gap |
@@ -550,7 +575,7 @@ by `‖W̄‖ ≤ χ`. Collect the `β` terms with `c := 1/dt + 2Re(s) + 2λ`:
 `Re s + λ > 0` gives `c > 0`, so `β ≥ 1` implies `c ≤ βc`. Substituting `c` and
 cancelling `1/dt` — the `dt` terms drop out exactly — gives (★). ∎
 
-**Corollary 4.1 (the Hautus test, recovered).** *If `σ_min([A(x) − sI, B(x)]) = 0`
+**Corollary 2 (the Hautus test, recovered).** *If `σ_min([A(x) − sI, B(x)]) = 0`
 for some `Re s ≥ −λ`, then `P({x})` is infeasible for every
 `(ν, χ, r, dt, w_lb, w_ub)` whenever `ε > 0`.*
 
@@ -559,16 +584,21 @@ singular vector for the zero singular value, so `w*[A − sI, B] = 0`, i.e. `δ 
 and `Bᵀw = 0`; then (★) reads `2(Re s + λ) + ε ≤ 0`, contradicting `Re s ≥ −λ`
 with `ε > 0`.
 
-**Corollary 4.2 (the price of a weak mode).** *With `σ := σ_min([A − sI, B])` at
+**Corollary 3 (the price of a weak mode).** *With `σ := σ_min([A − sI, B])` at
 some `Re s ≥ −λ`,*
 
 ```
-ν  ≥  [2(Re s + λ) + ε] / (2σ·(w_ub + σ/r))        and, at fixed χ,
-ν  ≥  r·[2(Re s + λ) + ε] / (2σ²)
+ν  ≥  [2(Re s + λ) + ε] / (2σ·(w_ub + σ/r))              and, at fixed χ,
+ν  ≥  r·[2(Re s + λ) + ε − 2σχ] / (2σ²)   =   r·[2(Re s + λ) + ε]/(2σ²)  −  rχ/σ
 ```
 
 *Proof.* Apply (★) at the left singular vector, where `‖δ‖ ≤ σ` and
 `w*BBᵀw ≤ σ²`, then substitute `χ ≤ ν·w_ub` (first) or hold `χ` fixed (second). ∎
+
+**The `−rχ/σ` term must be kept**, not dropped: dropping it would *strengthen*
+the bound, which (★) does not license. It is `O(1/σ)` against an `O(1/σ²)`
+leading term, so it changes nothing asymptotically — the growth rate as `σ → 0`
+is `ν ≳ r[2(Re s + λ) + ε]/(2σ²)`, and that is the form §2.2 measures at 0.5%.
 
 Since Proposition 3 saturates `ν = 1/w_lb` and `ν` is shared, a small `σ` at
 **one** state raises the gain bound `‖K‖ ≤ ‖B‖/(r·w_lb)` at **every** state.
@@ -634,7 +664,8 @@ feasible at `x₂` is feasible at `x₁` with the same `(ν, χ)`; hence
 *Proof.* The left side of (C1) at `x₁` equals that at `x₂` minus
 `ν(2/r)(B₁B₁ᵀ − B₂B₂ᵀ) ⪯ 0`, so it is `⪯ −εI` whenever `x₂`'s is; (C2)/(C3) do
 not involve `B`. For `ρ`, the stabilizing CARE solution is monotone
-non-increasing in `BR⁻¹Bᵀ`, so `P₁ ⪯ P₂`. ∎
+non-increasing in `BR⁻¹Bᵀ` — the standard Riccati comparison theorem, at equal
+`A` and `Q` — so `P₁ ⪯ P₂`. ∎
 
 **Why this is not a condition for class III.** The hypothesis `A(x₁) = A(x₂)`
 almost never holds between two states of a real plant, and authority is not even
@@ -655,10 +686,10 @@ margin `σ(x)` and `ρ(x)`, 200 samples:
 Segway and aircraft are class III with essentially **no** authority variation:
 their `ρ` varies through `A(x)` instead.
 
-**Remark 6.1 (why `sv(B)` predicts, and where the argument stops).** In (C1) the
+**Remark 1 (why `sv(B)` predicts, and where the argument stops).** In (C1) the
 metric enters the drift term `AW̄ + W̄Aᵀ` linearly and the control term
 `−ν(2/r)BBᵀ` not at all. `W̄` is a free per-state variable, so it can absorb
-`A(x)` up to the invariant content Corollary 4.1 isolates, but it cannot
+`A(x)` up to the invariant content Corollary 2 isolates, but it cannot
 manufacture authority. **The stop:** this argument is about the *optimal* `W̄`.
 `ρ(x)` comes from one fixed metric, which does not absorb `A` — which is exactly
 why segway and aircraft show `ρ` variation with `σ` flat, and why the §1.3 screen
