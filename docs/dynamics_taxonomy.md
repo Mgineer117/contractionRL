@@ -162,6 +162,32 @@ constant — and `> 1` for all seven class-III plants, the tightest margin being
 tora at `1.062`. (pvtol and turtlebot also have constant `sv(B)`, but Proposition
 1 catches them first: their `B` rotates without changing its singular values.)
 
+### Why `sv(B)` and not the simpler "`B` is state-dependent"
+
+On these nine plants the two are equivalent — both class-II plants have a
+literally constant `B` — so nothing is lost here by saying the simpler thing. But
+the simpler statement is **false in general**, and its counterexample is exactly
+the case Proposition 2 was written for: a `B` that **rotates**.
+
+If `B(x) = R(x)B₀` with `R(x)` orthogonal, then `B(x)` is genuinely
+state-dependent while `B(x)B(x)ᵀ = R B₀B₀ᵀ Rᵀ` has constant singular values, and
+whenever that rotation extends to a gauge for `A` too, Proposition 2 gives
+`λ*` constant — class II. Minimal instance, `f ≡ 0` on `R²` with `B(x) = R(x₁)`:
+
+```
+A ≡ 0,  B(x)B(x)ᵀ ≡ I    ⟹   Proposition 2 applies with T ≡ I
+measured:  max|B(0) − B(π)| = 2.0000   (B really does vary)
+           ρ(x) = 1.739818167          identical to 12 digits
+```
+
+The shape is not exotic and occurs in this repo: **pvtol**'s `B` depends on roll
+and **turtlebot**'s on yaw, and both have `sv(B)` spread exactly `1.000`. They do
+not settle the question only because Proposition 1 classifies them first, as
+class I.
+
+So `sv(B)` is the right quantity: same cost, it is the orthogonally-invariant
+part of `B`, and it has no rotation counterexample.
+
 **Status: empirical, not proved**, and two limits are already visible.
 
 * **It orders nothing.** ball_and_beam has the third-largest `sv(B)` spread
