@@ -144,27 +144,6 @@ _ov.add_argument("--value_loss_scale", "--value-loss-scale", type=float, default
 # c2rl.C2RLPPOCfg.cvstem_residual_base / nn_modules.CVSTEMLQRBase).
 _ov.add_argument("--cvstem_residual_base", "--cvstem-residual-base",
                  dest="cvstem_residual_base", action="store_true", default=None)
-# C2RL only: contraction-pretrain π before PPO (Cu≺0 vs the frozen CMG, NOT
-# cvstem-lqr) so u = uref + π starts stabilizing — see C2RLPPOCfg.
-_ov.add_argument("--residual_contraction_pretrain", "--residual-contraction-pretrain",
-                 dest="residual_contraction_pretrain", action="store_true", default=None)
-_ov.add_argument("--residual_pretrain_epochs", "--residual-pretrain-epochs",
-                 dest="residual_pretrain_epochs", type=int, default=None)
-_ov.add_argument("--residual_pretrain_batch", "--residual-pretrain-batch",
-                 dest="residual_pretrain_batch", type=int, default=None)
-# C2RL only: pretrain OBJECTIVE — "contraction" (default, Cu⮠ SDP violation vs
-# frozen CMG) or "cvstemlqr" (supervised MSE regression of u=uref+π onto the
-# analytic CV-STEM-LQR control law; base is NOT attached, deployed law stays
-# u=uref+π). See C2RLPPOCfg.residual_pretrain_method.
-_ov.add_argument("--residual_pretrain_method", "--residual-pretrain-method",
-                 dest="residual_pretrain_method", type=str, default=None,
-                 choices=["contraction", "cvstemlqr"])
-# C2RL only: clamp the "cvstemlqr" pretrain TARGET to the actuator box env_base.step
-# actually applies (2*UREF). Unclamped, the r=0.01 CV-STEM-LQR law is ~2.7x outside
-# that box on most samples, which pretrains the policy straight into saturation —
-# see C2RLPPOCfg.residual_pretrain_clamp_target.
-_ov.add_argument("--residual_pretrain_clamp_target", "--residual-pretrain-clamp-target",
-                 dest="residual_pretrain_clamp_target", action="store_true", default=None)
 # C2RL only: after the trained eval, ALSO evaluate with the residual bypassed
 # (= pure CV-STEM-LQR base) on the IDENTICAL frozen CMG — a controlled base-vs-
 # residual comparison free of CMG-regression nondeterminism. See models.CLActorModel.
@@ -196,10 +175,9 @@ _ov.add_argument("--residual_anchor_scale", "--residual-anchor-scale",
 # _ov.add_argument("--hard_control_lbd", "--hard-control-lbd",
 #                  dest="hard_control_lbd", type=float, default=None)
 # Phase-0 single-update-collapse diagnostics/ablations — see
-# C2RLPPOCfg.residual_pretrain_init_log_std / pretrain_critic_steps /
-# disable_advantage_norm docstrings.
-_ov.add_argument("--residual_pretrain_init_log_std", "--residual-pretrain-init-log-std",
-                 dest="residual_pretrain_init_log_std", type=float, default=None)
+# C2RLPPOCfg.pretrain_critic_steps / disable_advantage_norm docstrings.
+# These pretrain the CRITIC, which is unrelated to the removed policy-pretraining
+# (residual_contraction_pretrain / residual_pretrain_*) and is kept.
 _ov.add_argument("--pretrain_critic_steps", "--pretrain-critic-steps",
                  dest="pretrain_critic_steps", type=int, default=None)
 _ov.add_argument("--pretrain_critic_epochs", "--pretrain-critic-epochs",
@@ -448,16 +426,6 @@ def _apply_agent_overrides(agent_cfg, args):
         agent_cfg["memory"]["memory_size"] = args.memory_size
     if getattr(args, "cvstem_residual_base", None):
         a["cvstem_residual_base"] = True
-    if getattr(args, "residual_contraction_pretrain", None):
-        a["residual_contraction_pretrain"] = True
-    if getattr(args, "residual_pretrain_epochs", None) is not None:
-        a["residual_pretrain_epochs"] = args.residual_pretrain_epochs
-    if getattr(args, "residual_pretrain_batch", None) is not None:
-        a["residual_pretrain_batch"] = args.residual_pretrain_batch
-    if getattr(args, "residual_pretrain_method", None):
-        a["residual_pretrain_method"] = args.residual_pretrain_method
-    if getattr(args, "residual_pretrain_clamp_target", None):
-        a["residual_pretrain_clamp_target"] = True
     # Encoder settings are MODEL kwargs (models.policy.* / models.critic.*), not
     # agent-config keys — contraction_runner passes those blocks through verbatim
     # as model kwargs. setdefault, never assignment: a wandb sweep parameter under
@@ -487,8 +455,6 @@ def _apply_agent_overrides(agent_cfg, args):
     #     a["hard_control_rho"] = args.hard_control_rho
     # if getattr(args, "hard_control_lbd", None) is not None:
     #     a["hard_control_lbd"] = args.hard_control_lbd
-    if getattr(args, "residual_pretrain_init_log_std", None) is not None:
-        a["residual_pretrain_init_log_std"] = args.residual_pretrain_init_log_std
     if getattr(args, "pretrain_critic_steps", None) is not None:
         a["pretrain_critic_steps"] = args.pretrain_critic_steps
     if getattr(args, "pretrain_critic_epochs", None) is not None:
