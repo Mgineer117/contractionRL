@@ -68,7 +68,6 @@ Classic envs use analytical ``get_f_and_B`` and skip pretraining.
 from __future__ import annotations
 
 import copy
-import math
 import os
 import sys
 from collections.abc import Callable
@@ -290,6 +289,14 @@ class C2RLPPOCfg(AgentCfg):
     # caching at all (there's no offline dynamics file to derive a path from).
     # "cvstem" method only.
     cm_data_path: str = ""
+    # Solve the {x -> W*(x)} dataset inline when cm_data_path names one that does
+    # not exist, instead of raising. OFF by default, and that default matters: for
+    # a gamma/seed grid every run shares one cache key, so an automatic build
+    # would have every worker pay the same ~14-minute solve and race to write the
+    # same file. Turn it ON only for sweeps that SEARCH the cm.* axes -- those
+    # axes ARE the cache key, so each trial needs its own dataset and
+    # pre-building the space bayes will sample is not possible.
+    cm_build_if_missing: bool = False
     # ── Offline CMG synthesis (Phase A, always runs before Phase B) ─────────── #
     # Sample cmg_memory_size states — uniformly from the classic env's analytic
     # state space (get_rollout) or, when dynamics_pretrain_data_path is set,
@@ -411,6 +418,14 @@ class C2RLSACCfg(AgentCfg):
     max_lambda_reductions: int = 5  # see ncm_synthesis._solve_cm_metric_with_backoff
     min_feasibility_rate: float = 0.0
     cm_data_path: str = ""
+    # Solve the {x -> W*(x)} dataset inline when cm_data_path names one that does
+    # not exist, instead of raising. OFF by default, and that default matters: for
+    # a gamma/seed grid every run shares one cache key, so an automatic build
+    # would have every worker pay the same ~14-minute solve and race to write the
+    # same file. Turn it ON only for sweeps that SEARCH the cm.* axes -- those
+    # axes ARE the cache key, so each trial needs its own dataset and
+    # pre-building the space bayes will sample is not possible.
+    cm_build_if_missing: bool = False
     # ── Offline CMG synthesis (Phase A, always runs before Phase B) ─────────── #
     cmg_memory_size: int = 8192
     cmg_regress_epochs: int = 1000
@@ -1270,6 +1285,70 @@ class C2RLAgent(Agent):
             "regress_mse": info["final_loss"],
         }
 
+    def _build_cm_dataset_inline(self, cache_path, cache_kwargs) -> None:
+        """Solve and save the ``{x -> W*(x)}`` dataset this config asks for.
+
+        Same code path as ``scripts/build_cm_dataset.py`` -- deliberately, since
+        the destination and the cache key both come from ``cm_dataset_target()``
+        and computing either one twice is how a generator silently produces a file
+        the consumer then key-misses.
+
+        Written to a UNIQUE temp name and then atomically renamed, because two
+        sweep trials can sample the same cm.* point concurrently. Without that,
+        one worker reads a half-written npz. ``os.replace`` is atomic within a
+        filesystem, so the loser of the race just overwrites with identical
+        content.
+        """
+        import os
+        import tempfile
+
+        from .ncm_synthesis import build_cm_dataset, sample_state_box, save_cm_dataset
+
+        cfg = self._cfg
+        env = getattr(self, "_env", None) or getattr(self, "env", None)
+        base = getattr(env, "unwrapped", env)
+        if base is None or not hasattr(base, "get_f_and_B"):
+            raise RuntimeError(
+                "[C2RL] cm_build_if_missing needs an env exposing get_f_and_B and "
+                f"X_MIN/X_MAX; got {type(base).__name__}. Pre-build with "
+                "scripts/build_cm_dataset.py instead."
+            )
+        print(f"[C2RL] cm_build_if_missing: no dataset at {cache_path} — solving "
+              f"{cfg.cmg_memory_size} states now (this is the expensive part).",
+              flush=True)
+        x_samples = sample_state_box(base.X_MIN, base.X_MAX, n=cfg.cmg_memory_size,
+                                     seed=int(getattr(cfg, "cm_seed", 0)))
+        ds = build_cm_dataset(
+            None, base.get_f_and_B,
+            x_dim=int(base.num_dim_x),
+            lbd=cfg.lbd, w_lb=cfg.w_lb, w_ub=cfg.w_ub, eps=cfg.cm_eps,
+            num_samples=cfg.cmg_memory_size, solver=cfg.cm_solver,
+            device="cpu", tag="[C2RL build]",
+            x_samples=x_samples,
+            random_ratio=cache_kwargs["random_ratio"],
+            min_feasibility_rate=cfg.min_feasibility_rate,
+            r_scaler=cfg.cvstem_r_scaler,
+            max_lambda_reductions=cfg.max_lambda_reductions,
+            chi_weight=cfg.cm_chi_weight,
+            nu_weight=cfg.cm_nu_weight, wdot_dt=cfg.cm_wdot_dt,
+        )
+        from pathlib import Path
+        cache_path = Path(cache_path)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        # Suffix MUST end in .npz: save_cm_dataset calls np.savez, which appends
+        # ".npz" unless the name already has it -- so a ".npz.tmp" temp name would
+        # be written as "....npz.tmp.npz" and the rename below would then move a
+        # file that does not exist.
+        fd, tmp = tempfile.mkstemp(dir=str(cache_path.parent), suffix=".tmp.npz")
+        os.close(fd)
+        try:
+            save_cm_dataset(Path(tmp), ds, **cache_kwargs)
+            os.replace(tmp, cache_path)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        print(f"[C2RL] cm_build_if_missing: wrote {cache_path}", flush=True)
+
     def _synthesize_cmg_cvstem(self, *, timesteps: int = 0) -> dict:
         """CV-STEM path: LOAD the offline ``{x → W*(x)}`` dataset, then MSE-regress.
 
@@ -1298,6 +1377,32 @@ class C2RLAgent(Agent):
                 "scripts/build_cm_dataset.py."
             )
         dataset = load_cached_cm_dataset(cache_path, **cache_kwargs)
+        if dataset is None and bool(getattr(cfg, "cm_build_if_missing", False)):
+            # OPT-IN inline build, for sweeps that search the cm.* axes.
+            #
+            # Those axes ARE the cache key (lbd/w_lb/w_ub/r/eps/solver/N), so every
+            # trial needs a DIFFERENT dataset and no amount of pre-building covers
+            # the space bayes will sample. Without this the trial dies on the raise
+            # below, sweep_runner's _HARD_MARKERS does not match a
+            # FileNotFoundError, so it propagates the non-zero exit as a plain
+            # crash -- a METRIC-LESS trial, which bayes bookkeeping silently
+            # ignores. The search would then keep resampling the same region,
+            # learning nothing, which is the exact failure the wrapper exists to
+            # prevent.
+            #
+            # Still opt-in rather than the default: for a gamma/seed grid the key
+            # is IDENTICAL across runs, so an automatic build would have every
+            # worker pay the same ~14-minute solve and race to write one file.
+            # Requiring the flag keeps that case on the raise.
+            self._build_cm_dataset_inline(cache_path, cache_kwargs)
+            dataset = load_cached_cm_dataset(cache_path, **cache_kwargs)
+            if dataset is None:
+                raise RuntimeError(
+                    f"[C2RL] built a CM dataset at {cache_path} but it still does not "
+                    f"load against this config's cache key. The generator and the "
+                    f"consumer disagree -- both go through cm_dataset_target(), so "
+                    f"this is a bug, not a missing file."
+                )
         if dataset is None:
             # Either the file is absent or one of the cache_kwargs disagrees with
             # it. Both mean the same thing here: the metric this run is

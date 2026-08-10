@@ -100,3 +100,34 @@ parameters:
   # Sized for the PINNED 500-point window: keeps 500/100/50/20/10 points respectively.
   xref_encoder_stride:
     values: [1, 5, 10, 25, 50]
+
+  # ── Searched: the contraction metric itself ──────────────────────────────── #
+  # These four ARE the offline dataset's cache key, so every trial needs its own
+  # {x -> W*(x)} solve. cm_build_if_missing makes the trial pretrain it rather
+  # than die: sweep_runner's _HARD_MARKERS do not match a FileNotFoundError, so
+  # a missing dataset propagates as a plain crash -> a METRIC-LESS trial, which
+  # bayes silently ignores while resampling the same dead region.
+  # Budget accordingly: a trial that misses the cache pays the full per-state SDP
+  # solve (~14 min at cmg_memory_size=100000) BEFORE any training.
+  cm.cm_build_if_missing:
+    value: true
+  # Certified rate the metric is solved at. Large parts of this space are
+  # genuinely infeasible for a given plant; the runner's bad_value records that
+  # as a real datapoint instead of a hole.
+  cm.lbd:
+    distribution: log_uniform_values
+    min: 0.01
+    max: 2.0
+  # Metric envelope. w_lb caps nu <= 1/w_lb, and that cap alone decides
+  # feasibility on some plants (segway went 0/32 -> 32/32 feasible from 0.1 to
+  # 0.01), so it is a genuine axis rather than a formality.
+  cm.w_lb:
+    values: [0.0001, 0.001, 0.01]
+  cm.w_ub:
+    values: [100.0, 1000.0, 10000.0]
+  # R in K = (1/r)B^T M: sets the certified gain magnitude.
+  cm.cvstem_r_scaler:
+    values: [0.4, 0.8, 1.6, 3.2, 6.4]
+  # Control-effort weight in the Mahalanobis reward (0 = tracking error only).
+  cm.control_scaler:
+    values: [0.0, 0.01, 0.1, 1.0]
