@@ -67,6 +67,15 @@ SEED=$(( IDX / (G * E) ))
 
 SHORT=${ENV#classic-}; SHORT=${SHORT%-v0}
 NAME="c2rl_${SHORT}_g${GAMMA}_s${SEED}"
+
+# Make the grid coordinates first-class wandb fields. Without this the ONLY env
+# identifier on a run is the name string, and substring matching on it is wrong
+# here: "car" also matches "cartpole" AND "car_weak" (measured: filtering
+# `name contains car` returned 13 runs, 10 of them cartpole). WANDB_RUN_GROUP is
+# read by wandb.init() directly, so grouping needs no code change; seed is not
+# otherwise logged at all.
+export WANDB_RUN_GROUP="$SHORT"
+export WANDB_TAGS="env-${SHORT},gamma-${GAMMA}"
 echo "[$(date '+%F %T')] idx=$IDX/$TOTAL -> $NAME on $(hostname), CUDA=$CUDA_VISIBLE_DEVICES"
 
 # Wait for real room on THIS device before starting. Asked through torch, not
