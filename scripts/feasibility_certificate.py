@@ -40,6 +40,14 @@ still and equally accurate on those 9: check whether sv(B(x)) varies at all.
 The control box plays NO part in any of this. Feasibility here is contraction
 feasibility only: whether the LMI admits a metric. ``||K||`` is reported so the
 deployment cost is visible, but it never disqualifies a plant.
+
+SCOPE -- this uses the DRIFT Jacobian A = df/dx, via ncm_synthesis.drift_jacobians.
+The generalized Jacobian of a control-affine plant is A(x,u) = df/dx + sum_i u_i
+db_i/dx, and the neglected term is zero iff B is constant. Measured, it dominates
+on most class-III envs (up to 15.8x the drift term) and IS the whole dynamics for
+turtlebot, where f == 0. So class I here means "not lbd-stabilizable in the
+pointwise drift-Jacobian sense", NOT "not contractible" -- pvtol is differentially
+flat and turtlebot is controllable. See docs/dynamics_taxonomy.md section 4.
 """
 from __future__ import annotations
 

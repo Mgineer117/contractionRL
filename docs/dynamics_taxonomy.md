@@ -3,7 +3,8 @@
 **Related work** positions this against prior contraction work. **§1 is the
 taxonomy**: one definition of the three classes, and each membership
 condition stated as a proposition with its proof immediately after. §2 measures
-them. §3 holds the supporting results §1 leans on. §4 is what is not claimed.
+them. §3 holds the supporting results §1 leans on. §4 is the generality boundary and
+§5 is what is not claimed.
 
 **Scope.** Contraction feasibility only. The control box plays no part: no plant
 is called infeasible because its certified gain is large. `‖K‖` is reported so
@@ -644,7 +645,83 @@ remains empirical.
 
 ---
 
-# 4. What is not claimed
+# 4. Generality: what the propositions cover
+
+**The propositions are general; the program they characterize is not.** The
+distinction matters for any claim about control-affine systems at large.
+
+## 4.1 The proofs assume nothing beyond the LMI
+
+Propositions 1–6 use only (i) differentiability of `f` and continuity of `B`,
+(ii) the algebraic form of (C1)–(C3), and (iii) standard CARE theory under the
+stabilizability hypothesis stated in Proposition 5. No structure of `f` or `B` is
+used anywhere: no polynomial/SOS assumption, no feedback linearizability, no
+bound on `n` or `m`, no normality of `A`. In that sense they hold for every
+control-affine `ẋ = f(x) + B(x)u` on a compact box.
+
+## 4.2 But the program uses the DRIFT Jacobian, not the generalized one
+
+For a control-affine plant the differential dynamics is
+
+```
+δẋ  =  [ ∂f/∂x  +  Σᵢ uᵢ ∂bᵢ/∂x ] δx  +  B(x) δu
+```
+
+so the object a contraction certificate should see is the **generalized Jacobian**
+`A(x,u) = ∂f/∂x + Σᵢ uᵢ ∂bᵢ/∂x`. This document — following
+`ncm_synthesis.drift_jacobians`, which is what `cvstem_joint` is fed — uses
+`A(x) = ∂f/∂x` **alone**. The neglected term `Σᵢ uᵢ ∂bᵢ/∂x` vanishes identically
+**iff `B` is constant**.
+
+Measured at the control-box vertices, 40 samples per env, spectral norms:
+
+| env | class | `‖∂f/∂x‖` | `‖Σuᵢ∂bᵢ/∂x‖` | ratio | neglected term |
+|---|---|---|---|---|---|
+| car | **II** | 1.498 | **0** | 0.000 | **exactly zero** (`B` constant) |
+| quadrotor | **II** | 12.84 | **0** | 0.000 | **exactly zero** (`B` constant) |
+| segway | III | 14.28 | 3.22 | 0.23 | significant |
+| auv | III | 1.008 | 0.586 | 0.58 | significant |
+| aircraft | III | 21.09 | 20.51 | 0.97 | comparable |
+| cartpole | III | 9.194 | 9.85 | 1.07 | **dominates** |
+| tora | III | 1.207 | 2.625 | 2.18 | **dominates** |
+| ball_and_beam | III | 11.20 | 140.5 | 12.5 | **dominates** |
+| two_link_arm | III | 20.72 | 326.8 | 15.8 | **dominates** |
+| pvtol | I | 1.000 | 39.24 | 39.2 | **dominates** |
+| turtlebot | I | **0** | 0.44 | ∞ | **is the entire dynamics** |
+
+The pattern is exact and unflattering: **the drift-only model is faithful precisely
+on the class-II plants and wrong precisely on the class-III ones**, because
+"class III" is diagnosed by `B` varying and `B` varying is exactly what creates
+the neglected term. The class where the analysis is exact is the class where
+nothing happens.
+
+## 4.3 Consequences, stated plainly
+
+* **Class I is a statement about this program, not about the plant.** pvtol is
+  differentially flat and turtlebot is a standard controllable nonholonomic
+  system; both are "class I" only because a frozen drift Jacobian cannot see the
+  Lie bracket that actually steers them. For turtlebot `f ≡ 0`, so `A ≡ 0` and the
+  program is looking at *none* of the dynamics. Read class I as **"not
+  λ-stabilizable in the pointwise drift-Jacobian sense"**, never as "not
+  contractible".
+* **The class II/III boundary is only certified for constant-`B` plants.** For the
+  seven class-III envs the certificate is computed on a model whose neglected term
+  is between 0.23× and 15.8× the term retained.
+* **What generalizes cleanly.** Every proposition carries over verbatim with `x`
+  replaced by the pair `(x, u)` and `A(x)` by `A(x,u)`, since none of the proofs
+  touch where `A` came from. The per-state rate becomes
+  `λ*(x) = inf_{u ∈ U} λ*(x,u)`, Proposition 3's decoupling still holds over the
+  enlarged sample set, and Proposition 5's CARE is solved per `(x,u)`. Doing this
+  is the natural next step and is **not done here**; `solve_cm_metric` elsewhere in
+  this repo already evaluates `A(x,u)` at `u`-box vertices, so the machinery
+  exists.
+
+So: general for control-affine systems **as a theory of the drift-Jacobian
+program**, and a faithful theory of the *plant* only where `B` is constant.
+
+---
+
+# 5. What is not claimed
 
 * **Sampled, not box-wide.** Every statement is over the finite `S`. Extending to
   all of `X` needs the covering argument of `subset_lambda_procedure.md` §7 —
