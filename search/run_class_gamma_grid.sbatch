@@ -29,7 +29,14 @@
 #SBATCH --job-name=crl-clsgrid
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=06:00:00
+# 18 h, not 6. A cell is ~2.5 h, but ref_length AUTO scales with 1/(1-gamma), so a
+# gamma=0.999 cell carries a 2504-wide observation against gamma=0.5's 19-wide and
+# takes far longer; at 6 h those cells time out (measured: one died at 6:00:26).
+# The limit must be right at submit time -- scontrol update TimeLimit= is REFUSED
+# to a normal user, who may only lower a limit, never raise it. Override with
+# `sbatch --time=07:45:00` on ic-express, whose partition cap is 8 h; do not put
+# gamma >= 0.99 cells there.
+#SBATCH --time=18:00:00
 #SBATCH --output=%x-%A_%a.out
 
 set -uo pipefail

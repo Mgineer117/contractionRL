@@ -293,7 +293,63 @@ rather than reuse it as-is.
 
 ---
 
-## 5. What this plan does not establish
+## 5. Measured on the first launch (2026-08-09)
+
+Facts from the first 600 cells, replacing guesses that were in this plan.
+
+### γ is confounded with observation width, by design
+
+`train.py` sizes the reference window from the discount: `ref_length AUTO` spans
+the effective horizon `1/(1−γ)`. Measured on running cells:
+
+| γ | `ref_length` | observation |
+|---|---|---|
+| 0.5 | 3 | 19-wide |
+| 0.99 | 101 | 509-wide |
+| 0.999 | 500 (capped) | **2504-wide** |
+
+**A 132× swing in input dimension across the γ grid.** This is deliberate — a
+window shorter than the effective horizon makes `V` non-Markov, which is the
+POMDP the window exists to prevent (`RefWindow.check_markov`) — but it means the
+experiment does **not** compare `γ` alone. It compares *γ together with a
+correctly-sized window*, and network input width, capacity and wall time all move
+with the treatment.
+
+**This must be stated in the paper**, and it is the honest framing rather than a
+defect: holding `ref_length` fixed across γ would trade the confound for a
+non-Markov value function at high γ, which is worse. A follow-up that fixes
+`ref_length` at its γ=0.999 value for *every* γ would separate the two, at the
+cost of a needlessly wide input at low γ; it is not run here.
+
+### Wall time and the 6 h limit
+
+* A cell is **~2.5 h** (completed cartpole cells: 2:27–2:42), not the 20–60 min
+  that mid-run `Elapsed` suggests.
+* At `--time=06:00:00` some cells **do** time out — one old cell died at 6:00:26,
+  and the γ=0.999 cells are the exposed ones given the 2504-wide observation.
+* **`scontrol update TimeLimit=` is refused** to a normal user (`Access/permission
+  denied`); a limit can be lowered, never raised. So the wall time has to be right
+  at `sbatch` time. Use `--time=18:00:00` on scavenger (24 h cap) for any array
+  containing γ ≥ 0.99. `ic-express` caps at 8 h and cannot host those cells safely.
+* Recovery is by index, which is what the array layout is for:
+  `sbatch --array=<idx> --time=18:00:00 … "<same env list>"`. A timed-out cell
+  costs only itself.
+
+### scavenger preempts
+
+Four cells were PREEMPTED within the first hour. They **requeue automatically**
+(verified: the preempted indices reappear as PENDING), so no cell is lost, but a
+preempted cell restarts from scratch — up to 2.5 h of work discarded each time.
+Budget for it, or place long/high-γ cells on a non-preemptible partition.
+
+### Throughput
+
+~2.5 h/cell at ~16–19 concurrent ≈ **40 h per 300-cell arm**, before preemption
+losses. Two arms sharing the same capacity is a 3–4 day job.
+
+---
+
+## 6. What this plan does not establish
 
 * **Uniform step budget across envs.** 200 k timesteps for every plant is a
   fairness choice. A class-III plant that merely needs longer would look
