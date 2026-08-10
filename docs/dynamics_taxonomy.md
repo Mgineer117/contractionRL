@@ -277,8 +277,27 @@ and `sv(B)` are constant, `ρ` still ranges over `608.8 → 5.34 → 13.39` as
 *non-normal* structure and how it couples into `B` — neither of which is visible
 in the spectra taken separately.
 
+**This is not only a toy: `classic-car_weak-v0` is an instance in this repo.** It
+is the car on a widened velocity box `v ∈ [0.2, 2]` — same `f`, same `B`, same
+`env.py`, one constant changed. Its `B` is *literally constant*, so `sv(B)`
+spread is exactly `1.000`, and it is nonetheless **class III**:
+
+| | `car` | `car_weak` |
+|---|---|---|
+| `sv(B)` spread | 1.000 | **1.000** |
+| Hautus margin `σ` | 1.000 | 0.2049 |
+| `ρ` spread | 1.0000 | **15.469** |
+| `λ_C` spread | 1.0000 | **7.4668** |
+| class | II | **III** |
+
+So the screen returns "suspect class II" on `car_weak` and is **wrong**. The rate
+varies there through `A(x)` — `σ = min(1, v)` collapses as `v → 0.2` — which `B`
+cannot see. (`ν` rises `9.536 → 147.5`, 15.5×, against the ≥23.8× that
+Corollary 3's `1/σ²` branch demands of a lower bound: consistent, and not tight.)
+
 So the screen is a **heuristic**, not a theorem, and it is refuted in the
-`sv(B) constant ⟹ class II` direction by any 1-D plant with non-constant `f''`.
+`sv(B) constant ⟹ class II` direction by any 1-D plant with non-constant `f''`
+— and by a real environment in this repo.
 It survives on these nine because their class-II members (car, quadrotor) happen
 to have both a constant `B` *and* an `A`-variation that does not reach
 `λ_max(P)` — which §2.2 shows is a property of their particular box.
@@ -385,8 +404,9 @@ sv(B(x)) varies over the box ?               ──yes──>  class III INDICAT
 
 **Only the first branch is proved.** The second is the §1.3 screen: reliable in
 the *positive* direction on these nine plants, but its negative direction is
-outright false (constant `B` with varying drift is class III — §1.3), so a
-constant `sv(B)` warrants a check with `ρ` or a per-state SDP, never a
+outright false, and **`classic-car_weak-v0` is a plant in this repo that it gets
+wrong** — constant `B`, `sv(B)` spread exactly `1.000`, class III (§1.3). So a
+constant `sv(B)` warrants a check with `λ_C` or a per-state SDP, never a
 conclusion. Proposition 2 would prove class II, but no plant here satisfies it.
 
 **Class membership belongs to the pair (plant, box), never the plant alone** —
@@ -412,6 +432,7 @@ python scripts/feasibility_certificate.py --all --lbd 0.3 --verify -n 200
 | **pvtol** | **I** | 1.05e-19 | — | — | ∞ | — | — | — |
 | **turtlebot** | **I** | 0.00e+00 | — | — | ∞ | — | — | — |
 | car | **II** | 1.000 | **1.0000** | 1.0000 | 9.54 | 1.05e-1 | 9.53e-1 | 2.86 |
+| car_weak | III | 2.05e-1 | — | 15.469 | 148 | 6.78e-3 | 9.51e-1 | 8.78 |
 | quadrotor | **II** | 1.000 | **1.0000** | 1.0000 | 55.5 | 1.80e-2 | 5.15 | 7.27 |
 | ball_and_beam | III | 3.22e-1 | 1.373 | 58.6 | 389 | 2.57e-3 | 55.2 | 26.4 |
 | segway | III | 1.47e-1 | 1.755 | 2.20 | 759 | 1.32e-3 | 8.95 | 31.0 |
@@ -456,6 +477,16 @@ any box reaching `v < 1` is class III, and `v = 0` (where `f ≡ 0`, the turtleb
 is class I. One plant, three classes, selected by the box. (`ρ` climbs again at
 `v = 1000` with `σ` unmoved: Corollary 3 is a lower bound driven by weak
 authority, and does not capture growth driven by `‖A‖`.)
+
+**This is now a registered pair, not just a table.** `classic-car_weak-v0` is the
+same entry point on `v ∈ [0.2, 2]` (and reference speed drawn from `[0.3, 1.5]`
+rather than pinned at `1.5`, so the *reference* enters the weak region rather
+than only the tracking error). It certifies class III at `σ = 0.2049`,
+`ρ` spread `15.469`, against the car's `1.000`. The two differ in **two
+constants and nothing else** — same `f`, same `B`, same reward, same reference
+generator — which makes them the only available control for attributing a
+downstream effect to the contraction class rather than to plant identity. See
+`docs/experiment_plan_state_dependent_lambda.md`.
 
 ## 2.3 Why the obvious proof of the class-III screen fails
 
@@ -780,10 +811,11 @@ program**, and a faithful theory of the *plant* only where `B` is constant.
   Proposition 5's margin `q·w_lb + 1/dt` is what feeds it, but the Lipschitz
   constant is not computed here.
 * **The class-III screen is empirical, and one-directional.** It holds on nine
-  plants going from varying `sv(B)` to class III; the converse is FALSE (§1.3, a
-  1-D plant with constant `B` and varying drift). §2.3 shows the natural proof by
-  negating Proposition 2 is also unavailable, since Proposition 2 is not
-  necessary for class II.
+  plants going from varying `sv(B)` to class III; the converse is FALSE — and not
+  merely for a constructed 1-D plant, but for `classic-car_weak-v0`, a registered
+  environment here whose `B` is constant and whose class is III (§1.3). §2.3 shows
+  the natural proof by negating Proposition 2 is also unavailable, since
+  Proposition 2 is not necessary for class II.
 * **Proposition 2 has no instance here.** It certifies class II in principle; no
   plant in this repo satisfies its hypothesis, the car included.
 * **Feasibility, not performance.** `λ*` is a certified rate, not a measured AUC.

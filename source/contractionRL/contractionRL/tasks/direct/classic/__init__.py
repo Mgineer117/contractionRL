@@ -10,6 +10,7 @@ f-strings adapt to whichever package name they are imported under.
 """
 
 from . import car  # noqa: F401  registers classic-car-v0
+from . import car_weak  # noqa: F401  registers classic-car_weak-v0 (same plant, class III box)
 from . import cartpole  # noqa: F401 registers classic-cartpole-v0
 from . import turtlebot  # noqa: F401 registers classic-turtlebot-v0
 from . import segway  # noqa: F401 registers classic-segway-v0
@@ -21,4 +22,4 @@ from . import auv  # noqa: F401  registers classic-auv-v0
 from . import pvtol  # noqa: F401  registers classic-pvtol-v0
 from . import tora  # noqa: F401  registers classic-tora-v0
 
-__all__ = ["car", "cartpole", "turtlebot", "segway", "quadrotor", "ball_and_beam", "two_link_arm", "aircraft", "auv", "pvtol", "tora"]
+__all__ = ["car", "car_weak", "cartpole", "turtlebot", "segway", "quadrotor", "ball_and_beam", "two_link_arm", "aircraft", "auv", "pvtol", "tora"]
