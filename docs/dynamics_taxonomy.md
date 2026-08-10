@@ -271,9 +271,62 @@ Failing the screen, the rigorous options are:
 
 | test | cost | status |
 |---|---|---|
-| `ρ(x) = λ_max(P(x))` from the CARE of Proposition 5 takes two values | 1 CARE solve/sample | **Evidence only**; `ρ` upper-bounds what a state demands. Agreed with the exact test on 9 of 9. |
-| Corollary 4.2's floor at `x₂` exceeds `ρ(x₁)` | same, plus one SVD | **Rigorous** when it fires. Fired on 1 of 9 (auv). |
+| **`λ_C(x)` takes two values** — the largest rate the CARE certificate carries inside the envelope, `sup{λ : λ_max(P_λ(x)) ≤ 1/w_lb}` | ~10 Riccati solves/sample | **Evidence only** (a lower bound on `λ*`), but the **best screen available**: agrees on 9 of 9 and is in λ units. **Preferred.** |
+| `ρ(x) = λ_max(P(x))` takes two values | 1 CARE solve/sample | Evidence only; same 9 of 9, but wildly off in magnitude. |
+| `λ_C(x₁) > λ_E(x₂)`, with `λ_E` the modal upper bound below | ~10 Riccati + 1 eig | **Rigorous** when it fires. Fires on 2 of 9 (tora, auv). |
 | `λ*(x)` by one-sample SDP at two states | 2 SDP bisections | **Rigorous, always decisive.** |
+
+### Simplification attempts, and what they cost
+
+Three attempts to replace the machinery with something closed-form. One helped,
+two failed, and the failures are informative.
+
+**Worked — `λ_C` instead of `ρ`.** `ρ` answers *"how large a metric does `x`
+demand at a fixed λ"*; `λ_C` answers *"how fast can `x` go before the envelope
+stops it"*. Same information, but in the units of the answer, so it is directly
+comparable to the true spread instead of being off by orders of magnitude:
+
+| plant | true `λ*` spread | `λ_C` spread | `ρ` spread |
+|---|---|---|---|
+| car | 1.0000 | **1.0000** | 1.0000 |
+| quadrotor | 1.0000 | **1.0000** | 1.0000 |
+| segway | 1.755 | **1.97** | 2.20 |
+| cartpole | 2.092 | **2.81** | 7.26 |
+| ball_and_beam | 1.373 | 3.69 | 58.6 |
+| aircraft | 2.400 | **10.0** | 3.26 |
+| tora | 3.652 | 125 | 1 152 |
+| auv | 5.184 | **30.3** | 5 618 |
+
+**Failed — the identity-metric probe.** Setting `W̄ = I` makes the proxy term
+`(W̄ − I)/dt` vanish *exactly*, giving the closed form
+`λ_I(x) = ½·λ_min(μBBᵀ − A − Aᵀ) − ε/2` with `μ = 2/(r·w_lb)`, one symmetric
+eigendecomposition and no Riccati solve. It is useless in practice: `BBᵀ` is
+rank-deficient for any underactuated plant, so `λ_min` is set by the unactuated
+directions and `λ_I < 0` at **every** state of **every** env here (best case
+`−0.05`). A non-trivial metric is not a convenience for these plants; it is the
+only thing that makes a positive rate possible at all.
+
+**Failed — folding class I into one scalar.** At an *exact* left eigenvector the
+slack `δ` vanishes and `χ` drops out of (★) entirely, giving the much tighter
+modal upper bound
+
+```
+λ_E(x) := min over left eigenpairs (w, s) of A(x)  [ (ν/r)·w*BBᵀw − Re s ]  −  ε/2   ≥  λ*(x)
+```
+
+`λ_E ≤ 0` would then mean "no positive rate certifies", which is class I — one
+scalar covering Proposition 1 *and* bracketing `λ*`. **It does not work**, and it
+fails on exactly the plant predicted in §1.1: pvtol's `A` is defective, its
+eigenbasis is near-parallel, and `λ_E = 6.2 > 0` — so it declares a class-I plant
+feasible. The SVD-based Hautus test cannot be absorbed into an eigenvector-based
+scalar; it has to stay separate. (`λ_E` is still sound as an upper bound wherever
+`A` is semisimple, which is every feasible env here, and it is what makes the
+rigorous certificate above fire on 2 of 9 rather than 1 of 9.)
+
+**Net.** The class-I criterion was already minimal. The class II-vs-III screen
+improved from `ρ` to `λ_C`. No new *structural* criterion emerged, and §2.3
+explains why one is unlikely to: every simple structural candidate is vacuous on
+plants whose `A` varies, which is all of them.
 
 ## 1.4 The decision procedure
 

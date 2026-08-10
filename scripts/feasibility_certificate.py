@@ -116,6 +116,32 @@ def certify(A: np.ndarray, B: np.ndarray, lbd: float, r: float, dt: float, q: fl
     return P
 
 
+def lam_C(A, B, r, dt, q, nu, *, lo=1e-3, hi=100.0, tol=5e-3):
+    """Largest rate the CARE certificate carries at this state within the envelope.
+
+    ``rho`` answers "how big a metric does x demand at a FIXED lbd"; this answers
+    "how fast can x go before the envelope stops it", which is the same
+    information in the units of the answer. Strictly better as a II-vs-III
+    screen: on auv, rho's spread is 5618 against a true lambda* spread of 5.18,
+    while this reports 30.3. Bisection, one Riccati solve per step, still no SDP.
+
+    Returns a LOWER bound on lambda*(x): the CARE metric is one feasible choice,
+    not the optimal one.
+    """
+    def ok(v):
+        P = certify(A, B, v, r, dt, q)
+        return P is not None and float(np.linalg.eigvalsh(P)[-1]) <= nu
+
+    if not ok(lo):
+        return 0.0
+    if ok(hi):
+        return hi
+    while (hi - lo) / max(lo, 1e-12) > tol:
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if ok(mid) else (lo, mid)
+    return lo
+
+
 def lmi_residual(A, B, W, lbd, r, dt, nu):
     """max eig of the CV-STEM LMI at ``Wbar = nu*W`` -- the repo's exact expression."""
     Wb = nu * W
@@ -125,7 +151,7 @@ def lmi_residual(A, B, W, lbd, r, dt, nu):
 
 
 def analyse(task: str, *, lbd: float, r: float, dt: float, q: float,
-            n: int, seed: int, verify: bool) -> dict:
+            n: int, seed: int, verify: bool, lam_screen: bool = False) -> dict:
     import gymnasium as gym
 
     env = gym.make(f"classic-{task}-v0", num_envs=1, device="cpu").unwrapped
@@ -167,6 +193,10 @@ def analyse(task: str, *, lbd: float, r: float, dt: float, q: float,
     out.update(w_lb=w_lb, w_ub=w_ub, nu=nu, chi=nu * w_ub, eps_cert=q * w_lb + 1.0 / dt,
                spread=float(rho.max() / rho.min()),
                k_max=float(np.linalg.norm(K, ord=2, axis=(1, 2)).max()))
+    if lam_screen:
+        lc = np.array([lam_C(A[k], B[k], r, dt, q, nu) for k in range(n)])
+        pos = lc[lc > 0]
+        out["lam_spread"] = float(pos.max() / pos.min()) if pos.size else np.inf
     out["cls"] = "II" if out["spread"] - 1.0 < FLAT_TOL else "III"
 
     if verify:
@@ -189,6 +219,9 @@ def main() -> int:
     ap.add_argument("-n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--verify", action="store_true", help="re-evaluate the LMI at the certificate")
+    ap.add_argument("--lam-screen", action="store_true",
+                    help="also report the lam_C spread -- same classes as rho, but in "
+                         "lambda units and far closer to the true spread")
     args = ap.parse_args()
 
     import contractionRL.tasks.direct.classic  # noqa: F401  registers classic envs
@@ -209,7 +242,8 @@ def main() -> int:
     for t in tasks:
         try:
             res = analyse(t, lbd=args.lbd, r=args.r, dt=args.cm_dt, q=args.q,
-                          n=args.n, seed=args.seed, verify=args.verify)
+                          n=args.n, seed=args.seed, verify=args.verify,
+                          lam_screen=args.lam_screen)
         except Exception as exc:  # noqa: BLE001 -- a broken env must not hide the rest
             print(f"{t:16s} {'ERR':>4s}  {type(exc).__name__}: {exc}")
             continue
@@ -223,9 +257,10 @@ def main() -> int:
         note = f"verified: residual {res['residual']:.3g} <= -{res['eps_cert']:.3g}" \
             if "residual" in res and res["verified"] else \
             (f"VERIFY FAILED residual {res['residual']:.3g}" if "residual" in res else "")
+        extra = f"lam_C spread {res['lam_spread']:.4f}; " if "lam_spread" in res else ""
         print(f"{t:16s} {res['cls']:>4s} {m:13.3e} {res['nu']:10.4g} "
               f"{res['w_lb']:10.3e} {res['w_ub']:10.3e} {res['spread']:11.4f} "
-              f"{res['k_max']:9.4g}  {note}")
+              f"{res['k_max']:9.4g}  {extra}{note}")
 
     print("\ncls I   = some state is not lbd-stabilizable (infeasible at EVERY envelope)")
     print("cls II  = rho(x) constant over the box (no subset can raise lbd)")
