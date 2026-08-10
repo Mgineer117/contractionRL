@@ -132,18 +132,19 @@ coordinates.
 a valid sufficient condition with no instance here, which is worth stating
 plainly rather than leaving implied.
 
-## 1.3 Class III — no structural condition, but a reliable screen
+## 1.3 Class III — no structural condition, only a one-directional screen
 
 Class III is the default: not class I, and `λ*` not constant. There is **no**
 proven structural condition for it here. What there *is* — and this is the cheap
 thing to look at — is a screen that reads straight off `B(x)`:
 
-> **Screen.** Compute the singular values of `B(x)` over the box. If they **vary**,
-> the plant is class III; if they are **constant**, it is class II.
+> **Screen.** Compute the singular values of `B(x)` over the box. If they
+> **vary**, the plant is class III. If they are **constant**, class II is
+> *suspected* but NOT implied — see "Constant `B` does not give a constant rate"
+> below.
 
 One SVD per sample, no CARE and no SDP. Measured against the exact per-state
-`λ*(x)` (one-sample SDPs) on all nine feasible plants, it separates them
-perfectly:
+`λ*(x)` (one-sample SDPs), it separates all nine feasible plants:
 
 | env | class | `sv(B)` spread | exact `λ*(x)` spread |
 |---|---|---|---|
@@ -188,6 +189,34 @@ class I.
 So `sv(B)` is the right quantity: same cost, it is the orthogonally-invariant
 part of `B`, and it has no rotation counterexample.
 
+### Constant `B` does NOT give a constant rate
+
+The tempting strengthening — *"`B` constant ⟹ `λ*` constant"* — is **false**, and
+the counterexample is one-dimensional. Take `n = m = 1`, `B ≡ 1`, drift Jacobian
+`a(x)` varying (e.g. `f(x) = −x³/3`, `a(x) = −x²`). The scalar LMI is minimised at
+`W̄ = 1`, so at `ν = 1/w_lb`
+
+```
+λ*(x)  =  1/(r·w_lb)  −  a(x)  −  ε/2
+```
+
+which varies exactly as much as `a(x)` does. Measured with the CARE certificate,
+`a ∈ [−4, 2]` gives `ρ` from `0.1518` to `4.6520` — a spread of **30.7** with `B`
+constant throughout.
+
+Nor does adding constant `spec(A)` save it. With `A(v) = [[0, v],[0, 0]]`
+(nilpotent, `spec ≡ {0,0}`) and `B = [0;1]` constant, so that **both** `spec(A)`
+and `sv(B)` are constant, `ρ` still ranges over `608.8 → 5.34 → 13.39` as
+`v: 0.1 → 2 → 100`, a spread of **113.9**. What moves the rate there is `A`'s
+*non-normal* structure and how it couples into `B` — neither of which is visible
+in the spectra taken separately.
+
+So the screen is a **heuristic**, not a theorem, and it is refuted in the
+`sv(B) constant ⟹ class II` direction by any 1-D plant with non-constant `f''`.
+It survives on these nine because their class-II members (car, quadrotor) happen
+to have both a constant `B` *and* an `A`-variation that does not reach
+`λ_max(P)` — which §2.2 shows is a property of their particular box.
+
 **Status: empirical, not proved**, and two limits are already visible.
 
 * **It orders nothing.** ball_and_beam has the third-largest `sv(B)` spread
@@ -214,13 +243,16 @@ Failing the screen, the rigorous options are:
 ```
 σ_min([A−sI, B]) = 0 somewhere, Re s ≥ −λ ?  ──yes──>  class I    (infeasible, any envelope)
                     │no
-sv(B(x)) constant over the box ?             ──yes──>  class II   (subsets buy nothing)
+sv(B(x)) varies over the box ?               ──yes──>  class III  (subsets buy rate)
                     │no
-                                                       class III  (subsets buy rate)
+                          SUSPECT class II -- verify, do not conclude
 ```
 
-Only the first branch is proved. The second is the §1.3 screen, empirical on
-9 plants; Proposition 2 would prove class II but no plant here satisfies it.
+**Only the first branch is proved.** The second is the §1.3 screen: reliable in
+the *positive* direction on these nine plants, but its negative direction is
+outright false (constant `B` with varying drift is class III — §1.3), so a
+constant `sv(B)` warrants a check with `ρ` or a per-state SDP, never a
+conclusion. Proposition 2 would prove class II, but no plant here satisfies it.
 
 **Class membership belongs to the pair (plant, box), never the plant alone** —
 see §2.2. Shrinking a box can only raise the rate (§3.1, Remark), so plants move
@@ -528,8 +560,10 @@ remains empirical.
   all of `X` needs the covering argument of `subset_lambda_procedure.md` §7 —
   Proposition 5's margin `q·w_lb + 1/dt` is what feeds it, but the Lipschitz
   constant is not computed here.
-* **The class-III screen is empirical.** Nine plants, and §2.3 shows the natural
-  proof by negating Proposition 2 is unavailable because Proposition 2 is not
+* **The class-III screen is empirical, and one-directional.** It holds on nine
+  plants going from varying `sv(B)` to class III; the converse is FALSE (§1.3, a
+  1-D plant with constant `B` and varying drift). §2.3 shows the natural proof by
+  negating Proposition 2 is also unavailable, since Proposition 2 is not
   necessary for class II.
 * **Proposition 2 has no instance here.** It certifies class II in principle; no
   plant in this repo satisfies its hypothesis, the car included.
