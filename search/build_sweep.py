@@ -44,6 +44,13 @@ DEFAULT_PROJECT = "contractionRL-Search"
 # Isaac Lab task and must NOT get that flag.
 CLASSIC_ENVS = (
     "classic-car-v0",
+    # Same plant as classic-car-v0 on a widened velocity box, which flips it from
+    # contraction class II to class III -- the within-plant control for any
+    # class-vs-gamma comparison. Must be tunable separately: its weaker control
+    # authority (Hautus margin 0.205 vs 1.000) is exactly the kind of thing that
+    # can move the optimal hyperparameters, and assuming the car's carry over
+    # would beg the question the pair exists to answer.
+    "classic-car_weak-v0",
     "classic-cartpole-v0",
     "classic-segway-v0",
     "classic-turtlebot-v0",
