@@ -618,10 +618,29 @@ if _is_classic:
         # in the runs table — mirror it into the config, alongside a batch label
         # that defaults to the run date so a relaunch is separable from the
         # previous day's runs without passing anything.
+        # env / algorithm / gamma / seed are the axes any multi-run study groups
+        # by, and NONE of them reached the config before: skrl logs the agent
+        # dataclass flat (so `agent.discount_factor` resolves to null -- config
+        # ["agent"] is a null scalar, not a dict), `task` and `seed` were never
+        # logged at all, and the only env identifier was the run-name string.
+        # Substring-matching that string is wrong here: "car" also matches
+        # "cartpole" AND "car_weak" (measured: 13 hits, 10 of them cartpole).
+        # Written as CONFIG rather than tags so they are groupable/filterable
+        # columns in the runs table.
+        _env_short = (args_cli.task or "").removeprefix("classic-").removesuffix("-v0")
+        _gamma_cfg = args_cli.discount_factor
+        if _gamma_cfg is None:
+            _gamma_cfg = agent_cfg.get("agent", {}).get("discount_factor")
         _wkw.setdefault("config", {}).update({
             "run_name": _wkw["name"],
             "run_batch": args_cli.wandb_batch or _run_ts.split("_")[0],
+            "env": _env_short or None,
+            "algorithm": algorithm,
+            "gamma": float(_gamma_cfg) if _gamma_cfg is not None else None,
+            "seed_idx": args_cli.seed,
         })
+        # Native UI grouping on the same value, unless the caller set its own.
+        _wkw.setdefault("group", _env_short or None)
 
         # A sweep must init EARLY: its sampled hyperparameters only exist on
         # wandb.config once the run is live, and they have to reach agent_cfg
