@@ -445,7 +445,19 @@ class StatManagerEnvWrapper:
         min_lambdas = torch.min(lambda_vals, dim=1).values
         # /rate_divisor: the curve decays as e^{-(order·λ)t}, so its measured
         # rate is order·λ — undo it to report the true λ (see the docstring).
-        lambda_vec = torch.clamp(min_lambdas / rate_divisor, min=0.0, max=10.0)
+        # RAW = the estimator's own output, before censoring. Kept because the
+        # clamp below is a CENSORED outcome: a study of "how does gamma move
+        # lambda" cannot use a quantity that is pinned at 0 whenever the error
+        # grew and at 10 whenever it contracted faster than the search grid.
+        # If a treatment pushes lambda past either bound, the clamped series
+        # shows a plateau that is an artifact of the bound, not an effect.
+        lambda_raw_vec = min_lambdas / rate_divisor
+        lambda_vec = torch.clamp(lambda_raw_vec, min=0.0, max=10.0)
+        # How often each bound actually binds. If these are ~0 the clamp is
+        # inert and the clamped series is safe to use; if either is materially
+        # above 0 the clamped mean is not an estimate of anything.
+        lam_clip_lo = float((lambda_raw_vec < 0.0).float().mean().item())
+        lam_clip_hi = float((lambda_raw_vec > 10.0).float().mean().item())
         score_vec = lambda_vec / torch.clamp(best_C, min=1e-6)
 
         # 5. Running-mean lambda — the whole-EPISODE contraction rate, averaged
@@ -474,7 +486,34 @@ class StatManagerEnvWrapper:
         else:
             run_m, run_ci = 0.0, 0.0
         score_m, score_ci = mean_confidence_interval(score_vec.detach().cpu().numpy(), 0.95)
-        return {
+
+        # Full quantile sets for EVERY metric, not just auc/peak. The analysis
+        # question is "how does gamma move different parts of the outcome
+        # distribution" (quantile treatment effects), which a mean/CI pair
+        # cannot answer -- and these outcomes are bimodal here (c2rl seeds
+        # bifurcate), so the mean can sit in a gap where no run actually lives.
+        # Logged unconditionally so the mean-vs-median choice can be made after
+        # the data is in rather than before.
+        lam_np = lambda_vec.detach().cpu().numpy()
+        lam_raw_np = lambda_raw_vec.detach().cpu().numpy()
+        run_np = running_lambda_vec.detach().cpu().numpy()
+        score_np = score_vec.detach().cpu().numpy()
+
+        def _q(v, name):
+            """{name}_{median,p05,p25,p75,p95,min,max,std}; empty -> all 0.0."""
+            if v.size == 0:
+                return {f"{name}_{k}": 0.0 for k in
+                        ("median", "p05", "p25", "p75", "p95", "min", "max", "std")}
+            qs = np.percentile(v, [5, 25, 50, 75, 95])
+            return {
+                f"{name}_p05": float(qs[0]), f"{name}_p25": float(qs[1]),
+                f"{name}_median": float(qs[2]), f"{name}_p75": float(qs[3]),
+                f"{name}_p95": float(qs[4]),
+                f"{name}_min": float(v.min()), f"{name}_max": float(v.max()),
+                f"{name}_std": float(v.std()),
+            }
+
+        out = {
             "auc_mean": float(auc_m), "auc_ci95": float(auc_ci),
             "lambda_mean": float(lambda_m), "lambda_ci95": float(lambda_ci),
             "running_lambda_mean": float(run_m), "running_lambda_ci95": float(run_ci),
@@ -483,6 +522,17 @@ class StatManagerEnvWrapper:
             "peak_mean": peak_mean, "peak_median": peak_median, "peak_p95": peak_p95,
             "auc_median": auc_median, "auc_p05": auc_p05, "auc_p25": auc_p25,
             "auc_p75": auc_p75, "auc_p95": auc_p95, "auc_max": auc_max,
+            # Uncensored lambda + how often each clamp bound binds.
+            "lambda_raw_mean": float(lam_raw_np.mean()) if lam_raw_np.size else 0.0,
+            "lambda_clip_lo_frac": lam_clip_lo,
+            "lambda_clip_hi_frac": lam_clip_hi,
+            # n behind each reduction: running_lambda averages over CONTRACTING
+            # episodes only, so its n is itself an outcome (it is 1 - the
+            # non-contracting fraction) and a mean over 3 episodes is not
+            # comparable to one over 64.
+            "n_eval": int(lam_np.size),
+            "n_running_lambda": int(run_np.size),
+            "running_lambda_frac": float(run_np.size / max(lam_np.size, 1)),
             # The UNREDUCED per-env vectors behind the four scalars above, for
             # log_metric_distributions. Every mean here is over a population
             # whose spread is the actual finding — a healthy median under a
@@ -495,11 +545,18 @@ class StatManagerEnvWrapper:
             # only) and may be empty — the plotter guards on that.
             "_dist": {
                 "auc": auc_np,
-                "lambda": lambda_vec.detach().cpu().numpy(),
-                "running_lambda": running_lambda_vec.detach().cpu().numpy(),
+                "lambda": lam_np,
+                "lambda_raw": lam_raw_np,
+                "running_lambda": run_np,
+                "score": score_np,
                 "peak": peaks_np,
             },
         }
+        for v, nm in ((lam_np, "lambda"), (lam_raw_np, "lambda_raw"),
+                      (run_np, "running_lambda"), (score_np, "score"),
+                      (peaks_np, "peak"), (auc_np, "auc")):
+            out.update(_q(v, nm))
+        return out
 
     def _compute_batched_metrics(self):
         N = self._num_envs_for_eval
@@ -526,6 +583,12 @@ class StatManagerEnvWrapper:
         self._recent_peak_median = m["peak_median"]
         self._recent_peak_p95 = m["peak_p95"]
         self._recent_distributions = m["_dist"]
+        # Everything else _metric_set now returns (all quantiles, the uncensored
+        # lambda, the clamp-hit fractions, the reduction counts) passes through
+        # verbatim rather than being enumerated -- a named copy per key is how
+        # the earlier additions ended up logged for auc and peak but silently
+        # dropped for lambda, overshoot and score.
+        self._recent_extra = {k: v for k, v in m.items() if not k.startswith("_")}
 
         # Same reduction on the SQUARED Mahalanobis Lyapunov V(t)/V(0) =
         # ‖e(t)‖²_M/‖e(0)‖²_M — the quantity the CCM certificate contracts
@@ -904,12 +967,20 @@ class StatManagerEnvWrapper:
     def stability_summary(self) -> dict[str, float]:
         if not self._initialized:
             return {}
+        # _recent_extra carries every key _metric_set produced (quantiles for all
+        # metrics, uncensored lambda_raw, clamp-hit fractions, reduction counts).
+        # It is merged UNDER the explicit names below so the established
+        # contract -- the "{name}_mean"/"{name}_ci95" shape that
+        # track_stability_summary and patch_auc_checkpoint look up -- always
+        # wins on a key collision and cannot be changed by accident here.
+        extra = dict(getattr(self, "_recent_extra", {}) or {})
         # Every metric carries the "{name}_mean"/"{name}_ci95" key shape that
         # track_stability_summary documents and patch_auc_checkpoint
         # (agent_patches.py) looks up. C is a single shared scalar, so its
         # ci95 is 0 by construction. peak_{mean,median,p95} have no ci95 twin
         # (they're a one-shot distribution summary, not a mean/CI pair).
         return {
+            **extra,
             "auc_mean": self._recent_auc_mean,
             "auc_ci95": self._recent_auc_ci95,
             "contraction_rate_mean": self._recent_lambda_mean,

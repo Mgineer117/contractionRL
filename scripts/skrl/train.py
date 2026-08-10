@@ -711,6 +711,31 @@ if _is_classic:
                   f"offset={args_cli.ref_offset})")
         raw_env.unwrapped.configure_ref_window(
             length=_len, offset=args_cli.ref_offset, gamma=_gamma)
+        # The window reaches wandb as CONFIG. Without it the gamma/window pairing
+        # is invisible in the logged data: ref_length AUTO makes the observation
+        # width a FUNCTION of gamma (19-wide at 0.5, 2504-wide at 0.999), so any
+        # gamma effect read off runs that do not record their window is really a
+        # gamma-and-architecture effect with no way to tell after the fact.
+        # ref_length_mode says whether this run pinned it or inherited AUTO.
+        try:
+            import wandb as _wb
+            if _wb.run is not None:
+                _mel = int(raw_env.unwrapped.max_episode_len)
+                _wb.run.config.update({
+                    "ref_length": int(_len),
+                    "ref_offset": int(args_cli.ref_offset),
+                    "ref_length_mode": "pinned" if args_cli.ref_length is not None else "auto",
+                    "ref_window_span": int(_len) * int(args_cli.ref_offset),
+                    "effective_horizon": int(_RW.effective_horizon(_gamma, _mel)),
+                    "max_episode_len": _mel,
+                    # <1 means the window is SHORTER than the discount's horizon,
+                    # i.e. V is non-Markov in the reference -- the POMDP the
+                    # window exists to prevent.
+                    "window_over_horizon": (int(_len) * int(args_cli.ref_offset))
+                    / max(int(_RW.effective_horizon(_gamma, _mel)), 1),
+                }, allow_val_change=True)
+        except Exception:
+            pass  # wandb off or not yet initialised — logging must never break a run
 
     if getattr(args_cli, "fix_ref_trajectories", False):
         if not hasattr(raw_env.unwrapped, "set_fix_ref_trajectories"):
