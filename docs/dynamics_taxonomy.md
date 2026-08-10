@@ -1,6 +1,7 @@
 # A taxonomy of dynamics for state-dependent contraction rate
 
-**§1 is the taxonomy**: one definition of the three classes, and each membership
+**Related work** positions this against prior contraction work. **§1 is the
+taxonomy**: one definition of the three classes, and each membership
 condition stated as a proposition with its proof immediately after. §2 measures
 them. §3 holds the supporting results §1 leans on. §4 is what is not claimed.
 
@@ -29,6 +30,42 @@ For a sample set `S ⊂ X` and parameters `(λ, ε, dt, r, w_lb, w_ub)`, the pro
 
 Write `λ*(x) = sup{λ : P({x}) feasible}` and `λ*(S)` likewise, and `λ' := λ +
 1/(2dt)`.
+
+---
+
+# Related work
+
+Contraction-based synthesis treats the contraction rate as a single scalar fixed
+in advance: control contraction metrics [MS17] and CV-STEM/NCM [TC21] both impose
+pointwise LMIs across the state space but certify one uniform `λ`, so the
+state-dependence lives entirely in the *metric* `W(x)` and never in the *rate*.
+The one line of work that does make the rate state-dependent — Lohmiller and
+Slotine's shaping of state- and time-dependent convergence rates [LS10] — is a
+synthesis result: it *prescribes* a desired rate profile for feedback-linearizable
+systems, and therefore presupposes what we set out to determine. Finite-time
+Lyapunov exponents measure genuinely state-varying rates but only in
+time-averaged form, on the dynamical-systems rather than the certificate side
+[TCS21]. We instead take the per-state certified rate `λ*(x)` as the object of
+study for a *given* plant: we show the joint program decouples, so that
+`λ*(S) = min_x λ*(x)` and a per-state analysis is meaningful (Proposition 3); we
+give a constructive Riccati certificate that returns feasibility together with the
+metric envelope the plant demands, replacing SDP search (Proposition 5); and we
+classify dynamics by whether `λ*(x)` is constant or varies over the operating box,
+isolating which states bind the certificate and what a nearly-uncontrollable mode
+costs the shared metric scale (Corollary 4.2). The question is thus **diagnostic
+rather than prescriptive** — not "what rate shall we impose?" but "does this plant
+admit a uniform rate at all, and if not, why not?"
+
+* **[LS10]** W. Lohmiller and J.-J. E. Slotine, *Shaping state and time-dependent
+  convergence rates in non-linear control and observer design*, arXiv:1004.2971,
+  2010.
+* **[MS17]** I. R. Manchester and J.-J. E. Slotine, *Control Contraction Metrics:
+  Convex and Intrinsic Criteria for Nonlinear Feedback Design*, arXiv:1503.03144.
+* **[TC21]** H. Tsukamoto and S.-J. Chung, *Neural Contraction Metrics for Robust
+  Estimation and Control: A Convex Optimization Approach*, arXiv:2006.04361.
+* **[TCS21]** H. Tsukamoto, S.-J. Chung and J.-J. E. Slotine, *Contraction Theory
+  for Nonlinear Stability Analysis and Learning-based Control: A Tutorial
+  Overview*, arXiv:2110.00675.
 
 ---
 
@@ -573,6 +610,12 @@ remains empirical.
 * **Subset claims still owe an invariance argument.** `λ*(S')` certifies
   contraction *while the trajectory stays in `S'`*. The Remark in §3.1 says
   shrinking the box raises the rate; it says nothing about staying inside it.
+* **The related-work claim rests on a non-systematic search.** Four queries, not
+  a review. "Prior work prescribes the rate, we diagnose it" is the defensible
+  form; a novelty claim needs a proper search of the incremental-stability and
+  CCM literature first. Note also that "classify" is accurate while
+  "characterize" would not be: Proposition 2 has no instance in these envs and
+  the `sv(B)` screen is one-directional.
 * **The control box is out of scope by construction.** A plant needing `ν = 3e5`
   (tora) is contraction-feasible in the same sense as one needing `9.5` (car).
   Whether the gain fits an actuator is answered by `find_uniform_lambda.py`, and
