@@ -48,7 +48,25 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 
 read -r -a ENVS <<< "${1:?pass the env list as one quoted argument}"
 GAMMAS=(0.5 0.9 0.95 0.99 0.999)
-NSEEDS=${NSEEDS:-30}
+NSEEDS=${NSEEDS:-10}
+# THE WINDOW IS PINNED, AND THIS IS A TREATMENT DECISION, not a convenience
+# override of the yaml. ref_length AUTO sizes the observation to 1/(1-gamma),
+# so it makes observation width a FUNCTION of the treatment: 19-wide at
+# gamma=0.5 against 2504-wide at gamma=0.999. Any "effect of gamma" measured
+# that way is really an effect of gamma AND of a 132x change in input
+# dimension, and the two cannot be separated after the fact.
+#
+# Pinning it to the full episode gives every policy a Markov state -- the whole
+# reference trajectory is in the observation regardless of gamma -- so the
+# architecture is identical across cells and gamma is the only thing that moves.
+# The cost is that low-gamma policies carry a wider input than their horizon
+# needs, which is a capacity/compute cost, not a bias, and it is CONSTANT across
+# gamma so it cannot confound.
+#
+# 500 == max_episode_len for all four envs here (car, car_weak, segway,
+# cartpole: dt=0.03, time_bound=15.0). Verify before adding an env with a
+# different episode length -- pinning past the cap silently does nothing.
+PIN_REF_LEN=${PIN_REF_LEN:-500}
 # No STEPS / NUM_ENVS here on purpose: those live in each env's yaml. See the
 # train.py invocation below.
 
@@ -112,7 +130,7 @@ for attempt in 1 2 3; do
     # config: the yaml then documents something the run did not do, and per-env
     # tuning (segway/cartpole need 500k, car 300k) gets flattened to one number.
     python scripts/skrl/train.py --classic --task "$ENV" --algorithm c2rl-ppo \
-        --discount_factor "$GAMMA" --seed "$SEED" \
+        --discount_factor "$GAMMA" --seed "$SEED" --ref_length "$PIN_REF_LEN" \
         --wandb_project contractionRL --wandb_run_name "$NAME" --wandb_batch class_gamma
     rc=$?
     # Reap the local run cache regardless of outcome: ~1 GB per trial against a
