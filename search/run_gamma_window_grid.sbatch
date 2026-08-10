@@ -87,7 +87,9 @@ fi
 NAME="gw_${SHORT}_${TAG}_g${GAMMA}_s${SEED}"
 echo "[$(date '+%F %T')] idx=$IDX/$TOTAL -> $NAME on $(hostname), CUDA=$CUDA_VISIBLE_DEVICES"
 
-MIN_FREE_MB=${MIN_FREE_MB:-3500}
+# 2800, not 3500: measured steady use is ~2.1 GiB plus the CMG regression's
+# ~840 MiB eigh workspace, so 3500 was rejecting GPUs that would in fact have fit.
+MIN_FREE_MB=${MIN_FREE_MB:-2800}
 wait_for_vram() {
     local waited=0
     while [[ "$waited" -lt 3600 ]]; do
@@ -97,12 +99,20 @@ wait_for_vram() {
         echo "[$(date '+%F %T')] $NAME: ${free:-unreadable} MiB free < $MIN_FREE_MB — waiting"
         sleep 120; waited=$(( waited + 120 ))
     done
-    echo "[$(date '+%F %T')] $NAME: no room after 1h — cell NOT lost (resubmit --array=$IDX)"
-    return 1
+    # TRY ANYWAY rather than giving up. Measured: 4 of 96 cells burned an hour
+    # waiting and then exited 75 on a GPU reporting 2318 MiB free against a 3500
+    # threshold -- but c2rl needs ~3 GB, so 2318 was marginal, not hopeless, and
+    # some of those runs would have fit. Exiting turned a maybe into a certain
+    # loss AND consumed the array slot; SLURM marks exit 75 FAILED and does not
+    # requeue. Falling through instead means a genuine shortage surfaces as a
+    # CUDA OOM, which the retry loop below already handles.
+    echo "[$(date '+%F %T')] $NAME: still short after 1h — trying anyway; a real"
+    echo "    shortage will OOM and be retried (resubmit --array=$IDX if it fails out)"
+    return 0
 }
 
 for attempt in 1 2 3; do
-    wait_for_vram || exit 75
+    wait_for_vram
     echo "[$(date '+%F %T')] $NAME: attempt $attempt"
     # gamma, seed and (in arm 1) ref_length are the swept axes. timesteps,
     # num_envs and everything else come from the env yaml -- see

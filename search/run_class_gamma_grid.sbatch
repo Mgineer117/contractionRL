@@ -79,7 +79,9 @@ echo "[$(date '+%F %T')] idx=$IDX/$TOTAL -> $NAME on $(hostname), CUDA=$CUDA_VIS
 # nvidia-smi: on a MIG node CUDA_VISIBLE_DEVICES is a UUID, which `nvidia-smi -i`
 # rejects -- it returns empty and a naive check then passes. mem_get_info()
 # resolves index and MIG UUID alike.
-MIN_FREE_MB=${MIN_FREE_MB:-3500}
+# 2800, not 3500: measured steady use is ~2.1 GiB plus the CMG regression's
+# ~840 MiB eigh workspace, so 3500 was rejecting GPUs that would in fact have fit.
+MIN_FREE_MB=${MIN_FREE_MB:-2800}
 wait_for_vram() {
     local waited=0
     while [[ "$waited" -lt 3600 ]]; do
@@ -89,12 +91,19 @@ wait_for_vram() {
         echo "[$(date '+%F %T')] $NAME: ${free:-unreadable} MiB free < $MIN_FREE_MB — waiting"
         sleep 120; waited=$(( waited + 120 ))
     done
-    echo "[$(date '+%F %T')] $NAME: no room after 1h — cell NOT lost (resubmit --array=$IDX)"
-    return 1
+    # TRY ANYWAY rather than giving up. Measured on the sibling grid: 4 of 96 cells
+    # burned an hour and exited 75 on a GPU reporting 2318 MiB free against a 3500
+    # threshold -- marginal, not hopeless. Exiting turned a maybe into a certain
+    # loss AND consumed the array slot; SLURM marks exit 75 FAILED and does not
+    # requeue. Falling through means a genuine shortage surfaces as a CUDA OOM,
+    # which the retry loop below already handles.
+    echo "[$(date '+%F %T')] $NAME: still short after 1h — trying anyway; a real"
+    echo "    shortage will OOM and be retried (resubmit --array=$IDX if it fails out)"
+    return 0
 }
 
 for attempt in 1 2 3; do
-    wait_for_vram || exit 75
+    wait_for_vram
     echo "[$(date '+%F %T')] $NAME: attempt $attempt"
     # ONLY the swept axes (gamma, seed) and run identity are passed. Everything
     # else -- timesteps, num_envs, ref_offset, learning rate, network -- comes from
