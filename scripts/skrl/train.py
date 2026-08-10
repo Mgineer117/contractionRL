@@ -717,25 +717,35 @@ if _is_classic:
         # gamma effect read off runs that do not record their window is really a
         # gamma-and-architecture effect with no way to tell after the fact.
         # ref_length_mode says whether this run pinned it or inherited AUTO.
+        _mel = int(raw_env.unwrapped.max_episode_len)
+        _win_cfg = {
+            "ref_length": int(_len),
+            "ref_offset": int(args_cli.ref_offset),
+            "ref_length_mode": "pinned" if args_cli.ref_length is not None else "auto",
+            "ref_window_span": int(_len) * int(args_cli.ref_offset),
+            "effective_horizon": int(_RW.effective_horizon(_gamma, _mel)),
+            "max_episode_len": _mel,
+            # <1 means the window is SHORTER than the discount's horizon, i.e. V
+            # is non-Markov in the reference -- the POMDP the window exists to
+            # prevent.
+            "window_over_horizon": (int(_len) * int(args_cli.ref_offset))
+            / max(int(_RW.effective_horizon(_gamma, _mel)), 1),
+        }
+        # Written into the PENDING wandb_kwargs, not onto wandb.run: wandb.init()
+        # is called later, by skrl's Agent.init(), so wandb.run is still None
+        # here and a live config.update() silently no-ops (measured: every window
+        # key came back None on the first launch that tried it). The kwargs dict
+        # is the same object the wandb_kwargs block above populated, so mutating
+        # it now still reaches init.
+        if not args_cli.no_wandb:
+            agent_cfg["agent"].setdefault("experiment", {}).setdefault(
+                "wandb_kwargs", {}).setdefault("config", {}).update(_win_cfg)
         try:
             import wandb as _wb
-            if _wb.run is not None:
-                _mel = int(raw_env.unwrapped.max_episode_len)
-                _wb.run.config.update({
-                    "ref_length": int(_len),
-                    "ref_offset": int(args_cli.ref_offset),
-                    "ref_length_mode": "pinned" if args_cli.ref_length is not None else "auto",
-                    "ref_window_span": int(_len) * int(args_cli.ref_offset),
-                    "effective_horizon": int(_RW.effective_horizon(_gamma, _mel)),
-                    "max_episode_len": _mel,
-                    # <1 means the window is SHORTER than the discount's horizon,
-                    # i.e. V is non-Markov in the reference -- the POMDP the
-                    # window exists to prevent.
-                    "window_over_horizon": (int(_len) * int(args_cli.ref_offset))
-                    / max(int(_RW.effective_horizon(_gamma, _mel)), 1),
-                }, allow_val_change=True)
+            if _wb.run is not None:      # sweep path: init already happened
+                _wb.run.config.update(_win_cfg, allow_val_change=True)
         except Exception:
-            pass  # wandb off or not yet initialised — logging must never break a run
+            pass  # wandb off — logging must never break a run
 
     if getattr(args_cli, "fix_ref_trajectories", False):
         if not hasattr(raw_env.unwrapped, "set_fix_ref_trajectories"):
