@@ -215,4 +215,6 @@ empirical_dynamics:
 
 trainer:
   class: C2RLSkrlTrainer
-  timesteps: 1000000  # Total number of environment steps to train for
+  # 500k: cartpole needs materially longer than the car to settle. This is the
+  # SINGLE source of truth for the budget -- launch scripts must not override it.
+  timesteps: 500000  # Total number of environment steps to train for

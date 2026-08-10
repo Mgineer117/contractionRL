@@ -284,4 +284,7 @@ empirical_dynamics:
 
 trainer:
   class: C2RLSkrlTrainer
-  timesteps: 100000  # Total number of environment steps to train for
+  # 300k, matching classic-car-v0 exactly. The two differ ONLY in the state box
+  # and cm_data_path; an unequal training budget would confound the class
+  # comparison the pair exists for. SINGLE source of truth -- do not override.
+  timesteps: 300000  # Total number of environment steps to train for

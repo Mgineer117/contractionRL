@@ -49,8 +49,8 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 read -r -a ENVS <<< "${1:?pass the env list as one quoted argument}"
 GAMMAS=(0.5 0.9 0.95 0.99 0.999)
 NSEEDS=${NSEEDS:-30}
-STEPS=${STEPS:-200000}
-NUM_ENVS=${NUM_ENVS:-1024}
+# No STEPS / NUM_ENVS here on purpose: those live in each env's yaml. See the
+# train.py invocation below.
 
 G=${#GAMMAS[@]}
 E=${#ENVS[@]}
@@ -96,8 +96,13 @@ wait_for_vram() {
 for attempt in 1 2 3; do
     wait_for_vram || exit 75
     echo "[$(date '+%F %T')] $NAME: attempt $attempt"
+    # ONLY the swept axes (gamma, seed) and run identity are passed. Everything
+    # else -- timesteps, num_envs, ref_offset, learning rate, network -- comes from
+    # the env's own yaml, which is the single source of truth. Overriding a config
+    # value from a launch script silently detaches the run from the committed
+    # config: the yaml then documents something the run did not do, and per-env
+    # tuning (segway/cartpole need 500k, car 300k) gets flattened to one number.
     python scripts/skrl/train.py --classic --task "$ENV" --algorithm c2rl-ppo \
-        --num_envs "$NUM_ENVS" --ref_offset 1 --num_timesteps "$STEPS" \
         --discount_factor "$GAMMA" --seed "$SEED" \
         --wandb_project contractionRL --wandb_run_name "$NAME" --wandb_batch class_gamma
     rc=$?

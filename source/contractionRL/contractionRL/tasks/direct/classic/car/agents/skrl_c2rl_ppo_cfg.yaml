@@ -277,4 +277,6 @@ empirical_dynamics:
 
 trainer:
   class: C2RLSkrlTrainer
-  timesteps: 100000  # Total number of environment steps to train for
+  # 300k. This is the SINGLE source of truth for the budget -- launch scripts must
+  # not override it. classic-car_weak-v0 inherits this file's sibling copy.
+  timesteps: 300000  # Total number of environment steps to train for
