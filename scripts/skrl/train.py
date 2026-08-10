@@ -696,13 +696,17 @@ if _is_classic:
     # the Markov check below reports against the gamma actually used.
     _gamma = float(agent_cfg["agent"].get("discount_factor", 0.99))
     if hasattr(raw_env.unwrapped, "configure_ref_window"):
+        # Imported unconditionally: the window CONFIG block below calls
+        # _RW.effective_horizon() on both paths, and it used to be imported only
+        # inside the AUTO branch -- so every PINNED run died with
+        # "NameError: name '_RW' is not defined" before reaching training.
+        from contractionRL.agents.skrl.ref_window import RefWindow as _RW
         _len = args_cli.ref_length
         if _len is None:
             # AUTO: size the window to THIS run's gamma. Done here, after every
             # gamma override (CLI + wandb sweep) has landed, so a swept
             # discount_factor resizes the observation to match instead of
             # being evaluated against a stale hand-picked length.
-            from contractionRL.agents.skrl.ref_window import RefWindow as _RW
             _len = _RW.length_for_horizon(
                 _gamma, int(raw_env.unwrapped.max_episode_len), args_cli.ref_offset)
             print(f"[train] ref_length AUTO -> {_len} "
