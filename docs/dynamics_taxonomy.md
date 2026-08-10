@@ -83,6 +83,10 @@ class III  if  it is not class I and λ*(x) is NON-CONSTANT on X
 
 *The three are mutually exclusive and exhaustive by construction.*
 
+All three are properties of the **program** `P` — hence of the pair
+(plant, box) *and* of the modelling choice `A = ∂f/∂x` that `P` is fed. §4 draws
+that boundary and measures it.
+
 The classes run in order of what a certificate can do with the plant: class I
 admits none, class II admits one uniform rate, class III admits a rate that a
 subset of the box can improve. Definition 1 is not directly checkable — `λ*(x)`
@@ -108,8 +112,16 @@ mere stability is the substitution `A ↦ A + λI`, the classical `α`-shift of 
 (Anderson & Moore). Corollary 4.1 rederives it from this document's quantitative
 inequality, purely as a consistency check. ∎
 
-Class I is therefore just a name for *"not λ-stabilizable somewhere on the box"*.
-What is worth adding is only how to **evaluate** it:
+Class I is therefore a name for *"not λ-stabilizable somewhere on the box,
+**in the pointwise drift-Jacobian sense**"* — and that qualifier is load-bearing,
+not decorative. `(C1)` is fed `A = ∂f/∂x`, which cannot see the Lie bracket that
+steers a differentially flat or nonholonomic plant: pvtol and turtlebot are both
+class I here while both are perfectly controllable, and for turtlebot `f ≡ 0` so
+`A ≡ 0` and the test inspects *none* of the dynamics. **§4.2 measures the gap;
+§4.3 states how to read this.** The remedy for such plants is a method that sees
+brackets (`cmg_method: ccm`), not a different envelope.
+
+What is worth adding is only how to **evaluate** the test:
 
 * **The test is finite.** Uncontrollable modes sit only at eigenvalues of `A`, so
   testing `s ∈ spec(A) ∩ {Re s ≥ −λ}` misses nothing.
@@ -263,6 +275,13 @@ to have both a constant `B` *and* an `A`-variation that does not reach
   the yes/no, never for the size.
 * **The obvious proof route is dead** — §2.3.
 
+**A caution that §4.2 sharpens.** The screen fires exactly when `B` varies — and
+a varying `B` is precisely what makes the drift-only model `A = ∂f/∂x` an
+incomplete description of the plant, since the neglected term `Σᵢ uᵢ ∂bᵢ/∂x` is
+zero iff `B` is constant. So the screen is most confident exactly where the
+underlying program is least faithful. It remains a correct statement *about this
+program*; whether it survives on the generalized Jacobian is untested.
+
 The partial reason it works is Proposition 6: at fixed `A`, more control
 authority means a strictly easier state. The gap is that `A` is never fixed
 between two states of a real plant, and §3.5 shows authority is not even the
@@ -382,11 +401,13 @@ LMI margin `q·w_lb + 1/dt` (Proposition 5). pvtol and turtlebot are class I wit
 an uncontrollable mode at `s = 0` — turtlebot's margin is exactly zero because
 `f ≡ 0` makes `A ≡ 0`; pvtol's `1e-19` is a numerically-zero nilpotent block,
 matching the `A₂₂` with `eig = {0,0}` extracted independently in
-`cvstem_feasibility_theory.md` §1.3.
+`cvstem_feasibility_theory.md` §1.3. Both are class I **for this program**: both
+plants are in fact controllable, and §4.2 measures how much of their dynamics the
+drift Jacobian discards (pvtol 39×, turtlebot everything).
 
 * **The `ρ` screen was right every time** on the class, and wildly wrong on
   magnitude (ball_and_beam: `ρ` 58.6 against `λ*` 1.37). Classify with it, never
-  quantify.
+  quantify — or use `λ_C` (§1.3), which is right on both.
 * **auv has a state with `λ*(x) = 0`** at this envelope, which is why its `ν` is
   `8.6e4` and its `w_lb` `1.2e-5`.
 * **The classes are stable in λ.** Re-running at `λ = 1.0` reproduces every
