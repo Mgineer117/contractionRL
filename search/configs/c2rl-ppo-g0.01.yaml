@@ -1,4 +1,4 @@
-label: c2rl (rl=ppo, cm=cvstem) gamma=0.999
+label: c2rl (rl=ppo, cm=cvstem) gamma=0.01
 algorithm: c2rl-ppo
 num_envs: 1024
 
@@ -32,7 +32,7 @@ extra_flags:
 parameters:
   # ── The treatment: fixed for this sweep ──────────────────────────────────── #
   agent.discount_factor:
-    value: 0.999
+    value: 0.01
 
   # ── Held fixed, NOT searched ─────────────────────────────────────────────── #
   # Normalization off. Value/reward normalization was refuted for this algorithm
