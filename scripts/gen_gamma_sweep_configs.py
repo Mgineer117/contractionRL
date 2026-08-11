@@ -36,15 +36,27 @@ num_envs: 1024
 method: bayes
 
 metric:
-  name: "Stability/auc_mean"
-  goal: minimize
+  # The DISCOUNTED return -- the objective the agent is actually given, and the
+  # only quantity whose maximizer is pi*_gamma. Tuning against undiscounted AUC
+  # instead would select the policy that happens to track well while using gamma
+  # as an algorithmic device, which severs the link between what the theory
+  # proves and what the experiment measures. It is also NOT one of the reported
+  # outcomes, so selecting on it does not make any reported effect definitional.
+  #
+  # gamma-dependence of this criterion is harmless: it selects hyperparameters
+  # WITHIN a gamma and is never compared across them -- the cross-gamma
+  # comparison is on the fixed outcome metrics (AUC, lambda, C, C/lambda).
+  name: "Reward/discounted_return_mean"
+  goal: maximize
 
 runner:
   # A run that dies without writing the metric is IGNORED by bayes bookkeeping,
   # so nothing is learned and the same dead region gets resampled. The wrapper
-  # turns a failure into a real datapoint.
+  # turns a failure into a real datapoint. NEGATIVE because the goal is now
+  # maximize: the poison value must be worse than any real score, and the
+  # Mahalanobis reward is itself negative.
   wrapper: true
-  bad_value: 100.0
+  bad_value: -1.0e6
 
 extra_flags:
   - "--ref_offset"

@@ -769,8 +769,15 @@ if _is_classic:
     # Wrapper order is load-bearing: StatManagerEnvWrapper must see the flat
     # tensor observations BatchedGymnasiumWrapper produces, and WandbPlotWrapper
     # sits outermost so it observes every step() regardless of caller.
+    _stat_env = StatManagerEnvWrapper(BatchedGymnasiumWrapper(raw_env))
+    # Hand the wrapper the FINAL gamma so it can accumulate the discounted
+    # return sum_t gamma^t r_t -- the objective the agent is actually given, and
+    # the sweep's selection metric. Read from agent_cfg after every override
+    # (CLI and wandb sweep) has landed, so a swept discount_factor discounts with
+    # the value that run really used rather than the yaml's default.
+    _stat_env.set_discount_factor(float(agent_cfg["agent"].get("discount_factor", 0.99)))
     env = WandbPlotWrapper(
-        StatManagerEnvWrapper(BatchedGymnasiumWrapper(raw_env)),
+        _stat_env,
         total_timesteps=agent_cfg["trainer"]["timesteps"],
     )
 
