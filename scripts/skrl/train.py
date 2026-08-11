@@ -859,8 +859,27 @@ if _is_classic:
     runner.run()
     env.close()
 
-    _evaluate_classic_path_tracking(task=args_cli.task, runner=runner, args_cli=args_cli,
-                                    _is_classic=_is_classic)
+    # Post-training reporting must NEVER void a finished run. Training is done and
+    # the sweep's objective (Reward/discounted_return_mean) was logged during it,
+    # so a failure in the final evaluation costs some reporting detail, not the
+    # trial. Left unguarded, one FileNotFoundError writing eval_results.json
+    # turned every completed sweep trial into a crashed one -- and a crashed
+    # trial's metric is what bayes bookkeeping ignores, so the search learned
+    # nothing from runs that had actually succeeded.
+    #
+    # Deliberately broad: this is the last statement before exit, there is
+    # nothing downstream to protect, and any exception class here is strictly
+    # less important than the run that already completed. The traceback is
+    # printed in full rather than swallowed.
+    try:
+        _evaluate_classic_path_tracking(task=args_cli.task, runner=runner, args_cli=args_cli,
+                                        _is_classic=_is_classic)
+    except Exception:
+        import traceback
+        print("[Eval] WARNING: final evaluation FAILED — training itself completed "
+              "and its metrics are already logged. Traceback follows; exiting 0.",
+              flush=True)
+        traceback.print_exc()
     # Controlled comparison: re-eval the PURE base (residual bypassed) on the same
     # frozen CMG the trained residual just used — the airtight base-vs-residual delta.
     if getattr(args_cli, "eval_base_too", False):

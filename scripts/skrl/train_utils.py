@@ -957,20 +957,9 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
     print(f"{_tag} overshoot C      : {C_mean:.3f} ± {C_ci:.3f}")
     print(f"{_tag} contraction rate : {lbd_mean:.4f} ± {lbd_ci:.4f}  (C·e^(−λkΔt), min AUC)")
 
-    _json_name = f"eval_results{'_' + label.lower() if label else ''}.json"
-    out_json = os.path.join(agent.experiment_dir, _json_name)
-    # skrl creates experiment_dir lazily, on its FIRST checkpoint write — and a
-    # sweep trial sets checkpoint_interval=0 (train.py, "throwaway"), so the
-    # directory never appears and this write raised FileNotFoundError on the very
-    # last line of every trial. Training and the sweep metric had already
-    # completed, so the search still worked, but each trial was recorded as
-    # `failed` and lost its eval json. Cheaper to create the directory than to
-    # couple this to whether checkpointing happened to be on.
-    os.makedirs(os.path.dirname(out_json), exist_ok=True)
-    with open(out_json, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"[Eval] Saved → {out_json}")
-
+    # wandb FIRST, disk second. Training has already succeeded by this point and
+    # the numbers above are the result; a filesystem problem must not be able to
+    # lose them. This ordering used to be reversed, and the disk write threw.
     if not args_cli.no_wandb and "wandb" in sys.modules and sys.modules["wandb"].run is not None:
         wandb_logs = {}
         for k, v in results.items():
@@ -982,6 +971,28 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
                 else:
                     wandb_logs[f"final_eval/{k}"] = v
         sys.modules["wandb"].log(wandb_logs)
+
+    # makedirs, because agent.experiment_dir MAY NOT EXIST. skrl creates it
+    # lazily on its first write there, and for a sweep trial train.py sets
+    # checkpoint_interval = 0 (hundreds of throwaway trials must not each write
+    # ten checkpoints) -- so nothing ever writes, the directory is never made,
+    # and this open() raised FileNotFoundError on EVERY sweep trial that got as
+    # far as evaluating. Training had already finished at that point, so a
+    # multi-hour trial was being thrown away at the last step.
+    _json_name = f"eval_results{'_' + label.lower() if label else ''}.json"
+    out_json = os.path.join(agent.experiment_dir, _json_name)
+    try:
+        os.makedirs(agent.experiment_dir, exist_ok=True)
+        with open(out_json, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"[Eval] Saved → {out_json}")
+    except OSError as exc:
+        # Loud, but NOT fatal. The metrics are already in wandb above, and the
+        # json is a convenience copy: a full quota or a read-only path is not a
+        # reason to discard a finished run. Raising here is what turned a
+        # successful trial into a crashed one.
+        print(f"[Eval] WARNING: could not write {out_json}: {exc}. "
+              f"Metrics were logged to wandb; continuing.", flush=True)
 
 
 
