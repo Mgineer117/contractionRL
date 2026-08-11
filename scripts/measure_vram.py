@@ -75,12 +75,17 @@ def descendants(pid: int) -> set[int]:
 
 
 def measure(env: str, *, timesteps: int, ref_length: int, num_envs: int,
-            gamma: float, poll: float, timeout: float) -> dict:
+            gamma: float, poll: float, timeout: float,
+            encoder: str | None = None, stride: int | None = None) -> dict:
     cmd = [sys.executable, "scripts/skrl/train.py", "--classic",
            "--task", env, "--algorithm", "c2rl-ppo",
            "--num_timesteps", str(timesteps), "--discount_factor", str(gamma),
            "--seed", "0", "--ref_length", str(ref_length),
            "--num_envs", str(num_envs), "--no_wandb"]
+    if encoder:
+        cmd += ["--encoder", encoder, "--critic_encoder", encoder]
+    if stride:
+        cmd += ["--encoder_stride", str(stride), "--critic_encoder_stride", str(stride)]
     envv = dict(os.environ)
     envv["PYTHONPATH"] = os.path.join(ROOT, "source", "contractionRL")
     # Child stdout goes to a FILE, never to subprocess.PIPE. With a pipe that
@@ -126,8 +131,17 @@ def main() -> int:
     ap.add_argument("--gamma", type=float, default=0.999,
                     help="highest gamma; with a PINNED window this does not change "
                          "the observation, but it does change ref-window compute")
-    ap.add_argument("--poll", type=float, default=1.0)
+    # 0.1 s, not 1 s. nvidia-smi samples an instantaneous value, so a peak shorter
+    # than the poll interval is simply INVISIBLE -- and the transients here (the
+    # CMG regression's eigh, an attention score matrix) are exactly that shape.
+    # A slow poll biases the answer downward, which is the wrong direction.
+    ap.add_argument("--poll", type=float, default=0.1)
     ap.add_argument("--timeout", type=float, default=3600)
+    ap.add_argument("--encoder", default=None,
+                    help="force the window encoder (mlp|gru|attn) on BOTH actor and critic")
+    ap.add_argument("--stride", type=int, default=None, help="force encoder stride")
+    ap.add_argument("--headroom", type=float, default=0.25,
+                    help="fraction of the card left free when reporting packing")
     ap.add_argument("--cards", nargs="+", type=int, default=[24564, 49152, 81559],
                     help="card sizes (MiB) to report packing for: A10 24G, L40S 48G, H100 80G")
     args = ap.parse_args()
@@ -147,7 +161,7 @@ def main() -> int:
         print(f"[measure] {task} ...", flush=True)
         r = measure(task, timesteps=args.timesteps, ref_length=args.ref_length,
                     num_envs=args.num_envs, gamma=args.gamma, poll=args.poll,
-                    timeout=args.timeout)
+                    timeout=args.timeout, encoder=args.encoder, stride=args.stride)
         rows.append(r)
         status = "ok" if r["rc"] == 0 else f"rc={r['rc']}"
         print(f"    peak {r['peak_mib']} MiB   {status}   {r['elapsed_s']:.0f}s")
@@ -163,12 +177,22 @@ def main() -> int:
     ok = [r for r in rows if r["rc"] == 0 and r["peak_mib"] > 0]
     if ok:
         worst = max(ok, key=lambda r: r["peak_mib"])
-        print(f"\nworst env: {worst['env']} at {worst['peak_mib']} MiB")
+        pk = worst["peak_mib"]
+        print(f"\nworst env: {worst['env']} at {pk} MiB")
         print("Size a shared card by the WORST env, not the mean -- one OOM takes "
               "down whatever else is packed on that GPU.")
+        print(f"PESSIMISTIC packing: {int(args.headroom * 100)}% of the card held "
+              f"back, because a measured peak understates the real requirement --")
+        print("  * nvidia-smi samples instantaneously, so a transient shorter than "
+              "the poll can still be missed;")
+        print("  * the caching allocator fragments over a long run, and these "
+              "measurements are short;")
+        print("  * on a shared partition another user's job can arrive on the same "
+              "card after ours starts.")
         for c in args.cards:
-            print(f"  {c // 1024}G card -> {c // worst['peak_mib']} concurrent runs "
-                  f"(leave one slot spare for fragmentation)")
+            usable = int(c * (1.0 - args.headroom))
+            print(f"  {c // 1024}G card -> {usable // pk} concurrent runs "
+                  f"(optimistic {c // pk})")
     bad = [r for r in rows if r["rc"] != 0 or r["peak_mib"] == 0]
     if bad:
         print("\nNOT MEASURED (treat as unknown, do not assume):")
