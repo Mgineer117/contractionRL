@@ -243,18 +243,28 @@ parser.add_argument("--ref_offset", "--ref-offset", type=int, default=1,
 # How BOTH the actor's W2(xrefs) and the critic's psi(xrefs) turn the reference
 # window into a fixed vector. Shared by design — the critic's independence comes
 # from its own architecture (phi/psi/combine), not a second encoder choice.
-parser.add_argument("--encoder", "--enc", type=str, default="mlp",
+# default=None, NOT "mlp"/1, so "explicitly passed" is distinguishable from "not
+# passed". With a non-None default the apply site could only use setdefault (a
+# plain assignment would clobber a sweep-sampled value back to the CLI default
+# every trial) -- and setdefault means the YAML silently wins over an explicit
+# flag. Measured: `--encoder attn --encoder_stride 1` on classic-car-v0, whose
+# yaml pins encoder: gru / stride: 3, ran as gru/3 and said nothing, so a VRAM
+# measurement taken that way was of the wrong configuration entirely.
+parser.add_argument("--encoder", "--enc", type=str, default=None,
                     choices=["mlp", "gru", "attn"],
                     help="Reference-window encoder for the actor's W2 and the critic's "
                          "psi: mlp (flatten), gru (recency-weighted), attn (learned "
-                         "attention over points).")
-parser.add_argument("--encoder_stride", "--encoder-stride", type=int, default=1,
+                         "attention over points). Overrides the yaml. Default when "
+                         "absent: the yaml's value, else mlp.")
+parser.add_argument("--encoder_stride", "--encoder-stride", type=int, default=None,
                     help="Keep every Nth window point (nearest-first) before encoding; "
-                         "1 = dense. Bounds 'mlp' input width on a long window.")
+                         "1 = dense. Bounds 'mlp' input width on a long window. "
+                         "Overrides the yaml; default when absent: the yaml's value, "
+                         "else 1.")
 parser.add_argument("--critic_encoder", "--critic-encoder", type=str, default=None,
                     choices=["mlp", "gru", "attn"],
                     help="Override the critic's psi encoder (defaults to --encoder).")
-parser.add_argument("--critic_encoder_stride", "--critic-encoder-stride", type=int, default=1,
+parser.add_argument("--critic_encoder_stride", "--critic-encoder-stride", type=int, default=None,
                     help="Stride for the critic's psi encoder (see --encoder_stride).")
 parser.add_argument("--critic_combine", "--critic-combine", type=str, default="concat",
                     choices=["concat"],
@@ -434,8 +444,18 @@ def _apply_agent_overrides(agent_cfg, args):
     # every trial.
     _policy_block = agent_cfg.get("models", {}).get("policy")
     if isinstance(_policy_block, dict):
-        _policy_block.setdefault("encoder", args.encoder)
-        _policy_block.setdefault("encoder_stride", args.encoder_stride)
+        # Explicit flag WINS over the yaml; absent flag leaves the yaml (or a
+        # sweep-sampled value) alone and falls back to mlp/1 only if neither set
+        # it. Both halves matter: assignment-always clobbers sweeps, and
+        # setdefault-always makes the flag a no-op on any env that pins these.
+        if args.encoder is not None:
+            _policy_block["encoder"] = args.encoder
+        else:
+            _policy_block.setdefault("encoder", "mlp")
+        if args.encoder_stride is not None:
+            _policy_block["encoder_stride"] = args.encoder_stride
+        else:
+            _policy_block.setdefault("encoder_stride", 1)
     if getattr(args, "reward_euclidean", None):
         a["reward_euclidean"] = True
     if getattr(args, "reward_level", None):
@@ -731,11 +751,20 @@ if _is_classic:
 
     _critic_block = agent_cfg.get("models", {}).get("critic")
     if isinstance(_critic_block, dict):
-        # setdefault, not assignment — see the policy block above.
-        _critic_block.setdefault("encoder", args_cli.critic_encoder or args_cli.encoder)
+        # Same explicit-wins rule as the policy block above: an explicitly passed
+        # flag overrides the yaml, an absent one leaves the yaml (or a
+        # sweep-sampled value) and falls back only if nothing set it.
+        _enc = args_cli.critic_encoder or args_cli.encoder
+        if _enc is not None:
+            _critic_block["encoder"] = _enc
+        else:
+            _critic_block.setdefault("encoder", "mlp")
+        if args_cli.critic_encoder_stride is not None:
+            _critic_block["encoder_stride"] = args_cli.critic_encoder_stride
+        else:
+            _critic_block.setdefault("encoder_stride", 1)
         _critic_block.setdefault("combine", args_cli.critic_combine)
         _critic_block.setdefault("embed_dim", args_cli.critic_embed_dim)
-        _critic_block.setdefault("encoder_stride", args_cli.critic_encoder_stride)
 
     # Wrapper order is load-bearing: StatManagerEnvWrapper must see the flat
     # tensor observations BatchedGymnasiumWrapper produces, and WandbPlotWrapper
