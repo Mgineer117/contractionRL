@@ -26,6 +26,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -82,21 +83,33 @@ def measure(env: str, *, timesteps: int, ref_length: int, num_envs: int,
            "--num_envs", str(num_envs), "--no_wandb"]
     envv = dict(os.environ)
     envv["PYTHONPATH"] = os.path.join(ROOT, "source", "contractionRL")
-    p = subprocess.Popen(cmd, cwd=ROOT, env=envv, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True)
+    # Child stdout goes to a FILE, never to subprocess.PIPE. With a pipe that
+    # nothing drains until the child exits, the 64 KiB kernel buffer fills and the
+    # child BLOCKS on write -- and train.py's tqdm writes constantly, so it stalls
+    # within seconds. Measured before this fix: a car run sat at "epoch 25/3000"
+    # after a full hour and reported a peak of 1204 MiB, which was simply the
+    # footprint at the moment it froze, not a peak of anything.
+    with tempfile.NamedTemporaryFile("w+", suffix=".log", delete=False) as fh:
+        log_path = fh.name
     peak, t0, seen_gpu = 0, time.time(), False
-    while p.poll() is None:
-        if time.time() - t0 > timeout:
-            p.kill()
-            break
-        cur = proc_mib(descendants(p.pid))
-        if cur > 0:
-            seen_gpu = True
-        peak = max(peak, cur)
-        time.sleep(poll)
+    with open(log_path, "w") as out:
+        p = subprocess.Popen(cmd, cwd=ROOT, env=envv, stdout=out,
+                             stderr=subprocess.STDOUT, text=True)
+        while p.poll() is None:
+            if time.time() - t0 > timeout:
+                p.kill()
+                break
+            cur = proc_mib(descendants(p.pid))
+            if cur > 0:
+                seen_gpu = True
+            peak = max(peak, cur)
+            time.sleep(poll)
     tail = ""
     with contextlib.suppress(Exception):
-        tail = "".join((p.stdout.read() or "").splitlines(keepends=True)[-4:])
+        with open(log_path) as fh:
+            tail = "".join(fh.read().splitlines(keepends=True)[-4:])
+    with contextlib.suppress(Exception):
+        os.unlink(log_path)
     return {"env": env, "peak_mib": peak, "rc": p.returncode,
             "seen_gpu": seen_gpu, "elapsed_s": time.time() - t0, "tail": tail}
 
