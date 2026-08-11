@@ -2,7 +2,7 @@ label: c2rl (rl=ppo, cm=cvstem) gamma=0.5
 algorithm: c2rl-ppo
 num_envs: 1024
 
-# Bayes, not grid: the PPO/GAE knobs crossed with the encoder axes are far too
+# Bayes, not grid: the optimizer x PPO x architecture cross product is far too
 # large to enumerate, and a surrogate is the point.
 method: bayes
 
@@ -12,8 +12,8 @@ metric:
 
 runner:
   # A run that dies without writing the metric is IGNORED by bayes bookkeeping,
-  # so nothing is learned and the same dead region gets sampled again. The
-  # wrapper turns a failure into a real datapoint.
+  # so nothing is learned and the same dead region gets resampled. The wrapper
+  # turns a failure into a real datapoint.
   wrapper: true
   bad_value: 100.0
 
@@ -22,60 +22,63 @@ extra_flags:
   - "1"
   # PINNED, and this is the treatment protocol rather than a convenience. AUTO
   # sizes the window to 1/(1-gamma), which makes observation width a FUNCTION of
-  # the treatment (19-wide at gamma=0.5 against 2504-wide at 0.999) -- a
-  # fat-hand intervention no post-hoc analysis can undo. 500 == max_episode_len
-  # for car/car_weak/segway/cartpole, so every policy sees the whole reference
+  # the treatment (19-wide at gamma=0.5 against 2504-wide at 0.999) -- a fat-hand
+  # intervention no post-hoc analysis can undo. 500 == max_episode_len for
+  # car/car_weak/segway/cartpole, so every policy sees the whole reference
   # trajectory and has a Markov state regardless of its discount.
   - "--ref_length"
   - "500"
 
 parameters:
   # ── The treatment: fixed for this sweep ──────────────────────────────────── #
+  # Tuned AROUND, never tuned. The window does not track it -- ref_length is
+  # pinned above -- so the architecture is identical across all six sweeps.
   agent.discount_factor:
     value: 0.5
 
   # ── Held fixed, NOT searched ─────────────────────────────────────────────── #
-  # Normalization off. Value/reward normalization was refuted for this algorithm
-  # (see the commit that disabled it repo-wide); state normalization interacts
-  # with the uref-folding controller in a way that is load-bearing and not a
-  # free knob. Pinned rather than omitted so a trial cannot inherit a stale
-  # per-env yaml value and so the runs table records what was actually used.
+  # Normalization off: value/reward normalization was refuted for this algorithm,
+  # and state normalization interacts with the uref-folding controller in a way
+  # that is load-bearing rather than a free knob.
   agent.use_state_norm:
     value: false
   agent.use_value_norm:
     value: false
   agent.use_reward_norm:
     value: false
-  # No KLAdaptiveLR. learning_rate below is therefore a CONSTANT step size for
-  # the whole run, which is what makes it a meaningful search axis at all -- with
-  # an adaptive scheduler the initial value is mostly forgotten.
+  # No KLAdaptiveLR, so learning_rate below is a true CONSTANT for the whole run
+  # -- which is what makes it a meaningful search axis. `Policy / KL divergence`
+  # survives this: agent_patches.patch_kl_logging attaches a scheduler clamped to
+  # min_lr == max_lr, which cannot move the LR but keeps the hook.
   agent.learning_rate_scheduler:
     value: null
-  # CAPS action-smoothness regularizer fully OFF, both terms. At scale 0.0
-  # patch_caps_regularizer no-ops entirely -- no hooks, no extra tensors.
+  # CAPS action-smoothness fully off, both terms. At 0.0 patch_caps_regularizer
+  # no-ops entirely -- no hooks, no extra tensors.
   agent.caps_temporal_scale:
     value: 0.0
   agent.caps_spatial_scale:
     value: 0.0
 
   # ── Searched: optimizer ──────────────────────────────────────────────────── #
-  # Log-uniform over three decades. The per-env yamls pin 1.0e-5, which was
-  # chosen under a KL-adaptive schedule that is now off, so it is not a
-  # trustworthy centre and the range deliberately brackets it widely.
+  # Log-uniform over three decades. The per-env yamls pin 1.0e-5, chosen under a
+  # KL-adaptive schedule that is now off, so it is not a trustworthy centre and
+  # the range brackets it widely on purpose.
   agent.learning_rate:
     distribution: log_uniform_values
     min: 1.0e-6
     max: 1.0e-3
-  # PPO's own early-stopping KL threshold (NOT the scheduler target, which is
-  # gone with the scheduler). Larger = more permissive updates per rollout.
+  # PPO's own early stop. With the LR fixed this is the ONLY trust-region
+  # control, and the stop is per-MINIBATCH, not on the epoch mean.
   agent.kl_threshold:
     values: [0.004, 0.008, 0.016, 0.032, 0.064]
-  # Anneal the exploration std over training. A live hypothesis for the
-  # high-gamma instability: policy std stayed at 0.65-0.80 at high gamma against
-  # 0.22 at low gamma, and residual noise on an unstable plant is what turns a
-  # transient into an overshoot.
+  # A live hypothesis for the high-gamma instability: policy std stayed at
+  # 0.65-0.80 at high gamma against 0.22 at low gamma, and residual exploration
+  # noise on an unstable plant is what turns a transient into an overshoot.
   agent.std_dev_annealing:
     values: [true, false]
+  # 0.0 keeps the current behaviour in the ladder as a control.
+  agent.entropy_loss_scale:
+    values: [0.0, 0.001, 0.01]
 
   # ── Searched: PPO / GAE ──────────────────────────────────────────────────── #
   agent.gae_lambda:
@@ -86,48 +89,36 @@ parameters:
     values: [2, 5, 10]
   agent.mini_batches:
     values: [4, 8, 16]
+  # Steps per env per update. The per-env yamls disagree wildly here (car 4,
+  # segway/cartpole 24), which is itself a reason to search rather than inherit.
+  agent.rollouts:
+    values: [4, 8, 16, 24]
+  agent.grad_norm_clip:
+    values: [0.5, 1.0, 5.0]
 
-  # ── Searched: reference-window encoding ──────────────────────────────────── #
+  # ── Searched: architecture ───────────────────────────────────────────────── #
   # "mlp" flattens the (strided) points; "gru"/"attn" consume them as a sequence
-  # (nn_modules.PreviewSequenceEncoder). These two synthetic keys each fan out to
-  # BOTH models.policy.* and models.critic.* (train_utils.apply_wandb_sweep_
-  # overrides), so one trial always uses the same encoder and stride on both
-  # sides. models.policy.backbone stays pinned at `control`: the CLActor
+  # (nn_modules.PreviewSequenceEncoder). Both synthetic keys fan out to BOTH
+  # models.policy.* and models.critic.* (train_utils.apply_wandb_sweep_overrides),
+  # so a trial always uses the same encoder and stride on both sides.
+  # models.policy.backbone stays pinned at `control`: the CLActor
   # u = uref + feedback form is load-bearing for the Mahalanobis reward, not a
   # tuning axis.
   xref_encoder:
     values: [mlp, gru, attn]
   # Sized for the PINNED 500-point window: keeps 500/100/50/20/10 points respectively.
+  # NOTE stride 1 with attn is the expensive corner -- attention is quadratic in
+  # sequence length, so that cell dominates the VRAM budget for the whole sweep.
   xref_encoder_stride:
     values: [1, 5, 10, 25, 50]
-
-  # ── Searched: the contraction metric itself ──────────────────────────────── #
-  # These four ARE the offline dataset's cache key, so every trial needs its own
-  # {x -> W*(x)} solve. cm_build_if_missing makes the trial pretrain it rather
-  # than die: sweep_runner's _HARD_MARKERS do not match a FileNotFoundError, so
-  # a missing dataset propagates as a plain crash -> a METRIC-LESS trial, which
-  # bayes silently ignores while resampling the same dead region.
-  # Budget accordingly: a trial that misses the cache pays the full per-state SDP
-  # solve (~14 min at cmg_memory_size=100000) BEFORE any training.
-  cm.cm_build_if_missing:
-    value: true
-  # Certified rate the metric is solved at. Large parts of this space are
-  # genuinely infeasible for a given plant; the runner's bad_value records that
-  # as a real datapoint instead of a hole.
-  cm.lbd:
-    distribution: log_uniform_values
-    min: 0.01
-    max: 2.0
-  # Metric envelope. w_lb caps nu <= 1/w_lb, and that cap alone decides
-  # feasibility on some plants (segway went 0/32 -> 32/32 feasible from 0.1 to
-  # 0.01), so it is a genuine axis rather than a formality.
-  cm.w_lb:
-    values: [0.0001, 0.001, 0.01]
-  cm.w_ub:
-    values: [100.0, 1000.0, 10000.0]
-  # R in K = (1/r)B^T M: sets the certified gain magnitude.
-  cm.cvstem_r_scaler:
-    values: [0.4, 0.8, 1.6, 3.2, 6.4]
-  # Control-effort weight in the Mahalanobis reward (0 = tracking error only).
-  cm.control_scaler:
-    values: [0.0, 0.01, 0.1, 1.0]
+  # Hidden layers, actor and critic together. Reaches models.*.network[0].layers
+  # through a synthetic fanout, because `network` is a LIST and a dotted sweep
+  # key cannot index it -- without that handler layer shape is unreachable from a
+  # sweep and "architecture" would mean the encoder alone.
+  net_hidden:
+    values:
+      - [128, 128]
+      - [256, 256]
+      - [512, 512]
+      - [128, 128, 128]
+      - [256, 256, 256]

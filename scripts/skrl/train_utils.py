@@ -217,8 +217,25 @@ def apply_wandb_sweep_overrides(agent_cfg: dict) -> None:
         "xref_encoder_stride": (("models", "policy", "encoder_stride"),
                                  ("models", "critic", "encoder_stride")),
     }
+    # Network SHAPE, for both actor and critic. Needs its own handler rather than
+    # a dotted path because `network` is a LIST of blocks -- `models.policy.
+    # network.0.layers` cannot be walked by the setdefault loop below, which only
+    # descends dicts. Without this the only searchable architecture axis is the
+    # encoder, and layer width/depth (the thing usually meant by "architecture")
+    # is unreachable from a sweep.
+    _NET_KEY = "net_hidden"
 
     for dotted, value in wandb.config.items():
+        if dotted == _NET_KEY:
+            layers = list(value) if isinstance(value, (list, tuple)) else [value]
+            for role in ("policy", "critic"):
+                blocks = agent_cfg.get("models", {}).get(role, {}).get("network")
+                if not blocks:
+                    continue
+                # First block only: these configs use a single named block, and
+                # rewriting every block would also clobber any auxiliary head.
+                blocks[0]["layers"] = [int(u) for u in layers]
+            continue
         if dotted in _FANOUT:
             for *parents, leaf in _FANOUT[dotted]:
                 node = agent_cfg
