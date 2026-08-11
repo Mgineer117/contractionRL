@@ -91,11 +91,17 @@ parameters:
   # tuning axis.
   xref_encoder:
     values: [mlp, gru, attn]
-  # Sized for the PINNED 500-point window: keeps 500/100/50/20/10 points respectively.
-  # NOTE stride 1 with attn is the expensive corner -- attention is quadratic in
-  # sequence length, so that cell dominates the VRAM budget for the whole sweep.
+  # Sized for the PINNED 500-point window: keeps 100/50/20/10 points respectively.
+  # STRIDE 1 IS DELIBERATELY ABSENT. Attention is quadratic in sequence length,
+  # so attn x stride-1 over all 500 points dominated the cost of the entire
+  # sweep -- measured at 1% of training after 25 min, i.e. a 40-130 h trial
+  # against the wall clock, which is why the first launch finished zero trials.
+  # Dropping it does NOT weaken the Markov argument: stride subsamples the window
+  # for ENCODING while the window still SPANS all 500 steps, so the effective
+  # horizon the observation covers is unchanged. It only removes the densest
+  # encoding of that same span.
   xref_encoder_stride:
-    values: [1, 5, 10, 25, 50]
+    values: [5, 10, 25, 50]
   # Hidden layers, actor and critic together. Reaches models.*.network[0].layers
   # through a synthetic fanout, because `network` is a LIST and a dotted sweep
   # key cannot index it -- without that handler layer shape is unreachable from a

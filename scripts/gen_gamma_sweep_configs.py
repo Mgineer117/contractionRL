@@ -1,4 +1,33 @@
-label: c2rl (rl=ppo, cm=cvstem) gamma=0.999
+"""Generate one c2rl-ppo sweep config per gamma.
+
+Gamma is the TREATMENT: tuned around, never tuned. Each gamma gets its own
+Bayesian search, so the estimand is "effect of gamma under OPTIMAL tuning" --
+sharing one tuned config confounds it with "the defaults happen to suit low
+gamma", the artifact that made an earlier segway reading wrong.
+
+HELD FIXED by the ENV YAMLS and simply absent from the search space, so no trial
+can vary them and the decision lives in exactly one place:
+    use_state_norm / use_value_norm / use_reward_norm = false
+    learning_rate_scheduler = null                      (no KLAdaptiveLR)
+    caps_temporal_scale / caps_spatial_scale = 0.0      (regularizer fully off)
+
+REMOVED entirely: the cm.* family and every residual_pretrain_* axis. The
+contraction metric is an INPUT to this experiment -- built once per env by
+build_cm_dataset from that env's yaml -- not something a trial tunes. (The
+cm_build_if_missing machinery stays in the code at its False default, so
+restoring a cm.* sweep later is a config edit, not a code change.)
+
+SEARCHED, split into optimizer / PPO / architecture:
+    learning_rate, kl_threshold, std_dev_annealing, entropy_loss_scale
+    gae_lambda, ratio_clip, learning_epochs, mini_batches, rollouts, grad_norm_clip
+    xref_encoder, xref_encoder_stride, net_hidden
+"""
+import pathlib
+
+GAMMAS = ["0.01", "0.1", "0.5", "0.9", "0.99", "0.999"]
+PIN_LEN = 500
+
+TEMPLATE = """label: c2rl (rl=ppo, cm=cvstem) gamma={g}
 algorithm: c2rl-ppo
 num_envs: 1024
 
@@ -23,18 +52,18 @@ extra_flags:
   # PINNED, and this is the treatment protocol rather than a convenience. AUTO
   # sizes the window to 1/(1-gamma), which makes observation width a FUNCTION of
   # the treatment (19-wide at gamma=0.5 against 2504-wide at 0.999) -- a fat-hand
-  # intervention no post-hoc analysis can undo. 500 == max_episode_len for
+  # intervention no post-hoc analysis can undo. {pin} == max_episode_len for
   # car/car_weak/segway/cartpole, so every policy sees the whole reference
   # trajectory and has a Markov state regardless of its discount.
   - "--ref_length"
-  - "500"
+  - "{pin}"
 
 parameters:
   # ── The treatment: fixed for this sweep ──────────────────────────────────── #
   # Tuned AROUND, never tuned. The window does not track it -- ref_length is
   # pinned above -- so the architecture is identical across all six sweeps.
   agent.discount_factor:
-    value: 0.999
+    value: {g}
 
   # NOT LISTED, deliberately: use_state_norm / use_value_norm / use_reward_norm
   # (false), learning_rate_scheduler (null) and caps_temporal_scale /
@@ -91,13 +120,13 @@ parameters:
   # tuning axis.
   xref_encoder:
     values: [mlp, gru, attn]
-  # Sized for the PINNED 500-point window: keeps 100/50/20/10 points respectively.
+  # Sized for the PINNED {pin}-point window: keeps {keeps2} points respectively.
   # STRIDE 1 IS DELIBERATELY ABSENT. Attention is quadratic in sequence length,
-  # so attn x stride-1 over all 500 points dominated the cost of the entire
+  # so attn x stride-1 over all {pin} points dominated the cost of the entire
   # sweep -- measured at 1% of training after 25 min, i.e. a 40-130 h trial
   # against the wall clock, which is why the first launch finished zero trials.
   # Dropping it does NOT weaken the Markov argument: stride subsamples the window
-  # for ENCODING while the window still SPANS all 500 steps, so the effective
+  # for ENCODING while the window still SPANS all {pin} steps, so the effective
   # horizon the observation covers is unchanged. It only removes the densest
   # encoding of that same span.
   xref_encoder_stride:
@@ -113,3 +142,10 @@ parameters:
       - [512, 512]
       - [128, 128, 128]
       - [256, 256, 256]
+"""
+
+keeps2 = "/".join(str(PIN_LEN // s) for s in (5, 10, 25, 50))
+for g in GAMMAS:
+    p = pathlib.Path(f"search/configs/c2rl-ppo-g{g}.yaml")
+    p.write_text(TEMPLATE.format(g=g, pin=PIN_LEN, keeps2=keeps2))
+    print(f"wrote {p}")
