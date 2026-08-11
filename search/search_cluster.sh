@@ -210,7 +210,11 @@ _header "contractionRL cluster sweep launcher"
 _success "Algorithm: ${C_BOLD}$ALGORITHM${C_RESET}"
 
 # ── Env ───────────────────────────────────────────────────────────────────── #
-CLASSIC_ENVS=("classic-car-v0" "classic-cartpole-v0" "classic-segway-v0" "classic-turtlebot-v0" "classic-quadrotor-v0")
+# Keep in sync with build_sweep.py's CLASSIC_ENVS -- they are two separate
+# whitelists, and adding an env to only one of them fails LATE and quietly:
+# build_sweep accepts classic-car_weak-v0 while this script rejects it, so a
+# batch launch skips those sweeps with no job id and no error line.
+CLASSIC_ENVS=("classic-car-v0" "classic-car_weak-v0" "classic-cartpole-v0" "classic-segway-v0" "classic-turtlebot-v0" "classic-quadrotor-v0")
 ISAAC_ENVS=("Humanoid-PathTracking-v0" "Humanoid-VelTracking-v0" "Manipulator-PathTracking-v0" "Manipulator-VelTracking-v0" "Quadruped-PathTracking-v0" "Quadruped-VelTracking-v0")
 if [[ -z "$ENV_ARG" ]]; then
     ENV_ARG=$(prompt_choice "Select env to sweep (or 'all' for every classic env):" \
@@ -221,6 +225,7 @@ if [[ "$ENV_ARG" == "all" ]]; then
 else
     case "$ENV_ARG" in
         car|classic-car-v0)             ENVS=("classic-car-v0") ;;
+        car_weak|classic-car_weak-v0)   ENVS=("classic-car_weak-v0") ;;
         cartpole|classic-cartpole-v0)   ENVS=("classic-cartpole-v0") ;;
         segway|classic-segway-v0)       ENVS=("classic-segway-v0") ;;
         turtlebot|classic-turtlebot-v0) ENVS=("classic-turtlebot-v0") ;;
