@@ -36,28 +36,13 @@ parameters:
   agent.discount_factor:
     value: 0.01
 
-  # ── Held fixed, NOT searched ─────────────────────────────────────────────── #
-  # Normalization off: value/reward normalization was refuted for this algorithm,
-  # and state normalization interacts with the uref-folding controller in a way
-  # that is load-bearing rather than a free knob.
-  agent.use_state_norm:
-    value: false
-  agent.use_value_norm:
-    value: false
-  agent.use_reward_norm:
-    value: false
-  # No KLAdaptiveLR, so learning_rate below is a true CONSTANT for the whole run
-  # -- which is what makes it a meaningful search axis. `Policy / KL divergence`
-  # survives this: agent_patches.patch_kl_logging attaches a scheduler clamped to
-  # min_lr == max_lr, which cannot move the LR but keeps the hook.
-  agent.learning_rate_scheduler:
-    value: null
-  # CAPS action-smoothness fully off, both terms. At 0.0 patch_caps_regularizer
-  # no-ops entirely -- no hooks, no extra tensors.
-  agent.caps_temporal_scale:
-    value: 0.0
-  agent.caps_spatial_scale:
-    value: 0.0
+  # NOT LISTED, deliberately: use_state_norm / use_value_norm / use_reward_norm
+  # (false), learning_rate_scheduler (null) and caps_temporal_scale /
+  # caps_spatial_scale (0.0). All twelve classic c2rl-ppo yamls already set
+  # exactly these, so restating them here would be a second copy of the same
+  # decision -- and a sweep parameter is the wrong place to keep it, since it
+  # would then have to be edited in seven files instead of one whenever it
+  # changes. They are absent from the search space, so no trial can vary them.
 
   # ── Searched: optimizer ──────────────────────────────────────────────────── #
   # Log-uniform over three decades. The per-env yamls pin 1.0e-5, chosen under a
