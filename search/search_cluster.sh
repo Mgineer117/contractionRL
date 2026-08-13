@@ -766,6 +766,21 @@ for gpu in "\${JOB_GPUS[@]}"; do
                     probe_fail=0
                 fi
                 echo "[\$(date '+%F %T')] gpu \$gpu agent \$a: (re)starting wandb agent"
+                # PRIVATE wandb dir per (job, gpu, agent). Every worker used to
+                # share \$REPO_DIR/wandb, and the reaper below deletes run-* older
+                # than a minute -- so with several workers running concurrently,
+                # one worker's reaper deleted ANOTHER worker's LIVE run directory.
+                # The victim then died at wandb.finish() with
+                # "OSError: [Errno 116] Stale file handle", after training had
+                # completed and its metric was already logged. Measured: 14 of 70
+                # trials. Scoping the directory makes the reaper touch only runs
+                # this agent created.
+                # $REPO_DIR unescaped: baked in at generation time, because it is
+                # defined only in the OUTER launcher and does not exist inside the
+                # generated job script. Escaped, it would expand to empty and try
+                # to create /wandb_... at the filesystem root.
+                export WANDB_DIR="$REPO_DIR/wandb_\${SLURM_JOB_ID:-nojob}_g\${gpu}_a\${a}"
+                mkdir -p "\$WANDB_DIR"
                 CUDA_VISIBLE_DEVICES=\$gpu timeout "\$PER_RUN_TIMEOUT" wandb agent --count 1 "\$SWEEP_ID"
                 # Reap the local run cache. A c2rl-ppo trial leaves ~1 GB in
                 # wandb/run-*, so an 80-trial grid alone is ~80 GB and a 103 GB
@@ -774,7 +789,8 @@ for gpu in "\${JOB_GPUS[@]}"; do
                 # like a training bug rather than a full disk. Only run-* is
                 # removed (already streamed to the server); offline-run-* is
                 # left alone because for those the local copy IS the data.
-                find "$REPO_DIR/wandb" -maxdepth 1 -name 'run-*' -type d \\
+                # Scoped to THIS agent's private dir -- see above.
+                find "\$WANDB_DIR" -maxdepth 1 -name 'run-*' -type d \\
                     -mmin +1 -exec rm -rf {} + 2>/dev/null || true
                 run_count=\$(( run_count + 1 ))
                 if [[ "\$RUNS_PER_AGENT" -gt 0 && "\$run_count" -ge "\$RUNS_PER_AGENT" ]]; then
