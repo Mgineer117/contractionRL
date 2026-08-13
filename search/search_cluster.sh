@@ -770,11 +770,14 @@ for gpu in "\${JOB_GPUS[@]}"; do
                 # completed and its metric was already logged. Measured: 14 of 70
                 # trials. Scoping the directory makes the reaper touch only runs
                 # this agent created.
-                # $REPO_DIR unescaped: baked in at generation time, because it is
-                # defined only in the OUTER launcher and does not exist inside the
-                # generated job script. Escaped, it would expand to empty and try
-                # to create /wandb_... at the filesystem root.
-                export WANDB_DIR="$REPO_DIR/wandb_\${SLURM_JOB_ID:-nojob}_g\${gpu}_a\${a}"
+                # On SCRATCH, not in the repo. /u is quota'd at 103 GB and 500k
+                # inodes and is shared with conda envs and other projects; a
+                # single active run's run-*.wandb transaction log can reach
+                # several GB, and 15 concurrent workers put /u at 94 GB of 103 GB
+                # within an hour. ~/scratch is a separate filesystem with 10 TB
+                # and NO inode cap, so the sweep's local cache cannot exhaust the
+                # home quota and take the cluster session down with it.
+                export WANDB_DIR="\$HOME/scratch/wandb_sweeps/\${SLURM_JOB_ID:-nojob}_g\${gpu}_a\${a}"
                 mkdir -p "\$WANDB_DIR"
                 CUDA_VISIBLE_DEVICES=\$gpu timeout "\$PER_RUN_TIMEOUT" wandb agent --count 1 "\$SWEEP_ID"
                 # Reap the local run cache. A c2rl-ppo trial leaves ~1 GB in

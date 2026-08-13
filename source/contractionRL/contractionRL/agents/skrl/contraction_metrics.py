@@ -976,7 +976,22 @@ class StatManagerEnvWrapper:
             # as the real differences the sweeps are trying to resolve.
             # Emitting nothing until there is a real value keeps the key
             # absent instead of wrong; skrl simply has no datapoint to average.
-            if self._initialized and self._compute_count > 0 and isinstance(info, dict):
+            # ... and only when the value has actually CHANGED, i.e. once per
+            # buffer round rather than once per step. stability_summary() is
+            # recomputed by _compute_batched_metrics; between rounds it returns
+            # the identical numbers, so emitting every step wrote thousands of
+            # duplicate rows.
+            #
+            # This is not a cosmetic saving. wandb's local transaction log holds
+            # one record per logged scalar, and the summary grew from ~19 keys to
+            # ~54 when the full quantile set was added -- a single active run's
+            # run-*.wandb reached 3.4 GB, 15 concurrent workers put the home
+            # filesystem at 94 GB of a 103 GB quota, and the previous quota
+            # exhaustion killed the whole search.
+            _fresh = self._initialized and self._compute_count > 0 and (
+                self._compute_count != getattr(self, "_last_logged_compute_count", None))
+            if _fresh and isinstance(info, dict):
+                self._last_logged_compute_count = self._compute_count
                 if "log" not in info or not isinstance(info["log"], dict):
                     info["log"] = {}
                 info["log"].update(stability_log_dict(self.stability_summary(), self._device()))
