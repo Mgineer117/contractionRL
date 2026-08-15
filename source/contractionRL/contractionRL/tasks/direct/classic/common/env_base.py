@@ -68,6 +68,38 @@ class BaseEnv(gym.Env):
                 "one without the other silently falls back to xref_0 + xe_0."
             )
         self.X_INIT_SIGN_DIMS = list(env_config.get("x_init_sign_dims", []) or [])
+        # ── Early-termination box (opt-in) ───────────────────────────────── #
+        # The episode ENDS the first step x leaves [X_TERMINATION_MIN,
+        # X_TERMINATION_MAX]. Without it a diverged env is silently PINNED at the
+        # state box by the clamp in step() and keeps emitting off-distribution
+        # transitions for the rest of the episode — on segway, 500 steps of
+        # already-fallen data per failure, which is what makes the rollout batch
+        # (and hence the seed) decide what PPO fits.
+        #
+        # Defaults to the state box itself in every env module, i.e. it fires
+        # exactly where the clamp already silently activates — the same event,
+        # reported instead of hidden. Tighten it per env to end episodes sooner.
+        #
+        # OFF unless terminate_out_of_box is set (--terminate_out_of_box): it
+        # shortens episodes, which changes every algorithm's data distribution
+        # and would silently invalidate comparisons against already-published
+        # LQR/C3M/CV-STEM numbers.
+        _xt_lo = env_config.get("x_termination_min")
+        _xt_hi = env_config.get("x_termination_max")
+        self.X_TERMINATION_MIN = (None if _xt_lo is None else torch.tensor(
+            _xt_lo, device=self.device, dtype=torch.float32).flatten())
+        self.X_TERMINATION_MAX = (None if _xt_hi is None else torch.tensor(
+            _xt_hi, device=self.device, dtype=torch.float32).flatten())
+        if (self.X_TERMINATION_MIN is None) != (self.X_TERMINATION_MAX is None):
+            raise ValueError(
+                "[BaseEnv] x_termination_min and x_termination_max must be set "
+                "together — one without the other silently never terminates.")
+        self.terminate_out_of_box = False
+        self.x_termination_terminal = False
+        self.set_terminate_out_of_box(
+            bool(env_config.get("terminate_out_of_box", False)),
+            terminal=bool(env_config.get("x_termination_terminal", False)),
+            quiet=True)
         self.XE_MIN = torch.tensor(env_config["xe_min"], device=self.device, dtype=torch.float32).flatten()
         self.XE_MAX = torch.tensor(env_config["xe_max"], device=self.device, dtype=torch.float32).flatten()
         self.UREF_MIN = torch.tensor(env_config["uref_min"], device=self.device, dtype=torch.float32).flatten()
@@ -552,6 +584,65 @@ class BaseEnv(gym.Env):
                 self.init_maha_error[env_ids] = torch.bmm(
                     torch.bmm(e0.transpose(1, 2), M0), e0).squeeze(-1).squeeze(-1)
 
+    def set_terminate_out_of_box(self, flag: bool, *, terminal: bool = False,
+                                 quiet: bool = False) -> None:
+        """Turn the early-termination box on/off (the ``--terminate_out_of_box``
+        entry point, mirroring ``set_eig_reshape``).
+
+        ``terminal`` reports the excursion on ``terminated`` instead of
+        ``truncated``. Leave it False unless you know why: skrl's GAE is
+        ``not_done = ~terminated`` (agent_patches.compute_gae), so ``terminated``
+        replaces the true continuation value V(x) with ZERO. Every reward here is
+        a cost (V < 0), so ending the episode becomes strictly better than
+        continuing — a suicide bonus some seeds find and others don't, i.e.
+        exactly the variance this feature exists to remove. As ``truncated`` with
+        ``time_limit_bootstrap: true`` (set in every classic ppo/c2rl-ppo yaml)
+        skrl adds gamma*V(x_final) back, the agent is indifferent to the cut, and
+        there is no terminal penalty to tune.
+        """
+        flag = bool(flag)
+        if flag:
+            if self.X_TERMINATION_MIN is None:
+                raise ValueError(
+                    "[BaseEnv] terminate_out_of_box=True but this env defines no "
+                    "x_termination_min/max — it would silently never terminate.")
+            # step() clamps the state into [X_MIN, X_MAX] before anything else
+            # sees it, so a termination bound OUTSIDE that box can never be
+            # crossed and the whole feature would be a silent no-op.
+            if (self.X_TERMINATION_MIN < self.X_MIN).any() or (self.X_TERMINATION_MAX > self.X_MAX).any():
+                raise ValueError(
+                    "[BaseEnv] the termination box must lie inside [X_MIN, X_MAX] "
+                    "(step() clamps to it, so a wider bound never fires):\n"
+                    f"  X_MIN             {self.X_MIN.tolist()}\n"
+                    f"  X_TERMINATION_MIN {self.X_TERMINATION_MIN.tolist()}\n"
+                    f"  X_TERMINATION_MAX {self.X_TERMINATION_MAX.tolist()}\n"
+                    f"  X_MAX             {self.X_MAX.tolist()}")
+        self.terminate_out_of_box = flag
+        self.x_termination_terminal = bool(terminal)
+        if flag and not quiet:
+            print(f"[BaseEnv] terminate_out_of_box=True on "
+                  f"{'terminated' if self.x_termination_terminal else 'truncated'}: "
+                  f"episodes end on leaving {self.X_TERMINATION_MIN.tolist()} .. "
+                  f"{self.X_TERMINATION_MAX.tolist()}")
+        if self.x_termination_terminal:
+            print("[BaseEnv] WARNING: x_termination_terminal=True zeroes the GAE "
+                  "bootstrap at the cut. On a cost reward that is a suicide bonus "
+                  "— use truncation unless you have added a matching terminal "
+                  "penalty. See set_terminate_out_of_box.__doc__.")
+
+    def _left_termination_box(self, next_x: torch.Tensor):
+        """Per-env bool: did the state just leave the termination box?
+
+        ``None`` when the feature is off, so callers can tell "no excursion"
+        from "not checking" — the whole point of the opt-in gate.
+        Angles are wrapped first, so a bound inside (-pi, pi] is comparable
+        against the same representation the state is stored in.
+        """
+        if not self.terminate_out_of_box:
+            return None
+        xw = self.wrap_angles(next_x)
+        return ((xw < self.X_TERMINATION_MIN) | (xw > self.X_TERMINATION_MAX)).any(dim=-1)
+
     def step(self, u: torch.Tensor):
         if not isinstance(u, torch.Tensor):
             u = torch.tensor(u, device=self.device, dtype=torch.float32)
@@ -564,6 +655,11 @@ class BaseEnv(gym.Env):
         next_x = self.x_t + self.dt * x_dot
 
         next_x = carry_forward_nonfinite(next_x, self.x_t)
+
+        # Measured on the RAW integrated state, BEFORE the position freeze and
+        # the X-box clamp below — both erase the excursion, so a check placed
+        # after them could never fire. None when the feature is off.
+        left_box = self._left_termination_box(next_x)
 
         pos_min = self.X_MIN[:self.pos_dimension]
         pos_max = self.X_MAX[:self.pos_dimension]
@@ -582,6 +678,14 @@ class BaseEnv(gym.Env):
 
         termination = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         truncation = self.time_steps >= self.episode_len
+        if left_box is not None:
+            # Truncation, not termination, unless explicitly asked otherwise —
+            # see x_termination_terminal in __init__ for why (zeroed bootstrap
+            # = suicide bonus on a cost reward).
+            if self.x_termination_terminal:
+                termination = termination | left_box
+            else:
+                truncation = truncation | left_box
         dones = termination | truncation
 
         info_dict = {
@@ -596,6 +700,14 @@ class BaseEnv(gym.Env):
         # value (flat) because get_rewards' infos are rebuilt into this dict here.
         if "maha_tracking_error" in infos:
             info_dict["maha_tracking_error"] = infos["maha_tracking_error"]
+
+        # Which envs are ending SHORT of the horizon. StatManagerEnvWrapper
+        # invalidates those slots: AUC/lambda/C are defined on the full-length
+        # normalized error curve, and a curve cut at step k is not the same
+        # quantity — padding it (which is what the wrapper does for a short slot)
+        # would report a fabricated flat tail as if the policy had held there.
+        if left_box is not None:
+            info_dict["episode_ended_early"] = left_box.clone()
 
         if dones.any():
             done_idx = dones.nonzero(as_tuple=False).squeeze(-1)

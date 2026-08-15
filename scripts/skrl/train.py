@@ -177,6 +177,17 @@ _ov.add_argument("--reward_euclidean", "--reward-euclidean",
                  dest="reward_euclidean", action="store_true", default=None)
 _ov.add_argument("--reward_level", "--reward-level",
                  dest="reward_level", action="store_true", default=None)
+# End the episode when the state leaves the env's X_TERMINATION_* box, instead of
+# silently pinning it there for the rest of the horizon (env_base.step's clamp).
+# OFF by default: it shortens episodes, which changes the data distribution for
+# every algorithm and is not comparable with already-published numbers.
+parser.add_argument("--terminate_out_of_box", "--terminate-out-of-box",
+                    dest="terminate_out_of_box", action="store_true", default=False)
+# Report that excursion on `terminated` rather than `truncated`. Zeroes the GAE
+# bootstrap, which on a cost reward is a suicide bonus — see
+# BaseEnv.set_terminate_out_of_box.__doc__ before using it.
+parser.add_argument("--terminate_as_terminal", "--terminate-as-terminal",
+                    dest="terminate_as_terminal", action="store_true", default=False)
 # C2RL only: warm-start the residual to the online per-state CV-STEM-LQR controller.
 _ov.add_argument("--cvstem_residual_distill", "--cvstem-residual-distill",
                  dest="cvstem_residual_distill", action="store_true", default=None)
@@ -662,6 +673,12 @@ if _is_classic:
     if not _is_contraction and (args_cli.reward_euclidean or args_cli.reward_level):
         raw_env.unwrapped.reward_euclidean = bool(args_cli.reward_euclidean)
         raw_env.unwrapped.reward_level = bool(args_cli.reward_level)
+    if args_cli.terminate_out_of_box or args_cli.terminate_as_terminal:
+        if not hasattr(raw_env.unwrapped, "set_terminate_out_of_box"):
+            raise SystemExit("--terminate_out_of_box requires a classic env_base env (got "
+                             f"{type(raw_env.unwrapped).__name__})")
+        raw_env.unwrapped.set_terminate_out_of_box(
+            True, terminal=bool(args_cli.terminate_as_terminal))
     if args_cli.eig_reshape is not None:
         if not hasattr(raw_env.unwrapped, "set_eig_reshape"):
             raise SystemExit("--eig_reshape requires a classic env_base env (got "

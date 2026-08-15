@@ -45,6 +45,14 @@ POS_SPREAD = 20.0
 POS_BOUND = POS_SPREAD + 1.5 * 15.0 + 2.5
 X_MIN = [-POS_BOUND, -POS_BOUND, -math.pi, v_l]
 X_MAX = [POS_BOUND, POS_BOUND, math.pi, v_h]
+
+# Episode ENDS the first step x leaves this box (opt-in: --terminate_out_of_box).
+# Defaults to the state box itself, i.e. it fires exactly where env_base.step's
+# clamp already silently pins a diverged env -- the same event, reported instead
+# of hidden. Tighten it here to end failing episodes sooner.
+X_TERMINATION_MIN = list(X_MIN)
+X_TERMINATION_MAX = list(X_MAX)
+
 XREF_INIT_MIN = [-POS_SPREAD, -POS_SPREAD, -1.0, 1.5]
 XREF_INIT_MAX = [POS_SPREAD, POS_SPREAD, 1.0, 1.5]
 XE_INIT_MIN = [-1.0, -1.0, -1.0, -1.0]
@@ -63,6 +71,8 @@ UREF_MAX = [1.5, 1.5]
 
 ENV_CONFIG = {
     "x_min": X_MIN, "x_max": X_MAX,
+    "x_termination_min": X_TERMINATION_MIN,
+    "x_termination_max": X_TERMINATION_MAX,
     "xref_init_min": XREF_INIT_MIN, "xref_init_max": XREF_INIT_MAX,
     "xe_init_min": XE_INIT_MIN, "xe_init_max": XE_INIT_MAX,
     "xe_min": XE_MIN, "xe_max": XE_MAX,

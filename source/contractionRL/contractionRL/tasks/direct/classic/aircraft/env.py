@@ -79,6 +79,13 @@ STATE_NAMES = ("alpha", "pitch", "vel", "pitch_rate")   # vel = V / V_REF
 X_MIN = [-0.20, -0.40, 0.60, -0.50]
 X_MAX = [0.30, 0.40, 2.50, 0.50]
 
+# Episode ENDS the first step x leaves this box (opt-in: --terminate_out_of_box).
+# Defaults to the state box itself, i.e. it fires exactly where env_base.step's
+# clamp already silently pins a diverged env -- the same event, reported instead
+# of hidden. Tighten it here to end failing episodes sooner.
+X_TERMINATION_MIN = list(X_MIN)
+X_TERMINATION_MAX = list(X_MAX)
+
 XREF_INIT_MIN = [-0.05, -0.10, 1.20, -0.10]
 XREF_INIT_MAX = [0.05, 0.10, 1.80, 0.10]
 
@@ -100,6 +107,8 @@ UREF_MAX = [1.0, 1.0]
 ENV_CONFIG = {
     "x_min": X_MIN,
     "x_max": X_MAX,
+    "x_termination_min": X_TERMINATION_MIN,
+    "x_termination_max": X_TERMINATION_MAX,
     "xref_init_min": XREF_INIT_MIN,
     "xref_init_max": XREF_INIT_MAX,
     "xe_init_min": XE_INIT_MIN,
