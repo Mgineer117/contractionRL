@@ -163,6 +163,41 @@ class PathTrackingBase(DirectRLEnv):
         # _sanitize_state) — populated lazily on first use.
         self._last_valid_state: torch.Tensor | None = None
 
+        # ── Early-termination box — the Isaac twin of BaseEnv's ──────────── #
+        # Same name, same semantics, same default (ON), so
+        # set_terminate_out_of_box / terminate_out_of_box / X_TERMINATION_*
+        # resolve identically on both families (tests/test_isaac_parity.py's
+        # rule). Two real differences, both from Isaac Sim rather than choice:
+        #
+        #   * The box defaults to _state_bounds(), which is ±inf for most Isaac
+        #     envs (they have no physical state box the way car/segway do). An
+        #     all-infinite box can never be crossed, so the feature is INERT
+        #     there until a subclass declares finite bounds — announced once at
+        #     construction rather than left to look armed.
+        #   * There is no clamp to fire at. The classic pathology is a diverged
+        #     env silently PINNED at its box; here it is a diverged env running
+        #     on under the carry-forward guard. A non-finite state therefore
+        #     counts as out-of-box: it is the same event this is meant to end.
+        _xt_lo, _xt_hi = self._state_bounds()
+        _xt_lo = getattr(self.cfg, "x_termination_min", None) or _xt_lo
+        _xt_hi = getattr(self.cfg, "x_termination_max", None) or _xt_hi
+        self.X_TERMINATION_MIN = torch.as_tensor(
+            _xt_lo, device=self.device, dtype=torch.float32).flatten()
+        self.X_TERMINATION_MAX = torch.as_tensor(
+            _xt_hi, device=self.device, dtype=torch.float32).flatten()
+        self.terminate_out_of_box = False
+        self.x_termination_terminal = False
+        self.set_terminate_out_of_box(
+            bool(getattr(self.cfg, "terminate_out_of_box", True)),
+            terminal=bool(getattr(self.cfg, "x_termination_terminal", False)),
+            quiet=True)
+        # Every subclass owns its own _get_dones (fall detection, task-specific
+        # limits), so the box is folded in by wrapping the bound method ONCE
+        # here rather than editing each subclass — the same post-construction
+        # patching idiom agent_patches.py uses for skrl, and for the same
+        # reason: one place to change, and no subclass can forget to call it.
+        self._get_dones = self._with_termination_box(self._get_dones)
+
         # --- episode-level eval metric accumulators ---
         # Streaming (memory-efficient) accumulators for the unified contraction
         # metrics — running sum of error norms (_episode_auc), first/last/peak
@@ -582,6 +617,75 @@ class PathTrackingBase(DirectRLEnv):
         self.observation_space = self.ref_window.space(lo, hi, u_lo, u_hi)
         self.cfg.observation_space = self.ref_window.flat_dim
         self.num_observations = self.ref_window.flat_dim
+
+    def set_terminate_out_of_box(self, flag: bool, *, terminal: bool = False,
+                                 quiet: bool = False) -> None:
+        """Arm/disarm the early-termination box. Twin of ``BaseEnv``'s.
+
+        ``terminal`` reports the excursion on ``terminated`` instead of the
+        time-out (truncation) channel. Leave it False: skrl's GAE is
+        ``not_done = ~terminated`` (agent_patches.compute_gae), so ``terminated``
+        replaces the true continuation value V(x) with ZERO, and on a cost reward
+        that makes ending the episode strictly better than continuing — a suicide
+        bonus. On the truncation channel with ``time_limit_bootstrap: true`` skrl
+        adds gamma*V(x_final) back and the agent is indifferent to the cut.
+
+        (A physical FALL is a different case and stays on ``terminated`` in the
+        subclasses that detect it: a robot on the ground has no continuation
+        value to bootstrap, so zero is the honest estimate there.)
+        """
+        flag = bool(flag)
+        self.terminate_out_of_box = flag
+        self.x_termination_terminal = bool(terminal)
+        finite = bool(torch.isfinite(self.X_TERMINATION_MIN).any()
+                      or torch.isfinite(self.X_TERMINATION_MAX).any())
+        if flag and not finite and not quiet:
+            print("[PathTracking] terminate_out_of_box=True but this env declares no "
+                  "finite state bounds (_state_bounds is ±inf), so the box is INERT. "
+                  "Override _state_bounds or set cfg.x_termination_min/max to arm it.")
+        elif flag and not quiet:
+            print(f"[PathTracking] terminate_out_of_box=True on "
+                  f"{'terminated' if self.x_termination_terminal else 'truncated'}: "
+                  f"episodes end on leaving the declared state bounds")
+        if self.x_termination_terminal:
+            print("[PathTracking] WARNING: x_termination_terminal=True zeroes the GAE "
+                  "bootstrap at the cut. On a cost reward that is a suicide bonus — "
+                  "see set_terminate_out_of_box.__doc__.")
+
+    def _left_termination_box(self, x: torch.Tensor):
+        """Per-env bool: did the physical state just leave the box? ``None`` when
+        disarmed, so callers can tell "no excursion" from "not checking".
+
+        Non-finite counts as out-of-box — a diverged Isaac env is exactly what
+        the carry-forward guard keeps alive, and that is the event to end.
+        Angle dims are wrapped first, matching ``BaseEnv._left_termination_box``.
+        """
+        if not self.terminate_out_of_box:
+            return None
+        xw = wrap_diff(x, self.angle_idx)
+        out = (xw < self.X_TERMINATION_MIN) | (xw > self.X_TERMINATION_MAX)
+        return out.any(dim=-1) | (~torch.isfinite(x)).any(dim=-1)
+
+    def _with_termination_box(self, get_dones):
+        """Wrap a subclass ``_get_dones`` so the box folds into its result.
+
+        Returns ``(terminated, time_out)`` exactly as Isaac Lab expects; the
+        excursion joins ``time_out`` (truncation) unless x_termination_terminal.
+        Also publishes ``episode_ended_early`` on ``extras`` so
+        StatManagerEnvWrapper can drop those episodes from AUC/lambda instead of
+        measuring a curve that was cut — which is precisely the objection that
+        kept this env family from terminating on divergence before.
+        """
+        def wrapped():
+            terminated, time_out = get_dones()
+            left_box = self._left_termination_box(self._get_physical_state())
+            if left_box is None:
+                return terminated, time_out
+            self.extras["episode_ended_early"] = left_box.clone()
+            if self.x_termination_terminal:
+                return terminated | left_box, time_out
+            return terminated, time_out | left_box
+        return wrapped
 
     def _state_bounds(self):
         """Per-dim (low, high) for the physical state. Unbounded by default —

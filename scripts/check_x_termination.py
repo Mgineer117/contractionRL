@@ -2,10 +2,12 @@
 
     python scripts/check_x_termination.py
 
-Covers the four things that can silently break:
-  1. OFF by default — every env keeps the old never-terminating behaviour.
-  2. ON — leaving the box ends the episode, on `truncated` (not `terminated`),
-     so skrl's GAE keeps bootstrapping and there is no suicide bonus.
+Covers the things that can silently break:
+  1. ON by default — leaving the box ends the episode, on `truncated` (not
+     `terminated`), so skrl's GAE keeps bootstrapping and there is no suicide
+     bonus.
+  2. Turning it OFF restores the old never-terminating behaviour exactly, which
+     is what every pre-flip number was measured under.
   3. A termination box wider than [X_MIN, X_MAX] RAISES instead of no-opping
      (step() clamps first, so a wider bound could never fire).
   4. StatManagerEnvWrapper drops early-ended episodes from AUC/lambda instead of
@@ -31,21 +33,10 @@ def _env(**kw):
     return SegwayEnv(num_envs=NUM_ENVS, device="cpu", **kw)
 
 
-# ── 1. off by default ────────────────────────────────────────────────────── #
+# ── 1. on by default, and reported as truncation ─────────────────────────── #
 env = _env()
-assert env.terminate_out_of_box is False
-assert env.X_TERMINATION_MIN is not None, "constants must exist even when off"
-env.reset()
-# Slam the state far outside the box; with the feature off nothing ends early.
-env.x_t[:] = torch.tensor([100.0, 3.0, 50.0, 50.0])
-_, _, term, trunc, info = env.step(torch.zeros(NUM_ENVS, env.num_dim_control))
-assert not term.any() and not trunc.any(), "default behaviour changed"
-assert "episode_ended_early" not in info, "flag leaks when the feature is off"
-print("1. off by default                     ok")
-
-# ── 2. on -> truncation, not termination ─────────────────────────────────── #
-env = _env()
-env.set_terminate_out_of_box(True)
+assert env.terminate_out_of_box is True, "the box must be armed by default"
+assert env.X_TERMINATION_MIN is not None
 env.reset()
 env.x_t[:] = OUT_OF_BOX
 _, _, term, trunc, info = env.step(torch.zeros(NUM_ENVS, env.num_dim_control))
@@ -53,7 +44,20 @@ assert info["episode_ended_early"].all(), "pitch ran past pi/3 but nothing fired
 assert trunc.all(), "excursion must be reported as truncation"
 assert not term.any(), "terminated zeroes the GAE bootstrap = suicide bonus"
 assert (env.time_steps == 0).all(), "env must have auto-reset"
-print("2. on -> truncated, not terminated    ok")
+print("1. on by default -> truncated         ok")
+
+# ── 2. turning it off restores the old behaviour ─────────────────────────── #
+env = _env()
+env.set_terminate_out_of_box(False)
+assert env.terminate_out_of_box is False
+assert env.X_TERMINATION_MIN is not None, "constants must exist even when off"
+env.reset()
+# Slam the state far outside the box; with the feature off nothing ends early.
+env.x_t[:] = torch.tensor([100.0, 3.0, 50.0, 50.0])
+_, _, term, trunc, info = env.step(torch.zeros(NUM_ENVS, env.num_dim_control))
+assert not term.any() and not trunc.any(), "off must never terminate"
+assert "episode_ended_early" not in info, "flag leaks when the feature is off"
+print("2. off restores old behaviour         ok")
 
 # opt-in terminal flag still available for anyone who wants it
 env = _env()
@@ -115,11 +119,12 @@ print(f"4. early-ended slots excluded         ok "
       f"(early_end_frac={frac:.2f}, valid={wrapped._recent_valid_n})")
 
 # ── 5. feature OFF is the old behaviour, metric for metric ───────────────── #
-# The regression that matters most: every published number was produced with no
-# termination box, so with the flag off nothing may be dropped and every metric
-# must still be reported.
+# The regression that matters most: every pre-flip number was produced with no
+# termination box, so with it off nothing may be dropped and every metric must
+# still be reported — that is what --no_terminate_out_of_box has to reproduce.
 raw = gym.make("classic-segway-v0", num_envs=NUM_ENVS, device="cpu")
 env = raw.unwrapped
+env.set_terminate_out_of_box(False)
 wrapped = StatManagerEnvWrapper(BatchedGymnasiumWrapper(raw), num_envs_for_eval=NUM_ENVS)
 wrapped.reset()
 for _ in range(env.max_episode_len + 2):
@@ -133,5 +138,46 @@ assert wrapped._recent_valid_n == NUM_ENVS, "every slot must count when the box 
 for k in ("auc_mean", "contraction_rate_mean", "overshoot_mean", "contraction_score_mean"):
     assert k in summary and summary[k] == summary[k], f"{k} missing/NaN with the feature off"
 print(f"5. off == previous behaviour          ok (auc={summary['auc_mean']:.3f})")
+
+# ── 6. classic <-> isaac parity, without needing Isaac Sim ───────────────── #
+# CLAUDE.md's rule: anything a contraction agent finds via getattr must exist
+# with the SAME signature on both env families. path_tracking_base imports
+# isaaclab, so this is checked statically on the source rather than by importing.
+import ast  # noqa: E402
+
+SHARED = {"set_terminate_out_of_box", "_left_termination_box"}
+SRC = pathlib.Path(__file__).resolve().parent.parent / "source/contractionRL/contractionRL/tasks/direct"
+SIDES = {
+    "classic": SRC / "classic/common/env_base.py",
+    "isaac": SRC / "common/path_tracking_base.py",
+}
+
+
+def _sigs(path):
+    tree = ast.parse(path.read_text())
+    out = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in SHARED:
+            a = node.args
+            out[node.name] = (
+                [p.arg for p in a.args],
+                [p.arg for p in a.kwonlyargs],
+            )
+    return out
+
+
+sigs = {side: _sigs(p) for side, p in SIDES.items()}
+for name in SHARED:
+    assert name in sigs["classic"], f"{name} missing from env_base"
+    assert name in sigs["isaac"], f"{name} missing from path_tracking_base"
+    assert sigs["classic"][name] == sigs["isaac"][name], (
+        f"{name} signature differs:\n  classic {sigs['classic'][name]}\n"
+        f"  isaac   {sigs['isaac'][name]}")
+for side, p in SIDES.items():
+    src = p.read_text()
+    for attr in ("X_TERMINATION_MIN", "X_TERMINATION_MAX", "terminate_out_of_box",
+                 "x_termination_terminal", "episode_ended_early"):
+        assert attr in src, f"{attr} missing from {side}"
+print(f"6. classic/isaac API parity           ok ({len(SHARED)} methods, 5 attrs)")
 
 print("\nall checks passed")

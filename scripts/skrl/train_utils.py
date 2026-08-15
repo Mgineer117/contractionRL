@@ -236,6 +236,55 @@ def apply_wandb_sweep_overrides(agent_cfg: dict) -> None:
             node[leaf] = value
 
 
+def apply_cli_dotted_overrides(agent_cfg: dict, extra_args: list[str]) -> list[str]:
+    """Fold CLI ``--a.b.c=value`` args into ``agent_cfg``; return what was applied.
+
+    Same dotted-path semantics as :func:`apply_wandb_sweep_overrides`, so a knob
+    can be pinned by hand exactly the way a sweep would set it
+    (``--agent.mini_batches=16``). Without this these args land in argparse's
+    leftovers and are SILENTLY DROPPED on the classic route — the run then trains
+    on the yaml defaults while its command line claims otherwise, which is the
+    same class of silent-config failure as an unknown yaml key.
+
+    The leaf must already exist in the yaml. A typo would otherwise create a dead
+    key that ``rl_glue.filter_cfg_fields`` drops later without a word — the exact
+    failure this function exists to prevent.
+    """
+    import ast
+
+    applied = []
+    for arg in extra_args:
+        if not (arg.startswith("--") and "=" in arg and "." in arg.split("=", 1)[0]):
+            continue
+        dotted, raw = arg[2:].split("=", 1)
+        try:
+            # Literal first ("16" -> int, "0.3" -> float, "true"/"mlp" fall
+            # through to str), so a numeric knob never arrives as a string.
+            value = ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            value = {"true": True, "false": False, "null": None}.get(raw.lower(), raw)
+
+        *parents, leaf = dotted.split(".")
+        node = agent_cfg
+        for key in parents:
+            if not isinstance(node.get(key), dict):
+                raise SystemExit(
+                    f"[train] --{dotted}: no '{key}' section in this env's config — "
+                    "the override would be silently dropped.")
+            node = node[key]
+        if leaf not in node:
+            raise SystemExit(
+                f"[train] --{dotted}: '{leaf}' is not a key of "
+                f"{'.'.join(parents) or 'the config'} (have: "
+                f"{', '.join(sorted(node)[:12])}...). Refusing to set a key the "
+                "config does not declare — it would be dropped without a word.")
+        node[leaf] = value
+        applied.append(f"{dotted}={value!r}")
+    if applied:
+        print("[train] CLI overrides: " + "  ".join(applied))
+    return applied
+
+
 def finish_wandb(args_cli) -> None:
     """Close the active W&B run, if this process started one."""
     if getattr(args_cli, "no_wandb", False):

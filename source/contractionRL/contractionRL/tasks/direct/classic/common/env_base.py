@@ -68,7 +68,7 @@ class BaseEnv(gym.Env):
                 "one without the other silently falls back to xref_0 + xe_0."
             )
         self.X_INIT_SIGN_DIMS = list(env_config.get("x_init_sign_dims", []) or [])
-        # ── Early-termination box (opt-in) ───────────────────────────────── #
+        # ── Early-termination box (ON by default) ────────────────────────── #
         # The episode ENDS the first step x leaves [X_TERMINATION_MIN,
         # X_TERMINATION_MAX]. Without it a diverged env is silently PINNED at the
         # state box by the clamp in step() and keeps emitting off-distribution
@@ -76,14 +76,14 @@ class BaseEnv(gym.Env):
         # already-fallen data per failure, which is what makes the rollout batch
         # (and hence the seed) decide what PPO fits.
         #
-        # Defaults to the state box itself in every env module, i.e. it fires
-        # exactly where the clamp already silently activates — the same event,
-        # reported instead of hidden. Tighten it per env to end episodes sooner.
+        # The box defaults to the state box itself in every env module, i.e. it
+        # fires exactly where the clamp already silently activates — the same
+        # event, reported instead of hidden. Tighten it per env to end episodes
+        # sooner.
         #
-        # OFF unless terminate_out_of_box is set (--terminate_out_of_box): it
-        # shortens episodes, which changes every algorithm's data distribution
-        # and would silently invalidate comparisons against already-published
-        # LQR/C3M/CV-STEM numbers.
+        # ON by default. Note this shortens episodes, so numbers are NOT directly
+        # comparable with runs made before this default flipped; pass
+        # --no_terminate_out_of_box to reproduce those.
         _xt_lo = env_config.get("x_termination_min")
         _xt_hi = env_config.get("x_termination_max")
         self.X_TERMINATION_MIN = (None if _xt_lo is None else torch.tensor(
@@ -97,7 +97,7 @@ class BaseEnv(gym.Env):
         self.terminate_out_of_box = False
         self.x_termination_terminal = False
         self.set_terminate_out_of_box(
-            bool(env_config.get("terminate_out_of_box", False)),
+            bool(env_config.get("terminate_out_of_box", True)),
             terminal=bool(env_config.get("x_termination_terminal", False)),
             quiet=True)
         self.XE_MIN = torch.tensor(env_config["xe_min"], device=self.device, dtype=torch.float32).flatten()
@@ -630,17 +630,17 @@ class BaseEnv(gym.Env):
                   "— use truncation unless you have added a matching terminal "
                   "penalty. See set_terminate_out_of_box.__doc__.")
 
-    def _left_termination_box(self, next_x: torch.Tensor):
-        """Per-env bool: did the state just leave the termination box?
+    def _left_termination_box(self, x: torch.Tensor):
+        """Per-env bool: did the state just leave the termination box? ``None``
+        when disarmed, so callers can tell "no excursion" from "not checking".
 
-        ``None`` when the feature is off, so callers can tell "no excursion"
-        from "not checking" — the whole point of the opt-in gate.
         Angles are wrapped first, so a bound inside (-pi, pi] is comparable
-        against the same representation the state is stored in.
+        against the same representation the state is stored in. Called with the
+        POST-integration state, before step()'s clamp erases the excursion.
         """
         if not self.terminate_out_of_box:
             return None
-        xw = self.wrap_angles(next_x)
+        xw = self.wrap_angles(x)
         return ((xw < self.X_TERMINATION_MIN) | (xw > self.X_TERMINATION_MAX)).any(dim=-1)
 
     def step(self, u: torch.Tensor):
