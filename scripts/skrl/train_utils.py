@@ -236,6 +236,27 @@ def apply_wandb_sweep_overrides(agent_cfg: dict) -> None:
             node[leaf] = value
 
 
+def _disarm_termination_for_eval(env, tag: str = "[Eval]") -> None:
+    """Force the early-termination box OFF on an EVALUATION env.
+
+    Evaluation measures AUC = integral of ||e||/||e0|| over the FIXED horizon.
+    Cutting an episode short does not just shorten that integral, it INVERTS the
+    metric: a policy that falls at step 20 stops accumulating error and scores a
+    smaller (better-looking) AUC than one that tracks imperfectly for all 500
+    steps. The same truncation makes the number incomparable with every
+    LQR/C3M/CV-STEM baseline, all measured over full episodes.
+
+    Early termination is a TRAINING-data intervention -- it keeps 500 steps of
+    already-fallen transitions out of the rollout batch. It is not a measurement
+    change, so it is disarmed here regardless of the training setting.
+    """
+    unwrapped = getattr(env, "unwrapped", env)
+    if getattr(unwrapped, "terminate_out_of_box", False):
+        unwrapped.set_terminate_out_of_box(False)
+        print(f"{tag} early termination disarmed for evaluation — AUC is defined on the "
+              f"full horizon, and truncating it rewards a policy for failing sooner.")
+
+
 def apply_cli_dotted_overrides(agent_cfg: dict, extra_args: list[str]) -> list[str]:
     """Fold CLI ``--a.b.c=value`` args into ``agent_cfg``; return what was applied.
 
@@ -806,6 +827,7 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
 
     device = agent.device
     env = gym.make(task, device=device)
+    _disarm_termination_for_eval(env, "[Eval]")
 
     if held_out_seed is not None:
         if hasattr(env.unwrapped, "set_held_out_mode"):

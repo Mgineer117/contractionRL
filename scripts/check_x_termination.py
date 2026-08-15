@@ -169,7 +169,7 @@ def _bases(path, cls):
 # Parity is now structural: ONE implementation, inherited by both hosts. That is
 # strictly stronger than comparing two copies' signatures — which is what this
 # check used to do, and which caught them drifting on an argument name.
-assert SHARED <= _defs(MIXIN), f"mixin is missing {SHARED - _defs(MIXIN)}"
+assert _defs(MIXIN) >= SHARED, f"mixin is missing {SHARED - _defs(MIXIN)}"
 for side, (path, cls) in HOSTS.items():
     assert "TerminationBoxMixin" in _bases(path, cls), \
         f"{cls} must inherit TerminationBoxMixin, else the two can drift again"
@@ -177,5 +177,24 @@ for side, (path, cls) in HOSTS.items():
     assert not redefined, f"{side} re-defines {redefined} — that is the drift this prevents"
     assert "episode_ended_early" in path.read_text(), f"{side} never publishes episode_ended_early"
 print(f"6. one shared impl, both hosts        ok ({len(SHARED)} methods)")
+
+# ── 7. evaluation always measures the FULL horizon ───────────────────────── #
+# The nastiest failure this feature can cause: AUC = integral of ||e||/||e0||
+# over a fixed horizon, so truncating an eval episode does not merely shorten
+# the integral, it INVERTS the metric — a policy that falls at step 20 stops
+# accumulating error and outscores one that tracks imperfectly for 500 steps.
+from train_utils import _disarm_termination_for_eval  # noqa: E402
+
+raw = gym.make("classic-segway-v0", num_envs=NUM_ENVS, device="cpu")
+env = raw.unwrapped
+assert env.terminate_out_of_box is True, "precondition: armed by default"
+_disarm_termination_for_eval(raw, "[test]")
+assert env.terminate_out_of_box is False, \
+    "eval env must never terminate early — AUC would reward failing sooner"
+env.reset()
+env.x_t[:] = OUT_OF_BOX
+_, _, term, trunc, _ = env.step(torch.zeros(NUM_ENVS, env.num_dim_control))
+assert not term.any() and not trunc.any(), "eval env still ended an episode early"
+print("7. eval measures full horizon         ok")
 
 print("\nall checks passed")

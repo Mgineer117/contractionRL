@@ -101,7 +101,10 @@ class TerminationBoxMixin:
                         f"  X_TERMINATION_MAX {self.X_TERMINATION_MAX.tolist()}\n"
                         f"  X_MAX             {x_max.tolist()}")
         self.terminate_out_of_box = flag
-        self.x_termination_terminal = bool(terminal)
+        # Only meaningful while armed. Latching it on a disarmed box would print
+        # the warning below for a setting that cannot fire — e.g. the flag pair
+        # `--no_terminate_out_of_box --terminate_as_terminal`.
+        self.x_termination_terminal = bool(terminal) and flag
         if flag and not quiet:
             # An all-infinite box (most Isaac envs, whose _state_bounds is ±inf)
             # can never be crossed. Say so rather than let it look armed.

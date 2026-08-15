@@ -554,6 +554,15 @@ class StatManagerEnvWrapper:
             # house rule (see the agent_patches note on sentinel blending) is
             # that no datapoint beats a wrong one. Still bump _compute_count so
             # callers can tell a round completed.
+            #
+            # The per-env distributions and trajectory curves MUST be cleared,
+            # not left alone: _compute_count is what the plot wrappers watch to
+            # decide a fresh round exists (wandb_plot_wrapper), so keeping the
+            # previous round's arrays here would re-publish stale curves under a
+            # new step as though they had just been measured.
+            self._recent_distributions = {}
+            self._recent_trajs = ({}, {}, {})
+            self._recent_maha_err = {}
             self._compute_count += 1
             return
         # Clamp once: a stored error of exactly 0 would otherwise produce

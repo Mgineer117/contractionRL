@@ -204,6 +204,7 @@ def run_classic(args) -> list[dict]:
     from train_utils import (
         BatchedGymnasiumWrapper,
         _default_num_envs_classic,
+        _disarm_termination_for_eval,
         _inject_angle_idx,
         _resolve_symmetry_for_env,
     )
@@ -246,6 +247,9 @@ def run_classic(args) -> list[dict]:
         num_envs = max(num_envs, args.num_envs_for_eval)
 
         env = gym.make(args.task, num_envs=num_envs, device=device)
+        # Playback is a MEASUREMENT, same as train.py's evaluator — see
+        # _disarm_termination_for_eval for why a truncated horizon inverts AUC.
+        _disarm_termination_for_eval(env, "[play]")
         env = BatchedGymnasiumWrapper(env)
         env = StatManagerEnvWrapper(env, num_envs_for_eval=args.num_envs_for_eval)
 
