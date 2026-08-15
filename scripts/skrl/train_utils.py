@@ -1023,6 +1023,14 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
             model.eval()
 
     unwrapped = isaac_env.unwrapped
+    # Same rule as the classic evaluator, and it bites HARDER here: this loop
+    # runs a fixed T steps without checking dones, so an env that terminated
+    # early would be auto-reset underneath it and every later
+    # get_tracking_error() would silently measure a DIFFERENT episode against
+    # the old e(0). Inert today (Isaac _state_bounds is ±inf, so the box never
+    # fires) — disarmed anyway, because the day a subclass declares finite
+    # bounds this would corrupt the error curve without any error message.
+    _disarm_termination_for_eval(isaac_env, "[Eval]")
     dt = env_cfg.sim.dt * env_cfg.decimation
     T = int(env_cfg.episode_length_s / dt)
     num_envs = skrl_env.num_envs
