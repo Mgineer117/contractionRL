@@ -11,9 +11,10 @@ import torch
 
 from contractionRL.agents.skrl.ref_window import RefWindow
 from contractionRL.tasks.direct.common.state_guard import carry_forward_nonfinite
+from contractionRL.tasks.direct.common.termination_box import TerminationBoxMixin
 
 
-class BaseEnv(gym.Env):
+class BaseEnv(TerminationBoxMixin, gym.Env):
     def __init__(self, env_config: dict, num_envs: int = 1, device: str = "cpu"):
         super().__init__()
         self.num_envs = num_envs
@@ -84,22 +85,17 @@ class BaseEnv(gym.Env):
         # ON by default. Note this shortens episodes, so numbers are NOT directly
         # comparable with runs made before this default flipped; pass
         # --no_terminate_out_of_box to reproduce those.
-        _xt_lo = env_config.get("x_termination_min")
-        _xt_hi = env_config.get("x_termination_max")
-        self.X_TERMINATION_MIN = (None if _xt_lo is None else torch.tensor(
-            _xt_lo, device=self.device, dtype=torch.float32).flatten())
-        self.X_TERMINATION_MAX = (None if _xt_hi is None else torch.tensor(
-            _xt_hi, device=self.device, dtype=torch.float32).flatten())
-        if (self.X_TERMINATION_MIN is None) != (self.X_TERMINATION_MAX is None):
-            raise ValueError(
-                "[BaseEnv] x_termination_min and x_termination_max must be set "
-                "together — one without the other silently never terminates.")
-        self.terminate_out_of_box = False
-        self.x_termination_terminal = False
-        self.set_terminate_out_of_box(
-            bool(env_config.get("terminate_out_of_box", True)),
+        # angle_idx is resolved further down, but _left_termination_box only
+        # reads it per step — set the default now so the mixin never sees a
+        # missing attribute if that ordering ever changes.
+        self.angle_idx = getattr(self, "angle_idx", [])
+        self._init_termination_box(
+            env_config.get("x_termination_min"),
+            env_config.get("x_termination_max"),
+            clamp_box=(self.X_MIN, self.X_MAX),   # step() clamps into this box
+            armed=bool(env_config.get("terminate_out_of_box", True)),
             terminal=bool(env_config.get("x_termination_terminal", False)),
-            quiet=True)
+            tag="BaseEnv")
         self.XE_MIN = torch.tensor(env_config["xe_min"], device=self.device, dtype=torch.float32).flatten()
         self.XE_MAX = torch.tensor(env_config["xe_max"], device=self.device, dtype=torch.float32).flatten()
         self.UREF_MIN = torch.tensor(env_config["uref_min"], device=self.device, dtype=torch.float32).flatten()
@@ -583,65 +579,6 @@ class BaseEnv(gym.Env):
                 e0 = self.wrap_angles(x_0 - self.xref[env_ids, 0]).unsqueeze(-1)
                 self.init_maha_error[env_ids] = torch.bmm(
                     torch.bmm(e0.transpose(1, 2), M0), e0).squeeze(-1).squeeze(-1)
-
-    def set_terminate_out_of_box(self, flag: bool, *, terminal: bool = False,
-                                 quiet: bool = False) -> None:
-        """Turn the early-termination box on/off (the ``--terminate_out_of_box``
-        entry point, mirroring ``set_eig_reshape``).
-
-        ``terminal`` reports the excursion on ``terminated`` instead of
-        ``truncated``. Leave it False unless you know why: skrl's GAE is
-        ``not_done = ~terminated`` (agent_patches.compute_gae), so ``terminated``
-        replaces the true continuation value V(x) with ZERO. Every reward here is
-        a cost (V < 0), so ending the episode becomes strictly better than
-        continuing — a suicide bonus some seeds find and others don't, i.e.
-        exactly the variance this feature exists to remove. As ``truncated`` with
-        ``time_limit_bootstrap: true`` (set in every classic ppo/c2rl-ppo yaml)
-        skrl adds gamma*V(x_final) back, the agent is indifferent to the cut, and
-        there is no terminal penalty to tune.
-        """
-        flag = bool(flag)
-        if flag:
-            if self.X_TERMINATION_MIN is None:
-                raise ValueError(
-                    "[BaseEnv] terminate_out_of_box=True but this env defines no "
-                    "x_termination_min/max — it would silently never terminate.")
-            # step() clamps the state into [X_MIN, X_MAX] before anything else
-            # sees it, so a termination bound OUTSIDE that box can never be
-            # crossed and the whole feature would be a silent no-op.
-            if (self.X_TERMINATION_MIN < self.X_MIN).any() or (self.X_TERMINATION_MAX > self.X_MAX).any():
-                raise ValueError(
-                    "[BaseEnv] the termination box must lie inside [X_MIN, X_MAX] "
-                    "(step() clamps to it, so a wider bound never fires):\n"
-                    f"  X_MIN             {self.X_MIN.tolist()}\n"
-                    f"  X_TERMINATION_MIN {self.X_TERMINATION_MIN.tolist()}\n"
-                    f"  X_TERMINATION_MAX {self.X_TERMINATION_MAX.tolist()}\n"
-                    f"  X_MAX             {self.X_MAX.tolist()}")
-        self.terminate_out_of_box = flag
-        self.x_termination_terminal = bool(terminal)
-        if flag and not quiet:
-            print(f"[BaseEnv] terminate_out_of_box=True on "
-                  f"{'terminated' if self.x_termination_terminal else 'truncated'}: "
-                  f"episodes end on leaving {self.X_TERMINATION_MIN.tolist()} .. "
-                  f"{self.X_TERMINATION_MAX.tolist()}")
-        if self.x_termination_terminal:
-            print("[BaseEnv] WARNING: x_termination_terminal=True zeroes the GAE "
-                  "bootstrap at the cut. On a cost reward that is a suicide bonus "
-                  "— use truncation unless you have added a matching terminal "
-                  "penalty. See set_terminate_out_of_box.__doc__.")
-
-    def _left_termination_box(self, x: torch.Tensor):
-        """Per-env bool: did the state just leave the termination box? ``None``
-        when disarmed, so callers can tell "no excursion" from "not checking".
-
-        Angles are wrapped first, so a bound inside (-pi, pi] is comparable
-        against the same representation the state is stored in. Called with the
-        POST-integration state, before step()'s clamp erases the excursion.
-        """
-        if not self.terminate_out_of_box:
-            return None
-        xw = self.wrap_angles(x)
-        return ((xw < self.X_TERMINATION_MIN) | (xw > self.X_TERMINATION_MAX)).any(dim=-1)
 
     def step(self, u: torch.Tensor):
         if not isinstance(u, torch.Tensor):

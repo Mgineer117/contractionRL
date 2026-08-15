@@ -26,6 +26,7 @@ from contractionRL.agents.skrl.ref_window import RefWindow
 
 from .eval_metrics import fit_exponential_envelope
 from .state_guard import carry_forward_nonfinite
+from .termination_box import TerminationBoxMixin
 from .traj_buffer import TrajectoryBuffer
 
 # wandb is optional; only used when a run is active
@@ -46,7 +47,7 @@ _WANDB_PLOT_INTERVAL = 20   # log trajectory plot every N completed episodes (en
 _VIZ_MAX_ENVS = 1         # cap on how many envs' trajectories go into the plot
 
 
-class PathTrackingBase(DirectRLEnv):
+class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
     """Abstract base for path-tracking environments.
 
     Subclass must define:
@@ -178,19 +179,14 @@ class PathTrackingBase(DirectRLEnv):
         #     env silently PINNED at its box; here it is a diverged env running
         #     on under the carry-forward guard. A non-finite state therefore
         #     counts as out-of-box: it is the same event this is meant to end.
-        _xt_lo, _xt_hi = self._state_bounds()
-        _xt_lo = getattr(self.cfg, "x_termination_min", None) or _xt_lo
-        _xt_hi = getattr(self.cfg, "x_termination_max", None) or _xt_hi
-        self.X_TERMINATION_MIN = torch.as_tensor(
-            _xt_lo, device=self.device, dtype=torch.float32).flatten()
-        self.X_TERMINATION_MAX = torch.as_tensor(
-            _xt_hi, device=self.device, dtype=torch.float32).flatten()
-        self.terminate_out_of_box = False
-        self.x_termination_terminal = False
-        self.set_terminate_out_of_box(
-            bool(getattr(self.cfg, "terminate_out_of_box", True)),
+        _bounds_lo, _bounds_hi = self._state_bounds()
+        self._init_termination_box(
+            getattr(self.cfg, "x_termination_min", None) or _bounds_lo,
+            getattr(self.cfg, "x_termination_max", None) or _bounds_hi,
+            clamp_box=None,                       # no clamp on this side
+            armed=bool(getattr(self.cfg, "terminate_out_of_box", True)),
             terminal=bool(getattr(self.cfg, "x_termination_terminal", False)),
-            quiet=True)
+            tag="PathTracking")
         # Every subclass owns its own _get_dones (fall detection, task-specific
         # limits), so the box is folded in by wrapping the bound method ONCE
         # here rather than editing each subclass — the same post-construction
@@ -617,54 +613,6 @@ class PathTrackingBase(DirectRLEnv):
         self.observation_space = self.ref_window.space(lo, hi, u_lo, u_hi)
         self.cfg.observation_space = self.ref_window.flat_dim
         self.num_observations = self.ref_window.flat_dim
-
-    def set_terminate_out_of_box(self, flag: bool, *, terminal: bool = False,
-                                 quiet: bool = False) -> None:
-        """Arm/disarm the early-termination box. Twin of ``BaseEnv``'s.
-
-        ``terminal`` reports the excursion on ``terminated`` instead of the
-        time-out (truncation) channel. Leave it False: skrl's GAE is
-        ``not_done = ~terminated`` (agent_patches.compute_gae), so ``terminated``
-        replaces the true continuation value V(x) with ZERO, and on a cost reward
-        that makes ending the episode strictly better than continuing — a suicide
-        bonus. On the truncation channel with ``time_limit_bootstrap: true`` skrl
-        adds gamma*V(x_final) back and the agent is indifferent to the cut.
-
-        (A physical FALL is a different case and stays on ``terminated`` in the
-        subclasses that detect it: a robot on the ground has no continuation
-        value to bootstrap, so zero is the honest estimate there.)
-        """
-        flag = bool(flag)
-        self.terminate_out_of_box = flag
-        self.x_termination_terminal = bool(terminal)
-        finite = bool(torch.isfinite(self.X_TERMINATION_MIN).any()
-                      or torch.isfinite(self.X_TERMINATION_MAX).any())
-        if flag and not finite and not quiet:
-            print("[PathTracking] terminate_out_of_box=True but this env declares no "
-                  "finite state bounds (_state_bounds is ±inf), so the box is INERT. "
-                  "Override _state_bounds or set cfg.x_termination_min/max to arm it.")
-        elif flag and not quiet:
-            print(f"[PathTracking] terminate_out_of_box=True on "
-                  f"{'terminated' if self.x_termination_terminal else 'truncated'}: "
-                  f"episodes end on leaving the declared state bounds")
-        if self.x_termination_terminal:
-            print("[PathTracking] WARNING: x_termination_terminal=True zeroes the GAE "
-                  "bootstrap at the cut. On a cost reward that is a suicide bonus — "
-                  "see set_terminate_out_of_box.__doc__.")
-
-    def _left_termination_box(self, x: torch.Tensor):
-        """Per-env bool: did the physical state just leave the box? ``None`` when
-        disarmed, so callers can tell "no excursion" from "not checking".
-
-        Non-finite counts as out-of-box — a diverged Isaac env is exactly what
-        the carry-forward guard keeps alive, and that is the event to end.
-        Angle dims are wrapped first, matching ``BaseEnv._left_termination_box``.
-        """
-        if not self.terminate_out_of_box:
-            return None
-        xw = wrap_diff(x, self.angle_idx)
-        out = (xw < self.X_TERMINATION_MIN) | (xw > self.X_TERMINATION_MAX)
-        return out.any(dim=-1) | (~torch.isfinite(x)).any(dim=-1)
 
     def _with_termination_box(self, get_dones):
         """Wrap a subclass ``_get_dones`` so the box folds into its result.

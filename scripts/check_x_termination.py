@@ -145,39 +145,37 @@ print(f"5. off == previous behaviour          ok (auc={summary['auc_mean']:.3f})
 # isaaclab, so this is checked statically on the source rather than by importing.
 import ast  # noqa: E402
 
-SHARED = {"set_terminate_out_of_box", "_left_termination_box"}
+SHARED = {"set_terminate_out_of_box", "_left_termination_box", "_init_termination_box"}
 SRC = pathlib.Path(__file__).resolve().parent.parent / "source/contractionRL/contractionRL/tasks/direct"
-SIDES = {
-    "classic": SRC / "classic/common/env_base.py",
-    "isaac": SRC / "common/path_tracking_base.py",
+MIXIN = SRC / "common/termination_box.py"
+HOSTS = {
+    "classic": (SRC / "classic/common/env_base.py", "BaseEnv"),
+    "isaac": (SRC / "common/path_tracking_base.py", "PathTrackingBase"),
 }
 
 
-def _sigs(path):
-    tree = ast.parse(path.read_text())
-    out = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name in SHARED:
-            a = node.args
-            out[node.name] = (
-                [p.arg for p in a.args],
-                [p.arg for p in a.kwonlyargs],
-            )
-    return out
+def _defs(path):
+    return {n.name for n in ast.walk(ast.parse(path.read_text()))
+            if isinstance(n, ast.FunctionDef)}
 
 
-sigs = {side: _sigs(p) for side, p in SIDES.items()}
-for name in SHARED:
-    assert name in sigs["classic"], f"{name} missing from env_base"
-    assert name in sigs["isaac"], f"{name} missing from path_tracking_base"
-    assert sigs["classic"][name] == sigs["isaac"][name], (
-        f"{name} signature differs:\n  classic {sigs['classic'][name]}\n"
-        f"  isaac   {sigs['isaac'][name]}")
-for side, p in SIDES.items():
-    src = p.read_text()
-    for attr in ("X_TERMINATION_MIN", "X_TERMINATION_MAX", "terminate_out_of_box",
-                 "x_termination_terminal", "episode_ended_early"):
-        assert attr in src, f"{attr} missing from {side}"
-print(f"6. classic/isaac API parity           ok ({len(SHARED)} methods, 5 attrs)")
+def _bases(path, cls):
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.ClassDef) and node.name == cls:
+            return [b.id for b in node.bases if isinstance(b, ast.Name)]
+    raise AssertionError(f"class {cls} not found in {path}")
+
+
+# Parity is now structural: ONE implementation, inherited by both hosts. That is
+# strictly stronger than comparing two copies' signatures — which is what this
+# check used to do, and which caught them drifting on an argument name.
+assert SHARED <= _defs(MIXIN), f"mixin is missing {SHARED - _defs(MIXIN)}"
+for side, (path, cls) in HOSTS.items():
+    assert "TerminationBoxMixin" in _bases(path, cls), \
+        f"{cls} must inherit TerminationBoxMixin, else the two can drift again"
+    redefined = _defs(path) & SHARED
+    assert not redefined, f"{side} re-defines {redefined} — that is the drift this prevents"
+    assert "episode_ended_early" in path.read_text(), f"{side} never publishes episode_ended_early"
+print(f"6. one shared impl, both hosts        ok ({len(SHARED)} methods)")
 
 print("\nall checks passed")
