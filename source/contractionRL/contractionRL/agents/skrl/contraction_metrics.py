@@ -771,21 +771,32 @@ class StatManagerEnvWrapper:
                 self._traj_xref_buf[slot] = (
                     [] if full_xref is None else list(full_xref[int(env_idx)]))
 
-        # Update active slots
+        # Update active slots — BATCHED. This runs on every env step, and the
+        # old per-slot Python loop paid a device sync per slot per step (`if
+        # step == 0` on a GPU tensor is a blocking .item()): 64 slots x 2 syncs
+        # x every step. The scatter below is one pass, with a single .tolist()
+        # sync left for the trajectory buffer (a list of numpy rows, which has
+        # no tensor form to scatter into).
         active_slots = torch.nonzero((self._tracking_env_ids != -1) & (~self._completed_slots), as_tuple=True)[0]
 
-        for slot in active_slots:
-            env_id = self._tracking_env_ids[slot]
-            step = self._tracking_steps[slot]
+        if active_slots.numel():
+            env_ids_a = self._tracking_env_ids[active_slots]
+            steps_a = self._tracking_steps[active_slots]
 
-            if step == 0:
-                self._e0[slot] = err_vals[env_id].clamp(min=1e-8)
+            # e(0) anchor for slots opening this step. Written before it is read
+            # below, exactly as the sequential version did.
+            fresh = steps_a == 0
+            if fresh.any():
+                fs, fe = active_slots[fresh], env_ids_a[fresh]
+                self._e0[fs] = err_vals[fe].clamp(min=1e-8)
                 if maha_err_vals is not None:
-                    self._e0_maha[slot] = maha_err_vals[env_id].clamp(min=1e-8)
+                    self._e0_maha[fs] = maha_err_vals[fe].clamp(min=1e-8)
 
-            if step < self._max_ep_len:
-                val = err_vals[env_id] / self._e0[slot]
-                self._eval_buffer[slot, step] = val
+            in_range = steps_a < self._max_ep_len
+            if in_range.any():
+                slot, env_id, step = (active_slots[in_range], env_ids_a[in_range],
+                                      steps_a[in_range])
+                self._eval_buffer[slot, step] = err_vals[env_id] / self._e0[slot]
                 if maha_err_vals is not None:
                     # SQUARED normalized Mahalanobis error V(t)/V(0) =
                     # ‖e(t)‖²_M/‖e(0)‖²_M — the Lyapunov the CCM certificate is
@@ -793,17 +804,20 @@ class StatManagerEnvWrapper:
                     # in the exponent is undone in _metric_set(rate_divisor=2)
                     # so the reported λ matches the synthesis rate `lbd`.
                     self._eval_buffer_maha[slot, step] = (maha_err_vals[env_id] / self._e0_maha[slot]) ** 2
-                self._time_buffer[slot, step] = step * self._dt
+                self._time_buffer[slot, step] = step.to(self._time_buffer.dtype) * self._dt
 
                 # Rollout only — the reference was captured whole at slot open.
-                self._traj_x_buf[slot].append(obs_x[env_id])
+                # The one unavoidable Python loop: _traj_x_buf is a list of numpy
+                # rows per slot, so there is nothing to scatter into. Two
+                # .tolist() calls instead of a sync per slot.
+                for s_i, e_i in zip(slot.tolist(), env_id.tolist()):
+                    self._traj_x_buf[s_i].append(obs_x[e_i])
 
-            step += 1
-            self._tracking_steps[slot] = step
-
-            # If reached max length, pad to end
-            if step >= self._max_ep_len:
-                self._completed_slots[slot] = True
+            nxt = steps_a + 1
+            self._tracking_steps[active_slots] = nxt
+            # Only ACTIVE slots are touched, so this can never un-complete a slot
+            # that finished in an earlier round.
+            self._completed_slots[active_slots] = nxt >= self._max_ep_len
 
         # Check if all slots are completed
         if (self._tracking_env_ids != -1).all() and self._completed_slots.all():

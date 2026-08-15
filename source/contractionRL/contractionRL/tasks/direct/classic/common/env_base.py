@@ -318,7 +318,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
             uref_t = self.sample_reference_controls(
                 freqs, weights, _t, {"xref_0": xref_0, "xref_t": xref_list[-1]})
             xref_prev = xref_list[-1]
-            f_x, B_x, _ = self.get_f_and_B(xref_prev)
+            f_x, B_x, _ = self.get_f_and_B(xref_prev, need_null=False)
             x_dot = f_x + torch.bmm(B_x, uref_t.unsqueeze(-1)).squeeze(-1)
             next_x = xref_prev + self.dt * x_dot
 
@@ -587,7 +587,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         u = torch.clamp(u, self.U_MIN, self.U_MAX)
         self.time_steps += 1
 
-        f_x, B_x, _ = self.get_f_and_B(self.x_t)
+        f_x, B_x, _ = self.get_f_and_B(self.x_t, need_null=False)
         x_dot = f_x + torch.bmm(B_x, u.unsqueeze(-1)).squeeze(-1)
         next_x = self.x_t + self.dt * x_dot
 
@@ -668,13 +668,20 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
 
         return state, reward, termination, truncation, info_dict
 
-    def get_f_and_B(self, x: torch.Tensor):
+    def get_f_and_B(self, x: torch.Tensor, *, need_null: bool = True):
+        """``(f, B, B_null)``. ``need_null=False`` returns ``None`` for B_null and
+        skips computing it — the annihilator is only used by the contraction
+        SDPs, while the reference rollout integrates 500 steps per episode reset
+        and discarded it every time (20% of that rollout's cost, and with early
+        termination the rollout runs on every early reset, not once per 500
+        steps). Same signature on PathTrackingBase — see tests' parity rule."""
         if getattr(self, "use_learned_dynamics", False):
             with torch.no_grad():
                 f_x, B_x, Bbot_x = self.learned_dynamics_model(self.wrap_angles(x))
             return f_x, B_x, Bbot_x
 
-        return self._f_logic(x), self._B_logic(x), self._B_null_logic(x)
+        return (self._f_logic(x), self._B_logic(x),
+                self._B_null_logic(x) if need_null else None)
 
     def get_rollout(self, buffer_size: int, mode: str, num_control_per_state: int | None = None):
         if mode == "c3m":
@@ -718,10 +725,22 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         }
 
     def wrap_angles(self, x: torch.Tensor):
-        x_copy = x.clone()
-        for idx in self.angle_idx:
-            x_copy[:, idx] = (x_copy[:, idx] + math.pi) % (2 * math.pi) - math.pi
-        return x_copy
+        """Wrap the ``angle_idx`` columns into (-pi, pi]; others pass through.
+
+        Same formula as before, but one vectorized ``torch.where`` against a
+        cached mask instead of a full clone plus a Python loop with an in-place
+        write per angle dim. This is on the per-step path (step, reward,
+        reference rollout — ~190k calls in a 700-step 32-env rollout), and the
+        no-angle case now returns ``x`` untouched instead of cloning it.
+        """
+        if not self.angle_idx:
+            return x
+        mask = getattr(self, "_angle_mask", None)
+        if mask is None or mask.shape[-1] != x.shape[-1]:
+            mask = torch.zeros(x.shape[-1], dtype=torch.bool, device=x.device)
+            mask[list(self.angle_idx)] = True
+            self._angle_mask = mask
+        return torch.where(mask, torch.remainder(x + math.pi, 2 * math.pi) - math.pi, x)
 
     def configure_ref_window(self, length: int, offset: int = 1,
                              gamma: float | None = None) -> None:

@@ -466,12 +466,18 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         _wandb.log({"train/normalized_error": _wandb.Image(fig_err), "global_step": int(getattr(self, "common_step_counter", 0))})  # type: ignore[attr-defined]
         _plt.close(fig_err)
 
-    def get_f_and_B(self, x):
+    def get_f_and_B(self, x, *, need_null: bool = True):
         """Return (f, B, B_null) for contraction agents.
 
         Delegates to the injected NeuralDynamics model — call
         ``set_dynamics_model(model)`` before using C3M/LQR/SDLQR/C2RL.
+
+        ``need_null`` exists for signature parity with ``BaseEnv.get_f_and_B``
+        (a contraction agent calls whichever it was handed). It is accepted and
+        ignored here: the NeuralDynamics forward pass produces all three heads
+        together, so there is nothing to skip.
         """
+        del need_null
         if self._dynamics_model is None:
             raise RuntimeError(
                 "get_f_and_B requires a NeuralDynamics model — Isaac Sim envs have no "
