@@ -68,31 +68,17 @@ agent:
   learning_epochs: 5  # Number of gradient descent passes over the collected batch
   mini_batches: 4  # Number of subsets to divide the batch into for stochastic optimization
   gae_lambda: 1.0  # Lambda parameter for Generalized Advantage Estimation (GAE)
-  learning_rate: 1.0e-5   # Global step size, held FIXED by min_lr == max_lr below
-  # The LR is constant, but the scheduler is NOT removed — because
-  # `Policy / KL divergence` only exists while one is attached.
-  #
-  # skrl's PPO computes the approximate KL every minibatch and then throws it
-  # away: the only consumer is `KLAdaptiveLR.step(kl)`, and ppo.py never calls
-  # track_data on it. agent_patches.patch_kl_logging is what surfaces the metric,
-  # and it hooks that step() — so with `learning_rate_scheduler: null` it returns
-  # immediately and the KL silently stops being recorded (as does
-  # `Learning / Learning rate`, which skrl guards on `if self.scheduler`).
-  #
-  # Pinning min_lr == max_lr == learning_rate keeps step()'s two branches
-  # (max(lr/f, min_lr) / min(lr*f, max_lr)) at exactly that value, so the LR is
-  # as fixed as `null` made it while step(kl) still runs every update.
-  #
-  # The schedule was disabled for a real reason: steering toward kl_threshold
-  # 0.008 under a PPO early-stop of 0.01, its DECREASE branch could never fire —
-  # that needs mean KL > 0.016 (kl_factor=2), above the stop — so it only
-  # ratcheted the LR upward. Clamping is the honest version of that, and it
-  # keeps the metric.
-  learning_rate_scheduler: KLAdaptiveLR
-  learning_rate_scheduler_kwargs:
-    kl_threshold: 0.008  # inert while clamped; only decides which branch is taken
-    min_lr: 1.0e-5       # == max_lr == learning_rate, so the LR cannot move
-    max_lr: 1.0e-5
+  learning_rate: 1.0e-5   # Global step size, FIXED (no scheduler -- see below)
+  # No scheduler, matching every other c2rl-ppo config. This used to attach a
+  # clamped KLAdaptiveLR by hand, because `Policy / KL divergence` only exists
+  # while one is present (skrl throws the KL away otherwise -- KLAdaptiveLR.step
+  # is its only consumer). agent_patches.patch_kl_logging now attaches that
+  # clamped scheduler IN CODE for any PPO-family agent that lacks one, with
+  # min_lr == max_lr == the optimizer's current lr, so the metric survives and
+  # the LR still cannot move. Keeping a second copy here bought nothing and gave
+  # this file two different `kl_threshold` keys -- the scheduler's (inert) and
+  # PPO's own early stop below, which is the one that matters.
+  learning_rate_scheduler: null
   # false -> PPO LEARNS log_std through the policy loss (stock-PPO behavior) and
   # the schedule below is ignored; true -> log_std is frozen and driven by the
   # schedule. Override per-run with --std_dev_annealing false.
