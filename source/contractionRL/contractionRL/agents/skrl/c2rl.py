@@ -295,12 +295,6 @@ class C2RLPPOCfg(AgentCfg):
     # describes into full-scale gradients. True: skip that normalization (train
     # on raw GAE advantages). See agent_patches.patch_ppo_diagnostics.
     disable_advantage_norm: bool = False
-    # Middle ground between normalizing every batch and never normalizing:
-    # divide by max(batch std, EMA of batch std) so a batch whose advantage
-    # signal has COLLAPSED yields a small step instead of being rescaled back
-    # to unit variance. 0.0 = skrl's behaviour. See
-    # agent_patches.patch_ppo_diagnostics.
-    advantage_norm_ema: float = 0.0
     # AUC-aligned reward: raw Euclidean error decrement (M = I) instead of the
     # frozen-CMG Mahalanobis one. Meant to be paired with cvstem_residual_base —
     # the contraction certificate is provided by the baseline, so the residual
@@ -765,7 +759,6 @@ class C2RLAgent(Agent):
         patch_ppo_diagnostics(
             self._rl_agent,
             disable_advantage_norm=bool(getattr(parsed_cfg, "disable_advantage_norm", False)),
-            advantage_norm_ema=float(getattr(parsed_cfg, "advantage_norm_ema", 0.0) or 0.0),
         )
         patch_sac_entropy_clamp(self._rl_agent)
         # Applied to the INNER PPO/SAC sub-agent: C2RL's outer agent has no

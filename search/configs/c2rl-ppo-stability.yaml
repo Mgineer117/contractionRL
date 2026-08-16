@@ -69,13 +69,6 @@ parameters:
     values: [0.1, 0.5, 1.0, 5.0]
 
   # ── Advantage scaling ─────────────────────────────────────────────────── #
-  # skrl divides by THIS batch's advantage std, unconditionally. Measured on
-  # segway: raw advantage std is 25.7 while failing and 0.228 once tracking well
-  # (113x collapse), so an empty batch is rescaled back to unit variance and moves
-  # the policy as far as a full one. >0 divides by max(batch std, EMA of std)
-  # instead: no signal, no step. 0.0 reproduces stock skrl.
-  agent.advantage_norm_ema:
-    values: [0.0, 0.9, 0.99, 0.999]
   agent.gae_lambda:
     values: [0.9, 0.95, 0.99, 1.0]
 

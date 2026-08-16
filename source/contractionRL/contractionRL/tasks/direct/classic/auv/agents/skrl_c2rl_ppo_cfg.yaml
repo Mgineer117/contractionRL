@@ -78,20 +78,6 @@ agent:
   value_clip: 0.0  # Clipping bound for the value function update
   entropy_loss_scale: 0.0 # Coefficient to encourage exploration by maximizing action entropy
   value_loss_scale: 0.5  # Weight coefficient for the value function loss term
-  # Divide the GAE advantage by max(batch std, EMA of batch std) rather than by
-  # this batch's std alone. 0.0 = skrl's stock behaviour (normalize every batch
-  # to unit variance, unconditionally).
-  #
-  # Why it exists: on segway the raw advantage std is 25.7 while the policy is
-  # failing and 0.228 once it tracks well -- a 113x collapse, because the
-  # decrement reward V_t - V_{t+1} vanishes as the error does. Per-batch
-  # normalization rescales that empty batch straight back to unit variance, so a
-  # batch with NO signal moves the policy exactly as far as one full of it, and
-  # what it follows is critic error (explained variance is -0.24 in precisely
-  # that regime). The policy degrades, large errors restore real advantages, it
-  # relearns: a ~15-update limit cycle. A slow EMA floor makes a collapsed batch
-  # produce a small step instead. See agent_patches.patch_ppo_diagnostics.
-  advantage_norm_ema: 0.0
   kl_threshold: 0.01 # Early stopping threshold based on Kullback-Leibler divergence
   time_limit_bootstrap: true  # Bootstrap value at episode truncation instead of treating it as terminal
   rewards_shaper_scale: 1.0
