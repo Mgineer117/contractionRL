@@ -959,6 +959,14 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
 
     _json_name = f"eval_results{'_' + label.lower() if label else ''}.json"
     out_json = os.path.join(agent.experiment_dir, _json_name)
+    # skrl creates experiment_dir lazily, on its FIRST checkpoint write — and a
+    # sweep trial sets checkpoint_interval=0 (train.py, "throwaway"), so the
+    # directory never appears and this write raised FileNotFoundError on the very
+    # last line of every trial. Training and the sweep metric had already
+    # completed, so the search still worked, but each trial was recorded as
+    # `failed` and lost its eval json. Cheaper to create the directory than to
+    # couple this to whether checkpointing happened to be on.
+    os.makedirs(os.path.dirname(out_json), exist_ok=True)
     with open(out_json, "w") as f:
         json.dump(results, f, indent=2)
     print(f"[Eval] Saved → {out_json}")
