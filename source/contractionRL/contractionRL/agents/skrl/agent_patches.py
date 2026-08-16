@@ -85,7 +85,8 @@ def patch_kl_logging(agent) -> None:
     scheduler.step = _step
 
 
-def patch_ppo_diagnostics(agent, *, disable_advantage_norm: bool = False) -> None:
+def patch_ppo_diagnostics(agent, *, disable_advantage_norm: bool = False,
+                          advantage_norm_ema: float = 0.0) -> None:
     """Phase-0 collapse diagnostics. Swaps skrl's module-level ``compute_gae``
     for an instrumented copy of the SAME math (loop verbatim from skrl 1.4),
     logging per update::
@@ -99,6 +100,13 @@ def patch_ppo_diagnostics(agent, *, disable_advantage_norm: bool = False) -> Non
             first update where it jumps off 0 is the collapse candidate.
 
     ``disable_advantage_norm=True`` (Ablation C) also skips the normalization.
+
+    ``advantage_norm_ema`` in (0,1) is the measured MIDDLE of those two poles:
+    divide by ``max(batch std, EMA of batch std)`` instead of the batch std, so
+    a batch whose signal has collapsed produces a SMALL step rather than being
+    rescaled back to unit variance. 0.0 (default) keeps skrl's behaviour
+    exactly; 0.99 is a slow floor. See the block comment in the patched
+    ``compute_gae`` for the segway measurements motivating it.
 
     SCOPE: ``compute_gae`` is a bare module-level name with no per-instance
     hook, so this patches it GLOBALLY — fine while only one PPO agent runs per
@@ -148,7 +156,37 @@ def patch_ppo_diagnostics(agent, *, disable_advantage_norm: bool = False) -> Non
 
         if disable_advantage_norm:
             return returns, advantages
-        return returns, (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        std = advantages.std()
+        if advantage_norm_ema <= 0.0:
+            return returns, (advantages - advantages.mean()) / (std + 1e-8)
+
+        # ── EMA-floored normalization ───────────────────────────────────── #
+        # skrl divides by THIS batch's advantage std, unconditionally. That is
+        # fine while there is signal, and actively harmful when there is not.
+        #
+        # Measured on segway (c2rl-ppo, gamma=0.01): the raw advantage std is
+        # 25.7 while the policy is failing and 0.228 once it tracks well — a
+        # 113x collapse — because the decrement reward V_t - V_{t+1} vanishes as
+        # the error does. Per-batch normalization rescales that collapsed batch
+        # straight back to unit variance, so a batch containing NO signal
+        # produces exactly as large a policy step as one full of it. What the
+        # step then follows is critic error (explained variance is -0.24 in
+        # precisely that regime), the policy degrades, large errors restore real
+        # advantages, it relearns — a limit cycle with a ~15-update period.
+        #
+        # Dividing by a slow EMA of the std instead keeps the healthy-signal
+        # behaviour identical (std ~ EMA => same scaling) while letting a
+        # collapsed batch stay small: no signal, no step. The max() makes it
+        # one-sided — a batch NOISIER than usual is still normalized down, so
+        # this only ever removes gradient, never adds it.
+        prev = getattr(agent, "_adv_std_ema", None)
+        cur = float(std.item())
+        ema = cur if prev is None else (advantage_norm_ema * prev + (1.0 - advantage_norm_ema) * cur)
+        agent._adv_std_ema = ema
+        agent.track_data("Diagnostics / advantage std EMA", ema)
+        denom = max(cur, ema)
+        return returns, (advantages - advantages.mean()) / (denom + 1e-8)
 
     _ppo_mod.compute_gae = _instrumented_compute_gae
 

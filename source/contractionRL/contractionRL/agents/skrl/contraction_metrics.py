@@ -270,6 +270,15 @@ class StatManagerEnvWrapper:
         self._tracking_env_ids = None
         self._tracking_steps = None
         self._completed_slots = None
+        # Slots whose episode ended SHORT of the horizon (env_base's
+        # terminate_out_of_box). AUC/lambda/C are functionals of the FULL
+        # normalized error curve, and a curve cut at step k is a different
+        # quantity — the short-slot padding below would otherwise report a
+        # fabricated flat tail as if the policy had held there. Excluded from
+        # every reduction instead; see _compute_batched_metrics.
+        self._invalid_slots = None
+        self._recent_early_end_frac: float = 0.0
+        self._recent_valid_n: int = 0
         self._e0 = None
 
         self._traj_x_buf = None
@@ -353,6 +362,7 @@ class StatManagerEnvWrapper:
         self._tracking_env_ids = torch.full((N,), -1, dtype=torch.long, device=dev)
         self._tracking_steps = torch.zeros(N, dtype=torch.long, device=dev)
         self._completed_slots = torch.zeros(N, dtype=torch.bool, device=dev)
+        self._invalid_slots = torch.zeros(N, dtype=torch.bool, device=dev)
         self._e0 = torch.zeros(N, dtype=torch.float32, device=dev)
 
         self._traj_x_buf = [[] for _ in range(N)]
@@ -360,6 +370,20 @@ class StatManagerEnvWrapper:
 
         self._initialized = True
         return True
+
+    @staticmethod
+    def _early_end_flags(info):
+        """Per-env "this episode is ending SHORT of the horizon", or None.
+
+        ``env_base.step`` emits ``episode_ended_early`` only when its
+        terminate_out_of_box box is armed, so None means "not checking" rather
+        than "no excursion". Read at the SAME step the env auto-resets, which is
+        exactly when ``_record`` completes the slot it belongs to.
+        """
+        if not isinstance(info, dict):
+            return None
+        ee = info.get("episode_ended_early")
+        return ee.reshape(-1).bool().detach().cpu() if torch.is_tensor(ee) else None
 
     def _init_flags(self):
         """Per-env bool: episode counter == 0, i.e. the env just (auto-)reset.
@@ -379,7 +403,8 @@ class StatManagerEnvWrapper:
             pass
         return None
 
-    def _metric_set(self, errs: torch.Tensor, rate_divisor: float = 1.0) -> dict[str, float]:
+    def _metric_set(self, errs: torch.Tensor, rate_divisor: float = 1.0,
+                    valid: torch.Tensor | None = None) -> dict[str, float]:
         """Reduce a NORMALIZED per-slot error buffer (rows already ÷ e(0)) to the
         stability metric summary. Shared by the Euclidean ``_eval_buffer`` and
         the Mahalanobis ``_eval_buffer_maha`` — the time base (``_time_buffer``)
@@ -393,9 +418,21 @@ class StatManagerEnvWrapper:
         CCM certificate is V̇ ≤ -2λV). The raw curve's decay rate is divided by
         it so the reported λ is the true contraction rate in both cases —
         comparable to each other and to the synthesis `lbd`. Overshoot ``C`` and
-        AUC are left as measured on the curve itself (no divisor)."""
+        AUC are left as measured on the curve itself (no divisor).
+
+        ``valid`` (per-slot bool) drops rows before any reduction. The time base
+        and the per-slot lengths are indexed by the SAME mask — slicing only
+        ``errs`` would silently pair row i's curve with row i's neighbour's
+        clock."""
+        if valid is not None:
+            errs = errs[valid]
+            time_buffer = self._time_buffer[valid]
+            tracking_steps = self._tracking_steps[valid]
+        else:
+            time_buffer = self._time_buffer
+            tracking_steps = self._tracking_steps
         # 1. AUC per env (trapezoid over the true per-slot time base)
-        dt_array = self._time_buffer[:, 1:] - self._time_buffer[:, :-1]
+        dt_array = time_buffer[:, 1:] - time_buffer[:, :-1]
         auc_vec = torch.sum(dt_array * 0.5 * (errs[:, :-1] + errs[:, 1:]), dim=1)
         # Order statistics of the per-env AUC. auc_mean alone cannot distinguish
         # "the whole population got worse" from "a couple of envs blew up": with
@@ -423,7 +460,7 @@ class StatManagerEnvWrapper:
         peak_p95 = float(np.percentile(peaks_np, 95))
         worst_idx = torch.argmax(max_overshoots)
         x_worst = errs[worst_idx]
-        t_worst = self._time_buffer[worst_idx]
+        t_worst = time_buffer[worst_idx]
 
         # 3. Find optimal C for worst curve: C(lambda) = max_t x(t)·e^{lambda·t}
         #    over lambda in (0, 10], keeping the C whose envelope AUC is minimal.
@@ -438,7 +475,7 @@ class StatManagerEnvWrapper:
         best_C = C_lambdas[best_idx]
 
         # 4. With C fixed, per-env lambda = min_t (ln C - ln x(t)) / t  (t > 0)
-        t_pos = torch.clamp(self._time_buffer[:, 1:], min=1e-8)  # (N, T-1)
+        t_pos = torch.clamp(time_buffer[:, 1:], min=1e-8)  # (N, T-1)
         x_pos = errs[:, 1:]                                      # (N, T-1)
 
         lambda_vals = (torch.log(best_C) - torch.log(x_pos)) / t_pos
@@ -458,10 +495,10 @@ class StatManagerEnvWrapper:
         #    that did NOT decrease are dropped from the average entirely (not
         #    counted as a 0) — this is a rate over CONTRACTING episodes only,
         #    not a score that also penalizes non-contracting ones.
-        lengths = self._tracking_steps.clamp(max=self._max_ep_len).reshape(-1, 1)
+        lengths = tracking_steps.clamp(max=self._max_ep_len).reshape(-1, 1)
         end_idx = (lengths - 1).clamp(min=0)  # (N, 1), last REAL recorded index
         err_end = torch.gather(errs, 1, end_idx).squeeze(1)
-        t_end = torch.gather(self._time_buffer, 1, end_idx).squeeze(1).clamp(min=1e-8)
+        t_end = torch.gather(time_buffer, 1, end_idx).squeeze(1).clamp(min=1e-8)
         err_start = errs[:, 0]
         episode_lambda = (torch.log(err_start) - torch.log(err_end)) / (t_end * rate_divisor)
         decreased = err_end < err_start
@@ -503,10 +540,35 @@ class StatManagerEnvWrapper:
 
     def _compute_batched_metrics(self):
         N = self._num_envs_for_eval
+        # Slots whose episode was cut short (terminate_out_of_box) carry a
+        # PADDED tail, not a measured one — see _invalid_slots. Reduce over the
+        # survivors only, and report what fraction was dropped: with early
+        # termination on, that fraction IS the failure rate, and it is the one
+        # number a mean-AUC over survivors cannot show.
+        valid = ~self._invalid_slots
+        self._recent_valid_n = int(valid.sum().item())
+        self._recent_early_end_frac = float((~valid).float().mean().item())
+        if self._recent_valid_n == 0:
+            # Nothing measurable this round. Leave the _recent_* scalars alone
+            # and let stability_summary() report the metrics as ABSENT — the
+            # house rule (see the agent_patches note on sentinel blending) is
+            # that no datapoint beats a wrong one. Still bump _compute_count so
+            # callers can tell a round completed.
+            #
+            # The per-env distributions and trajectory curves MUST be cleared,
+            # not left alone: _compute_count is what the plot wrappers watch to
+            # decide a fresh round exists (wandb_plot_wrapper), so keeping the
+            # previous round's arrays here would re-publish stale curves under a
+            # new step as though they had just been measured.
+            self._recent_distributions = {}
+            self._recent_trajs = ({}, {}, {})
+            self._recent_maha_err = {}
+            self._compute_count += 1
+            return
         # Clamp once: a stored error of exactly 0 would otherwise produce
         # 0 * inf = NaN in the C search (exp(lambda*t) overflows to inf in
         # float32 once lambda*t ≳ 88) and -inf in the log for lambda.
-        m = self._metric_set(torch.clamp(self._eval_buffer, min=1e-8))
+        m = self._metric_set(torch.clamp(self._eval_buffer, min=1e-8), valid=valid)
         self._recent_auc_mean = m["auc_mean"]
         self._recent_auc_ci95 = m["auc_ci95"]
         self._recent_lambda_mean = m["lambda_mean"]
@@ -532,7 +594,8 @@ class StatManagerEnvWrapper:
         # (V̇ ≤ -2λV), hence rate_divisor=2 so the reported λ is the true rate.
         # Only when the env supplied it.
         if self._maha_seen:
-            mm = self._metric_set(torch.clamp(self._eval_buffer_maha, min=1e-8), rate_divisor=2.0)
+            mm = self._metric_set(torch.clamp(self._eval_buffer_maha, min=1e-8),
+                                  rate_divisor=2.0, valid=valid)
             self._recent_maha_auc_mean = mm["auc_mean"]
             self._recent_maha_auc_ci95 = mm["auc_ci95"]
             self._recent_maha_lambda_mean = mm["lambda_mean"]
@@ -618,6 +681,8 @@ class StatManagerEnvWrapper:
         if init_flags is None:
             init_flags = torch.zeros(error.shape[0], dtype=torch.bool, device=self._device())
 
+        early_end = self._early_end_flags(info)
+
         # Extract values for tracking
         err_vals = error.detach()
 
@@ -678,12 +743,25 @@ class StatManagerEnvWrapper:
                     # in the buffer until the WHOLE buffer is reduced; freeing
                     # it here would let the very next init reuse and overwrite
                     # it, and (ids != -1).all() below could then never fire.
+                    # Ended SHORT of the horizon by the env's own termination
+                    # box (not by the time limit)? Then the padding below is a
+                    # fabrication, so the slot is excluded from every metric
+                    # rather than padded into a plausible-looking full curve.
+                    if early_end is not None and bool(early_end[int(env_idx)]):
+                        self._invalid_slots[old_slot] = True
                     step = self._tracking_steps[old_slot]
                     if step < self._max_ep_len:
-                        last_val = self._eval_buffer[old_slot, step-1] if step > 0 else 1.0
-                        self._eval_buffer[old_slot, step:] = last_val
-                        last_maha = self._eval_buffer_maha[old_slot, step-1] if step > 0 else 1.0
-                        self._eval_buffer_maha[old_slot, step:] = last_maha
+                        if self._invalid_slots[old_slot]:
+                            # NaN, not the held last value: the curve simply has
+                            # no data past the cut, and NaN is what makes the
+                            # plotted line stop there instead of running flat.
+                            self._eval_buffer[old_slot, step:] = float("nan")
+                            self._eval_buffer_maha[old_slot, step:] = float("nan")
+                        else:
+                            last_val = self._eval_buffer[old_slot, step-1] if step > 0 else 1.0
+                            self._eval_buffer[old_slot, step:] = last_val
+                            last_maha = self._eval_buffer_maha[old_slot, step-1] if step > 0 else 1.0
+                            self._eval_buffer_maha[old_slot, step:] = last_maha
                         time_steps_pad = torch.arange(step, self._max_ep_len, device=self._device(), dtype=torch.float32)
                         self._time_buffer[old_slot, step:] = time_steps_pad * self._dt
 
@@ -695,27 +773,39 @@ class StatManagerEnvWrapper:
                 self._tracking_env_ids[slot] = env_idx
                 self._tracking_steps[slot] = 0
                 self._completed_slots[slot] = False
+                self._invalid_slots[slot] = False
                 self._traj_x_buf[slot] = []
                 # Whole reference path for THIS episode, captured now (it is
                 # resampled per episode by reset_idx), not grown per step.
                 self._traj_xref_buf[slot] = (
                     [] if full_xref is None else list(full_xref[int(env_idx)]))
 
-        # Update active slots
+        # Update active slots — BATCHED. This runs on every env step, and the
+        # old per-slot Python loop paid a device sync per slot per step (`if
+        # step == 0` on a GPU tensor is a blocking .item()): 64 slots x 2 syncs
+        # x every step. The scatter below is one pass, with a single .tolist()
+        # sync left for the trajectory buffer (a list of numpy rows, which has
+        # no tensor form to scatter into).
         active_slots = torch.nonzero((self._tracking_env_ids != -1) & (~self._completed_slots), as_tuple=True)[0]
 
-        for slot in active_slots:
-            env_id = self._tracking_env_ids[slot]
-            step = self._tracking_steps[slot]
+        if active_slots.numel():
+            env_ids_a = self._tracking_env_ids[active_slots]
+            steps_a = self._tracking_steps[active_slots]
 
-            if step == 0:
-                self._e0[slot] = err_vals[env_id].clamp(min=1e-8)
+            # e(0) anchor for slots opening this step. Written before it is read
+            # below, exactly as the sequential version did.
+            fresh = steps_a == 0
+            if fresh.any():
+                fs, fe = active_slots[fresh], env_ids_a[fresh]
+                self._e0[fs] = err_vals[fe].clamp(min=1e-8)
                 if maha_err_vals is not None:
-                    self._e0_maha[slot] = maha_err_vals[env_id].clamp(min=1e-8)
+                    self._e0_maha[fs] = maha_err_vals[fe].clamp(min=1e-8)
 
-            if step < self._max_ep_len:
-                val = err_vals[env_id] / self._e0[slot]
-                self._eval_buffer[slot, step] = val
+            in_range = steps_a < self._max_ep_len
+            if in_range.any():
+                slot, env_id, step = (active_slots[in_range], env_ids_a[in_range],
+                                      steps_a[in_range])
+                self._eval_buffer[slot, step] = err_vals[env_id] / self._e0[slot]
                 if maha_err_vals is not None:
                     # SQUARED normalized Mahalanobis error V(t)/V(0) =
                     # ‖e(t)‖²_M/‖e(0)‖²_M — the Lyapunov the CCM certificate is
@@ -723,17 +813,20 @@ class StatManagerEnvWrapper:
                     # in the exponent is undone in _metric_set(rate_divisor=2)
                     # so the reported λ matches the synthesis rate `lbd`.
                     self._eval_buffer_maha[slot, step] = (maha_err_vals[env_id] / self._e0_maha[slot]) ** 2
-                self._time_buffer[slot, step] = step * self._dt
+                self._time_buffer[slot, step] = step.to(self._time_buffer.dtype) * self._dt
 
                 # Rollout only — the reference was captured whole at slot open.
-                self._traj_x_buf[slot].append(obs_x[env_id])
+                # The one unavoidable Python loop: _traj_x_buf is a list of numpy
+                # rows per slot, so there is nothing to scatter into. Two
+                # .tolist() calls instead of a sync per slot.
+                for s_i, e_i in zip(slot.tolist(), env_id.tolist()):
+                    self._traj_x_buf[s_i].append(obs_x[e_i])
 
-            step += 1
-            self._tracking_steps[slot] = step
-
-            # If reached max length, pad to end
-            if step >= self._max_ep_len:
-                self._completed_slots[slot] = True
+            nxt = steps_a + 1
+            self._tracking_steps[active_slots] = nxt
+            # Only ACTIVE slots are touched, so this can never un-complete a slot
+            # that finished in an earlier round.
+            self._completed_slots[active_slots] = nxt >= self._max_ep_len
 
         # Check if all slots are completed
         if (self._tracking_env_ids != -1).all() and self._completed_slots.all():
@@ -741,6 +834,7 @@ class StatManagerEnvWrapper:
             # Clear slots
             self._tracking_env_ids.fill_(-1)
             self._completed_slots.fill_(False)
+            self._invalid_slots.fill_(False)
 
     @staticmethod
     def _obs_tensor(obs):
@@ -759,6 +853,7 @@ class StatManagerEnvWrapper:
         if self._initialized:
             self._tracking_env_ids.fill_(-1)
             self._completed_slots.fill_(False)
+            self._invalid_slots.fill_(False)
         self._reset_action_volatility()
         o = self._obs_tensor(obs)
         if o is not None:
@@ -904,6 +999,12 @@ class StatManagerEnvWrapper:
     def stability_summary(self) -> dict[str, float]:
         if not self._initialized:
             return {}
+        if self._compute_count > 0 and self._recent_valid_n == 0:
+            # Every episode in the round was cut short, so AUC/lambda/C are
+            # UNAVAILABLE, not zero and not the previous round's numbers.
+            # Reporting only the fraction keeps the failure visible without
+            # publishing a stale value under a fresh timestamp.
+            return {"early_end_frac": self._recent_early_end_frac}
         # Every metric carries the "{name}_mean"/"{name}_ci95" key shape that
         # track_stability_summary documents and patch_auc_checkpoint
         # (agent_patches.py) looks up. C is a single shared scalar, so its
@@ -929,6 +1030,11 @@ class StatManagerEnvWrapper:
             "auc_max": self._recent_auc_max,
             "peak_median": self._recent_peak_median,
             "peak_p95": self._recent_peak_p95,
+            # Fraction of tracked episodes excluded because they ended short.
+            # 0.0 whenever terminate_out_of_box is off, so the key is always
+            # present and always means the same thing. With it on, this is the
+            # failure rate — the statistic a mean over survivors cannot show.
+            "early_end_frac": self._recent_early_end_frac,
         }
 
     def stability_maha_summary(self) -> dict[str, float]:
@@ -940,6 +1046,8 @@ class StatManagerEnvWrapper:
         the action volatility metrics."""
         if not self._initialized or not self._maha_seen:
             return {}
+        if self._compute_count > 0 and self._recent_valid_n == 0:
+            return {}  # unavailable — same rule as stability_summary
         return {
             "auc_mean": self._recent_maha_auc_mean,
             "auc_ci95": self._recent_maha_auc_ci95,

@@ -177,6 +177,20 @@ _ov.add_argument("--reward_euclidean", "--reward-euclidean",
                  dest="reward_euclidean", action="store_true", default=None)
 _ov.add_argument("--reward_level", "--reward-level",
                  dest="reward_level", action="store_true", default=None)
+# End the episode when the state leaves the env's X_TERMINATION_* box, instead of
+# silently pinning it there for the rest of the horizon (env_base.step's clamp).
+# ON by default (env_base) — `--no_terminate_out_of_box` restores the old
+# never-terminating behaviour, which is what any pre-flip number was measured
+# under. None means "not specified", so the env keeps its own default.
+parser.add_argument("--terminate_out_of_box", "--terminate-out-of-box",
+                    dest="terminate_out_of_box", action="store_true", default=None)
+parser.add_argument("--no_terminate_out_of_box", "--no-terminate-out-of-box",
+                    dest="terminate_out_of_box", action="store_false")
+# Report that excursion on `terminated` rather than `truncated`. Zeroes the GAE
+# bootstrap, which on a cost reward is a suicide bonus — see
+# BaseEnv.set_terminate_out_of_box.__doc__ before using it.
+parser.add_argument("--terminate_as_terminal", "--terminate-as-terminal",
+                    dest="terminate_as_terminal", action="store_true", default=False)
 # C2RL only: warm-start the residual to the online per-state CV-STEM-LQR controller.
 _ov.add_argument("--cvstem_residual_distill", "--cvstem-residual-distill",
                  dest="cvstem_residual_distill", action="store_true", default=None)
@@ -376,6 +390,7 @@ from train_utils import (
     _resolve_caps_kwargs,
     _resolve_symmetry_for_env,
     apply_agent_patches,
+    apply_cli_dotted_overrides,
     apply_wandb_sweep_overrides,
     disable_tensorboard_files,
     finish_wandb,
@@ -551,6 +566,12 @@ if _is_classic:
 
     entry_key = f"skrl_{algorithm.replace('-', '_')}_cfg_entry_point"
     agent_cfg = _load_cfg(entry_key, args_cli.cfg)
+    # Hand-pinned `--agent.mini_batches=16`-style knobs, applied the same way a
+    # sweep would. BEFORE the seed read and every model build below, so an
+    # overridden value is what actually gets used. A wandb sweep still wins: it
+    # applies later (search "apply_wandb_sweep_overrides"), which is correct —
+    # the sweep is the one sampling that axis.
+    apply_cli_dotted_overrides(agent_cfg, hydra_args)
     # --seed CLI arg wins; otherwise fall back to the yaml's own seed (NOT the
     # random.randint(...) module-level `seed` computed at line 164 before the
     # yaml was even loaded — using that unconditionally silently discarded
@@ -662,6 +683,15 @@ if _is_classic:
     if not _is_contraction and (args_cli.reward_euclidean or args_cli.reward_level):
         raw_env.unwrapped.reward_euclidean = bool(args_cli.reward_euclidean)
         raw_env.unwrapped.reward_level = bool(args_cli.reward_level)
+    # None = not specified, so the env keeps its own default (ON). Only an
+    # explicit flag reaches through here.
+    if args_cli.terminate_out_of_box is not None or args_cli.terminate_as_terminal:
+        if not hasattr(raw_env.unwrapped, "set_terminate_out_of_box"):
+            raise SystemExit("--terminate_out_of_box requires an env_base/PathTrackingBase env (got "
+                             f"{type(raw_env.unwrapped).__name__})")
+        raw_env.unwrapped.set_terminate_out_of_box(
+            True if args_cli.terminate_out_of_box is None else args_cli.terminate_out_of_box,
+            terminal=bool(args_cli.terminate_as_terminal))
     if args_cli.eig_reshape is not None:
         if not hasattr(raw_env.unwrapped, "set_eig_reshape"):
             raise SystemExit("--eig_reshape requires a classic env_base env (got "

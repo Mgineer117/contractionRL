@@ -66,7 +66,11 @@ agent:
   grad_norm_clip: 0.5  # Maximum permitted magnitude for gradients (prevents exploding gradients)
   ratio_clip: 0.2  # PPO trust region clipping bound for the objective ratio
   value_clip: 0.0  # Clipping bound for the value function update
-  entropy_loss_scale: 0.001 # Coefficient to encourage exploration by maximizing action entropy
+  # 0.0: C2RL's policy is u = uref + feedback against a frozen contraction
+  # metric, so exploration is not the scarce resource -- an entropy bonus
+  # holds sigma up and injects noise into an unstable plant instead. Matches
+  # every classic c2rl-ppo config, which already pinned this at 0.0.
+  entropy_loss_scale: 0.0 # Coefficient to encourage exploration by maximizing action entropy
   value_loss_scale: 0.5  # Weight coefficient for the value function loss term
   kl_threshold: 0.01 # Early stopping threshold based on Kullback-Leibler divergence
   time_limit_bootstrap: true  # Bootstrap value at episode truncation instead of treating it as terminal

@@ -67,6 +67,11 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=None, help="Environment/agent seed.")
 parser.add_argument("--device", type=str, default=None, help="Compute device (default cuda:0 / cfg).")
 parser.add_argument("--checkpoint", type=str, default=None, help="Explicit checkpoint path (single algorithm).")
+parser.add_argument(
+    "--ref_length", "--ref-length", dest="ref_length", type=int, default=None,
+    help="Reference-window length. Default AUTO from the cfg's discount_factor, matching "
+         "train.py — override only if the run was trained with an explicit --ref_length.",
+)
 # Isaac-only extras (ignored on the classic route).
 parser.add_argument("--disable_fabric", action="store_true", default=False, help="Isaac: disable fabric.")
 parser.add_argument("--ml_framework", type=str, default="torch", choices=["torch", "jax"])
@@ -204,6 +209,7 @@ def run_classic(args) -> list[dict]:
     from train_utils import (
         BatchedGymnasiumWrapper,
         _default_num_envs_classic,
+        _disarm_termination_for_eval,
         _inject_angle_idx,
         _resolve_symmetry_for_env,
     )
@@ -246,6 +252,23 @@ def run_classic(args) -> list[dict]:
         num_envs = max(num_envs, args.num_envs_for_eval)
 
         env = gym.make(args.task, num_envs=num_envs, device=device)
+        # Playback is a MEASUREMENT, same as train.py's evaluator — see
+        # _disarm_termination_for_eval for why a truncated horizon inverts AUC.
+        _disarm_termination_for_eval(env, "[play]")
+        # Rebuild the SAME reference window the checkpoint was trained with.
+        # train.py sizes it AUTO from gamma (RefWindow.length_for_horizon) unless
+        # --ref_length was given, and its evaluator mirrors the training env's
+        # window explicitly. play.py did neither, so it built a length-1 window
+        # and every AUTO-sized checkpoint failed to load with a state_dict shape
+        # mismatch (w2 18-wide in the checkpoint vs 9-wide here at gamma=0.01) —
+        # i.e. this script could not evaluate any C2RL run at all.
+        if hasattr(env.unwrapped, "configure_ref_window"):
+            from contractionRL.agents.skrl.ref_window import RefWindow as _RW
+            _gamma = float(agent_cfg["agent"].get("discount_factor", 0.99))
+            _offset = int(agent_cfg["agent"].get("ref_offset", 1) or 1)
+            _len = args.ref_length if getattr(args, "ref_length", None) else _RW.length_for_horizon(
+                _gamma, int(env.unwrapped.max_episode_len), _offset)
+            env.unwrapped.configure_ref_window(length=_len, offset=_offset, gamma=_gamma)
         env = BatchedGymnasiumWrapper(env)
         env = StatManagerEnvWrapper(env, num_envs_for_eval=args.num_envs_for_eval)
 

@@ -45,6 +45,13 @@ STATE_NAMES = ("joint_pos_0", "joint_pos_1", "joint_vel_0", "joint_vel_1")
 X_MIN = [-math.pi, -2.9, -3.0, -3.0]
 X_MAX = [math.pi, 2.9, 3.0, 3.0]
 
+# Episode ENDS the first step x leaves this box (opt-in: --terminate_out_of_box).
+# Defaults to the state box itself, i.e. it fires exactly where env_base.step's
+# clamp already silently pins a diverged env -- the same event, reported instead
+# of hidden. Tighten it here to end failing episodes sooner.
+X_TERMINATION_MIN = list(X_MIN)
+X_TERMINATION_MAX = list(X_MAX)
+
 XREF_INIT_MIN = [-0.5, -0.5, -0.3, -0.3]
 XREF_INIT_MAX = [0.5, 0.5, 0.3, 0.3]
 
@@ -68,6 +75,8 @@ UREF_MAX = [30.0, 30.0]
 ENV_CONFIG = {
     "x_min": X_MIN,
     "x_max": X_MAX,
+    "x_termination_min": X_TERMINATION_MIN,
+    "x_termination_max": X_TERMINATION_MAX,
     "xref_init_min": XREF_INIT_MIN,
     "xref_init_max": XREF_INIT_MAX,
     "xe_init_min": XE_INIT_MIN,

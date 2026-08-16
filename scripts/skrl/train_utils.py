@@ -236,6 +236,76 @@ def apply_wandb_sweep_overrides(agent_cfg: dict) -> None:
             node[leaf] = value
 
 
+def _disarm_termination_for_eval(env, tag: str = "[Eval]") -> None:
+    """Force the early-termination box OFF on an EVALUATION env.
+
+    Evaluation measures AUC = integral of ||e||/||e0|| over the FIXED horizon.
+    Cutting an episode short does not just shorten that integral, it INVERTS the
+    metric: a policy that falls at step 20 stops accumulating error and scores a
+    smaller (better-looking) AUC than one that tracks imperfectly for all 500
+    steps. The same truncation makes the number incomparable with every
+    LQR/C3M/CV-STEM baseline, all measured over full episodes.
+
+    Early termination is a TRAINING-data intervention -- it keeps 500 steps of
+    already-fallen transitions out of the rollout batch. It is not a measurement
+    change, so it is disarmed here regardless of the training setting.
+    """
+    unwrapped = getattr(env, "unwrapped", env)
+    if getattr(unwrapped, "terminate_out_of_box", False):
+        unwrapped.set_terminate_out_of_box(False)
+        print(f"{tag} early termination disarmed for evaluation — AUC is defined on the "
+              f"full horizon, and truncating it rewards a policy for failing sooner.")
+
+
+def apply_cli_dotted_overrides(agent_cfg: dict, extra_args: list[str]) -> list[str]:
+    """Fold CLI ``--a.b.c=value`` args into ``agent_cfg``; return what was applied.
+
+    Same dotted-path semantics as :func:`apply_wandb_sweep_overrides`, so a knob
+    can be pinned by hand exactly the way a sweep would set it
+    (``--agent.mini_batches=16``). Without this these args land in argparse's
+    leftovers and are SILENTLY DROPPED on the classic route — the run then trains
+    on the yaml defaults while its command line claims otherwise, which is the
+    same class of silent-config failure as an unknown yaml key.
+
+    The leaf must already exist in the yaml. A typo would otherwise create a dead
+    key that ``rl_glue.filter_cfg_fields`` drops later without a word — the exact
+    failure this function exists to prevent.
+    """
+    import ast
+
+    applied = []
+    for arg in extra_args:
+        if not (arg.startswith("--") and "=" in arg and "." in arg.split("=", 1)[0]):
+            continue
+        dotted, raw = arg[2:].split("=", 1)
+        try:
+            # Literal first ("16" -> int, "0.3" -> float, "true"/"mlp" fall
+            # through to str), so a numeric knob never arrives as a string.
+            value = ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            value = {"true": True, "false": False, "null": None}.get(raw.lower(), raw)
+
+        *parents, leaf = dotted.split(".")
+        node = agent_cfg
+        for key in parents:
+            if not isinstance(node.get(key), dict):
+                raise SystemExit(
+                    f"[train] --{dotted}: no '{key}' section in this env's config — "
+                    "the override would be silently dropped.")
+            node = node[key]
+        if leaf not in node:
+            raise SystemExit(
+                f"[train] --{dotted}: '{leaf}' is not a key of "
+                f"{'.'.join(parents) or 'the config'} (have: "
+                f"{', '.join(sorted(node)[:12])}...). Refusing to set a key the "
+                "config does not declare — it would be dropped without a word.")
+        node[leaf] = value
+        applied.append(f"{dotted}={value!r}")
+    if applied:
+        print("[train] CLI overrides: " + "  ".join(applied))
+    return applied
+
+
 def finish_wandb(args_cli) -> None:
     """Close the active W&B run, if this process started one."""
     if getattr(args_cli, "no_wandb", False):
@@ -757,6 +827,7 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
 
     device = agent.device
     env = gym.make(task, device=device)
+    _disarm_termination_for_eval(env, "[Eval]")
 
     if held_out_seed is not None:
         if hasattr(env.unwrapped, "set_held_out_mode"):
@@ -888,6 +959,14 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
 
     _json_name = f"eval_results{'_' + label.lower() if label else ''}.json"
     out_json = os.path.join(agent.experiment_dir, _json_name)
+    # skrl creates experiment_dir lazily, on its FIRST checkpoint write — and a
+    # sweep trial sets checkpoint_interval=0 (train.py, "throwaway"), so the
+    # directory never appears and this write raised FileNotFoundError on the very
+    # last line of every trial. Training and the sweep metric had already
+    # completed, so the search still worked, but each trial was recorded as
+    # `failed` and lost its eval json. Cheaper to create the directory than to
+    # couple this to whether checkpointing happened to be on.
+    os.makedirs(os.path.dirname(out_json), exist_ok=True)
     with open(out_json, "w") as f:
         json.dump(results, f, indent=2)
     print(f"[Eval] Saved → {out_json}")
@@ -952,6 +1031,14 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
             model.eval()
 
     unwrapped = isaac_env.unwrapped
+    # Same rule as the classic evaluator, and it bites HARDER here: this loop
+    # runs a fixed T steps without checking dones, so an env that terminated
+    # early would be auto-reset underneath it and every later
+    # get_tracking_error() would silently measure a DIFFERENT episode against
+    # the old e(0). Inert today (Isaac _state_bounds is ±inf, so the box never
+    # fires) — disarmed anyway, because the day a subclass declares finite
+    # bounds this would corrupt the error curve without any error message.
+    _disarm_termination_for_eval(isaac_env, "[Eval]")
     dt = env_cfg.sim.dt * env_cfg.decimation
     T = int(env_cfg.episode_length_s / dt)
     num_envs = skrl_env.num_envs

@@ -26,6 +26,7 @@ from contractionRL.agents.skrl.ref_window import RefWindow
 
 from .eval_metrics import fit_exponential_envelope
 from .state_guard import carry_forward_nonfinite
+from .termination_box import TerminationBoxMixin
 from .traj_buffer import TrajectoryBuffer
 
 # wandb is optional; only used when a run is active
@@ -46,7 +47,7 @@ _WANDB_PLOT_INTERVAL = 20   # log trajectory plot every N completed episodes (en
 _VIZ_MAX_ENVS = 1         # cap on how many envs' trajectories go into the plot
 
 
-class PathTrackingBase(DirectRLEnv):
+class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
     """Abstract base for path-tracking environments.
 
     Subclass must define:
@@ -162,6 +163,36 @@ class PathTrackingBase(DirectRLEnv):
         # last known-finite physical state, for the divergence guard (see
         # _sanitize_state) — populated lazily on first use.
         self._last_valid_state: torch.Tensor | None = None
+
+        # ── Early-termination box — the Isaac twin of BaseEnv's ──────────── #
+        # Same name, same semantics, same default (ON), so
+        # set_terminate_out_of_box / terminate_out_of_box / X_TERMINATION_*
+        # resolve identically on both families (tests/test_isaac_parity.py's
+        # rule). Two real differences, both from Isaac Sim rather than choice:
+        #
+        #   * The box defaults to _state_bounds(), which is ±inf for most Isaac
+        #     envs (they have no physical state box the way car/segway do). An
+        #     all-infinite box can never be crossed, so the feature is INERT
+        #     there until a subclass declares finite bounds — announced once at
+        #     construction rather than left to look armed.
+        #   * There is no clamp to fire at. The classic pathology is a diverged
+        #     env silently PINNED at its box; here it is a diverged env running
+        #     on under the carry-forward guard. A non-finite state therefore
+        #     counts as out-of-box: it is the same event this is meant to end.
+        _bounds_lo, _bounds_hi = self._state_bounds()
+        self._init_termination_box(
+            getattr(self.cfg, "x_termination_min", None) or _bounds_lo,
+            getattr(self.cfg, "x_termination_max", None) or _bounds_hi,
+            clamp_box=None,                       # no clamp on this side
+            armed=bool(getattr(self.cfg, "terminate_out_of_box", True)),
+            terminal=bool(getattr(self.cfg, "x_termination_terminal", False)),
+            tag="PathTracking")
+        # Every subclass owns its own _get_dones (fall detection, task-specific
+        # limits), so the box is folded in by wrapping the bound method ONCE
+        # here rather than editing each subclass — the same post-construction
+        # patching idiom agent_patches.py uses for skrl, and for the same
+        # reason: one place to change, and no subclass can forget to call it.
+        self._get_dones = self._with_termination_box(self._get_dones)
 
         # --- episode-level eval metric accumulators ---
         # Streaming (memory-efficient) accumulators for the unified contraction
@@ -435,12 +466,18 @@ class PathTrackingBase(DirectRLEnv):
         _wandb.log({"train/normalized_error": _wandb.Image(fig_err), "global_step": int(getattr(self, "common_step_counter", 0))})  # type: ignore[attr-defined]
         _plt.close(fig_err)
 
-    def get_f_and_B(self, x):
+    def get_f_and_B(self, x, *, need_null: bool = True):
         """Return (f, B, B_null) for contraction agents.
 
         Delegates to the injected NeuralDynamics model — call
         ``set_dynamics_model(model)`` before using C3M/LQR/SDLQR/C2RL.
+
+        ``need_null`` exists for signature parity with ``BaseEnv.get_f_and_B``
+        (a contraction agent calls whichever it was handed). It is accepted and
+        ignored here: the NeuralDynamics forward pass produces all three heads
+        together, so there is nothing to skip.
         """
+        del need_null
         if self._dynamics_model is None:
             raise RuntimeError(
                 "get_f_and_B requires a NeuralDynamics model — Isaac Sim envs have no "
@@ -582,6 +619,27 @@ class PathTrackingBase(DirectRLEnv):
         self.observation_space = self.ref_window.space(lo, hi, u_lo, u_hi)
         self.cfg.observation_space = self.ref_window.flat_dim
         self.num_observations = self.ref_window.flat_dim
+
+    def _with_termination_box(self, get_dones):
+        """Wrap a subclass ``_get_dones`` so the box folds into its result.
+
+        Returns ``(terminated, time_out)`` exactly as Isaac Lab expects; the
+        excursion joins ``time_out`` (truncation) unless x_termination_terminal.
+        Also publishes ``episode_ended_early`` on ``extras`` so
+        StatManagerEnvWrapper can drop those episodes from AUC/lambda instead of
+        measuring a curve that was cut — which is precisely the objection that
+        kept this env family from terminating on divergence before.
+        """
+        def wrapped():
+            terminated, time_out = get_dones()
+            left_box = self._left_termination_box(self._get_physical_state())
+            if left_box is None:
+                return terminated, time_out
+            self.extras["episode_ended_early"] = left_box.clone()
+            if self.x_termination_terminal:
+                return terminated | left_box, time_out
+            return terminated, time_out | left_box
+        return wrapped
 
     def _state_bounds(self):
         """Per-dim (low, high) for the physical state. Unbounded by default —

@@ -11,9 +11,10 @@ import torch
 
 from contractionRL.agents.skrl.ref_window import RefWindow
 from contractionRL.tasks.direct.common.state_guard import carry_forward_nonfinite
+from contractionRL.tasks.direct.common.termination_box import TerminationBoxMixin
 
 
-class BaseEnv(gym.Env):
+class BaseEnv(TerminationBoxMixin, gym.Env):
     def __init__(self, env_config: dict, num_envs: int = 1, device: str = "cpu"):
         super().__init__()
         self.num_envs = num_envs
@@ -68,6 +69,33 @@ class BaseEnv(gym.Env):
                 "one without the other silently falls back to xref_0 + xe_0."
             )
         self.X_INIT_SIGN_DIMS = list(env_config.get("x_init_sign_dims", []) or [])
+        # ── Early-termination box (ON by default) ────────────────────────── #
+        # The episode ENDS the first step x leaves [X_TERMINATION_MIN,
+        # X_TERMINATION_MAX]. Without it a diverged env is silently PINNED at the
+        # state box by the clamp in step() and keeps emitting off-distribution
+        # transitions for the rest of the episode — on segway, 500 steps of
+        # already-fallen data per failure, which is what makes the rollout batch
+        # (and hence the seed) decide what PPO fits.
+        #
+        # The box defaults to the state box itself in every env module, i.e. it
+        # fires exactly where the clamp already silently activates — the same
+        # event, reported instead of hidden. Tighten it per env to end episodes
+        # sooner.
+        #
+        # ON by default. Note this shortens episodes, so numbers are NOT directly
+        # comparable with runs made before this default flipped; pass
+        # --no_terminate_out_of_box to reproduce those.
+        # angle_idx is resolved further down, but _left_termination_box only
+        # reads it per step — set the default now so the mixin never sees a
+        # missing attribute if that ordering ever changes.
+        self.angle_idx = getattr(self, "angle_idx", [])
+        self._init_termination_box(
+            env_config.get("x_termination_min"),
+            env_config.get("x_termination_max"),
+            clamp_box=(self.X_MIN, self.X_MAX),   # step() clamps into this box
+            armed=bool(env_config.get("terminate_out_of_box", True)),
+            terminal=bool(env_config.get("x_termination_terminal", False)),
+            tag="BaseEnv")
         self.XE_MIN = torch.tensor(env_config["xe_min"], device=self.device, dtype=torch.float32).flatten()
         self.XE_MAX = torch.tensor(env_config["xe_max"], device=self.device, dtype=torch.float32).flatten()
         self.UREF_MIN = torch.tensor(env_config["uref_min"], device=self.device, dtype=torch.float32).flatten()
@@ -290,7 +318,7 @@ class BaseEnv(gym.Env):
             uref_t = self.sample_reference_controls(
                 freqs, weights, _t, {"xref_0": xref_0, "xref_t": xref_list[-1]})
             xref_prev = xref_list[-1]
-            f_x, B_x, _ = self.get_f_and_B(xref_prev)
+            f_x, B_x, _ = self.get_f_and_B(xref_prev, need_null=False)
             x_dot = f_x + torch.bmm(B_x, uref_t.unsqueeze(-1)).squeeze(-1)
             next_x = xref_prev + self.dt * x_dot
 
@@ -559,11 +587,16 @@ class BaseEnv(gym.Env):
         u = torch.clamp(u, self.U_MIN, self.U_MAX)
         self.time_steps += 1
 
-        f_x, B_x, _ = self.get_f_and_B(self.x_t)
+        f_x, B_x, _ = self.get_f_and_B(self.x_t, need_null=False)
         x_dot = f_x + torch.bmm(B_x, u.unsqueeze(-1)).squeeze(-1)
         next_x = self.x_t + self.dt * x_dot
 
         next_x = carry_forward_nonfinite(next_x, self.x_t)
+
+        # Measured on the RAW integrated state, BEFORE the position freeze and
+        # the X-box clamp below — both erase the excursion, so a check placed
+        # after them could never fire. None when the feature is off.
+        left_box = self._left_termination_box(next_x)
 
         pos_min = self.X_MIN[:self.pos_dimension]
         pos_max = self.X_MAX[:self.pos_dimension]
@@ -582,6 +615,14 @@ class BaseEnv(gym.Env):
 
         termination = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         truncation = self.time_steps >= self.episode_len
+        if left_box is not None:
+            # Truncation, not termination, unless explicitly asked otherwise —
+            # see x_termination_terminal in __init__ for why (zeroed bootstrap
+            # = suicide bonus on a cost reward).
+            if self.x_termination_terminal:
+                termination = termination | left_box
+            else:
+                truncation = truncation | left_box
         dones = termination | truncation
 
         info_dict = {
@@ -596,6 +637,14 @@ class BaseEnv(gym.Env):
         # value (flat) because get_rewards' infos are rebuilt into this dict here.
         if "maha_tracking_error" in infos:
             info_dict["maha_tracking_error"] = infos["maha_tracking_error"]
+
+        # Which envs are ending SHORT of the horizon. StatManagerEnvWrapper
+        # invalidates those slots: AUC/lambda/C are defined on the full-length
+        # normalized error curve, and a curve cut at step k is not the same
+        # quantity — padding it (which is what the wrapper does for a short slot)
+        # would report a fabricated flat tail as if the policy had held there.
+        if left_box is not None:
+            info_dict["episode_ended_early"] = left_box.clone()
 
         if dones.any():
             done_idx = dones.nonzero(as_tuple=False).squeeze(-1)
@@ -619,13 +668,20 @@ class BaseEnv(gym.Env):
 
         return state, reward, termination, truncation, info_dict
 
-    def get_f_and_B(self, x: torch.Tensor):
+    def get_f_and_B(self, x: torch.Tensor, *, need_null: bool = True):
+        """``(f, B, B_null)``. ``need_null=False`` returns ``None`` for B_null and
+        skips computing it — the annihilator is only used by the contraction
+        SDPs, while the reference rollout integrates 500 steps per episode reset
+        and discarded it every time (20% of that rollout's cost, and with early
+        termination the rollout runs on every early reset, not once per 500
+        steps). Same signature on PathTrackingBase — see tests' parity rule."""
         if getattr(self, "use_learned_dynamics", False):
             with torch.no_grad():
                 f_x, B_x, Bbot_x = self.learned_dynamics_model(self.wrap_angles(x))
             return f_x, B_x, Bbot_x
 
-        return self._f_logic(x), self._B_logic(x), self._B_null_logic(x)
+        return (self._f_logic(x), self._B_logic(x),
+                self._B_null_logic(x) if need_null else None)
 
     def get_rollout(self, buffer_size: int, mode: str, num_control_per_state: int | None = None):
         if mode == "c3m":
@@ -669,10 +725,22 @@ class BaseEnv(gym.Env):
         }
 
     def wrap_angles(self, x: torch.Tensor):
-        x_copy = x.clone()
-        for idx in self.angle_idx:
-            x_copy[:, idx] = (x_copy[:, idx] + math.pi) % (2 * math.pi) - math.pi
-        return x_copy
+        """Wrap the ``angle_idx`` columns into (-pi, pi]; others pass through.
+
+        Same formula as before, but one vectorized ``torch.where`` against a
+        cached mask instead of a full clone plus a Python loop with an in-place
+        write per angle dim. This is on the per-step path (step, reward,
+        reference rollout — ~190k calls in a 700-step 32-env rollout), and the
+        no-angle case now returns ``x`` untouched instead of cloning it.
+        """
+        if not self.angle_idx:
+            return x
+        mask = getattr(self, "_angle_mask", None)
+        if mask is None or mask.shape[-1] != x.shape[-1]:
+            mask = torch.zeros(x.shape[-1], dtype=torch.bool, device=x.device)
+            mask[list(self.angle_idx)] = True
+            self._angle_mask = mask
+        return torch.where(mask, torch.remainder(x + math.pi, 2 * math.pi) - math.pi, x)
 
     def configure_ref_window(self, length: int, offset: int = 1,
                              gamma: float | None = None) -> None:
