@@ -73,7 +73,7 @@ parameters:
   # from-scratch PPO (only viable per prior runs at low discount_factor/small
   # obs — see project memory on u=uref+π needing pretrain to avoid diverging).
   agent.residual_contraction_pretrain:
-    values: [true, false]
+    value: false # [true, false]
   # Which pretrain objective, when the above is true (no-op otherwise):
   # "contraction" (default) minimizes the C3M Cu≺0 SDP violation against the
   # frozen Phase-A CMG metric — no CV-STEM-LQR involved. "cvstemlqr" instead

@@ -48,11 +48,23 @@ XE_MAX = [lim, lim, lim, lim]
 UREF_MIN = [-6.0]
 UREF_MAX = [6.0]
 
+# Initial state drawn DIRECTLY from this box (see env_base.X_INIT_MIN),
+# placing every episode start in the plant's LOW-lambda region:
+# lbd*(x0) median 0.2207 -> 0.0987. The sign dims are
+# mirrored by ONE shared sign, because the slow set is two lobes on a
+# diagonal that no single box can cover.
+X_INIT_MIN = [-5.0, 0.6596, 0.0098, -3.1244]
+X_INIT_MAX = [5.0, 1.0467, 0.994, -0.6786]
+X_INIT_SIGN_DIMS = [1, 2, 3]
+
 ENV_CONFIG = {
     "x_min": X_MIN,
     "x_max": X_MAX,
     "xref_init_min": XREF_INIT_MIN,
     "xref_init_max": XREF_INIT_MAX,
+    "x_init_min": X_INIT_MIN,
+    "x_init_max": X_INIT_MAX,
+    "x_init_sign_dims": X_INIT_SIGN_DIMS,
     "xe_init_min": XE_INIT_MIN,
     "xe_init_max": XE_INIT_MAX,
     "xe_min": XE_MIN,
