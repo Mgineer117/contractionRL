@@ -222,7 +222,12 @@ cmg:
   # algorithms' metrics are only comparable if they are fit to the same amount of
   # SDP data. NOT a free knob: it sets the regression's dataset size, so the four
   # settings below are sized against it.
-  cmg_memory_size: 100000
+  # 10000, not 100000: build_cm_dataset now solves ONE joint SDP over all of them
+  # rather than one per state, and that program costs ~N^1.95 — ~15 h at 10000,
+  # so 100000 would be ~100x that and never finish. The regression budget below
+  # is already written against 10000 ("At cmg_memory_size 10000 the split is
+  # 9000 train"), and 10000 is what docs/subset_lambda_procedure.md §8d ships.
+  cmg_memory_size: 10000
   # regress_cmg does `iters = max(1, n_train // batch_size)`, so at 900 training
   # points the old batch 1024 silently became ONE full-batch step per epoch —
   # 1000 gradient steps total, deep in the starved regime (measured relative

@@ -185,7 +185,9 @@ cm:
 # network onto {x -> W*}. "ccm": train models.cmg directly with C1/C2 losses,
 # no SDP. Either way, freeze before Phase B.
 cmg:
-  cmg_memory_size: 100000
+  # 10000, not 100000 — see car's config: the joint SDP costs ~N^1.95, so 100000
+  # would be ~100x the ~15 h that 10000 takes and would never finish.
+  cmg_memory_size: 10000
   cmg_regress_epochs: 3000
   cmg_regress_lr: 1.0e-3
   cmg_regress_lr_scheduler: "StepLR"  # built the same way as empirical_dynamics' scheduler

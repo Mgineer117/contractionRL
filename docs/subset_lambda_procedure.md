@@ -446,12 +446,35 @@ A full search at N=10000 is not an option: one joint solve is ~15 h at that size
 
 ### Values in the configs
 
-| env | λ | r | w_lb | w_ub | cm_eps | λ at old `w=[0.01,100]` | status |
+Re-measured 2026-08-17 at the stage-1 point above (`N=100`, ε=0.1, `--cm-dt 1.0`,
+`w=[1e-3,1e3]`), each at the `r` its own config ships. Every row PASSES the 5%
+actuator check, so this table is now what the configs carry rather than a
+snapshot that drifted from them:
+
+| env | λ | r | ν | χ | ‖K‖₂ max | out of box | budget |
 |---|---|---|---|---|---|---|---|
-| car | 0.3902 | 1.6 | 1e-3 | 1e3 | 0.01 | 0.3902 (r=1.6) | applied to all 4 |
-| cartpole | 0.0771 | 12.8 | 1e-3 | 1e3 | 0.01 | 0.0343 (r=1.6) | applied to all 4 |
-| quadrotor | 0.2601 | 12.8 | 1e-3 | 1e3 | 0.01 | 0.1734 (r=12.8) | applied to all 4 |
-| segway | — | — | — | — | — | infeasible | **INFEASIBLE at w=[1e-3,1e3] too** |
+| car | 0.3902 | 1.6 | 4.394 | 4.084 | 2.137 | 4.34% | 1.5 |
+| car_weak | 0.0771 | 3.2 | 13.56 | 8.417 | 2.043 | 4.82% | 1.5 |
+| cartpole | 0.3902 | 3.2 | 960.8 | 155.4 | 30.03 | 3.00% | 6 |
+| segway | 0.0152 | 6.4 | 1000 | 1012 | 22.68 | 0.65% | 6 |
+| quadrotor | 1.3169 | 0.1 | 33.00 | 198.1 | — | 0.35% | 30 |
+
+**segway is NOT infeasible** — the row below claiming so predates `8a64182`,
+which certified it at λ=0.0152 with `r=6.4`. Its ν does pin at exactly
+`1/w_lb = 1000`, so it sits on the envelope boundary and nothing looser is
+available to it, which is what the §"segway does not fit this envelope"
+discussion below is really describing. That section's *mechanism* still holds;
+its verdict does not.
+
+`car_weak` is new (2026-08-17). It is the class-III half of the car pair
+(`v ∈ [0.2, 2]` makes the Hautus margin `σ = min(1, v) = v < 1`), and it
+certifies 5× slower than the otherwise-identical car at 2× the control-effort
+weight. Verified at stage 2's `N=1000`/ε=0.01: ν=9.354, χ=6.138, ‖K‖₂max=1.926,
+1.83% out of box.
+
+The values this table USED to list — cartpole 0.0771/12.8, quadrotor
+0.2601/12.8, segway infeasible — were superseded by `8a64182` and no longer
+match any config. They are kept only in the historical note that follows.
 
 Loosening `w_lb` 0.01 → 1e-3 raised λ on the two plants that were envelope-limited
 (cartpole 2.2×, quadrotor 1.5×) and left the car exactly where it was — the car's
