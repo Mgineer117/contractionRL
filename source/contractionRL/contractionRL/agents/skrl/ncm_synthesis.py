@@ -635,6 +635,16 @@ def build_cm_dataset(
     A_j = DfDx.astype(np.float64)
     B_j = B_np.astype(np.float64)
     joint_dt = float(wdot_dt or temporal_dt or 1.0)
+    # Announced BEFORE the solve, and flushed. One joint program at n=10000 runs
+    # ~15 h (cost ~n^1.95) inside a single cvxpy call with no progress of its own,
+    # where the per-state loop it replaced had a tqdm bar. Without this the job is
+    # indistinguishable from a hang for its entire life — and Python block-buffers
+    # stdout to a file, so a wall-limit SIGTERM would discard even this. Run these
+    # under `python -u`.
+    print(f"{tag} joint CV-STEM SDP: ONE program over {n} samples "
+          f"(lbd={lbd:g}, eps={eps:g}, w=[{w_lb:g},{w_ub:g}], r={r_scaler:g}, "
+          f"dt={joint_dt:g}, solver={solver}) — no per-sample progress to report, "
+          f"expect ~15 h at n=10000 ...", flush=True)
     sol = cvstem_joint(A_j, B_j, lbd=lbd, eps=eps, dt=joint_dt,
                        solver=solver, r_scaler=r_scaler, chi_weight=chi_weight,
                        nu_weight=nu_weight, w_lb=w_lb, w_ub=w_ub)
