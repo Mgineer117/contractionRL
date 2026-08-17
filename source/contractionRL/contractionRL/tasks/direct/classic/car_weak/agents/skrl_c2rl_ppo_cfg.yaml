@@ -171,19 +171,29 @@ cm:
   w_lb: 0.001
   # Contraction rate λ — used by cmg_method's synthesis loss (CM SDP LMI for
   # "cvstem", CMG Cu/C1 loss for "ccm").
-  # 0.3902 with cvstem_r_scaler 1.6 / w_lb 0.01 / w_ub 100: measured by
-  # scripts/find_uniform_lambda.py under UNIFORM state-box sampling — the joint
-  # CV-STEM SDP over 1000 uniform samples at cm_dt=1.0, stepping λ down by 1.5 on
-  # LMI infeasibility and r up by 2 whenever >5% of the generated controls
-  # u = uref - (1/r)BᵀM·e leave the 2x-expanded uref box. 3.73% land outside at
-  # this (λ, r); ν=4.233, χ=3.853, |u|max=2.645.
-  # That program is STRICTER than the one solved here: it carries Tsukamoto's
-  # (W̄-I)/dt term and one shared ν over all samples, whereas solve_cm_metric runs
-  # pointwise with cm_wdot_dt=0 (no Ẇ term) — so the rate certifies here too.
-  # The earlier 0.422 / r 0.131687 came from TUBE sampling along 4 rolled-out
-  # reference trajectories; uniform sampling reaches states no tube visits, which
-  # is why it lands at a lower rate and a much weaker gain.
-  lbd: 0.3902
+  # 0.0771 with cvstem_r_scaler 3.2 / w_lb 0.001 / w_ub 1000: measured 2026-08-17
+  # by scripts/find_uniform_lambda.py under UNIFORM state-box sampling — the joint
+  # CV-STEM SDP, stepping λ down by 1.5 on LMI infeasibility and r up by 2
+  # whenever >5% of the generated controls u = uref - (1/r)BᵀM·e leave the
+  # 2x-expanded uref box. 4.82% land outside at this (λ, r); ν=13.56, χ=8.417.
+  # Protocol is 8a64182's: search at N=100/cm_eps=0.1, then re-verify at
+  # N=1000/cm_eps=0.01 (eps is a covering radius, so a thin draw needs a wide
+  # margin and a dense one does not); the dataset then ships at N=10000/0.01.
+  #
+  # cm_dt=1.0 IS PART OF THE MEASUREMENT. find_uniform_lambda defaults --cm-dt to
+  # the ENV's dt (0.03 here), but build_cm_dataset resolves
+  # dt=(cm_wdot_dt or temporal_dt or 1.0) and cm_wdot_dt defaults to 0.0, so the
+  # program that SHIPS uses 1.0. The Ẇ proxy is (W̄-I)/cm_dt, so searching at 0.03
+  # makes that term 33x too large and the solver buys it back with ν: measured
+  # ν=140 and >99% of controls out of box at EVERY λ, i.e. this env looks
+  # infeasible when it is not. Always pass --cm_dt 1.0.
+  #
+  # Why this is 5x slower than car's 0.3902 on an IDENTICAL plant: car_weak is
+  # the class-III half of the pair (v ∈ [0.2, 2] makes the Hautus margin
+  # σ = min(1, v) = v < 1, see the env docstring), so the same box needs a lower
+  # certified rate and more control-effort weight to keep ‖K‖ inside the same
+  # ±1.5 feedback budget car has.
+  lbd: 0.0771
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled, already 0)
   # SDP contraction metric (cm_eps used by both cmg_method paths; cm_solver "cvstem" only)
@@ -208,7 +218,10 @@ cm:
   #              Control is penalized via this Riccati term, not bounded over an
   #              action range — see ncm_synthesis.py module docstring.
   cmg_method: cvstem
-  cvstem_r_scaler: 1.6
+  # 3.2, not car's 1.6 — measured together with lbd: 0.0771 above, not tuned
+  # separately. r is live only where the ν term in J competes; at car_weak's rate
+  # it took the box violations from ~7% at r=0.1 down to 4.82% at r=3.2.
+  cvstem_r_scaler: 3.2
   # On SDP infeasibility AT A GIVEN STATE, retry that state alone with λ
   # halved, up to this many times, before giving up on it and dropping it from
   # the dataset — 0 disables this and reverts to dropping immediately. Warns

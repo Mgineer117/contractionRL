@@ -619,6 +619,70 @@ def build_cm_dataset(
     DfDx = jacobian(f, x, create_graph=False).detach().cpu().numpy()  # (n, x, x)
     B_np = B.detach().cpu().numpy()  # (n, x, u)
 
+    # ── ONE joint SDP over all n samples, not one per state ─────────────── #
+    # The pointwise program below solves an INDEPENDENT SDP per state with its own
+    # ν/χ and no Ẇ term, so its "feasibility" is a per-state statement, not a
+    # contraction certificate: it can report 100% at a λ the joint program cannot
+    # certify at all (measured on car_weak). C2RL then regressed its frozen CMG
+    # onto that, and every downstream rate claim inherited the weaker program.
+    # This is the same cvstem_joint that find_uniform_lambda searches with, so the
+    # (lbd, r) it certifies is the one actually solved here.
+    #
+    # dt: cm_wdot_dt defaults to 0.0, so this falls through to 1.0 — which IS the
+    # certified value (see commit 8a64182's table). find_uniform_lambda instead
+    # defaults --cm-dt to the ENV's dt (0.03), and passing that here would make
+    # the (W̄-I)/dt term 33x larger and force ν from ~4 to ~140.
+    A_j = DfDx.astype(np.float64)
+    B_j = B_np.astype(np.float64)
+    joint_dt = float(wdot_dt or temporal_dt or 1.0)
+    sol = cvstem_joint(A_j, B_j, lbd=lbd, eps=eps, dt=joint_dt,
+                       solver=solver, r_scaler=r_scaler, chi_weight=chi_weight,
+                       nu_weight=nu_weight, w_lb=w_lb, w_ub=w_ub)
+    if sol is None:
+        raise RuntimeError(
+            f"{tag} joint CV-STEM SDP INFEASIBLE at lbd={lbd:g}, eps={eps:g}, "
+            f"w=[{w_lb:g},{w_ub:g}], r={r_scaler:g} over {n} samples. This is a real "
+            "result, not a transient failure: no single metric family certifies that "
+            "rate over this state box. Re-run scripts/find_uniform_lambda.py for this "
+            "env (with --cm_dt 1.0) and use what it certifies.")
+    # The LMI residual, MEASURED rather than reported by the solver. cvstem_joint
+    # returns only {W, nu, chi, J}, so a `sol.get("residual")` here is silently
+    # NaN — and residual_mean/residual_max are exactly the evidence that the
+    # shipped metric satisfies the LMI strictly (8a64182 advertises "strictly
+    # negative LMI residuals"). NaN would keep the field's name and drop its
+    # meaning, so recompute the slack at the returned solution:
+    #     S_k = (W̄-I)/dt + A W̄ + W̄ Aᵀ + 2λ W̄ - ν(2/r) B Bᵀ  ⪯  -eps·I
+    # with W̄_k = ν·W_k (cvstem_joint returns the DEPLOYED W = W̄/ν).
+    nu_v, r_v = float(sol["nu"]), r_scaler + 1e-5
+    W_dep = np.asarray(sol["W"], dtype=np.float64)
+    res = np.empty(n, dtype=np.float64)
+    for k in range(n):
+        Wb = nu_v * W_dep[k]
+        S = ((Wb - np.eye(Wb.shape[0])) / joint_dt
+             + A_j[k] @ Wb + Wb @ A_j[k].T + 2.0 * lbd * Wb
+             - nu_v * (2.0 / r_v) * (B_j[k] @ B_j[k].T))
+        res[k] = float(np.linalg.eigvalsh(0.5 * (S + S.T))[-1])
+    if not (res.max() < 0.0):
+        raise RuntimeError(
+            f"{tag} joint CV-STEM SDP returned status optimal but its LMI is NOT "
+            f"strictly negative: max residual {res.max():.6g} at lbd={lbd:g}, "
+            f"eps={eps:g} over {n} samples. Treat as infeasible — a solver that "
+            "reports optimal on a marginally-violated program certifies nothing.")
+    print(f"{tag} joint CV-STEM SDP feasible over {n} samples: nu={nu_v:.4g}, "
+          f"chi={sol['chi']:.4g}, J={sol['J']:.4g}, dt={joint_dt:g}, "
+          f"LMI residual mean={res.mean():.4g} max={res.max():.4g}.")
+    return {
+        "x": x_np.astype(np.float32),
+        "W": W_dep.astype(np.float32),
+        # One program, so feasibility is all-or-nothing — there is no per-state
+        # rate to average, and no per-state lambda backoff.
+        "feasibility_rate": 1.0,
+        "residual_mean": float(res.mean()),
+        "residual_max": float(res.max()),
+        "lambda_reduced_count": 0,
+        "lambda_reduced_rate": 0.0,
+    }
+
     xs, Ws, residuals = [], [], []
     n_reduced = 0
     reduced_lbds: list[float] = []
