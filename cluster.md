@@ -109,6 +109,40 @@ echo "[$(date)] done rc=$rc"
 exit 0
 ```
 
+## 1c. Sizing a CM dataset build — measured, and mostly counter-intuitive
+
+`build_cm_dataset` solves ONE joint CV-STEM SDP over `cmg_memory_size` samples.
+Three properties, all measured at `eps=0.01`, `dt=1.0`, MOSEK:
+
+**It is SERIAL.** car at N=400: **85.89 s on 1 core, 84.89 s on 4, 84.82 s on
+24.** MOSEK's interior point does not parallelize on this problem, so
+`--cpus-per-task` above ~4 buys nothing and just burns the allocation. Ask for 4.
+
+**Cost is ~N² and steep in state dimension.** Fitting `T = a·N^b` at
+N=100/200/400:
+
+| plant | x_dim | fit | N=1000 | N=10000 |
+|---|---|---|---|---|
+| car (and car_weak, cartpole, segway) | 4 | `9.16e-4·N^1.91` | 8 min | **~11 h** |
+| quadrotor | 10 | `3.39e-3·N^1.97` | 47 min | **~74 h** |
+
+The dimension term is not small: each sample contributes an `x_dim × x_dim` PSD
+block, so the 10-dim plant is ~5x the 4-dim one at equal N. **quadrotor at
+N=10000 does not fit any wall this cluster offers** — the ceiling is
+`IllinoisComputes`' 3 days = 72 h. Submit it with `--time=3-00:00:00` as a best
+effort and expect it to be marginal. There is no checkpoint/resume for a
+cvxpy+MOSEK solve, so a timeout loses the whole run.
+
+**Memory, not CPU, is the resource to over-provision.** N=10000 passed 17 GB
+locally and was OOM-killed on a 30 GB box. Ask for 200 G.
+
+**Never on `scavenger`.** It is preemptible: a cartpole build there was preempted
+and requeued after ~2.5 h, and SLURM truncated its `--output` on restart, so the
+progress was gone twice over. An 11 h solve cannot survive repeated preemption
+and a longer wall time does not help. Use `IllinoisComputes` with
+`--account=huytran1-ic` (3-day limit, not preempted); `huytran1-ae-eng` is the
+other account on this project.
+
 ## 2. Environment
 
 `wandb`, `python`, etc. are **not** on the login node's bare PATH. Every remote
