@@ -33,7 +33,7 @@ cm:
   # From scripts/find_uniform_lambda.py's uniform state-box search — measured
   # jointly with the r/w_lb/w_ub here, one solution of one program.
   lbd: 0.1171
-  cm_eps: 0.1
+  cm_eps: 0.01
   # Tsukamoto's CV-STEM sampling period, which is a synthesis hyperparameter and
   # Not the integrator step: his cart-pole notebook uses dt=1 while the sim runs
   # at 0.1 and RK4-substeps at 0.01. Unset, this falls back to the env integrator

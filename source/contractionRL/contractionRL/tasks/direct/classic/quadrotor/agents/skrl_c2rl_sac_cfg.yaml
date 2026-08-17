@@ -140,7 +140,7 @@ cm:
 # network onto {x -> W*}. "ccm": train models.cmg directly with C1/C2 losses,
 # no SDP. Either way, freeze before Phase B.
 cmg:
-  cmg_memory_size: 100000
+  cmg_memory_size: 10000
   cmg_regress_epochs: 3000
   cmg_regress_lr: 1.0e-3
   cmg_regress_lr_scheduler: "StepLR"  # built the same way as empirical_dynamics' scheduler

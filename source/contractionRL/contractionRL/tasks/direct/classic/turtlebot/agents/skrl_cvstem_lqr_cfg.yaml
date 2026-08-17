@@ -34,7 +34,7 @@ cm:
   cm_solver: MOSEK  # SCS (no license) | CLARABEL | MOSEK (tightest/fastest; see README)
   # Uniform state-box samples in the one joint SDP (his Nx=1000). A solver-Size
   # knob: each sample adds an x_dim² PSD block plus two LMIs to a single problem.
-  cm_samples: 1000
+  cm_samples: 10000
   cm_seed: 0
   # Cache the joint solve (see CVSTEMLQRCfg.cm_data_path). Keyed on every
   # knob that enters the program, so a config change re-solves rather than
