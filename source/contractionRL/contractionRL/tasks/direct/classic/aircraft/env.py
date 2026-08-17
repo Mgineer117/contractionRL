@@ -13,12 +13,12 @@ here.
 
 Why this plant is here
 ----------------------
-CATEGORY A, dynamic-pressure scaling, and the one with the strongest physical
+category a, dynamic-pressure scaling, and the one with the strongest physical
 story.  Control-surface authority is proportional to dynamic pressure
 
     qbar = 0.5 * rho * V^2
 
-so the elevator's moment scales with the SQUARE of airspeed: at 60 m/s it has
+so the elevator's moment scales with the square of airspeed: at 60 m/s it has
 (60/250)^2 = 1/17 of the authority it has at 250 m/s.  Measured sv(B) spread
 17.249 over the state box below.
 
@@ -26,7 +26,7 @@ This is precisely why gain scheduling was invented in aerospace (Rugh & Shamma
 above): a fixed gain that is stable at low speed is over-aggressive at high
 speed, and vice versa.  A contraction certificate over the whole envelope must
 be governed by the slow, low-authority corner -- which is exactly the situation
-where restricting to a state SUBSET buys a faster certified rate.
+where restricting to a state subset buys a faster certified rate.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ import torch
 
 from ..common.env_base import BaseEnv
 
-# AIRCRAFT PARAMETERS -- a generic medium transport (Stevens & Lewis Ch. 3)
+# Aircraft parameters -- a generic medium transport (Stevens & Lewis Ch. 3)
 RHO = 1.225          # kg/m^3, sea-level density (held constant: no altitude state)
 S_WING = 25.0        # m^2
 CBAR = 2.0           # m, mean aerodynamic chord
@@ -52,15 +52,15 @@ C_M_Q = -10.0        # pitch damping
 C_M_DELTA = -1.2     # 1/rad, elevator effectiveness
 
 # ── Non-dimensionalisation ──────────────────────────────────────────────── #
-# Airspeed is carried as v = V / V_REF and the two inputs are NORMALISED
+# Airspeed is carried as v = V / V_REF and the two inputs are normalised
 # commands in [-1, 1] that map onto the physical ranges below.
 #
 # Without this the SDP is unusable, and not for a tunable reason: raw V spans
-# 60-250 m/s while the angles span ~0.1 rad, and R = r*I applies ONE weight to
+# 60-250 m/s while the angles span ~0.1 rad, and R = r*I applies one weight to
 # both. The certified gain K = R^-1 B^T M then reads a 20 m/s speed error and a
 # 0.1 rad attitude error through the same scale, so the elevator channel is
 # dominated by speed and saturates at every r -- measured |u| p95 of 47571 RAD
-# of elevator, versus |K| of 2-27 on the repo's other plants. Raising UREF to
+# of elevator, versus |K| of 2-27 on the repo's other plants. Raising uref to
 # cover that would certify a controller commanding physically impossible
 # surfaces. Scaling the state and the inputs fixes the conditioning while
 # leaving the physics, and the qbar ~ V^2 variation this plant exists to show,
@@ -69,9 +69,9 @@ V_REF = 100.0            # m/s, so v = V/V_REF is O(1)
 DELTA_MAX = 0.20         # rad of elevator at u[0] = 1
 THRUST_MAX = 10000.0     # N of thrust at u[1] = 1
 
-# alpha is NOT in the symmetry vocabulary, which is correct: it is an
+# alpha is not in the symmetry vocabulary, which is correct: it is an
 # aerodynamic angle in a small range, not a wrapping heading. State order puts
-# the two ACTUATED derivatives (V, q) last so the default B_null applies.
+# the two actuated derivatives (V, q) last so the default B_null applies.
 STATE_NAMES = ("alpha", "pitch", "vel", "pitch_rate")   # vel = V / V_REF
 
 # X bounds. V spans a realistic envelope (60 = near stall, 250 = cruise-high),
@@ -79,7 +79,7 @@ STATE_NAMES = ("alpha", "pitch", "vel", "pitch_rate")   # vel = V / V_REF
 X_MIN = [-0.20, -0.40, 0.60, -0.50]
 X_MAX = [0.30, 0.40, 2.50, 0.50]
 
-# Episode ENDS the first step x leaves this box (opt-in: --terminate_out_of_box).
+# Episode ends the first step x leaves this box (opt-in: --terminate_out_of_box).
 # Defaults to the state box itself, i.e. it fires exactly where env_base.step's
 # clamp already silently pins a diverged env -- the same event, reported instead
 # of hidden. Tighten it here to end failing episodes sooner.
@@ -98,8 +98,8 @@ lim = 1.0
 XE_MIN = [-lim, -lim, -lim, -lim]
 XE_MAX = [lim, lim, lim, lim]
 
-# reference control bounds -- NORMALISED commands, u[0] = 1 is full elevator
-# (DELTA_MAX rad) and u[1] = 1 is full thrust (THRUST_MAX N). APPLIED box is 2x,
+# reference control bounds -- Normalised commands, u[0] = 1 is full elevator
+# (DELTA_MAX rad) and u[1] = 1 is full thrust (THRUST_MAX N). Applied box is 2x,
 # i.e. the physical surfaces can reach 2x their nominal range under feedback.
 UREF_MIN = [-1.0, -1.0]
 UREF_MAX = [1.0, 1.0]

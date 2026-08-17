@@ -1,6 +1,6 @@
 name: CI
 
-# The whole suite runs WITHOUT Isaac Sim: the classic analytical environments are
+# The whole suite runs without Isaac Sim: the classic analytical environments are
 # pure NumPy/torch, and the Isaac-side contracts are checked statically (AST +
 # config files) rather than by launching a simulator. See tests/test_isaac_parity.py.
 
@@ -25,7 +25,7 @@ jobs:
       - run: pip install ruff
       # Bug classes only (dead code, undefined names, bare except), not style.
       # A repo-wide style pass would mean reordering imports, and this project has
-      # load-bearing import order — scripts/skrl/train.py MUST import AppLauncher
+      # load-bearing import order — scripts/skrl/train.py must import AppLauncher
       # before anything else on the Isaac route. Style is handled by pre-commit.
       - run: ruff check source scripts tests --select F401,F811,F821,F841,E711,E712,E714,E722
 

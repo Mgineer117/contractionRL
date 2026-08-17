@@ -1,21 +1,21 @@
 """Feature 3 — error_geometry.py's control-space geometry, one panel per w_lb/w_ub pair.
 
-This IS error_geometry.py with one axis swapped. That script holds the bounds
-fixed and gives a panel to each SYNTHESIS OBJECTIVE (ccm vs cvstem_pretrained vs
+This is error_geometry.py with one axis swapped. That script holds the bounds
+fixed and gives a panel to each synthesis objective (ccm vs cvstem_pretrained vs
 cvstem_online vs random); this one pins the objective to ``cmg_method="ccm"``
 (ncm_synthesis.train_cmg_ccm — the C1/C2 contraction losses, no SDP, no
 regression) and gives a panel to each ``[w_lb, w_ub]`` eigenvalue envelope.
 Everything else — the trunk, the control grid, the lookahead, the normalization,
 the figures — is unchanged, so the panels differ by the envelope and nothing else.
 
-Leading them is a EUCLIDEAN panel (M = I, --no-euclidean to drop it): no metric
+Leading them is a euclidean panel (M = I, --no-euclidean to drop it): no metric
 at all, the naive geometry every conditioned panel is a departure from. It costs
 one landscape and turns "is this basin the metric's doing?" from a judgement call
 into a comparison on screen. Note where it sits on the axis the envelopes are
-spread along: cond(M) = 1, BELOW even the tightest envelope's ceiling of 3 — it
+spread along: cond(M) = 1, below even the tightest envelope's ceiling of 3 — it
 is the isotropy those envelopes are clamping the C1/C2 fit toward.
 
-Each envelope gets its OWN C1/C2 fit from the same config, over the same states,
+Each envelope gets its own C1/C2 fit from the same config, over the same states,
 cached separately. The panel is therefore the metric c2rl would actually deploy
 at those bounds, not a rescaling of one fit: w_lb/w_ub enter
 BoundedCCM_Generator's forward pass as hard sigmoid eigenvalue bounds
@@ -24,14 +24,14 @@ under each is the only faithful way to show them.
 
 Why this exists: C2RL is very sensitive to w_lb/w_ub (works at 0.5/1.5, badly
 elsewhere) while the normalized-error curves show little difference. Those curves
-are √(eᵀMe / e₀ᵀMe₀), which is INVARIANT to M → c·M — blind to the metric's scale
+are √(eᵀMe / e₀ᵀMe₀), which is invariant to M → c·M — blind to the metric's scale
 by construction, and CV-STEM's SDP even solves for a scale-normalized W̄ ⪰ I with
 the scale parked in ν (ncm_synthesis.solve_cm_metric). The landscapes here are
 built from the same normalized quantity, so read them as the geometry the bounds
 produce — the shape of the basin, where its optimum sits, how sharp it is — not
 as a scale comparison, which no panel in this file can show.
 
-At each trunk state, EVERY control in the actuator box is HELD for --lookahead H
+At each trunk state, every control in the actuator box is held for --lookahead H
 steps and the resulting error measured, exactly as in error_geometry.py:
 
     error(u, k) = sqrt( e'^T M(x') e' / e0^T M(x0) e0 ),  e' = wrap(x' - xref_{k+H})
@@ -40,22 +40,22 @@ steps and the resulting error measured, exactly as in error_geometry.py:
   * u_dim == 2 (car, turtlebot)   -> MP4: u0 x u1 x error surface per envelope per
                                     timestep, with --history translucent shells
 
-The trunk (--trunk, viz_common.trunk_states) is COMMA-SEPARATED, one output file
-per trunk (default: uref,cvstem_lqr,greedy), and within each file it is ALWAYS
+The trunk (--trunk, viz_common.trunk_states) is comma-Separated, one output file
+per trunk (default: uref,cvstem_lqr,greedy), and within each file it is always
 one trunk shared by every panel:
 
   * ``cvstem_lqr`` — that analytical controller's trajectory. Metric-independent,
     and stays in the well-tracked region a real controller occupies.
-  * ``uref`` — zero feedback. The only fully algorithm- AND metric-independent
+  * ``uref`` — zero feedback. The only fully algorithm- And metric-independent
     choice, at the cost of a trunk whose error grows unchecked (car: |e| 0.819 →
     9.892) into a region no working controller would visit.
-  * ``greedy`` — best control on the grid, metric-DEPENDENT, so ONE designated
+  * ``greedy`` — best control on the grid, metric-Dependent, so one designated
     envelope drives the trunk for every panel (--trunk-bounds); letting each panel
     follow its own metric would put them on different trajectories and their
     differences would no longer be attributable to the envelope alone.
 
 Measured on car (seed 42), worth knowing before reading a panel: the C1/C2 fit
-wants cond(M) ≈ 45-47 under every envelope, so 0.5:1.5 sits PINNED against its
+wants cond(M) ≈ 45-47 under every envelope, so 0.5:1.5 sits pinned against its
 box (realized 2.99 of a permitted 3) while 0.1:10 is not binding at all (46.6
 inside a box of 100). The tight envelope is the one actively clamping the metric
 toward isotropy — that is the difference these panels are drawing.
@@ -111,18 +111,18 @@ EUCLIDEAN_LABEL = "euclidean (M = I)"
 class EuclideanMetric:
     """M(x) = I — the naive, unconditioned baseline panel.
 
-    Not a synthesis result and not an envelope: it is the geometry when NOTHING
+    Not a synthesis result and not an envelope: it is the geometry when nothing
     conditions it. √(eᵀMe / e₀ᵀMe₀) collapses to plain ‖e‖/‖e₀‖, so this panel's
     surface is the raw Euclidean error landscape and its error curve coincides
     with the r_euc every other panel already carries. That redundancy is the
-    point — it puts the reference IN the comparison, as a surface next to the
+    point — it puts the reference in the comparison, as a surface next to the
     conditioned surfaces, instead of a number to be recalled. A conditioned
     metric earns its shape only insofar as its basin departs from this one.
 
     cond(M) = 1 exactly, tighter than any envelope here permits (the tightest,
     0.5:1.5, allows 3), so it also anchors the low end of the cond axis the
     panels are spread along — and it is exactly what the tight envelopes are
-    clamping the C1/C2 fit TOWARD. Draw it first for that reason.
+    clamping the C1/C2 fit toward. Draw it first for that reason.
     """
 
     batched = True
@@ -224,7 +224,7 @@ def panel_label(key) -> str:
 
 
 def panel_box(key) -> str:
-    """What cond(M) the panel's metric is ALLOWED — the envelope's mechanism."""
+    """What cond(M) the panel's metric is allowed — the envelope's mechanism."""
     return "cond = 1 by construction" if key is EUCLIDEAN else f"cond box ≤ {key[1] / key[0]:g}"
 
 
@@ -246,7 +246,7 @@ def assign_colors(labels: list[str]) -> None:
     curve would come out identical black. Registering here rather than editing
     viz_common keeps the envelope labels out of a table whose entries are a fixed,
     CVD-validated categorical order for metrics and policies: these are not
-    categories at all but an ORDERED magnitude (envelope width), which takes a
+    categories at all but an ordered magnitude (envelope width), which takes a
     sequential single-hue ramp light→dark so "wider" is legible without the legend.
     Started at 0.30 — the ramp's lightest steps wash out on the light surface.
     """
@@ -261,11 +261,11 @@ def assign_colors(labels: list[str]) -> None:
 def make_bounded_metric(env, scen, base_cfg, lo, hi, *, ccm_samples):
     """One ccm CMG fitted under the [lo, hi] envelope.
 
-    The envelope is injected into a COPY of the config's ``cm:`` block — where
+    The envelope is injected into a copy of the config's ``cm:`` block — where
     CCMTrainedMetric reads w_lb/w_ub from, and where c2rl reads them too — so the
     panel is the metric c2rl would deploy at those bounds.
 
-    Each pair gets its OWN cache directory. CCMTrainedMetric's cache is one file
+    Each pair gets its own cache directory. CCMTrainedMetric's cache is one file
     per env keyed on a config hash that includes w_lb/w_ub — correct, but
     single-slot, so a sweep sharing it would evict and retrain every panel on
     every rerun. A directory per pair makes the sweep cache properly.
@@ -293,11 +293,11 @@ def main():
           f"trunks={trunks}")
 
     # c2rl_ppo is the config whose cm: block these bounds belong to — the same one
-    # CCMTrainedMetric defaults to, so ONLY w_lb/w_ub are overridden here.
+    # CCMTrainedMetric defaults to, so only w_lb/w_ub are overridden here.
     base_cfg = load_algo_cfg(args.env, "c2rl_ppo")
     levels = control_grid(env, scen, args.num_chunks, args.u_range)
 
-    # ── one C1/C2 fit per envelope, built ONCE and reused across every trunk ── #
+    # ── one C1/C2 fit per envelope, built once and reused across every trunk ── #
     # A metric is a property of the env + config, not of the trajectory it is
     # evaluated along, so fitting per trunk would repeat the expensive part for
     # identical weights.
@@ -314,12 +314,12 @@ def main():
     bounds = [b for b in bounds if b in metrics]
     if not bounds:
         raise SystemExit("[bounds] no envelope could be fitted — nothing to plot.")
-    # The ramp is an ORDERED encoding of envelope width, so it spans the envelopes
+    # The ramp is an ordered encoding of envelope width, so it spans the envelopes
     # only; euclidean is a baseline of a different kind and takes the recessive
     # gray + dashed treatment viz_plot gives every baseline.
     assign_colors([bound_label(*b) for b in bounds])
 
-    # Baseline FIRST: the panels read left-to-right as departures from it.
+    # Baseline first: the panels read left-to-right as departures from it.
     keys = ([] if args.no_euclidean else [EUCLIDEAN]) + bounds
     if not args.no_euclidean:
         metrics[EUCLIDEAN] = EuclideanMetric(scen.x_dim)
@@ -333,13 +333,13 @@ def main():
 def render_trunk(args, env, scen, levels, keys, bounds, metrics, trunk):
     """Build the trunk, every panel's landscape along it, and render one figure.
 
-    ``keys`` is what gets drawn (optionally EUCLIDEAN, then the envelopes);
+    ``keys`` is what gets drawn (optionally euclidean, then the envelopes);
     ``bounds`` is the envelopes alone, for the choices only an envelope can make.
     """
-    # ── the trunk: ONE trajectory, shared by every panel ─────────────────── #
+    # ── the trunk: One trajectory, shared by every panel ─────────────────── #
     # Shared is the whole point — the panels differ only by their conditioning
     # metric's envelope, so they must be sampled at identical states. `greedy` is
-    # the one metric-DEPENDENT mode, hence --trunk-bounds driving a single trunk.
+    # the one metric-Dependent mode, hence --trunk-bounds driving a single trunk.
     trunk_metric = None
     if trunk == "greedy":
         tb = parse_bounds(args.trunk_bounds)[0] if args.trunk_bounds else bounds[0]
@@ -364,7 +364,7 @@ def render_trunk(args, env, scen, levels, keys, bounds, metrics, trunk):
                 compute_landscape_2d(env, scen, metric, x, u, levels, frames, args.lookahead))
         geo[key] = {"heat": heat, "r": r, "r_euc": r_euc, "metric": metric}
         # cond(M) is the envelope's whole mechanism — reported against the box it
-        # is allowed, because a fit PINNED at its ceiling and one sitting well
+        # is allowed, because a fit pinned at its ceiling and one sitting well
         # inside are different situations that the surface alone does not name.
         # Computed for euclidean too rather than asserted: it is a cheap check
         # that the baseline metric really is I along this trunk.
@@ -448,7 +448,7 @@ def draw(args, scen, levels, keys, bounds, geo, trunk, x, u, frames):
             k = int(frames[f])
             lo = max(0, f - args.history)
             # One norm per frame, shared by all panels: the envelopes stay
-            # comparable WITHIN the frame while the axis retunes to the shells on
+            # comparable within the frame while the axis retunes to the shells on
             # screen so their change is visible.
             fnorm = error_norm(
                 [geo[key]["heat"][:, :, j] for key in keys for j in range(lo, f + 1)],

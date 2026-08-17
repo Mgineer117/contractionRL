@@ -20,9 +20,9 @@ class WandbPlotWrapper:
         self.env = env
         self.num_envs = getattr(env, "num_envs", 1)
         self._total_steps = 0
-        # Plot cadence is measured in `.step()` CALLS (== the trainer's "timesteps"/
-        # "global_step" unit, i.e. NOT multiplied by num_envs), so it scales with an
-        # env's actual episode length instead of a fixed episode COUNT. The previous
+        # Plot cadence is measured in `.step()` calls (== the trainer's "timesteps"/
+        # "global_step" unit, i.e. Not multiplied by num_envs), so it scales with an
+        # env's actual episode length instead of a fixed episode count. The previous
         # "every 50 completed episodes" default silently never fired for any run
         # whose (timesteps / episode_len) never reached a multiple of 50 — e.g. a
         # 30000-timestep run of a 500-step-episode classic env completes only ~60
@@ -96,9 +96,9 @@ class WandbPlotWrapper:
 
         # --- Format 2: SAME_STEP autoreset (final_info is a tuple/list/ndarray) ---
         # gymnasium's SyncVectorEnv._add_info funnels "final_info" through the
-        # SAME generic per-key aggregation as every other info key: since each
+        # Same generic per-key aggregation as every other info key: since each
         # env's `info["final_info"]` value is a `dict`, `_init_info_arrays`
-        # allocates an OBJECT-DTYPE NUMPY ARRAY (`np.zeros(num_envs, dtype=object)`),
+        # allocates an object-DTYPE NUMPY array (`np.zeros(num_envs, dtype=object)`),
         # not a tuple/list — checking only (tuple, list) silently skipped this
         # branch on gymnasium>=0.29's SyncVectorEnv, so no Stability/* from
         # classic envs' terminal info dict ever reached wandb.
@@ -134,7 +134,7 @@ class WandbPlotWrapper:
 
     def _plot_and_push(self):
         # Delegate to the shared plotter so the standalone PPO/SAC/LQR/SD-LQR
-        # path emits the SAME "train/normalized_error" and "train/path_tracking"
+        # path emits the same "train/normalized_error" and "train/path_tracking"
         # figures (same style/keys) that C3M/C2RL emit from their eval() — a
         # single source of truth for all tracking plots, backed by
         # StatManagerEnvWrapper's buffer (already normalized by e(0)).
@@ -144,7 +144,7 @@ class WandbPlotWrapper:
         )
 
         # Histograms of the per-env AUC / lambda / running lambda / peak
-        # overshoot behind the Stability scalars. Pushed BEFORE the early
+        # overshoot behind the Stability scalars. Pushed before the early
         # returns below: those guard on trajectory recording (traj_x), which is
         # a separate buffer — the metric distributions are computed from
         # _eval_buffer and are available whenever the StatManager has reduced,
@@ -157,13 +157,13 @@ class WandbPlotWrapper:
         traj_x, traj_xref, traj_err = self.env.trajectories()
         if not traj_err:
             return
-        # trajectories() is keyed by BUFFER SLOT (up to num_envs_for_eval,
-        # e.g. 64). Log ALL slots that actually recorded an episode — the plotter
+        # trajectories() is keyed by buffer slot (up to num_envs_for_eval,
+        # e.g. 64). Log all slots that actually recorded an episode — the plotter
         # lays them out as ceil(n/5) subplots, 5 curves each. Unused slots still
-        # carry a full-length all-zero error row in traj_err but an EMPTY traj_x
+        # carry a full-length all-zero error row in traj_err but an empty traj_x
         # list, so they are filtered here (gating on non-empty traj_x) — that
         # both drops flat placeholder lines and keeps every figure
-        # (normalized_error / normalized_maha_error / path_tracking) on the SAME
+        # (normalized_error / normalized_maha_error / path_tracking) on the same
         # env set and ordering.
         # len(), not truthiness — a numpy array raises on `if arr`.
         plot_keys = sorted(k for k in traj_err

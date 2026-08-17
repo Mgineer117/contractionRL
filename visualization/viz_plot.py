@@ -30,7 +30,7 @@ SURFACE = "#fcfcfb"
 GRID = "#e5e4e0"
 
 # Sequential ramp for the error surface. viridis rather than a single-hue blue
-# ramp: it is perceptually uniform AND spans a much wider lightness range, so
+# ramp: it is perceptually uniform and spans a much wider lightness range, so
 # surface curvature stays legible where a light-blue ramp washed out — the low
 # end of the landscape (exactly the basin worth reading) was the part that
 # disappeared. Series overlays wear white halos to stay separable from it.
@@ -59,11 +59,11 @@ _HALO = [pe.Stroke(linewidth=3.2, foreground=SURFACE, alpha=0.75), pe.Normal()]
 def error_norm(heats: list[np.ndarray], error_range: tuple[float, float] | None = None) -> LogNorm:
     """Log scale for colour + 3D height.
 
-    By default DATA-DERIVED from exactly the surfaces being displayed. In the
+    By default data-Derived from exactly the surfaces being displayed. In the
     2-D video that is the shells of the current frame only, so the axis retunes
     every frame and the difference between those shells fills the plot — which
     is the point of showing them. The cost is deliberate: shading/height are then
-    comparable WITHIN a frame (all metrics share one scale) but not across
+    comparable within a frame (all metrics share one scale) but not across
     frames, so read motion from the shells, not from absolute colour.
 
     ``error_range`` pins it instead, when cross-run comparability matters more.
@@ -99,7 +99,7 @@ def draw_surface_1d(ax, t: np.ndarray, u_levels: np.ndarray, heat: np.ndarray,
     """u_dim == 1: the complete t × u × normalized-error surface.
 
     heat: (C, K). Height is log₁₀ of the next-step normalized error; color is
-    the same log scale as every other panel. Control curves are drawn ON the
+    the same log scale as every other panel. Control curves are drawn on the
     surface (height interpolated along the u axis at each t), so a policy's
     u(t) is seen riding the landscape it actually traverses.
     """
@@ -142,17 +142,17 @@ def draw_frame_2d(ax, u0: np.ndarray, u1: np.ndarray, Z: np.ndarray, norm: LogNo
     fills the plot. ``markers`` places each policy's commanded control on the
     surface.
 
-    ``history``: earlier frames' landscapes, ordered OLDEST → most recent,
+    ``history``: earlier frames' landscapes, ordered oldest → most recent,
     drawn as translucent surfaces beneath the current one with alpha ramping up
     toward the present so the newest reads strongest. Without them the
     geometry's motion is invisible in any single frame — you see where the
-    surface IS but not how it is moving; the stack of fading shells is that
+    surface is but not how it is moving; the stack of fading shells is that
     motion.
     """
     H = np.clip(Z, norm.vmin, norm.vmax)
     U0, U1 = np.meshgrid(u0, u1, indexing="ij")
     z_lo, z_hi = _zlim(norm)
-    # Dedicated floor plane BELOW the data range: a good controller drives the
+    # Dedicated floor plane below the data range: a good controller drives the
     # trough down onto vmin, so a floor at z_lo would be flush against the
     # surface with no room to read markers against.
     z_floor = z_lo - 0.18 * (z_hi - z_lo)
@@ -216,7 +216,7 @@ def _edges(centers: np.ndarray) -> np.ndarray:
     return np.concatenate([[first], mid, [last]])
 
 
-# Series that are REFERENCE BASELINES rather than competing entries, mapped to
+# Series that are reference baselines rather than competing entries, mapped to
 # the legend text that says so. Membership here drives gray+dashed styling in
 # draw_error_panel; SERIES_COLORS must carry a matching recessive gray.
 BASELINE_LABELS = {
@@ -259,7 +259,7 @@ def draw_error_panel(ax, t: np.ndarray, series: list[tuple[str, np.ndarray]],
 
 
 def add_colorbar(fig, norm, cax, *, label="next-step normalized error  √(V/V₀)   (log scale)"):
-    """Colorbar for the shared error scale, drawn into a DEDICATED axes.
+    """Colorbar for the shared error scale, drawn into a dedicated axes.
 
     Built from a standalone ScalarMappable: ``plot_surface(facecolors=...)``
     produces no mappable of its own, and every panel shares one scale anyway.

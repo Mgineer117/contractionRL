@@ -1,8 +1,8 @@
 """Feature 1 — the complete control-space error geometry, one panel per metric.
 
-One geometry per contraction-metric source, side by side, all over the SAME
-states so the metric is the only difference. Each is defined by THE OBJECTIVE
-ITS CMG MINIMIZES, trained here from the config rather than loaded from whatever
+One geometry per contraction-metric source, side by side, all over the same
+states so the metric is the only difference. Each is defined by the objective
+its CMG minimizes, trained here from the config rather than loaded from whatever
 checkpoint is on disk, so each panel means what its name says:
 
   * ccm               — CMG trained on the C1/C2 contraction losses
@@ -10,35 +10,35 @@ checkpoint is on disk, so each panel means what its name says:
   * cvstem_pretrained — CMG trained by MSE regression onto CV-STEM SDP solutions
                         (build_cm_dataset + regress_cmg; the Tsukamoto NCM).
   * cvstem_online     — no CMG: the SDP re-solved at every state.
-  * random            — CONTROL BASELINE: ccm's architecture/config/bounds,
+  * random            — control baseline: ccm's architecture/config/bounds,
                         untrained.
 
-So ccm vs cvstem_pretrained compares the two SYNTHESIS FORMULATIONS on identical
-networks; cvstem_online vs cvstem_pretrained IS that fit's regression error; and
+So ccm vs cvstem_pretrained compares the two synthesis formulations on identical
+networks; cvstem_online vs cvstem_pretrained is that fit's regression error; and
 both vs random is what the objective bought. Random matters because a random CMG
-is still a bounded SPD field, so its landscape is NOT featureless — only the
+is still a bounded SPD field, so its landscape is not featureless — only the
 excess over it is creditable to the objective.
 
 --metric-ckpt overrides ccm with a stored CMG. Use knowingly: c3m.pt's CMG is
-trained JOINTLY with its controller on pd+c1+c2(+os) loss, so it is co-adapted
-and NOT a pure C1/C2 metric.
+trained jointly with its controller on pd+c1+c2(+os) loss, so it is co-adapted
+and not a pure C1/C2 metric.
 
-TRUNK (--trunk, ``viz_common.trunk_states``) is the trajectory the states are
+Trunk (--trunk, ``viz_common.trunk_states``) is the trajectory the states are
 sampled along. Accepts a comma-separated list, one output file per trunk
 (default uref,cvstem_lqr,greedy); within a file all panels share one trunk.
 
   * ``cvstem_lqr`` (default) / ``lqr`` / ``sd_lqr`` — follow that analytical
     controller. Metric-independent, and stays in the well-tracked region a real
-    controller occupies. Trade: conditioned on where THAT controller went.
-  * ``uref`` — zero feedback. The only fully algorithm- AND metric-independent
+    controller occupies. Trade: conditioned on where that controller went.
+  * ``uref`` — zero feedback. The only fully algorithm- And metric-independent
     choice, at the cost of unchecked error growth into a region no working
     controller visits (car: |e| 0.819 -> 2.741, vs 0.065 under cvstem_lqr).
-  * ``greedy`` — best grid control under --trunk-metric. Metric-DEPENDENT, so
-    ONE designated metric drives the trunk for every panel; letting each follow
+  * ``greedy`` — best grid control under --trunk-metric. Metric-Dependent, so
+    one designated metric drives the trunk for every panel; letting each follow
     its own would put them on different trajectories and the differences would
     no longer be attributable to the metric.
 
-At each state EVERY control in the actuator box is HELD for --lookahead H steps::
+At each state every control in the actuator box is held for --lookahead H steps::
 
     error(u, k) = sqrt( e'^T M(x') e' / e0^T M(x0) e0 ),  e' = wrap(x' - xref_{k+H})
 
@@ -50,12 +50,12 @@ nothing projected away:
     frame keeping the previous --history geometries as translucent shells so the
     motion is visible within a single frame.
 
-The error axis retunes EVERY FRAME over exactly the shells on screen. All panels
+The error axis retunes every frame over exactly the shells on screen. All panels
 in a frame share one norm (so metrics are comparable within a frame); colour and
-height are NOT comparable across frames — read motion from the shells.
+height are not comparable across frames — read motion from the shells.
 --error-range pins the axis when cross-run comparability matters more.
 
-WHY H > 1 BY DEFAULT: the error-minimizing control over H steps satisfies
+Why h > 1 by default: the error-minimizing control over H steps satisfies
 ||u*|| ~ ||e||/(H*dt). At H=1 (dt=0.03) that is ~33*||e||, far outside the
 actuator box, so the control has no time to act and every slice is a monotone
 wall with no interior optimum. Raising H brings ||u*|| inside the box without
@@ -207,7 +207,7 @@ def main():
 
     levels = control_grid(env, scen, args.num_chunks, args.u_range)
 
-    # ── metrics are built ONCE and reused across every trunk ──────────────── #
+    # ── metrics are built once and reused across every trunk ──────────────── #
     # A metric is a property of the env + config, not of the trajectory it is
     # evaluated along, so training/solving it per trunk would repeat the whole
     # expensive part (C1/C2 fit, SDP dataset) for identical results.
@@ -240,10 +240,10 @@ def main():
 
 def render_trunk(args, env, scen, levels, kinds, metrics, trunk):
     """Build the trunk, every metric's landscape along it, and render one figure."""
-    # ── the trunk: ONE trajectory, shared by every panel ─────────────────── #
+    # ── the trunk: One trajectory, shared by every panel ─────────────────── #
     # Shared is the whole point — the panels differ only by their conditioning
     # metric, so they must be sampled at identical states. `greedy` is the one
-    # metric-DEPENDENT mode, hence --trunk-metric driving a single trunk rather
+    # metric-Dependent mode, hence --trunk-metric driving a single trunk rather
     # than one trunk per panel.
     trunk_metric = None
     if trunk == "greedy":
@@ -336,7 +336,7 @@ def render_trunk(args, env, scen, levels, kinds, metrics, trunk):
             k = int(frames[f])
             lo = max(0, f - args.history)
             # One norm per frame, shared by all three panels: the metrics stay
-            # comparable WITHIN the frame while the axis retunes to the shells on
+            # comparable within the frame while the axis retunes to the shells on
             # screen so their change is visible.
             fnorm = error_norm(
                 [geo[kd]["heat"][:, :, j] for kd in kinds for j in range(lo, f + 1)],

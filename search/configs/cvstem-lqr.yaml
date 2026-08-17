@@ -1,8 +1,8 @@
 label: cvstem-lqr (joint CV-STEM SDP + chol(M) net, 1-episode eval)
 algorithm: cvstem-lqr
-# 64 envs, fixed. CV-STEM-LQR is ANALYTICAL — nothing is trained, so a trial is
+# 64 envs, fixed. CV-STEM-LQR is analytical — nothing is trained, so a trial is
 # a pure evaluation and more envs buys only a better mean. The metric is one
-# joint SDP solved ONCE at construction (then a frozen network), so the env count
+# joint SDP solved once at construction (then a frozen network), so the env count
 # is no longer the dominant cost — cm_samples is.
 num_envs: 64
 
@@ -21,27 +21,27 @@ runner:
   # own ENV_CONFIG (time_bound / dt) at launch, so it never drifts from the
   # env definition: car/cartpole/segway 500, turtlebot 600, quadrotor 400.
   one_episode: true
-  # An infeasible SDP at ANY state, in ANY of the 64 envs, aborts the trial
-  # immediately and records this AUC. The metric is MINIMIZED, so the poison
+  # An infeasible SDP at any state, in any of the 64 envs, aborts the trial
+  # immediately and records this AUC. The metric is minimized, so the poison
   # value is a large one, and finite — inf/nan would break the surrogate bayes
   # fits over these observations.
   #
   # Scale check (measured, classic-cartpole-v0, lqr, 64 envs, one 500-step
   # episode): Stability/auc_mean ≈ 7.5. So 1e3 sits ~two orders of magnitude
   # above a working controller, which is the intent. Note this is a sentinel,
-  # not a bound: a genuinely diverging FEASIBLE run can exceed it and thus rank
+  # not a bound: a genuinely diverging feasible run can exceed it and thus rank
   # below an infeasible one. That only affects ordering among already-terrible
   # trials, but it does mean bad_value should stay well clear of the range real
   # runs occupy — re-check it if the AUC definition or episode length changes.
   #
-  # The earlier note here read "lqr ≈ 61", and that number was an ARTIFACT:
+  # The earlier note here read "lqr ≈ 61", and that number was an artifact:
   # StatManagerEnvWrapper logged its 1e2 constructor sentinel on every step
   # before the buffer's first completion, and skrl's write_interval averaged
   # the sentinel together with the one real value, yielding
   # ≈ 60 + 0.4·true_auc. Fixed 2026-07-19 — the wrapper now emits no
   # Stability/* key at all until a real value exists (see the _compute_count
   # gate in contraction_metrics.py's step()). Sweep results recorded before
-  # that fix are on the old, offset-and-compressed scale and are NOT
+  # that fix are on the old, offset-and-compressed scale and are not
   # comparable to ones recorded after it.
   bad_value: 1000.0
 
@@ -61,15 +61,15 @@ parameters:
   # certificate.
   cm.cm_eps:
     values: [0.001, 0.01, 0.1, 1.0]
-  # Two values only, as a FALSIFICATION probe rather than a search: r is
+  # Two values only, as a falsification probe rather than a search: r is
   # believed inert (see below), and this checks that across the whole lbd grid
   # instead of at the single point it was measured. If the two values give the
   # same auc_mean everywhere, drop it back out of the sweep.
   agent.r_scaler:
     values: [0.01, 1.0]
-  # ── Believed INERT: agent.r_scaler ───────────────────────────────────── #
+  # ── Believed inert: agent.r_scaler ───────────────────────────────────── #
   # R = r_scaler·I sits in both the SDP's Riccati term and the deployed gain
-  # K = R⁻¹BᵀM = (ν/r)·BᵀW̄⁻¹, and ν scales EXACTLY with r, so K is unchanged.
+  # K = R⁻¹BᵀM = (ν/r)·BᵀW̄⁻¹, and ν scales exactly with r, so K is unchanged.
   # Re-measured directly on the car at lbd=0.593, cm_samples=1000, wdot=proxy:
   #   r=0.01 -> nu=7.143,  chi=42.35, J=78.55
   #   r=1.0  -> nu=713.6,  chi=42.35, J=785.0
@@ -77,5 +77,5 @@ parameters:
   # whole budget re-measuring one point. Same for nu_weight.
   #
   # This also means the car's r_scaler=0.01 (the invalid 2026-07-19 winner
-  # p7o6fjx4) is NOT what makes that config saturate: ‖M‖ <= nu, so the gain is
-  # ~714 at ANY r, and lbd/cm_eps are the only knobs that move it.
+  # p7o6fjx4) is not what makes that config saturate: ‖M‖ <= nu, so the gain is
+  # ~714 at any r, and lbd/cm_eps are the only knobs that move it.

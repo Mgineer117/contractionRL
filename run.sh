@@ -1,14 +1,14 @@
 #!/bin/bash
-# One interactive entry point for multi-seed training — LOCAL or SLURM CLUSTER.
+# One interactive entry point for multi-seed training — local or SLURM cluster.
 #
 # This is a thin front-end that asks where to run and the usual knobs
 # (algorithm, env, seeds, seeding concurrency, GPUs), then dispatches:
 #
-#   LOCAL   → hands the answers to ./run_seeds.sh (which detaches via nohup,
+#   Local   → hands the answers to ./run_seeds.sh (which detaches via nohup,
 #             trains every (env, algo, seed), and aggregates the Stability CSV).
-#   CLUSTER → additionally asks the SLURM knobs (partition, GPUs/job, wall-time,
+#   Cluster → additionally asks the SLURM knobs (partition, GPUs/job, wall-time,
 #             account/qos, env-activation line), generates a self-contained
-#             sbatch job that runs the SAME (env, algo, seed) loop on the
+#             sbatch job that runs the same (env, algo, seed) loop on the
 #             allocated GPUs and aggregates at the end, then submits it.
 #
 # Both paths stamp every run with the same CRL_RUN_TAG, so the aggregator picks
@@ -16,7 +16,7 @@
 #   results/<tag>_runs.csv   one row per seed
 #   results/<tag>.csv        one row per (env, algorithm): mean/std/CI over seeds
 #
-# NOTE: for a hyperparameter SWEEP (W&B, search space in search/configs/), use
+# NOTE: for a hyperparameter sweep (W&B, search space in search/configs/), use
 # search/search_cluster.sh instead — this script trains fixed configs across
 # seeds, it does not search.
 #
@@ -107,7 +107,7 @@ DEFAULT_TAG="run_$(date '+%Y%m%d_%H%M%S')"
 TAG=$(prompt_default "Run tag / output CSV basename" "$DEFAULT_TAG")
 
 # ─────────────────────────────────────────────────────────────────────────── #
-# LOCAL: delegate to run_seeds.sh (it owns detach + GPU round-robin + aggregate)
+# Local: delegate to run_seeds.sh (it owns detach + GPU round-robin + aggregate)
 # ─────────────────────────────────────────────────────────────────────────── #
 if [[ "$MODE" == local ]]; then
     NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
@@ -138,7 +138,7 @@ if [[ "$MODE" == local ]]; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────── #
-# CLUSTER: gather SLURM knobs, generate an sbatch job, submit it
+# Cluster: gather SLURM knobs, generate an sbatch job, submit it
 # ─────────────────────────────────────────────────────────────────────────── #
 need() { command -v "$1" >/dev/null 2>&1 || { _error "'$1' not found — are you on a SLURM login node?"; exit 1; }; }
 need sbatch; need sinfo
@@ -229,7 +229,7 @@ mkdir -p "$LOG_DIR"
 # ── Generate the self-contained sbatch job ────────────────────────────────── #
 # The job runs the whole (env, algo, seed) loop on the GPUs SLURM allocated it,
 # pinning each concurrent run to one allocated device (read from
-# CUDA_VISIBLE_DEVICES, NOT nvidia-smi, so workers never spill onto GPUs the job
+# CUDA_VISIBLE_DEVICES, not nvidia-smi, so workers never spill onto GPUs the job
 # doesn't own), then aggregates the Stability CSV for exactly this tag.
 {
     echo "#!/bin/bash"
@@ -251,7 +251,7 @@ export CRL_RUN_TAG="$TAG"
 LOG_DIR="$LOG_DIR"
 PARALLEL=$PARALLEL
 
-# GPUs SLURM gave THIS job. torch sees them as 0..N-1 inside the allocation.
+# GPUs SLURM gave this job. torch sees them as 0..N-1 inside the allocation.
 if [[ -n "\${CUDA_VISIBLE_DEVICES:-}" ]]; then
     IFS=',' read -ra JOB_GPUS <<< "\$CUDA_VISIBLE_DEVICES"
 else

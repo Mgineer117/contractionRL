@@ -5,7 +5,7 @@
 # hyperparameter ranges that will be searched, then launches the sweep detached
 # (nohup) so it survives closing the terminal.
 #
-# The searched space is NOT defined here — it lives in search/configs/, one
+# The searched space is not defined here — it lives in search/configs/, one
 # yaml per algorithm, applying to every env. This script only discovers those
 # configs, and search/build_sweep.py turns the chosen one into a W&B sweep yaml.
 # To change what is searched, or to add an algorithm, edit search/configs/
@@ -190,7 +190,7 @@ if [[ "$DETACHED" -ne 1 ]]; then
     _rule
 
     _header "Generated sweep (${ENVS[0]})"
-    # Preview the REAL generated sweep, not a re-description of it — what is
+    # Preview the real generated sweep, not a re-description of it — what is
     # shown here is exactly what wandb will be handed. Colored a bit if `pygmentize`
     # or `bat` happen to be around; a plain cat otherwise, so this never gains a
     # hard dependency just for a nicer preview.
@@ -248,7 +248,7 @@ for i in "${!ENVS[@]}"; do
 
     _header "$ENV  ${C_DIM}(${ALGORITHM}, GPU ${GPU})${C_RESET}"
 
-    # Project and sweep name both come from build_sweep.py: ONE fixed project
+    # Project and sweep name both come from build_sweep.py: One fixed project
     # (contractionRL-Search) for everything, with the sweep named
     # "<env>-<algorithm>". Relaunching the same env+algorithm therefore reuses
     # the same name — wandb sweep names are not unique and each launch still
@@ -259,7 +259,7 @@ for i in "${!ENVS[@]}"; do
     # than into search/ (which is versioned, and holds the space itself).
     SWEEP_YAML="$LOG_DIR/sweep.yaml"
     # `|| { ...; continue; }` on each fallible step below, because this script
-    # runs under `set -euo pipefail`: without it a failure here aborts the WHOLE
+    # runs under `set -euo pipefail`: without it a failure here aborts the whole
     # script, so with --env all a single bad env would silently take every
     # remaining env down with it instead of being skipped.
     if ! python search/build_sweep.py --algorithm "$ALGORITHM" --env "$ENV" \
@@ -270,7 +270,7 @@ for i in "${!ENVS[@]}"; do
 
     # `|| true` twice, for two different set -e traps:
     #   - the command substitution itself fails if `wandb sweep` exits nonzero;
-    #   - `pipefail` fails the grep pipeline when grep matches NOTHING, which is
+    #   - `pipefail` fails the grep pipeline when grep matches nothing, which is
     #     exactly the "sweep creation failed" case the check below handles.
     # Without these the -z/Error branch is unreachable dead code.
     SWEEP_INIT_OUTPUT=$(wandb sweep "$SWEEP_YAML" 2>&1) || true

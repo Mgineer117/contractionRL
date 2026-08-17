@@ -3,25 +3,25 @@
 Reference
 ---------
 J. Hauser, S. Sastry and G. Meyer, "Nonlinear control design for slightly
-non-minimum phase systems: application to V/STOL aircraft", Automatica,
+non-minimum phase systems: application to V/stol aircraft", Automatica,
 28(4):665-679, 1992.  The epsilon-coupled model below (rolling moment produces a
 small parasitic lateral force) is that paper's, and epsilon is its coupling
 coefficient.
 
 Why this plant is here
 ----------------------
-CATEGORY C, the NEGATIVE CONTROL.  B(x) is state-dependent -- it carries
+category c, the negative control.  B(x) is state-dependent -- it carries
 -sin(phi) and cos(phi) -- and yet
 
     || (-sin(phi), cos(phi)) || = 1   for every phi,
 
-so the thrust column ROTATES with attitude and never shrinks.  Measured sv(B)
+so the thrust column rotates with attitude and never shrinks.  Measured sv(B)
 spread 1.000, identical to the kinematic car and the velocity-controlled
-turtlebot.  No state is harder to actuate than any other, so no state SUBSET can
+turtlebot.  No state is harder to actuate than any other, so no state subset can
 certify a faster contraction rate and subset pruning is useless here.
 
 This is the plant that separates the real criterion from the obvious one: the
-question is never "does B depend on x" but "do B's SINGULAR VALUES depend on x".
+question is never "does B depend on x" but "do B's singular values depend on x".
 Keeping a plant that answers no is what makes the positive results (cartpole
 2.213, ball-and-beam 3.470, two-link arm 5.753) mean something.
 """
@@ -34,7 +34,7 @@ import torch
 
 from ..common.env_base import BaseEnv
 
-# PVTOL PARAMETERS (Hauser, Sastry & Meyer 1992)
+# PVTOL parameters (Hauser, Sastry & Meyer 1992)
 G = 9.81
 EPS = 0.1        # thrust/rolling-moment coupling; the paper's "slightly
                  # non-minimum phase" parameter
@@ -44,7 +44,7 @@ STATE_NAMES = ("pos_x", "pos_y", "roll", "vel_x_w", "vel_y_w", "roll_rate")
 X_MIN = [-4.0, -4.0, -0.6, -3.0, -3.0, -3.0]
 X_MAX = [4.0, 4.0, 0.6, 3.0, 3.0, 3.0]
 
-# Episode ENDS the first step x leaves this box (opt-in: --terminate_out_of_box).
+# Episode ends the first step x leaves this box (opt-in: --terminate_out_of_box).
 # Defaults to the state box itself, i.e. it fires exactly where env_base.step's
 # clamp already silently pins a diverged env -- the same event, reported instead
 # of hidden. Tighten it here to end failing episodes sooner.
@@ -61,7 +61,7 @@ lim = 1.0
 XE_MIN = [-lim] * 6
 XE_MAX = [lim] * 6
 
-# reference control bounds -- [thrust, rolling moment]. The APPLIED box is 2x
+# reference control bounds -- [thrust, rolling moment]. The applied box is 2x
 # this. Hovering needs thrust = g = 9.81, so the reference box is centred on
 # hover rather than on zero and reaches 2g at full deflection.
 UREF_MIN = [0.0, -2.0]
@@ -113,7 +113,7 @@ class PVTOLEnv(BaseEnv):
         f[:, 0] = x[:, 3]          # xdot
         f[:, 1] = x[:, 4]          # ydot
         f[:, 2] = x[:, 5]          # phidot
-        f[:, 4] = -G               # gravity is the ONLY drift on the velocities
+        f[:, 4] = -G               # gravity is the only drift on the velocities
         return f
 
     def _B_logic(self, x):
@@ -131,7 +131,7 @@ class PVTOLEnv(BaseEnv):
     def _B_null_logic(self, x):
         """Null space of B^T, computed in closed form.
 
-        The default implementation puts the identity on the LEADING
+        The default implementation puts the identity on the leading
         ``x_dim - u_dim`` rows, which assumes B is confined to the trailing
         rows. Here B occupies rows 3-5, so that default would not be orthogonal
         to it. Three null directions are the unactuated positions/attitude
@@ -154,7 +154,7 @@ class PVTOLEnv(BaseEnv):
     def sample_reference_controls(self, freqs, weights, _t, infos, add_noise=False):
         n = weights.shape[0]
         uref = torch.zeros(n, self.num_dim_control, device=self.device)
-        # TRIM: thrust must cancel gravity along the BODY axis, so it grows as
+        # Trim: thrust must cancel gravity along the body axis, so it grows as
         # 1/cos(phi) when tilted. A constant G only hovers at phi = 0; tilted, it
         # under-lifts and the reference falls out of the box (measured 36-53%
         # clamping at every excitation amplitude).

@@ -100,7 +100,7 @@ one sample of 200 tight on the LMI while `ν = 100.000` sat exactly on its cap o
 | all (quadrotor: 60/60) | the constraint is uniformly active; no small set to excise |
 
 The second case has a sharper signature worth checking for, because it means the
-experiment cannot succeed and should not be run further: if λ*, ν AND χ come back
+experiment cannot succeed and should not be run further: if λ*, ν and χ come back
 *identical* across levels and across both subset rules, the optimum is fixed by a
 global cap and is independent of which states are in the set. Measured on the
 quadrotor — λ=0.2407, ν=100.000, χ=27.363 identical over seven solves spanning
@@ -108,7 +108,7 @@ n=150 down to n=33, both rules — with ν exactly at `1/w_lb = 100` while χ=27
 sat far below its own cap of `ν·w_ub = 10⁴`. There `w_lb` alone throttles the
 actuation term `ν(2/r)BBᵀ`. The fix is a different envelope, not a smaller region.
 
-Confirm it directly rather than by inference — re-solve the SAME sample set at
+Confirm it directly rather than by inference — re-solve the same sample set at
 looser `w_lb` and see whether λ tracks the cap. On the quadrotor:
 
 | w_lb | ν cap | λ* | ν attained | classifier |
@@ -153,7 +153,7 @@ fresh draw per level** (§6).
 
 Greedily remove what binds. Two variants, and the choice is a real trade:
 
-- **`box`** — per level, cut ONE axis-aligned face so the single tightest sample
+- **`box`** — per level, cut one axis-aligned face so the single tightest sample
   falls outside, choosing among the `2·d` candidate cuts the one that loses the
   fewest samples. The retained set stays a box `X_k ⊂ X_{k-1}`, i.e. a region
   that can be written down, stated in a paper, and checked at runtime.
@@ -177,10 +177,10 @@ Two failure modes to avoid, both observed:
 
 ### 5b. Tube (deployment)
 
-Sample `x = x_ref + s·x_e` with `s ~ U(0,1)` per sample, drawn ONCE; level `k`
+Sample `x = x_ref + s·x_e` with `s ~ U(0,1)` per sample, drawn once; level `k`
 keeps `{s ≤ ρ_k}` for a decreasing radius schedule `ρ_k`. Nested by construction.
 
-Do **not** instead rescale `x = x_ref + ρ_k·x_e` per level: that MOVES every
+Do **not** instead rescale `x = x_ref + ρ_k·x_e` per level: that moves every
 sample rather than dropping any, so each level is a fresh draw and (M) does not
 apply. (Observed on cartpole: 0.0304, 0.0441, 0.0384, 0.0347 — dips that are
 pure resampling noise.)
@@ -198,7 +198,7 @@ reference rollouts.
 
 1. **Nesting.** Every level's sample set is a literal subset of the previous.
    Assert it in code.
-2. **Monotonicity — in the subset AND in the envelope.** The reported curve is
+2. **Monotonicity — in the subset and in the envelope.** The reported curve is
    non-decreasing under nesting (M). The same argument applies to relaxing
    `w_lb`: a larger `1/w_lb` weakens `ν ≤ 1/w_lb`, enlarging the feasible set, so
    `λ*` can only rise. Either violation means inaccurate solves; do not interpret
@@ -309,7 +309,7 @@ The r=1.6 cartpole numbers were never deployable — that is exactly why the
 actuator check raised `r`. Quote the sweep at the shipped `r` or the gain is
 measured on a controller that would leave the actuator box.
 
-### These λ are LMI-only — the actuator check is NOT applied
+### These λ are LMI-only — the actuator check is not applied
 
 `lambda_subsets.py` bisects λ against **LMI feasibility alone**.
 `find_uniform_lambda` additionally requires ≤`--viol-frac` of the drawn
@@ -323,7 +323,7 @@ measured on a controller that would leave the actuator box.
 | quadrotor | 0.8156 | 0.2601 |
 
 So a sweep gain is a comparison of **LMI-certifiable rates over nested sets**. It
-is NOT a claim that a controller achieving those rates fits the actuator box —
+is not a claim that a controller achieving those rates fits the actuator box —
 at every level above L0 the rate is un-checked, and even L0 exceeds the
 actuator-checked λ.
 
@@ -335,11 +335,11 @@ segway's 1.59× as an LMI result or not at all.
 
 Wording that survives review: *"the certificate is limited by a thin set of
 states — removing them admits a λ this many times faster"*, not *"the controller
-contracts this many times faster."* The second claim needs the actuator check AND
+contracts this many times faster."* The second claim needs the actuator check and
 the invariance argument of §6.6.
 
 Trustworthy depth: quote **L3** (n=40), not L5 (n=20-22). λ* is certified over
-SAMPLED states, so a thin set is optimistic — the same covering argument as §7,
+Sampled states, so a thin set is optimistic — the same covering argument as §7,
 applied to the subset. At L3: cartpole 0.5089 (**5.72×**, 47% volume), segway
 1.4443 (**1.50×**, 42% volume).
 
@@ -356,7 +356,7 @@ rotation, so its samples are interchangeable (λ, ν, χ identical to 6 digits w
 the tight set churns between 25 and 82 members); the quadrotor's LMI is active at
 every sample simultaneously.
 
-## 8c. WHY a plant does or does not respond — measure it in one pass
+## 8c. Why a plant does or does not respond — measure it in one pass
 
 The joint program shares one ν and one χ across every sample, so
 
@@ -364,7 +364,7 @@ The joint program shares one ν and one χ across every sample, so
 λ*(S) ≤ min_{x ∈ S} λ*(x)                                             (W)
 ```
 
-where `λ*(x)` is the rate a SINGLE state admits (a one-sample SDP). The worst
+where `λ*(x)` is the rate a single state admits (a one-sample SDP). The worst
 state is a ceiling on the whole set, so a subset can raise λ* only by removing
 states that are worse than the rest. Whether such states exist is a property of
 the plant, measurable per state without any nesting machinery.
@@ -378,7 +378,7 @@ Measured at `w_lb=1e-3`, ε=0.1, 40 uniform states per plant:
 | car | 4.981 | 4.981 | 4.981 | **1.00×** | 100% | 1.00× |
 | quadrotor | 0.816 | 0.816 | 0.816 | **1.00×** | 100% | 1.00× |
 
-Car and quadrotor return the SAME `λ*(x)` at all 40 states, to solver precision.
+Car and quadrotor return the same `λ*(x)` at all 40 states, to solver precision.
 Every state is exactly as hard as every other, so there is nothing a subset can
 remove — 1.00× is forced, not incidental. Cartpole and segway have a 2.27× and
 1.65× spread with only 10% and 5% of states near the worst: a thin hard shell,
@@ -399,7 +399,7 @@ sets. If `max/min ≈ 1`, the sweep cannot produce an effect and should not be r
 ### Cheaper still, and it is the actual cause: does `B(x)` vary?
 
 `B` enters the LMI only through `ν(2/r)BBᵀ`, the single term supplying control
-authority, and `ν` is SHARED across the set. `W̄_k` is a free per-state variable,
+authority, and `ν` is shared across the set. `W̄_k` is a free per-state variable,
 so it absorbs whatever `A(x)` does; what it cannot absorb is a state with less
 actuation than its neighbours, because the authority budget is global. So
 per-state difficulty is uniform whenever `B` is constant, no matter how `A` moves.
@@ -436,7 +436,7 @@ Three stages, each at its own `(N, ε)`, and the split is deliberate — see §7
 ```
 
 `ε` falls 0.1 → 0.01 between stages 1 and 2 while `N` rises 100 → 10000. The two
-move in OPPOSITE directions on feasibility (smaller ε relaxes `S ⪯ -εI`, more
+move in opposite directions on feasibility (smaller ε relaxes `S ⪯ -εI`, more
 samples adds constraints), so neither dominates and stage 2 is a genuine test,
 not a formality. That is why the generation solve doubles as the certification:
 a λ that only held on a thin draw fails there.
@@ -447,7 +447,7 @@ A full search at N=10000 is not an option: one joint solve is ~15 h at that size
 ### Values in the configs
 
 Re-measured 2026-08-17 at the stage-1 point above (`N=100`, ε=0.1, `--cm-dt 1.0`,
-`w=[1e-3,1e3]`), each at the `r` its own config ships. Every row PASSES the 5%
+`w=[1e-3,1e3]`), each at the `r` its own config ships. Every row passes the 5%
 actuator check, so this table is now what the configs carry rather than a
 snapshot that drifted from them:
 
@@ -459,7 +459,7 @@ snapshot that drifted from them:
 | segway | 0.0152 | 6.4 | 1000 | 1012 | 22.68 | 0.65% | 6 |
 | quadrotor | 1.3169 | 0.1 | 33.00 | 198.1 | — | 0.35% | 30 |
 
-**segway is NOT infeasible** — the row below claiming so predates `8a64182`,
+**segway is not infeasible** — the row below claiming so predates `8a64182`,
 which certified it at λ=0.0152 with `r=6.4`. Its ν does pin at exactly
 `1/w_lb = 1000`, so it sits on the envelope boundary and nothing looser is
 available to it, which is what the §"segway does not fit this envelope"
@@ -472,7 +472,7 @@ certifies 5× slower than the otherwise-identical car at 2× the control-effort
 weight. Verified at stage 2's `N=1000`/ε=0.01: ν=9.354, χ=6.138, ‖K‖₂max=1.926,
 1.83% out of box.
 
-The values this table USED to list — cartpole 0.0771/12.8, quadrotor
+The values this table used to list — cartpole 0.0771/12.8, quadrotor
 0.2601/12.8, segway infeasible — were superseded by `8a64182` and no longer
 match any config. They are kept only in the historical note that follows.
 
@@ -526,7 +526,7 @@ alone or a larger actuator-violation budget; it is not fixable by lowering λ.
 λ rose **2.23×** for **11%** of the active volume, monotone throughout.
 
 With `--drop-mode box` and the same `p = 0.10` (several face cuts per level until
-10% of samples are excluded), the retained set stays a BOX and the result is
+10% of samples are excluded), the retained set stays a box and the result is
 reportable as a region:
 
 | L | n | vol | λ* | gain | pitch | pitch_rate |
@@ -569,7 +569,7 @@ limited plants are flat: when a global cap fixes the solution, χ does not move
 either. Reported as an observation on one plant, not a theorem — but it is
 directly checkable on any run, since χ is already in the solver output.
 
-**(†) IS NOT GENERAL — it is a cartpole observation and segway refutes it.**
+**(†) is not general — it is a cartpole observation and segway refutes it.**
 Three measurements, weakest constraint last:
 
 | sweep | λ·χ across levels | spread |
@@ -582,7 +582,7 @@ On segway χ *rose* 23 886 → 71 627 while λ rose 0.9621 → 1.4137 — the op
 sign to (†), under the same ν-pinned condition that was supposed to make it hold.
 So "λ rises because χ falls" is not the mechanism in general; it is what happened
 on cartpole. The defensible statement is only that λ* rises when the subset drops
-states the certificate was resting on, and that HOW the metric changes to permit
+states the certificate was resting on, and that how the metric changes to permit
 it is plant-dependent. Relaxing the envelope also breaks (†) across plants:
 quadrotor gives λ·χ = 6.6, 57.4, 597.5 at `w_lb` = 0.01, 0.001, 0.0001.
 
@@ -647,7 +647,7 @@ Empirically λ ∝ (1/w_lb)^≈0.3 across four plants and four decades of cap
 (car: 2.12 → 5.01 → 11.24 → 53.23 at `w_lb` = 1e-2 … 1e-6), so the rate a paper
 reports is meaningless without its envelope printed beside it.
 
-## A tighter envelope makes subsets worth MORE
+## A tighter envelope makes subsets worth more
 
 Same plant, same draw, same rule, nearly the same volume removed — only the
 envelope differs:

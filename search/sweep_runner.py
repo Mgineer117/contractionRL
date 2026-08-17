@@ -14,38 +14,38 @@ module docstring measures 0% feasible on segway at ``w_lb=0.1``, 100% at
 ``w_lb=0.001``).
 
 Left alone, an infeasible trial is the worst possible sweep outcome — not
-because it fails, but because it fails WITHOUT A METRIC:
+because it fails, but because it fails without a metric:
 
   * offline (C2RL cvstem): it either grinds through all 131072 per-state SDP
     solves before ``build_cm_dataset`` raises, or trains a full run on a CMG
     regressed onto a handful of surviving states.
   * online (CV-STEM-LQR): every infeasible state silently falls back to
     ``u = u_ref``, so the trial finishes with a plausible-looking AUC produced
-    by a controller that was partly OPEN-LOOP.
+    by a controller that was partly open-Loop.
 
 Either way the sweep controller sees a run with no metric — and a metric-less
-run is simply IGNORED by bayes bookkeeping. Nothing is learned from it, so the
+run is simply ignored by bayes bookkeeping. Nothing is learned from it, so the
 same dead region gets sampled again, forever.
 
-So this wrapper runs the trial as a child, watches its output, and the FIRST
+So this wrapper runs the trial as a child, watches its output, and the first
 time infeasibility is reported it kills the child, writes ``--bad-value`` to the
 sweep metric, and exits 0. The trial becomes a real, very bad datapoint instead
 of a hole — which is also what makes bayes usable over a partly-infeasible
 space: the wall is an observation the surrogate can learn to avoid.
 
 Nothing in the solver path is modified; detection is pure output inspection.
-Crucially, the child's OWN config decides what counts as a terminal miss — this
+Crucially, the child's own config decides what counts as a terminal miss — this
 wrapper only watches for the signals that mean the child actually dropped a
 state or aborted. Strictness is a per-algorithm choice made in the config:
 
     cm.max_lambda_reductions: 0      # strict offline: a miss can't be rescued,
                                      #   the state drops and the ratio/rate fires
-    cm.min_feasibility_rate:  1.0    # offline: child raises if ANY state is dropped
+    cm.min_feasibility_rate:  1.0    # offline: child raises if any state is dropped
 
-C2RL offline runs the OPPOSITE way on purpose: ``max_lambda_reductions: 10`` lets
+C2RL offline runs the opposite way on purpose: ``max_lambda_reductions: 10`` lets
 a per-state λ-backoff rescue a miss, and ``min_feasibility_rate: 0.95`` tolerates
 a few genuine drops. A rescued state is feasible, so it never trips a detection
-signal — which is why the ``infeasible at λ=`` rescue WARNING is NOT a kill
+signal — which is why the ``infeasible at λ=`` rescue WARNING is not a kill
 signal (see ``_HARD_MARKERS``). Only a state the child could not rescue (dropped)
 reaches the wrapper, via the ratio/rate paths.
 
@@ -55,7 +55,7 @@ Detection signals:
     must stay in sync). Raised at construction, before any rollout: one program
     covers every sample, so there is nothing per-state to rescue.
   * tqdm postfix ``feasible=<k>/<i>`` with ``k < i``     — earliest offline signal,
-    fires within the first 128 states (a DROPPED, not rescued, state)
+    fires within the first 128 states (a dropped, not rescued, state)
   * ``NCM synthesis: <k>/<n> states feasible`` with k<n  — end-of-solve summary
   * ``produced 0 feasible metrics`` / ``below min_feasibility_rate`` — the raises
 
@@ -64,7 +64,7 @@ to the child, so after killing the child it can resume that exact run and write
 the metric into its summary — which is the value the sweep controller reads.
 
 Sign convention: ``--bad-value`` must match ``metric.goal``. For the AUC metrics
-these configs use (MINIMIZED) it is a large positive number, not a negative one.
+these configs use (minimized) it is a large positive number, not a negative one.
 
 Usage (normally invoked by the sweep yaml search/build_sweep.py generates):
     python search/sweep_runner.py --task classic-car-v0 --algorithm cvstem-lqr \
@@ -96,14 +96,14 @@ _HARD_MARKERS = (
     "produced 0 feasible metrics",
     "below min_feasibility_rate",
 )
-# NOTE: "infeasible at λ=" is deliberately NOT a hard marker. ncm_synthesis only
+# NOTE: "infeasible at λ=" is deliberately not a hard marker. ncm_synthesis only
 # prints that line when `reductions > 0 and Wv is not None` — i.e. on a
-# SUCCESSFUL λ-backoff rescue, not a real miss. With cm.max_lambda_reductions=0
+# Successful λ-backoff rescue, not a real miss. With cm.max_lambda_reductions=0
 # a genuine miss can't be rescued, so the state is dropped silently and surfaces
 # through the k<n ratio / min_feasibility_rate paths below. With
 # max_lambda_reductions>0 (c2rl offline) the rescue is the intended, healthy
 # behaviour, so killing on the warning would be a false positive. Strictness is
-# governed by max_lambda_reductions (+ min_feasibility_rate), NOT by this line.
+# governed by max_lambda_reductions (+ min_feasibility_rate), not by this line.
 # tqdm postfix (`pbar.set_postfix(feasible=f"{len(xs)}/{i+1}")`) and the final
 # summary line — both carry a k/n pair that is only healthy when k == n.
 _RATIO_PATTERNS = (
@@ -125,15 +125,15 @@ def _infeasibility_reason(text: str) -> str | None:
 
 
 def _iter_output(proc: subprocess.Popen):
-    """Yield chunks of the child's merged stdout, split on \\n AND \\r.
+    """Yield chunks of the child's merged stdout, split on \\n and \\r.
 
     tqdm redraws its bar with a bare carriage return, so the postfix — our
     earliest infeasibility signal — never arrives on a newline-terminated line,
     and readline() would sit on it until the whole progress bar finished.
 
-    Reads at the FILE DESCRIPTOR level (os.read returns as soon as any bytes are
+    Reads at the file descriptor level (os.read returns as soon as any bytes are
     available) rather than proc.stdout.read(n), which blocks until it has
-    collected exactly n chars or hits EOF. That difference is the whole point of
+    collected exactly n chars or hits eof. That difference is the whole point of
     this function: the child prints the infeasibility marker and then can sit
     there — mid-SDP-solve, or blocked — for a long time without emitting enough
     further output to fill a fixed-size read. A buffered read would not surface
@@ -150,7 +150,7 @@ def _iter_output(proc: subprocess.Popen):
             break
         if not chunk:
             break
-        # Decode incrementally: a 4096-byte boundary can land mid-UTF-8 (the
+        # Decode incrementally: a 4096-byte boundary can land mid-Utf-8 (the
         # markers contain λ), so hold any partial trailing sequence over.
         pending += chunk
         try:
@@ -174,7 +174,7 @@ def _iter_output(proc: subprocess.Popen):
             yield part, True
         # A marker can arrive with no trailing newline (the child may stall
         # immediately after printing it), so the in-progress tail must be
-        # scannable too. Flagged partial: the caller scans it but does NOT print
+        # scannable too. Flagged partial: the caller scans it but does not print
         # it, and it stays buffered so the eventual complete line is still
         # yielded — and printed — exactly once.
         if buf:
@@ -205,7 +205,7 @@ def _terminate(proc: subprocess.Popen) -> None:
 def _log_bad_metric(metric_name: str, bad_value: float, reason: str, run_id: str | None) -> None:
     """Resume the child's run and write ``bad_value`` into the sweep metric.
 
-    The sweep controller reads the run SUMMARY, so a single log call is enough.
+    The sweep controller reads the run summary, so a single log call is enough.
     Best-effort: a failure here must not turn a cleanly-detected infeasibility
     into a nonzero exit (which would make the agent look like it crashed).
     """
@@ -314,7 +314,7 @@ def main() -> int:
 
     if reason is not None:
         _log_bad_metric(args.metric_name, args.bad_value, reason, run_id)
-        return 0  # a recorded bad trial, NOT an agent crash
+        return 0  # a recorded bad trial, not an agent crash
 
     return proc.returncode
 

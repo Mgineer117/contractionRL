@@ -165,7 +165,7 @@ yaw_rate(t) = A·sin(ω·t + φ)             sinusoidal yaw, makes the robot cur
 | **Obs** = state + cmds(4) + prev_action | **49** | **70** | **32** |
 | **Action** | 12 joint targets: `default_pos + 0.25·action` | 19 joint targets: `default_pos + 0.25·action` | 7 joint targets: `mid ± half_range·action` (soft-limit midpoint form) |
 | **Reward terms** | `rew_alive(0.5) + rew_lin(exp(-lin_err/0.25)·2.0) + rew_yaw(exp(-yaw_err/0.25)·0.5) + rew_flat(-0.5·Σg_xy²) + rew_z(-0.5·vz²) + rew_rp(-0.05·Σω_xy²) + rew_torque(-1e-5·Στ²) + rew_action_rate(-0.01·Σ(a-a')²)` | `rew_alive(1.0) + rew_lin(exp(-lin_err/0.1)·2.0) + rew_yaw(exp(-yaw_err/0.1)·0.5) + rew_flat(-1.0·Σg_xy²) + rew_z(-0.5·vz²) + rew_rp(-0.05·Σω_xy²) + rew_torque(-1e-5·Στ²) + rew_action_rate(-0.01·Σ(a-a')²)` | `rew_vel(-1.0·‖ee_vel-cmd‖²) + rew_yaw(-0.5·(ee_yaw_vel-cmd)²) + rew_action_rate(-0.01·Σ(a-a')²) + rew_joint_limits(-0.1·soft-limit penalty)` — no exp-shaping, no alive bonus |
-| **Termination** | fall: `base_height < 0.20 m` OR tilt `proj_gravity_b[z] > -0.71` | fall: `base_height < 0.50 m` OR tilt `proj_gravity_b[z] > -0.71` | time-out only, no failure condition |
+| **Termination** | fall: `base_height < 0.20 m` or tilt `proj_gravity_b[z] > -0.71` | fall: `base_height < 0.50 m` or tilt `proj_gravity_b[z] > -0.71` | time-out only, no failure condition |
 | **Decimation / control freq** | 4 @ sim dt=1/200s → **50 Hz** (step dt=0.02s) | 4 @ 1/200s → **50 Hz** | 2 @ sim dt=1/120s → **60 Hz** (step dt≈0.0167s) |
 | **Episode length** | `episode_length_s=40.0` → **2000 steps** | `episode_length_s=40.0` → **2000 steps** | `episode_length_s=15.0` → **900 steps** |
 
@@ -282,7 +282,7 @@ no reference trajectory).
 - **Obs (4)**: `[pole_pos, pole_vel, cart_pos, cart_vel]`
 - **Action (1)**: direct joint-effort target, `action·100.0 N`
 - **Reward**: `rew_alive(1.0·(1-terminated)) + rew_termination(-2.0·terminated) + rew_pole_pos(-1.0·pole_pos²) + rew_cart_vel(-0.01·|cart_vel|) + rew_pole_vel(-0.005·|pole_vel|)`
-- **Termination**: `|cart_pos| > 3.0 m` OR `|pole_pos| > π/2`
+- **Termination**: `|cart_pos| > 3.0 m` or `|pole_pos| > π/2`
 - **Decimation/control freq**: 2 @ sim dt=1/120s → **60 Hz**
 - **Episode length**: `episode_length_s=5.0` → **300 steps**
 
@@ -451,11 +451,11 @@ the trial on the first infeasibility and writes a poison AUC (`1e3` for `cvstem-
 and a metric-less run is silently ignored by bayes bookkeeping, so the same dead corner
 gets resampled forever.
 
-`cvstem-lqr` is the ORIGINAL CV-STEM pipeline (`AstroHiro/ncm`): ONE joint SDP over
+`cvstem-lqr` is the original CV-STEM pipeline (`AstroHiro/ncm`): One joint SDP over
 uniform state-box samples with `nu`/`chi` shared, then a `chol(M)` network — solved once
 at construction, no per-step solve and no per-state lambda backoff. An infeasible joint
 program aborts immediately, before any rollout — there is no partial feasibility to
-record. Note `agent.r_scaler` is INERT for this agent: with `nu` free the solved
+record. Note `agent.r_scaler` is inert for this agent: with `nu` free the solved
 `nu` scales with `r` and the gain is unchanged, so only `cm.lbd`/`cm.cm_eps` move the
 certificate (measured — see `scripts/find_uniform_lambda.py`'s docstring).
 
@@ -611,7 +611,7 @@ reference. Configs: `agents/skrl_ppo_cfg.yaml`, `agents/skrl_sac_cfg.yaml`.
 into the agent config before construction (`observation_preprocessor` for Isaac envs, remapped
 from the legacy `state_preprocessor` yaml key for classic envs — see
 [skrl's `Runner._process_cfg`](https://skrl.readthedocs.io)); it's applied (not updated) inside
-`act()` and updated (`train=True`) inside `update()`'s gradient step, over the FULL observation
+`act()` and updated (`train=True`) inside `update()`'s gradient step, over the full observation
 vector `[x, xref, uref]` (path-tracking envs) with no special-casing of any sub-range. Value
 normalization (`use_value_norm`, PPO only — SAC has no state-value network) adds a separate
 `RunningStandardScaler(size=1)` on the value output.
@@ -645,7 +645,7 @@ On classic envs with `use_analytical_dynamics: true`, the env's exact `get_f_and
 2. Anneal the controller's exploration `log_std` by training progress.
 3. **One full pass over the training buffer** (`(x, xref, uref)` triples from `get_rollout`), in
    `batch_size` chunks; each chunk does `cmg_updates_per_policy_update` CMG-only gradient steps
-   (controller frozen) followed by ONE controller-only gradient step (CMG frozen) — both directions
+   (controller frozen) followed by one controller-only gradient step (CMG frozen) — both directions
    optimise the same `pd_loss + c1_loss + c2_loss (+ os_loss)`, alternating which side actually
    receives the gradient is what keeps the joint (metric, controller) optimization stable.
 
@@ -670,11 +670,11 @@ sees the same raw physical-unit `(x, xref, uref)` at both training and eval time
 
 ### SD-LQR (State-Dependent LQR)
 
-Linearises `ẋ = f(x) + B(x)u` at the **current state** `x`, solves CARE, applies `u = uref − K(x)·e`.
+Linearises `ẋ = f(x) + B(x)u` at the **current state** `x`, solves care, applies `u = uref − K(x)·e`.
 No training — analytical per-step computation (`update()` is a no-op). Every `act()` call:
 autodiff `get_f_and_B` (analytical for classic envs, or a `NeuralDynamics` checkpoint pretrained
 by C3M for Isaac envs) at the linearization point to get `f, B` and their Jacobians, form
-`A = ∂f/∂x + Σⱼ uref_j·∂Bⱼ/∂x`, solve the CARE per-environment (`scipy`, CPU-only — falls back to
+`A = ∂f/∂x + Σⱼ uref_j·∂Bⱼ/∂x`, solve the care per-environment (`scipy`, CPU-only — falls back to
 zero feedback if `(A, B)` isn't stabilizable at that point rather than aborting the batch), then
 apply the gain.
 
@@ -703,7 +703,7 @@ skrl `PPO` sub-agents, `c2rl-sac` uses two official skrl `SAC` sub-agents) that 
 - **con_policy** ("contracting", `gamma_con` ≈ 0) and **opt_policy** ("optimal", `gamma_opt`, e.g.
   0.99) optimise the **same** Mahalanobis tracking reward
   `−tracking_scaler·‖e‖²_M/std − control_scaler·‖u−uref‖²/std` (`M(x)` = the CMG's current metric)
-  — they differ ONLY in discount factor, not in reward. opt_policy is what's actually deployed at
+  — they differ only in discount factor, not in reward. opt_policy is what's actually deployed at
   inference unless `con_only: true`.
 - con_policy's mean control and its state-Jacobian `K = du/dx` are what the CMG (CCM generator,
   same architecture as C3M) is trained against — opt_policy plays no role in shaping the metric.
@@ -716,7 +716,7 @@ skrl `PPO` sub-agents, `c2rl-sac` uses two official skrl `SAC` sub-agents) that 
 1. **Con rollout** — collect `rollouts` env steps with con_policy acting (its own replay/rollout
    buffer — PPO: reset every epoch; SAC: a persistent replay buffer, sized independently via
    `memory_size`).
-2. **update_con** — recompute the Mahalanobis reward from the RAW just-collected observations and
+2. **update_con** — recompute the Mahalanobis reward from the raw just-collected observations and
    overwrite the environment reward with it, then take one PPO/SAC gradient step for con_policy
    (PPO updates explicitly here; SAC recomputes the reward per-minibatch inside a patched
    `memory.sample()` and defers the actual gradient step to `con_agent.post_interaction()`, so
@@ -732,7 +732,7 @@ skrl `PPO` sub-agents, `c2rl-sac` uses two official skrl `SAC` sub-agents) that 
 - **Observations** — `use_state_norm: false` in every shipped config (see the PPO/SAC
   normalization note above for why: with `control`/`mlp` residual backbones, normalizing the obs
   also normalizes the sliced `uref`, distorting the `u = uref + feedback` law). When enabled,
-  con_agent and opt_agent EACH get their own independent `RunningStandardScaler` over
+  con_agent and opt_agent each get their own independent `RunningStandardScaler` over
   `[x, xref, uref]` — con_agent's fit to the states con_policy visits, opt_agent's to opt_policy's,
   and the two can diverge over training. PPO additionally normalizes its value function per
   sub-agent when `use_value_norm: true`.
@@ -740,7 +740,7 @@ skrl `PPO` sub-agents, `c2rl-sac` uses two official skrl `SAC` sub-agents) that 
   control-effort term) are each divided by the sqrt of their own EMA'd batch variance
   (`reward_norm_beta`), tracked on the outer C2RL agent (not per sub-agent), so their scale stays
   roughly stationary as the CMG's metric shape changes during training.
-- **CMG metric `M(x)` + Mahalanobis reward always use RAW observations** — both read straight from
+- **CMG metric `M(x)` + Mahalanobis reward always use raw observations** — both read straight from
   the rollout/`get_rollout` tensors, never through a preprocessor. This is deliberate: `M(x)` and
   `e = x − xref` are physical quantities, and per-dimension normalization would scale `x` and
   `xref` independently (different observation indices, independent running stats), distorting `e`.

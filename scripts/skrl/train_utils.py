@@ -9,10 +9,10 @@ _DEFAULT_NUM_ENVS_PPO_CLASSIC = 1024
 _VEL_TASK_TO_ROBOT = {"Quadruped": "quadruped", "Humanoid": "humanoid", "Manipulator": "manipulator"}
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Generated DATA lives under data/, not logs/. The distinction is lifetime and
+# Generated data lives under data/, not logs/. The distinction is lifetime and
 # role, not format: logs/ holds the output of one run (checkpoints, tensorboard
 # events, eval json) and is disposable per run, while data/ holds artifacts that
-# are INPUTS to later runs of other algorithms — dynamics_data.npz (the
+# are inputs to later runs of other algorithms — dynamics_data.npz (the
 # reference trajectories path-tracking envs track) and the cm_data*.npz metric
 # caches synthesized from it. Deleting logs/ must never force a re-synthesis.
 _DATA_ROOT = os.path.join(_ROOT, "data")
@@ -28,7 +28,7 @@ def _run_metadata(args_cli, task: str) -> dict:
     directory is named by timestamp only, so nothing in the file says which
     seed/env/algorithm it came from. Multi-seed aggregation (run_seeds.sh +
     scripts/aggregate_seeds.py) needs exactly that to group runs, so it is
-    written INTO the json rather than parsed back out of a path.
+    written into the json rather than parsed back out of a path.
 
     CRL_RUN_TAG is set by run_seeds.sh to a per-launch tag, so the aggregator
     can select one batch of seeds instead of every historical run under logs/.
@@ -43,7 +43,7 @@ def _run_metadata(args_cli, task: str) -> dict:
 
 
 def _resolve_symmetry_for_env(raw_env) -> int:
-    """``_resolve_symmetry`` for the STANDALONE PPO/SAC path, which has no
+    """``_resolve_symmetry`` for the standalone PPO/SAC path, which has no
     ContractionRunner to ask. Delegates to the same verified check so both
     routes make the same call for the same env (never one quotiented and one
     not, which would make PPO and C2RL-PPO architecturally incomparable).
@@ -65,7 +65,7 @@ def _resolve_symmetry_for_env(raw_env) -> int:
 def _inject_angle_idx(agent_cfg: dict, angle_idx: list, sym=None) -> None:
     """Inject ``angle_idx``/``pos_dim`` into every model sub-block of agent_cfg["models"].
 
-    Only the STANDALONE PPO/SAC path needs this: those models are built by
+    Only the standalone PPO/SAC path needs this: those models are built by
     _gaussian_factory/_deterministic_factory (runner.py) purely from each
     yaml/cfg block's own keys, with no access to the env object. The
     ContractionRunner path (C3M/LQR/SDLQR/C2RL) is self-sufficient — it reads
@@ -73,7 +73,7 @@ def _inject_angle_idx(agent_cfg: dict, angle_idx: list, sym=None) -> None:
     for that path. A no-op (angle_idx=[]) here is also harmless: every
     consumer treats an empty angle_idx as "nothing to embed".
 
-    ``pos_dim`` is the width of the leading TRANSLATION-invariant state block
+    ``pos_dim`` is the width of the leading translation-invariant state block
     (see angle_utils' translation quotient). It travels with ``angle_idx``
     because every consumer needs both to size and build its input; 0 keeps the
     previous absolute-observation behaviour.
@@ -96,14 +96,14 @@ def _resolve_caps_kwargs(agent_cfg: dict, args_cli, *, pop: bool) -> dict:
     by both agent families, so one flag means the same thing everywhere. Returns
     kwargs for ``agent_patches.patch_caps_regularizer``.
 
-    ``pop=True`` for the STANDALONE PPO/SAC route: there ``agent_cfg["agent"]``
+    ``pop=True`` for the standalone PPO/SAC route: there ``agent_cfg["agent"]``
     is handed to skrl's Runner, which builds a PPO_CFG/SAC_CFG from it and
     rejects unknown fields — so the caps_* keys have to leave the dict once
     read, and the caller applies the returned kwargs itself.
 
     ``pop=False`` for the C2RL route: C2RL declares caps_* as real fields on
     C2RLPPOCfg/C2RLSACCfg and applies the patch to its own inner PPO/SAC
-    sub-agent, so the keys stay — and any ``--caps_*`` override is written BACK
+    sub-agent, so the keys stay — and any ``--caps_*`` override is written back
     into the dict, which is the only way the flag reaches that route at all.
 
     Sweeps set these through ``agent.caps_*`` (see search/configs/); the CLI
@@ -159,7 +159,7 @@ def disable_tensorboard_files() -> None:
 def install_wandb_scalar_hook() -> None:
     """Mirror every skrl ``SummaryWriter.add_scalar`` into the active W&B run.
 
-    Logged against a CUSTOM step metric (``global_step``) rather than wandb's
+    Logged against a custom step metric (``global_step``) rather than wandb's
     internal step counter: any ``wandb.log()`` without ``step=`` (video/media
     uploads, the PathTracking figures) advances that internal counter, after
     which scalars logged with an explicit smaller ``step=`` are silently dropped
@@ -194,18 +194,18 @@ def apply_wandb_sweep_overrides(agent_cfg: dict) -> None:
 
     A sweep parameter whose value is itself a dict (wandb's nested-parameter
     form for jointly-sampled pairs, e.g. ``{w_lb, w_ub}`` — see
-    ``search/configs/``) is MERGED into the existing sub-dict rather than
+    ``search/configs/``) is merged into the existing sub-dict rather than
     assigned: assigning would wipe sibling keys already at that path
     (``agent.class``, ``agent.lbd``, …) that the sweep isn't sampling.
 
-    Two synthetic, non-dotted keys fan a SINGLE sampled value out to both the
+    Two synthetic, non-dotted keys fan a single sampled value out to both the
     actor's and the critic's reference-trajectory encoder, so one bayes trial
-    always uses the SAME encoder (and stride) on both sides rather than
+    always uses the same encoder (and stride) on both sides rather than
     sampling them independently — wandb's nested-dict form only joins keys
     that share a parent path (e.g. ``cm.w_lb``/``cm.w_ub``), which
     ``models.policy.encoder``/``models.critic.encoder`` don't:
-      ``xref_encoder``        -> models.policy.encoder AND models.critic.encoder
-      ``xref_encoder_stride`` -> models.policy.encoder_stride AND
+      ``xref_encoder``        -> models.policy.encoder and models.critic.encoder
+      ``xref_encoder_stride`` -> models.policy.encoder_stride and
                                   models.critic.encoder_stride
     See search/configs/c2rl-ppo-cvstem.yaml.
     """
@@ -237,16 +237,16 @@ def apply_wandb_sweep_overrides(agent_cfg: dict) -> None:
 
 
 def _disarm_termination_for_eval(env, tag: str = "[Eval]") -> None:
-    """Force the early-termination box OFF on an EVALUATION env.
+    """Force the early-termination box off on an evaluation env.
 
-    Evaluation measures AUC = integral of ||e||/||e0|| over the FIXED horizon.
-    Cutting an episode short does not just shorten that integral, it INVERTS the
+    Evaluation measures AUC = integral of ||e||/||e0|| over the fixed horizon.
+    Cutting an episode short does not just shorten that integral, it inverts the
     metric: a policy that falls at step 20 stops accumulating error and scores a
     smaller (better-looking) AUC than one that tracks imperfectly for all 500
     steps. The same truncation makes the number incomparable with every
     LQR/C3M/CV-STEM baseline, all measured over full episodes.
 
-    Early termination is a TRAINING-data intervention -- it keeps 500 steps of
+    Early termination is a training-data intervention -- it keeps 500 steps of
     already-fallen transitions out of the rollout batch. It is not a measurement
     change, so it is disarmed here regardless of the training setting.
     """
@@ -263,7 +263,7 @@ def apply_cli_dotted_overrides(agent_cfg: dict, extra_args: list[str]) -> list[s
     Same dotted-path semantics as :func:`apply_wandb_sweep_overrides`, so a knob
     can be pinned by hand exactly the way a sweep would set it
     (``--agent.mini_batches=16``). Without this these args land in argparse's
-    leftovers and are SILENTLY DROPPED on the classic route — the run then trains
+    leftovers and are silently dropped on the classic route — the run then trains
     on the yaml defaults while its command line claims otherwise, which is the
     same class of silent-config failure as an unknown yaml key.
 
@@ -320,10 +320,10 @@ def normalize_agent_cfg(agent_cfg: dict, *, algorithm: str) -> dict:
 
     Shared by both of train.py's routes so a yaml key means the same thing on
     each. Returns the std-dev-annealing decision, which the caller passes to
-    ``agent_patches.patch_ppo_std_annealing`` AFTER the agent is built.
+    ``agent_patches.patch_ppo_std_annealing`` after the agent is built.
 
     Observation/state normalization is disabled unconditionally: the Mahalanobis
-    reward and the CV-STEM metric are defined in RAW physical coordinates, and
+    reward and the CV-STEM metric are defined in raw physical coordinates, and
     per-dimension scaling would distort the tracking error ``e = x - xref`` (see
     c2rl.py's module docstring). Value normalization stays available for PPO,
     where it only rescales the critic target.
@@ -333,8 +333,8 @@ def normalize_agent_cfg(agent_cfg: dict, *, algorithm: str) -> dict:
     a = agent_cfg.setdefault("agent", {})
     a.pop("use_state_norm", None)
     use_value_norm = a.pop("use_value_norm", True)
-    # C2RL builds its own PPO/SAC sub-agent from the RAW yaml dict via
-    # rl_glue.make_base_rl_cfg, which reads ``use_value_norm`` ITSELF (defaulting
+    # C2RL builds its own PPO/SAC sub-agent from the raw yaml dict via
+    # rl_glue.make_base_rl_cfg, which reads ``use_value_norm`` itself (defaulting
     # to True when absent). Popping it here therefore made the key invisible to
     # C2RL: the `algorithm == "ppo"` branch below never fires for "c2rl-ppo", so
     # the flag was consumed, discarded, and then silently re-defaulted to True —
@@ -361,12 +361,12 @@ def normalize_agent_cfg(agent_cfg: dict, *, algorithm: str) -> dict:
     for key in ("anneal_stddev", "anneal_log_std"):
         a.pop(key, None)
     # std_dev_annealing/_kwargs follow the reward_euclidean rule below: skrl's
-    # PPO_CFG/SAC_CFG reject them, but C2RL builds its sub-agent from this SAME
+    # PPO_CFG/SAC_CFG reject them, but C2RL builds its sub-agent from this same
     # dict via rl_glue.make_base_rl_cfg and reads both off C2RLPPOCfg. Popping
     # unconditionally made them invisible to C2RL, which then fell back to the
-    # dataclass/patch DEFAULTS: `std_dev_annealing: true` (so
+    # dataclass/patch defaults: `std_dev_annealing: true` (so
     # `--std_dev_annealing false` did nothing) and kwargs=None (so the yaml
-    # schedule was ignored and log_std annealed LINEARLY to -2.0, sigma~=0.135,
+    # schedule was ignored and log_std annealed linearly to -2.0, sigma~=0.135,
     # instead of exponentially to the configured final_log_std).
     # reward_euclidean/reward_level are env-side switches (applied straight to
     # the raw env in train.py's standalone branch — see _apply_agent_overrides'
@@ -397,7 +397,7 @@ def apply_agent_patches(agent, *, algorithm: str, annealing: dict, caps: dict,
     ``.policy``/``.scheduler``/``.scaler`` and patches its inner PPO/SAC
     sub-agent itself (see c2rl.py).
 
-    ``patch_auc_checkpoint`` goes LAST because it wraps ``post_interaction``,
+    ``patch_auc_checkpoint`` goes last because it wraps ``post_interaction``,
     and it must see (and therefore run after) the annealing wrapper installed by
     ``patch_ppo_std_annealing``. ``namespace=False`` for the contraction
     algorithms, which already namespace their own ``track_data`` keys.
@@ -434,9 +434,9 @@ def _max_step_reward(robot: str, env_cfg) -> float:
     penalties) have a best case of 0 and are omitted.
 
     quadruped/humanoid: alive bonus + the two exp-tracking terms (each saturates
-    at its scale when the tracking error is 0). The quadruped ALSO has a gait
+    at its scale when the tracking error is 0). The quadruped also has a gait
     term `(2*gait_score - 1) * rew_gait`, gait_score in [0, 1], whose best case
-    is `+rew_gait` (>0) — it MUST be included or the "theoretical max" it feeds
+    is `+rew_gait` (>0) — it must be included or the "theoretical max" it feeds
     (0.5 * max * T for the ref-traj quality gate) is under-counted, so an
     actually-achievable return can exceed it (observed: a real run hit ~6200
     against a mis-computed 5200 ceiling). Humanoid has no gait term. manipulator
@@ -499,13 +499,13 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
     if min_reward > 0:
         print(f"\n[RefTraj] Evaluating quality (threshold: mean total reward >= {min_reward}) …")
 
-        # Deliberately measures the SAME quantity as training's "Reward / Total
+        # Deliberately measures the same quantity as training's "Reward / Total
         # reward (mean)": min_reward is calibrated as 0.5 * best-case-per-step *
-        # T, i.e. on a full TRAINING episode's scale. So this rollout must
+        # T, i.e. on a full training episode's scale. So this rollout must
         # reproduce training's episode structure — fall termination at its cfg
         # default (True) and the policy's own stochastic actions.
         #
-        # It must NOT disable terminate_on_fall the way _evaluate_best_model
+        # It must not disable terminate_on_fall the way _evaluate_best_model
         # does: with it off a fallen robot flails for the full T steps,
         # accumulating the lying-down penalties at ~-2.5/step — a large negative
         # tail training never sees, since it resets on fall. That measurement
@@ -559,7 +559,7 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
             return
 
     # Collect trajectories. We over-collect a candidate pool larger than
-    # num_trajs (oversample_factor x) and then keep the LONGEST num_trajs of
+    # num_trajs (oversample_factor x) and then keep the longest num_trajs of
     # them — early termination is exactly what a poor/failing rollout looks
     # like, so ranking by survival length is a simple, direct proxy for
     # "better trajectory". Recording every one of num_envs (rather than just
@@ -583,7 +583,7 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
     obs_dict, _ = skrl_env.reset()
     obs = _get_obs(obs_dict)
 
-    # _act_low/_act_high (defined above, alongside `unwrapped`) are used ONLY
+    # _act_low/_act_high (defined above, alongside `unwrapped`) are used only
     # when writing into the saved `u` array below, never to modify what's
     # stepped through the env. The policy samples with clip_actions=False
     # (clipping inside the actor corrupts the log-prob), and the env already
@@ -616,7 +616,7 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
         valid_indices = valid_mask.nonzero(as_tuple=True)[0]
 
         ep_states[valid_indices, step_counts[valid_indices]] = state_tensor[valid_indices].float()
-        # Clip only for the SAVED record, not for stepping (see note above).
+        # Clip only for the saved record, not for stepping (see note above).
         ep_actions[valid_indices, step_counts[valid_indices]] = \
             torch.clamp(actions[valid_indices], _act_low, _act_high).float()
 
@@ -675,7 +675,7 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
 
     pbar.close()
 
-    # Keep the num_trajs LONGEST candidates out of the oversampled pool.
+    # Keep the num_trajs longest candidates out of the oversampled pool.
     all_lengths_np = np.asarray(all_lengths, dtype=np.int64)
     keep = np.argsort(all_lengths_np)[::-1][:num_trajs]
     print(f"[RefTraj] Pool lengths: min={all_lengths_np.min()}, max={all_lengths_np.max()}, "
@@ -686,7 +686,7 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
 
     os.makedirs(out_dir, exist_ok=True)
 
-    # The diagnostic plot is a LOG, not data — it documents this generation run
+    # The diagnostic plot is a log, not data — it documents this generation run
     # rather than feeding a later one, so it goes to logs/ and leaves data/
     # holding only the npz artifacts other algorithms consume.
     plot_dir = os.path.join(_ROOT, "logs", robot)
@@ -713,9 +713,9 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
     dt = env_cfg.sim.dt * env_cfg.decimation
     print(f"[RefTraj] Computing dynamics (x_dot) via 4th-order central difference (dt={dt:.3f})...")
 
-    # angle_idx columns (e.g. yaw) wrap at +-pi in the SAVED states_arr — a raw
+    # angle_idx columns (e.g. yaw) wrap at +-pi in the saved states_arr — a raw
     # finite difference across that wrap would spike x_dot by ~2*pi/dt for one
-    # sample. Difference an UNWRAPPED copy instead (np.unwrap makes each angle
+    # sample. Difference an unwrapped copy instead (np.unwrap makes each angle
     # column continuous by adding +-2*pi at jumps); states_arr itself (saved as
     # `x` below) is left untouched — NeuralDynamics only ever consumes x through
     # its (cos, sin) embedding, which is identical for theta and theta + 2*pi*k,
@@ -747,13 +747,13 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
         x_dot_arr = x_dot_arr[valid_mask]
         lengths_arr = lengths_arr[valid_mask]
 
-    # Single unified file: reference trajectories ARE the (x, u) part of the
+    # Single unified file: reference trajectories are the (x, u) part of the
     # dynamics data, so there is no separate ref_trajs.npz anymore.
     #   x       (N, T, x_dim)  physical states; steps >= lengths[n] are padding
     #                          (the last valid state repeated, keeping x_dot ~ 0)
     #   u       (N, T, u_dim)  executed (clipped) actions, same padding rule
     #   x_dot   (N, T, x_dim)  4th-order central differences of x
-    #   lengths (N,)           number of VALID steps per trajectory — consumers
+    #   lengths (N,)           number of valid steps per trajectory — consumers
     #                          mask with arange(T) < lengths[:, None]
     dyn_path = os.path.join(out_dir, "dynamics_data.npz")
     np.savez_compressed(dyn_path, x=states_arr, u=actions_arr, x_dot=x_dot_arr, lengths=lengths_arr)
@@ -768,25 +768,25 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
 def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_groups: int = 10,
                                     episodes_per_group: int = 5, label: str = "",
                                     held_out_seed: int | None = None, held_out_trajectories: int = 64):
-    """Post-training evaluation for CLASSIC path-tracking envs (CAC-dev style).
+    """Post-training evaluation for classic path-tracking envs (CAC-dev style).
 
     Classic envs are plain non-vectorized gymnasium Envs with variable-length
     episodes and no early termination (only truncation at the sampled length),
     so unlike the Isaac rollout there is no terminate_on_fall concept and no
-    vectorized-boundary bookkeeping: a plain loop over ONE env instance, one
+    vectorized-boundary bookkeeping: a plain loop over one env instance, one
     episode at a time, using its native ``tracking_error``/``dt`` step info.
 
     Reports mean +/- 95% CI of total reward, error AUC, and overshoot C /
     contraction rate lambda from the minimal-AUC envelope C*exp(-lambda*k*dt).
 
-    ``held_out_seed`` (UVFA-style generalization test): evaluates on a FIXED
+    ``held_out_seed`` (UVFA-style generalization test): evaluates on a fixed
     bank of ``held_out_trajectories`` shapes from a generator seeded
     independently of training — guaranteed unseen, unlike this function's
-    ordinary i.i.d. eval trajectories (a fresh draw from the SAME distribution,
+    ordinary i.i.d. eval trajectories (a fresh draw from the same distribution,
     not a held-out slice of it). Pair with a second call using
     ``label="HeldOut"`` so both land in separate ``eval_results.json``.
 
-    Skipped by ``--skip_final_eval``. SEQUENTIAL over one env instance (50
+    Skipped by ``--skip_final_eval``. Sequential over one env instance (50
     episodes), fine as an end-of-training report but dead weight in a sweep: it
     does not feed the sweep metric at all (that ``Stability/auc_mean`` comes
     from StatManagerEnvWrapper during the trainer loop; the ``auc_mean`` here is
@@ -838,7 +838,7 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
             print(f"[Eval] --eval_held_out_seed set but {type(env.unwrapped).__name__} has no "
                   f"set_held_out_mode — falling back to ordinary i.i.d.-random eval trajectories.")
 
-    # Mirror the training env's reference WINDOW so the eval observation matches
+    # Mirror the training env's reference window so the eval observation matches
     # what the models were built for. A mismatch is not a shape error that
     # surfaces loudly — RefWindow.split would raise, but only after the eval env
     # has already been built — so copy the layout explicitly.
@@ -922,7 +922,7 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
         # Raw per-episode AUCs. auc_mean +/- CI alone cannot distinguish the two
         # very different ways a seed ends up with a bad number: a uniform shift
         # (every episode slightly worse — a genuinely weaker controller) versus a
-        # heavy tail (most episodes fine, a handful diverging — a ROBUSTNESS
+        # heavy tail (most episodes fine, a handful diverging — a robustness
         # failure). Those call for opposite fixes, and across-seed AUC spread is
         # exactly the symptom under investigation, so the per-episode
         # distribution is kept alongside the robust summaries below.
@@ -932,11 +932,11 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
         "auc_max": float(np.max(auc_list)),
         # Fraction of episodes whose normalized error never really contracts.
         # AUC = int(||e||/||e0||) dt over a time_bound-long episode, so an
-        # episode that merely HOLDS its initial error scores ~time_bound.
+        # episode that merely holds its initial error scores ~time_bound.
         #
         # The threshold was 0.1*time_bound (= 1.5 at time_bound 15) on the
         # assumption that a contracting episode scores ~1. It does not: the
-        # best arms measured run 1.48-2.06 per episode, i.e. AT OR ABOVE that
+        # best arms measured run 1.48-2.06 per episode, i.e. At or above that
         # cut, so the metric labelled the strongest controller in the study
         # ~50% "diverged". Measured distribution across 1095 archived runs:
         #     contracting   1.5 - 2.1
@@ -957,7 +957,7 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
     print(f"{_tag} overshoot C      : {C_mean:.3f} ± {C_ci:.3f}")
     print(f"{_tag} contraction rate : {lbd_mean:.4f} ± {lbd_ci:.4f}  (C·e^(−λkΔt), min AUC)")
 
-    # wandb FIRST, disk second. Training has already succeeded by this point and
+    # wandb first, disk second. Training has already succeeded by this point and
     # the numbers above are the result; a filesystem problem must not be able to
     # lose them. This ordering used to be reversed, and the disk write threw.
     if not args_cli.no_wandb and "wandb" in sys.modules and sys.modules["wandb"].run is not None:
@@ -972,11 +972,11 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
                     wandb_logs[f"final_eval/{k}"] = v
         sys.modules["wandb"].log(wandb_logs)
 
-    # makedirs, because agent.experiment_dir MAY NOT EXIST. skrl creates it
+    # makedirs, because agent.experiment_dir may not exist. skrl creates it
     # lazily on its first write there, and for a sweep trial train.py sets
     # checkpoint_interval = 0 (hundreds of throwaway trials must not each write
     # ten checkpoints) -- so nothing ever writes, the directory is never made,
-    # and this open() raised FileNotFoundError on EVERY sweep trial that got as
+    # and this open() raised FileNotFoundError on every sweep trial that got as
     # far as evaluating. Training had already finished at that point, so a
     # multi-hour trial was being thrown away at the last step.
     _json_name = f"eval_results{'_' + label.lower() if label else ''}.json"
@@ -987,7 +987,7 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
             json.dump(results, f, indent=2)
         print(f"[Eval] Saved → {out_json}")
     except OSError as exc:
-        # Loud, but NOT fatal. The metrics are already in wandb above, and the
+        # Loud, but not fatal. The metrics are already in wandb above, and the
         # json is a convenience copy: a full quota or a read-only path is not a
         # reason to discard a finished run. Raising here is what turned a
         # successful trial into a crashed one.
@@ -997,7 +997,7 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
 
 
 def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli, num_groups: int = 10):
-    """Post-training evaluation of the BEST checkpoint (CAC-dev style).
+    """Post-training evaluation of the best checkpoint (CAC-dev style).
 
     Loads best_agent.pt, disables fall termination (episodes always run the
     full length so metrics are comparable across policies), rolls out one full
@@ -1042,10 +1042,10 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
             model.eval()
 
     unwrapped = isaac_env.unwrapped
-    # Same rule as the classic evaluator, and it bites HARDER here: this loop
+    # Same rule as the classic evaluator, and it bites harder here: this loop
     # runs a fixed T steps without checking dones, so an env that terminated
     # early would be auto-reset underneath it and every later
-    # get_tracking_error() would silently measure a DIFFERENT episode against
+    # get_tracking_error() would silently measure a different episode against
     # the old e(0). Inert today (Isaac _state_bounds is ±inf, so the box never
     # fires) — disarmed anyway, because the day a subclass declares finite
     # bounds this would corrupt the error curve without any error message.
@@ -1084,7 +1084,7 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
                 # on contraction agents. "mean_actions" (present for Gaussian
                 # policies) gives the deterministic action; deterministic
                 # policies (e.g. C3M's CLDeterministicActorModel) have no
-                # separate mean, so their raw action IS already deterministic.
+                # separate mean, so their raw action is already deterministic.
                 actions, outputs = agent.act(obs, None, timestep=0, timesteps=0)
                 actions = torch.clamp(outputs.get("mean_actions", actions), _act_low, _act_high)
             obs_dict, rewards, terminated, truncated, _ = skrl_env.step(actions)
@@ -1098,7 +1098,7 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
     rew_np = total_reward.cpu().numpy()
 
     # Cap the Stability-tab sample size to the SAC-family env count, regardless
-    # of how many parallel envs THIS run actually used. PPO-family algorithms
+    # of how many parallel envs this run actually used. PPO-family algorithms
     # train/roll out with far more parallel envs (e.g. 4096) than SAC-family
     # ones (64, see _DEFAULT_NUM_ENVS_SAC) — without this cap, PPO's mean/CI
     # would be computed from a much larger sample than SAC's, so the two
@@ -1117,7 +1117,7 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
     norm_err_np = err_np / e0_np_safe[:, None]
     auc_np = _trapz(norm_err_np, dx=dt, axis=1)
 
-    # Contraction envelope on NORMALIZED error e(t)/e(0) — CAC-dev convention.
+    # Contraction envelope on normalized error e(t)/e(0) — CAC-dev convention.
     # Envs whose initial error is ~0 (near-zero commanded velocity) carry no
     # contraction information and are excluded from the fit.
     e0 = err_np[:, 0]
@@ -1183,7 +1183,7 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CLASSIC ROUTE  (--classic flag)
+# Classic route  (--classic flag)
 # ══════════════════════════════════════════════════════════════════════════════
 import gymnasium
 from skrl.envs.wrappers.torch.gymnasium_envs import GymnasiumWrapper

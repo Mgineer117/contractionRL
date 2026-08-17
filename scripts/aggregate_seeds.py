@@ -4,7 +4,7 @@
 Each training run writes ``eval_results.json`` next to its checkpoints — the
 best_agent.pt rollout produced by train_utils._evaluate_best_model /
 _evaluate_classic_path_tracking. That file already holds the Stability numbers
-for ONE seed (auc, overshoot C, contraction rate lambda, contraction score,
+for one seed (auc, overshoot C, contraction rate lambda, contraction score,
 total reward), plus the run identity written by train_utils._run_metadata.
 
 This script collects those per-seed files and reduces them across seeds,
@@ -56,7 +56,7 @@ def _t95(n: int) -> float:
     too tight, so a short table is used rather than pulling in scipy — this
     script is meant to run without the Isaac env active.
     """
-    # Keyed by SAMPLE COUNT n (not dof): table[n] is t(0.975, n-1).
+    # Keyed by sample count n (not dof): table[n] is t(0.975, n-1).
     table = {2: 12.706, 3: 4.303, 4: 3.182, 5: 2.776, 6: 2.571, 7: 2.447,
              8: 2.365, 9: 2.306, 10: 2.262, 11: 2.228, 12: 2.201, 13: 2.179,
              14: 2.160, 15: 2.145, 16: 2.131, 17: 2.120, 18: 2.110, 19: 2.101,

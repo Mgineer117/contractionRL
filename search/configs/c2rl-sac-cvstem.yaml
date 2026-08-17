@@ -13,7 +13,7 @@ metric:
 
 runner:
   wrapper: true
-  # Matches c2rl-ppo-cvstem.yaml. The two sweeps optimize the SAME metric, so a
+  # Matches c2rl-ppo-cvstem.yaml. The two sweeps optimize the same metric, so a
   # poison value an order of magnitude apart made their leaderboards
   # incomparable at a glance — and inflated SAC's apparent spread.
   bad_value: 100.0
@@ -22,26 +22,26 @@ parameters:
   agent.discount_factor:
     # Narrower than the PPO sweep's, deliberately. At gamma -> 0 SAC's critic
     # degenerates to Q ~= r, so the policy greedily optimizes the
-    # ENTROPY-REGULARIZED one-step reward and alpha dominates the objective —
+    # Entropy-Regularized one-step reward and alpha dominates the objective —
     # a failure mode PPO does not share (GAE still yields a usable, if myopic,
     # advantage there). Low gamma is left to the PPO sweep.
     values: [0.1, 0.3, 0.5, 0.7, 0.9, 0.99, 0.999]
-  # NOTE the key: `models.` — NOT `agent.models.`. train.py resolves a sweep key
+  # NOTE the key: `models.` — not `agent.models.`. train.py resolves a sweep key
   # by splitting on '.' and walking agent_cfg from the ROOT, and `models:` is a
-  # TOP-LEVEL yaml block. The old `agent.models.policy.backbone` wrote into a
+  # Top-Level yaml block. The old `agent.models.policy.backbone` wrote into a
   # dangling agent_cfg["agent"]["models"] subtree that nothing reads, so the
   # backbone was silently never swept.
   models.policy.backbone:
-    # SAC needs a BOUNDED action distribution — an unbounded Gaussian's log_prob
+    # SAC needs a bounded action distribution — an unbounded Gaussian's log_prob
     # has no fixed point for automatic entropy tuning. runner.py hard-rejects
     # mlp/control for the SAC family, so only the squashed pair is valid here.
     values: [control-squashed, mlp-squashed]
   agent.learn_entropy:
     values: [true, false]
   agent.initial_entropy_value:
-    # With learn_entropy=false this IS alpha for the whole run; with true it is
+    # With learn_entropy=false this is alpha for the whole run; with true it is
     # only the starting point. Worth sweeping either way: alpha is weighed
-    # against the RAW Mahalanobis reward in the critic target, whose scale
+    # against the raw Mahalanobis reward in the critic target, whose scale
     # depends on w_lb/w_ub, so a single default cannot be right across configs.
     values: [0.05, 0.2, 0.5]
   # SAC has no equivalent of PPO's value normalization (rl_glue gates

@@ -3,7 +3,7 @@ ContractionRunner: raw-dict -> dataclass config filtering, plus the
 CMG-derived Mahalanobis reward machinery C2RL always reads its reward from.
 
 Extracted verbatim from C2RLAgent (see c2rl.py's module docstring for the full
-normalization rationale) so algorithms call the SAME code instead of copies
+normalization rationale) so algorithms call the same code instead of copies
 that can silently drift apart.
 """
 from __future__ import annotations
@@ -64,7 +64,7 @@ def make_base_rl_cfg(
     d = {k: v for k, v in raw_cfg.items() if k in valid and k != "experiment"}
     d["discount_factor"] = gamma
 
-    # YAML 1.1 (PyYAML) parses unquoted scientific notation WITHOUT a
+    # YAML 1.1 (PyYAML) parses unquoted scientific notation without a
     # decimal point (e.g. `1e-5`) as a str, not a float. skrl's Runner
     # normally rescues this via _process_cfg's eval(), but C2RL's inner
     # PPO/SAC sub-agent bypasses Runner entirely, so a `learning_rate: 1e-5`
@@ -97,7 +97,7 @@ def make_base_rl_cfg(
     rewards_shaper_scale = raw_cfg.get("rewards_shaper_scale")
     # use_reward_norm: non-biasing running-std reward normalization (r/std, no
     # mean subtraction — preserves the optimal policy). Installed through the
-    # SAME rewards_shaper hook and, when both are set, absorbs rewards_shaper_scale
+    # Same rewards_shaper hook and, when both are set, absorbs rewards_shaper_scale
     # as its post-normalization scale (giving reward variance scale²). See
     # preprocessors.RunningRewardScaler for why value_norm alone leaves the
     # metric-bound-dependent (w_lb/w_ub) reward-scale instability unaddressed.
@@ -114,7 +114,7 @@ def make_base_rl_cfg(
     # automatically via train.py's use_state_norm/use_value_norm, applied
     # through skrl's Runner._process_cfg. None of that runs here — these
     # agents are built directly, bypassing Runner entirely — so replicate it
-    # explicitly: same class, same opt-out flags. Default OFF (see the
+    # explicitly: same class, same opt-out flags. Default off (see the
     # C2RLPPOCfg/C2RLSACCfg field defaults): a config that omits the
     # key gets no observation normalization.
     if raw_cfg.get("use_state_norm", False):
@@ -134,12 +134,12 @@ def make_base_rl_cfg(
     # write_interval=1 so a SummaryWriter gets created — the actual flush
     # cadence is driven explicitly by the outer trainer (once per rollout
     # epoch), not by skrl's own interval logic. checkpoint_interval stays 0:
-    # checkpointing is handled by the OUTER agent's own checkpoint_modules, so
+    # checkpointing is handled by the outer agent's own checkpoint_modules, so
     # these inner agents don't need their own redundant checkpoint files.
     # experiment.wandb is deliberately omitted (defaults False) so these inner
-    # agents never call wandb.init() themselves — the OUTER agent (or
+    # agents never call wandb.init() themselves — the outer agent (or
     # train.py, for a sweep) is the sole wandb.init() caller; their own
-    # scalars still reach the SAME active run because skrl's
+    # scalars still reach the same active run because skrl's
     # SummaryWriter.add_scalar is monkey-patched process-wide by train.py's
     # wandb hookup.
     d["experiment"] = {

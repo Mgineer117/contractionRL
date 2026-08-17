@@ -31,12 +31,12 @@ The **factor 2** on the Riccati term is load-bearing: the closed loop under
 solution with gain ``K(x) = R⁻¹B(x)ᵀM(x)`` (not wired up here — C2RL consumes
 only ``M``, for the Mahalanobis reward).
 
-``ν`` is the metric SCALE and ``χ`` its CONDITION NUMBER, and both are DECISION
-VARIABLES — the two quantities CV-STEM optimizes. (Hard-coding them degenerated
+``ν`` is the metric scale and ``χ`` its condition number, and both are decision
+variables — the two quantities CV-STEM optimizes. (Hard-coding them degenerated
 the program to ``Minimize(0)``, returning an arbitrary interior-point solution
 that wasn't even continuous in ``x``. That mode is gone.)
 
-FEASIBILITY IS A SIGNAL, NOT A BUG: infeasible at a state means no metric
+Feasibility is a signal, not a bug: infeasible at a state means no metric
 contracts the system at that λ there. Handled by ``min_feasibility_rate`` /
 ``max_lambda_reductions`` (per-state λ-backoff).
 
@@ -46,7 +46,7 @@ CV-STEM leaves ν unbounded above and merely penalizes it. **That cap is what
 makes segway/cartpole infeasible at w_lb=0.1** — they need a higher-gain
 (smaller-w_lb) metric than the envelope permits. Measured on segway: 0% feasible
 at w_lb=0.1, 100% at w_lb=0.001 or r_scaler=0.01. So on 0% feasible, lower
-``w_lb``/``cvstem_r_scaler`` BEFORE touching λ — it's an envelope problem, not a
+``w_lb``/``cvstem_r_scaler`` before touching λ — it's an envelope problem, not a
 rate one.
 
 ``Ẇ`` is dropped by default
@@ -61,10 +61,10 @@ coherence, which is the point of learning an NCM over a lookup table.
 default because it is infeasible here**: at these envs' ``dt ≈ 0.03-0.05`` the
 term scales by 20-33x and swamps everything else. Exposed for experiment only.
 
-When states ARE trajectory-ordered (``build_cm_dataset``'s ``traj_x``/
+When states are trajectory-ordered (``build_cm_dataset``'s ``traj_x``/
 ``traj_lengths``/``temporal_dt``, driven by C2RL's ``cm_wdot_trajectory``) there
-IS a real neighbour: each solve's normalized ``W̄`` threads forward as the next
-state's ``W_prev_bar``, giving the ACTUAL material derivative
+is a real neighbour: each solve's normalized ``W̄`` threads forward as the next
+state's ``W_prev_bar``, giving the actual material derivative
 ``Ẇ ≈ (W̄_t − W̄_{t−1})/temporal_dt`` rather than the identity-proxy. Mutually
 exclusive with ``wdot_dt``, which it supersedes per state (falling back to it
 only at trajectory starts, where there genuinely is no predecessor).
@@ -129,7 +129,7 @@ def _ensure_mosek_license() -> None:
     _MOSEK_LICENSE_CONFIGURED = True
 
 
-# Run at import time — MOSEK's license env var must be set BEFORE `import mosek`
+# Run at import time — MOSEK's license env var must be set before `import mosek`
 # happens (transitively, the first time `import cvxpy` runs inside
 # `_require_cvxpy`), not merely before `prob.solve(...)`. cvxpy's mosek backend
 # reads the license path once at import; setting the env var afterwards is too
@@ -150,7 +150,7 @@ def _warn_once_if_license_error(solver: str, exc: Exception) -> None:
     ``solve_cm_metric`` deliberately swallows every per-state solve error and
     returns ``None`` (treated as "infeasible at this state") so one bad solve
     can't abort a whole batch — but a missing/misconfigured license (e.g.
-    ``cm_solver: MOSEK`` without a valid ``mosek.lic``) fails on EVERY solve,
+    ``cm_solver: MOSEK`` without a valid ``mosek.lic``) fails on every solve,
     and would otherwise silently show up as "0% feasible" with no clue why.
     """
     global _LICENSE_ERROR_WARNED
@@ -181,17 +181,17 @@ def _sym(M):
 def _add_wdot_term(S, Wbar, I, *, wdot_dt: float, W_prev_bar: np.ndarray | None, dt: float):
     """Fold the ``-Ẇ`` material-derivative term into the (normalized) LMI operand ``S``.
 
-    Two mutually-exclusive proxies for ``Ẇ``, both acting on the NORMALIZED ``W̄``
+    Two mutually-exclusive proxies for ``Ẇ``, both acting on the normalized ``W̄``
     (so they stay convex/linear in the decision variable and don't drag in the
     variable scale ``ν``):
 
     * **temporal** (``W_prev_bar`` given, ``dt>0``): the true material derivative
       along a trajectory, ``Ẇ ≈ (W̄ - W̄_prev)/dt``, so ``-Ẇ = (W̄_prev - W̄)/dt``.
-      ``W̄_prev`` is the PREVIOUS step's normalized metric at the same state
+      ``W̄_prev`` is the previous step's normalized metric at the same state
       sequence; at a trajectory start / just after a reset it is ``None`` and the
       term is dropped (``Ẇ≈0`` there). This is Tsukamoto's ``(W̄-I)/dt``
       generalized from ``I`` to the actual predecessor — a strictly better
-      estimate, since consecutive states of the SAME trajectory are differenced
+      estimate, since consecutive states of the same trajectory are differenced
       rather than differencing from an arbitrary identity. Driven by
       ``build_cm_dataset``'s ``traj_x``/``traj_lengths``/``temporal_dt`` (C2RL's
       ``cm_wdot_trajectory`` config) — also retained as a general library
@@ -248,20 +248,20 @@ def solve_cm_metric(
         wdot_dt: if > 0, include Tsukamoto's ``Ẇ ≈ (W̄ - I)/dt`` proxy for the
             material derivative (``classncm.cvstem0``). ``0`` (default) omits it.
         W_prev_bar/dt/return_wbar: temporal ``Ẇ`` — see ``_add_wdot_term``.
-        u_bound/rho: POST-HOC actuator-feasibility check, making "control out of
+        u_bound/rho: Post-Hoc actuator-feasibility check, making "control out of
             bound" a first-class feasibility condition without adding a control
             variable to the SDP. The solved ``W`` implies ``K = R⁻¹BᵀW⁻¹``; if
             the 95th-percentile ``‖Ke‖`` over isotropic ``e`` with ``‖e‖=rho``
             exceeds ``u_bound``, the state is INFEASIBLE (returns None) and the
             caller's λ-backoff retries. See the 95th-percentile rationale at the
             implementation.
-        u_lo/u_hi: SIGNED per-channel actuator bounds (e.g. the env's actual
-            ``2·UREF_MIN``/``2·UREF_MAX``), used INSTEAD of ``u_bound`` when
+        u_lo/u_hi: Signed per-channel actuator bounds (e.g. the env's actual
+            ``2·UREF_MIN``/``2·UREF_MAX``), used instead of ``u_bound`` when
             both are given. Unlike ``u_bound`` (a symmetric magnitude, wrong
             for an asymmetric actuator box like turtlebot's ``[0, 0.22]``
-            linear-velocity channel), this checks the SIGNED sampled feedback
+            linear-velocity channel), this checks the signed sampled feedback
             against ``[u_lo, u_hi]`` directly — sign-correct by construction.
-            A channel fails when MORE than 5% of the 512 Monte Carlo samples
+            A channel fails when more than 5% of the 512 Monte Carlo samples
             fall outside its own ``[u_lo, u_hi]`` (95% must clear the bound).
 
     Returns:
@@ -276,7 +276,7 @@ def solve_cm_metric(
     x_dim = A_f.shape[0]
     r = r_scaler + 1e-5  # strictly positive — mirrors sdlqr.py's R_scaler guard
 
-    # CV-STEM's variable structure (classncm.cvstem0): solve for the NORMALIZED
+    # CV-STEM's variable structure (classncm.cvstem0): solve for the normalized
     # dual metric W̄ with I ⪯ W̄ ⪯ χ·I, then deploy W = W̄/ν. χ is therefore
     # exactly the condition number and ν exactly the metric scale.
     Wbar = cp.Variable((x_dim, x_dim), symmetric=True)
@@ -323,7 +323,7 @@ def solve_cm_metric(
     if (u_lo is not None and u_hi is not None and rho > 0) or (u_bound is not None and rho > 0):
         K = (1.0 / r) * B.T @ np.linalg.inv(Wv)
         u_dim = K.shape[0]
-        # 95th-PERCENTILE control magnitude under isotropic error e, ‖e‖=rho.
+        # 95th-Percentile control magnitude under isotropic error e, ‖e‖=rho.
         # Targets "almost always feasible, rare tail excluded": the spectral
         # worst case (‖K‖₂·rho) is too conservative (one rare direction flags
         # the state) and the Frobenius RMS lets a tail saturate unnoticed. The
@@ -334,7 +334,7 @@ def solve_cm_metric(
         _dirs /= np.linalg.norm(_dirs, axis=1, keepdims=True)
         _u_samples = (rho * _dirs) @ K.T
         if u_lo is not None and u_hi is not None:
-            # SIGNED, asymmetric bound (the actual actuator box) — a channel
+            # Signed, asymmetric bound (the actual actuator box) — a channel
             # fails when more than 5% of samples fall outside [lo, hi].
             u_lo_arr = np.broadcast_to(np.asarray(u_lo, dtype=np.float64), (u_dim,))
             u_hi_arr = np.broadcast_to(np.asarray(u_hi, dtype=np.float64), (u_dim,))
@@ -347,8 +347,8 @@ def solve_cm_metric(
             # across [w, v]. One scalar vs an aggregate norm would let a slack
             # channel mask a saturated one.
             u_bound_arr = np.broadcast_to(np.asarray(u_bound, dtype=np.float64), (u_dim,))
-            # PAIRWISE: each control channel's own 95th-percentile |u_i| must clear
-            # ITS OWN bound — not one shared vector-norm bound across all channels.
+            # Pairwise: each control channel's own 95th-percentile |u_i| must clear
+            # Its own bound — not one shared vector-norm bound across all channels.
             _q95_per_dim = np.quantile(np.abs(_u_samples), 0.95, axis=0)
             if np.any(_q95_per_dim > u_bound_arr):
                 return _fail()
@@ -360,18 +360,18 @@ def solve_cm_metric(
 
 
 # Cap on per-state λ-reduction warnings before they are suppressed (see
-# build_cm_dataset). A wrong envelope backs off on EVERY state, and 100k+
+# build_cm_dataset). A wrong envelope backs off on every state, and 100k+
 # identical lines bury the aggregate summary that reports the effective λ.
 _MAX_REDUCTION_WARNINGS = 5
 
 
 def _lmi_residual(A_f: np.ndarray, B: np.ndarray, W: np.ndarray, lbd: float, *, r_scaler: float = 1.0) -> float:
-    """Max eigenvalue of the contraction LMI at a SOLVED ``W`` — post-hoc numpy
+    """Max eigenvalue of the contraction LMI at a solved ``W`` — post-hoc numpy
     re-evaluation of what ``solve_cm_metric`` constrains.
 
-    Evaluated on the DEPLOYED ``W = W̄/ν`` while the SDP constrains the
+    Evaluated on the deployed ``W = W̄/ν`` while the SDP constrains the
     normalized ``W̄``, so the bound to clear is ``-eps/ν``, not ``-eps``. Should
-    stay comfortably NEGATIVE; >= 0 flags a solver reporting "optimal" that is
+    stay comfortably negative; >= 0 flags a solver reporting "optimal" that is
     numerically borderline (useful for comparing cm_solver choices).
     """
     A_f = np.asarray(A_f, dtype=np.float64)
@@ -406,13 +406,13 @@ def _solve_cm_metric_with_backoff(
     u_lo: float | np.ndarray | None = None,
     u_hi: float | np.ndarray | None = None,
 ) -> tuple[np.ndarray | None, float, int] | tuple[np.ndarray | None, np.ndarray | None, float, int]:
-    """Solve ``solve_cm_metric`` at ``lbd``; on infeasibility (LMI infeasible OR,
+    """Solve ``solve_cm_metric`` at ``lbd``; on infeasibility (LMI infeasible or,
     when ``u_bound`` is set, the implied gain would saturate the actuator — see
-    ``solve_cm_metric``), retry the SAME state alone with λ halved, up to
+    ``solve_cm_metric``), retry the same state alone with λ halved, up to
     ``max_lambda_reductions`` times, before giving up.
 
     Per-state, not global: a "hard" state (e.g. near a kinematic singularity)
-    can be infeasible purely because the requested RATE is too aggressive there
+    can be infeasible purely because the requested rate is too aggressive there
     while a slower-contracting metric still exists. Relaxing λ for that state
     alone beats both dropping it and coarsening the certificate everywhere.
 
@@ -423,7 +423,7 @@ def _solve_cm_metric_with_backoff(
     λ-backoff canNOT rescue a structurally infeasible LMI, nor a state whose
     every feasible metric implies an over-bound gain (measured: 0/300 car states
     even after 10 halvings at r_scaler=0.01) — the objective (χ/λ + ν) has no
-    relationship to ``‖K‖``. BY DESIGN: "control out of bound" is meant to
+    relationship to ``‖K‖``. By design: "control out of bound" is meant to
     surface as a low ``feasibility_rate`` at the requested (λ, r_scaler) so an
     outer search discards the trial. ``u_bound``/``rho`` are plumbed here for
     any future caller that wants that gate; no current caller sets them (C2RL's
@@ -455,7 +455,7 @@ def _sample_cm_states(
     x_samples: np.ndarray | None, random_ratio: float, tag: str = "[C2RL]",
 ) -> np.ndarray:
     """Assemble the ``num_samples`` states the SDP is solved over, mixing a
-    ``random_ratio`` fraction of BROAD off-reference states with
+    ``random_ratio`` fraction of broad off-reference states with
     reference-structured ones — so the regressed CMG generalizes to where an
     early chaotic policy actually goes, not just the near-reference tube.
 
@@ -490,7 +490,7 @@ def _sample_cm_states(
             parts.append(pool[idx])
         else:
             # "dynamics" mode tiles states by num_control_per_state; ask for 1 so we
-            # get n_rand DISTINCT states (we only use x, not the paired controls).
+            # get n_rand distinct states (we only use x, not the paired controls).
             rand = np.asarray(
                 get_rollout(n_rand, "dynamics", num_control_per_state=1)["x"].cpu(),
                 dtype=np.float32,
@@ -503,11 +503,11 @@ def _sample_cm_states(
 def _flatten_trajectory_states(
     traj_x: np.ndarray, traj_lengths: np.ndarray, *, x_dim: int, max_states: int, tag: str = "[C2RL]",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Flatten offline reference TRAJECTORIES into one ordered ``(n, x_dim)``
-    array plus a ``(n,)`` mask marking each kept trajectory's FIRST state — the
+    """Flatten offline reference trajectories into one ordered ``(n, x_dim)``
+    array plus a ``(n,)`` mask marking each kept trajectory's first state — the
     temporal Ẇ term needs both the time order and where to reset the predecessor.
 
-    Trajectory ORDER is shuffled (so a ``max_states`` cap doesn't always keep the
+    Trajectory order is shuffled (so a ``max_states`` cap doesn't always keep the
     same early ones), but each trajectory's own steps stay contiguous and in
     order, never interleaved. Truncates (never pads) the last trajectory to hit
     ``max_states`` exactly; warns and uses everything if the pool is smaller.
@@ -568,7 +568,7 @@ def build_cm_dataset(
 ) -> dict:
     """Build the offline ``{x → W*(x)}`` NCM dataset. See module docstring.
 
-    STATES come from ``x_samples`` if given, else ``traj_x``/``traj_lengths``
+    States come from ``x_samples`` if given, else ``traj_x``/``traj_lengths``
     (trajectory-ordered, see below), else a fresh ``get_rollout(·, "c3m")`` draw.
     Either way: autodiff ``get_f_and_B`` for ``∂f/∂x``, then one CV-STEM SDP per
     state. Infeasible states retry with λ halved up to ``max_lambda_reductions``
@@ -578,14 +578,14 @@ def build_cm_dataset(
     Returns ``{"x", "W", "feasibility_rate", "residual_mean", "residual_max",
     "lambda_reduced_count", "lambda_reduced_rate"}`` over the feasible states.
     Residuals are the post-hoc LMI slack at each solved ``W``, evaluated at the
-    λ ACTUALLY used for that state.
+    λ actually used for that state.
 
     ``u_bound``/``rho``: a state whose implied gain would saturate the actuator
     counts as infeasible, with the same λ-backoff (and counted in
     ``lambda_reduced_rate``).
 
     ``traj_x``/``traj_lengths``/``temporal_dt`` (C2RL's ``cm_wdot_trajectory``):
-    states are drawn by ``_flatten_trajectory_states`` in ORIGINAL time order,
+    states are drawn by ``_flatten_trajectory_states`` in original time order,
     and with ``temporal_dt > 0`` the loop threads each solve's ``W̄`` forward as
     the next state's ``W_prev_bar`` (reset to None at trajectory starts and
     after a dropped state), making the SDP's Ẇ the real material derivative
@@ -619,8 +619,8 @@ def build_cm_dataset(
     DfDx = jacobian(f, x, create_graph=False).detach().cpu().numpy()  # (n, x, x)
     B_np = B.detach().cpu().numpy()  # (n, x, u)
 
-    # ── ONE joint SDP over all n samples, not one per state ─────────────── #
-    # The pointwise program below solves an INDEPENDENT SDP per state with its own
+    # ── one joint SDP over all n samples, not one per state ─────────────── #
+    # The pointwise program below solves an independent SDP per state with its own
     # ν/χ and no Ẇ term, so its "feasibility" is a per-state statement, not a
     # contraction certificate: it can report 100% at a λ the joint program cannot
     # certify at all (measured on car_weak). C2RL then regressed its frozen CMG
@@ -628,20 +628,20 @@ def build_cm_dataset(
     # This is the same cvstem_joint that find_uniform_lambda searches with, so the
     # (lbd, r) it certifies is the one actually solved here.
     #
-    # dt: cm_wdot_dt defaults to 0.0, so this falls through to 1.0 — which IS the
+    # dt: cm_wdot_dt defaults to 0.0, so this falls through to 1.0 — which is the
     # certified value (see commit 8a64182's table). find_uniform_lambda instead
-    # defaults --cm-dt to the ENV's dt (0.03), and passing that here would make
+    # defaults --cm-dt to the env's dt (0.03), and passing that here would make
     # the (W̄-I)/dt term 33x larger and force ν from ~4 to ~140.
     A_j = DfDx.astype(np.float64)
     B_j = B_np.astype(np.float64)
     joint_dt = float(wdot_dt or temporal_dt or 1.0)
-    # Announced BEFORE the solve, and flushed. One joint program at n=10000 runs
+    # Announced before the solve, and flushed. One joint program at n=10000 runs
     # ~15 h (cost ~n^1.95) inside a single cvxpy call with no progress of its own,
     # where the per-state loop it replaced had a tqdm bar. Without this the job is
     # indistinguishable from a hang for its entire life — and Python block-buffers
     # stdout to a file, so a wall-limit SIGTERM would discard even this. Run these
     # under `python -u`.
-    print(f"{tag} joint CV-STEM SDP: ONE program over {n} samples "
+    print(f"{tag} joint CV-STEM SDP: one program over {n} samples "
           f"(lbd={lbd:g}, eps={eps:g}, w=[{w_lb:g},{w_ub:g}], r={r_scaler:g}, "
           f"dt={joint_dt:g}, solver={solver}) — no per-sample progress to report, "
           f"expect ~15 h at n=10000 ...", flush=True)
@@ -655,14 +655,14 @@ def build_cm_dataset(
             "result, not a transient failure: no single metric family certifies that "
             "rate over this state box. Re-run scripts/find_uniform_lambda.py for this "
             "env (with --cm_dt 1.0) and use what it certifies.")
-    # The LMI residual, MEASURED rather than reported by the solver. cvstem_joint
+    # The LMI residual, measured rather than reported by the solver. cvstem_joint
     # returns only {W, nu, chi, J}, so a `sol.get("residual")` here is silently
     # NaN — and residual_mean/residual_max are exactly the evidence that the
     # shipped metric satisfies the LMI strictly (8a64182 advertises "strictly
     # negative LMI residuals"). NaN would keep the field's name and drop its
     # meaning, so recompute the slack at the returned solution:
     #     S_k = (W̄-I)/dt + A W̄ + W̄ Aᵀ + 2λ W̄ - ν(2/r) B Bᵀ  ⪯  -eps·I
-    # with W̄_k = ν·W_k (cvstem_joint returns the DEPLOYED W = W̄/ν).
+    # with W̄_k = ν·W_k (cvstem_joint returns the deployed w = W̄/ν).
     nu_v, r_v = float(sol["nu"]), r_scaler + 1e-5
     W_dep = np.asarray(sol["W"], dtype=np.float64)
     res = np.empty(n, dtype=np.float64)
@@ -674,7 +674,7 @@ def build_cm_dataset(
         res[k] = float(np.linalg.eigvalsh(0.5 * (S + S.T))[-1])
     if not (res.max() < 0.0):
         raise RuntimeError(
-            f"{tag} joint CV-STEM SDP returned status optimal but its LMI is NOT "
+            f"{tag} joint CV-STEM SDP returned status optimal but its LMI is not "
             f"strictly negative: max residual {res.max():.6g} at lbd={lbd:g}, "
             f"eps={eps:g} over {n} samples. Treat as infeasible — a solver that "
             "reports optimal on a marginally-violated program certifies nothing.")
@@ -711,7 +711,7 @@ def build_cm_dataset(
         )
         if use_temporal:
             Wv, Wbar_v, lbd_used, reductions = result
-            # Chain forward for the NEXT state in this trajectory. A dropped/
+            # Chain forward for the next state in this trajectory. A dropped/
             # infeasible state (Wv is None) breaks the chain — the next state
             # is no longer truly consecutive (one dt) with any solved
             # predecessor, so treat it like a fresh trajectory start rather
@@ -722,7 +722,7 @@ def build_cm_dataset(
         if reductions > 0 and Wv is not None:
             n_reduced += 1
             reduced_lbds.append(lbd_used)
-            # Rate-limited: when the envelope is wrong EVERY state backs off, and
+            # Rate-limited: when the envelope is wrong every state backs off, and
             # 100k+ identical lines bury the aggregate summary below — which is
             # the line that actually tells you the effective λ. Print a few, then
             # count silently.
@@ -771,7 +771,7 @@ def build_cm_dataset(
             f"min={np.min(reduced_lbds):.4g}, requested λ={lbd:.4g}) — those states' CMG targets "
             f"certify a SLOWER contraction rate than the rest of the dataset."
         )
-        # A near-total backoff means the ENVELOPE is wrong, not that a few
+        # A near-total backoff means the envelope is wrong, not that a few
         # outlying states are hard — and the feasibility rate cannot say so,
         # because backoff is exactly what drives that rate to 100%. Call it out
         # explicitly: otherwise a run reports "100% feasible" while every single
@@ -816,7 +816,7 @@ def _same_weight(cached, requested: float | None) -> bool:
 
 def _same_u_bound(cached, requested) -> bool:
     """Like ``_same_weight`` but for ``u_bound``, which may now be a scalar or
-    a per-channel array (PAIRWISE actuator check) — compares element-wise."""
+    a per-channel array (pairwise actuator check) — compares element-wise."""
     cached_arr = np.atleast_1d(np.asarray(cached, dtype=np.float64))
     if requested is None:
         return bool(np.all(np.isnan(cached_arr)))
@@ -865,7 +865,7 @@ def load_cached_cm_dataset(
     u_bound: float | np.ndarray | None = None,
     rho: float = 0.0,
 ) -> dict | None:
-    """Load a cached CM dataset only if synthesized under the EXACT same SDP
+    """Load a cached CM dataset only if synthesized under the exact same SDP
     config. Any change to lbd/w_lb/w_ub/eps/solver/num_samples/r_scaler returns
     None (forcing a fresh solve) rather than silently reusing stale ``W``
     targets that no longer match the requested contraction condition.
@@ -887,18 +887,18 @@ def load_cached_cm_dataset(
         and _same_weight(npz["chi_weight"], chi_weight)
         and float(npz["nu_weight"]) == nu_weight
         and float(npz["wdot_dt"]) == wdot_dt
-        # random_ratio changes the STATE distribution the CMG is fit over, so a
+        # random_ratio changes the state distribution the CMG is fit over, so a
         # cache solved at a different mix must not be reused (.get for old caches).
         and float(npz.get("random_ratio", 0.0)) == random_ratio
-        # wdot_trajectory/temporal_dt change BOTH the state distribution (a
-        # trajectory-ordered subset, not _sample_cm_states' i.i.d. mix) AND the
+        # wdot_trajectory/temporal_dt change both the state distribution (a
+        # trajectory-ordered subset, not _sample_cm_states' i.i.d. mix) and the
         # LMI itself (a real Ẇ term) — .get for caches predating this feature.
         and bool(npz.get("wdot_trajectory", False)) == wdot_trajectory
         and float(npz.get("temporal_dt", 0.0)) == temporal_dt
         # u_bound/rho add the actuator-feasibility check (see solve_cm_metric) —
         # .get for caches predating this feature (None sentinel stored as nan,
         # same trick as chi_weight, since u_bound=None is a real "off" state).
-        # u_bound may now be per-channel (PAIRWISE check) — compare as arrays.
+        # u_bound may now be per-channel (pairwise check) — compare as arrays.
         and _same_u_bound(npz.get("u_bound", float("nan")), u_bound)
         and float(npz.get("rho", 0.0)) == rho
     )
@@ -989,11 +989,11 @@ def regress_cmg(
 ) -> dict:
     """Fit the CMG to the NCM dataset by MSE regression.
 
-    Compares the CMG's DEPLOYED metric (``bound_W(ccm_gen(x), ...)``) against the
+    Compares the CMG's deployed metric (``bound_W(ccm_gen(x), ...)``) against the
     SDP targets ``W*``. Stopping is driven solely by held-out validation loss,
     and the best-val-epoch weights are restored afterward.
     """
-    # The dataset stays resident on the HOST; only the minibatch actually being
+    # The dataset stays resident on the host; only the minibatch actually being
     # trained on is moved to the accelerator. Its footprint grows as
     # cmg_memory_size x x_dim^2 (plus the same again for the targets), so
     # holding it on the device charges every concurrent trial for the whole
@@ -1002,7 +1002,7 @@ def regress_cmg(
     x = torch.as_tensor(dataset["x"]).to(torch.float32)
     W_target = torch.as_tensor(dataset["W"]).to(torch.float32)
     if getattr(ccm_gen, "outputs_metric", False):
-        # The head emits M, so invert the SDP's W* ONCE here rather than
+        # The head emits M, so invert the SDP's W* Once here rather than
         # inverting the network's output on every env step. Done in float64:
         # W* spans [w_lb, w_ub] with a ratio up to 1e3, and inverting the small
         # end in float32 is where the fit would lose the stiff, weakly-actuated
@@ -1114,9 +1114,9 @@ def regress_cmg(
     }
 
 
-# REMOVED 2026-07-30: hard-control-bound CV-STEM synthesis (solve_cm_metric_bounded /
+# Removed 2026-07-30: hard-control-bound CV-STEM synthesis (solve_cm_metric_bounded /
 # build_cm_dataset_bounded / regress_gain_net) — Boyd's bounded-peak-input LMI with the
-# gain as a free SDP variable Y := K·W. Mathematically correct, but measured WORSE than
+# gain as a free SDP variable Y := K·W. Mathematically correct, but measured worse than
 # the post-hoc actuator filter (solve_cm_metric's u_bound/rho) once deployed through
 # regressed nets: 98.4% held-out actuator-violation rate vs the filter's 24.6%. Its
 # trace(W)-minimizing objective rides the LMI boundary with no margin, so regression
@@ -1200,12 +1200,12 @@ def train_cmg_ccm(
 
     def _ccm_loss(x_batch: torch.Tensor) -> tuple[torch.Tensor, float, float]:
         # The whole body needs autograd (jacobian/weighted_gradients both call
-        # torch.autograd.grad internally) regardless of the CALLER's ambient
+        # torch.autograd.grad internally) regardless of the caller's ambient
         # grad mode — the validation branch below calls this from inside
         # torch.no_grad(), where a bare `with torch.enable_grad():` around only
         # get_f_and_B isn't enough: torch.autograd.grad() itself checks
         # torch.is_grad_enabled() at call time, so jacobian()/weighted_gradients()
-        # calls made AFTER that inner block closes (back under the outer
+        # calls made after that inner block closes (back under the outer
         # no_grad) raise "does not require grad and does not have a grad_fn"
         # even though their inputs do have a grad_fn.
         with torch.enable_grad():
@@ -1345,10 +1345,10 @@ class OnlineCVSTEMMetric:
     the PPO and SAC base algorithms (both read the reward from the env).
 
     Where the offline pipeline (``build_cm_dataset`` + ``regress_cmg``) solves
-    the SDP once per SAMPLED state and then approximates ``W`` everywhere by a
+    the SDP once per sampled state and then approximates ``W`` everywhere by a
     network fit, this solves it at exactly the states the rollout visits:
 
-      1. ``f, B = get_f_and_B(x)`` and the DRIFT Jacobian ``A = ∂f/∂x``
+      1. ``f, B = get_f_and_B(x)`` and the drift Jacobian ``A = ∂f/∂x``
          (batched, autograd, on device — control enters the LMI only through
          the Riccati term, so the generalized Jacobian is deliberately not used
          here; see ``solve_cm_metric``).
@@ -1356,7 +1356,7 @@ class OnlineCVSTEMMetric:
       3. One ``_solve_cm_metric_with_backoff`` per env, in a Python loop.
       4. Stack back to a ``(b, x_dim, x_dim)`` tensor on ``x``'s device.
 
-    So every deployed ``M = W⁻¹`` is a VERIFIED feasible metric rather than a
+    So every deployed ``M = W⁻¹`` is a verified feasible metric rather than a
     regression of one — at the cost of ``num_envs`` SDP solves per env-step
     (~12 ms each with MOSEK on a 4-state system), which is why this is a
     single-run research configuration and not a sweep one.
@@ -1364,7 +1364,7 @@ class OnlineCVSTEMMetric:
     Infeasibility aborts the run (``CVSTEMInfeasibleError``, carrying
     ``cvstem_lqr.INFEASIBLE_MARKER`` so ``search/sweep_runner.py`` records it as
     a bad trial rather than a crash). Unlike CV-STEM-LQR there is no "zero
-    feedback" fallback available here — this metric defines a REWARD, and any
+    feedback" fallback available here — this metric defines a reward, and any
     substitute ``W`` at that state would silently score an uncertified metric
     as if it were certified.
     """
@@ -1457,34 +1457,34 @@ class OnlineCVSTEMMetric:
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
-# ORIGINAL CV-STEM (AstroHiro/ncm, ``classncm``) — one joint SDP over uniform
+# Original CV-STEM (AstroHiro/ncm, ``classncm``) — one joint SDP over uniform
 # samples, then a network regressed onto chol(M)
 # ─────────────────────────────────────────────────────────────────────────── #
 #
 # The reference pipeline, in its own order (``classncm.train`` →
 # ``cvstem`` → ``M2cholM`` → keras ``fit``):
 #
-#   1. draw ``Nx`` states i.i.d. UNIFORM over the state box (``xlims``);
-#   2. solve ONE ``cp.Problem`` over all of them, per-state ``W̄_k`` but a
-#      SINGLE shared ``ν`` and ``χ``, minimizing ``J = d₁b̄·χ/α + d₂·ν``;
+#   1. draw ``Nx`` states i.i.d. Uniform over the state box (``xlims``);
+#   2. solve one ``cp.Problem`` over all of them, per-state ``W̄_k`` but a
+#      Single shared ``ν`` and ``χ``, minimizing ``J = d₁b̄·χ/α + d₂·ν``;
 #   3. label ``M_k = W_k⁻¹``, take ``chol(M_k)ᵀ`` and vectorize it;
-#   4. MSE-regress a plain MLP ``x ↦ chol(M)`` — that network IS the metric;
+#   4. MSE-regress a plain MLP ``x ↦ chol(M)`` — that network is the metric;
 #   5. deploy ``K = R⁻¹BᵀM(x)``, ``M = RᵀR`` SPD by construction.
 #
-# Differences from ``solve_cm_metric`` above, which is the SAME LMI solved
-# POINTWISE (each state getting its own ν/χ) and is what C2RL consumes:
+# Differences from ``solve_cm_metric`` above, which is the same LMI solved
+# Pointwise (each state getting its own ν/χ) and is what C2RL consumes:
 #
 # * ``ν``/``χ`` shared. Pointwise feasibility at every state is a strictly
-#   WEAKER claim than one metric family covering them all, and pointwise
+#   Weaker claim than one metric family covering them all, and pointwise
 #   ``W_k = W̄_k/ν_k`` are not even on a common scale.
-# * NO deployment envelope. ``solve_cm_metric`` adds ``ν ≤ 1/w_lb`` and
+# * No deployment envelope. ``solve_cm_metric`` adds ``ν ≤ 1/w_lb`` and
 #   ``χ ≤ ν·w_ub`` so the regressed ``W`` stays inside ``bound_W``'s range; the
 #   reference leaves ``ν`` free and merely penalizes it, which is why its
-#   network regresses an UNBOUNDED ``chol(M)`` instead of a bounded ``W``.
+#   network regresses an unbounded ``chol(M)`` instead of a bounded ``W``.
 # * ``Ẇ`` is always present as ``(W̄ - I)/dt``. It is not a derivative estimate:
 #   ``W̄`` is the decision variable, ``I`` a constant, ``dt`` the env step, and
 #   the samples are unordered so no predecessor exists. Since ``W̄ ⪰ I`` is
-#   enforced the term is PSD, so it only TIGHTENS the LMI: feasibility with it
+#   enforced the term is PSD, so it only tightens the LMI: feasibility with it
 #   implies feasibility of the static (``Ẇ=0``) LMI, and it certifies the
 #   deployed state-varying metric exactly when ``-Ẇ ⪯ (W̄-I)/dt`` along the real
 #   trajectory — an assumption box sampling cannot check.
@@ -1494,7 +1494,7 @@ class OnlineCVSTEMMetric:
 # ``r_scaler`` NOTE (only true once ν is free): the LMI sees ν and r solely
 # through the ratio ``ν/r``, and so does the deployed gain
 # ``K = (ν/r)·B̄ᵀW̄⁻¹``. So r cannot make the program feasible or infeasible — it
-# enters ONLY as the weight ``nu_weight·r`` on control authority in ``J``.
+# enters only as the weight ``nu_weight·r`` on control authority in ``J``.
 # Raising r therefore shrinks ‖K‖ by making the optimizer buy less authority,
 # which is exactly (up to scale) what raising ``nu_weight`` does. That is why
 # an over-bound control is answered by raising r while an infeasible LMI is
@@ -1515,7 +1515,7 @@ def cvstem_joint(
     w_lb: float | None = None,
     w_ub: float | None = None,
 ) -> dict | None:
-    """Tsukamoto's ``cvstem0``: ONE SDP over all ``n`` samples, ν/χ SHARED.
+    """Tsukamoto's ``cvstem0``: One SDP over all ``n`` samples, ν/χ shared.
 
     Args:
         A: drift Jacobians ``∂f/∂x``, ``(n, x_dim, x_dim)``.
@@ -1526,13 +1526,13 @@ def cvstem_joint(
             solving the different (static) program.
         pairs: optional ``[(i, j), ...]`` meaning "sample ``j`` is one ``dt`` after
             sample ``i``" — from ``(x, u, x_next)`` transitions. When given, sample
-            ``i``'s LMI carries the REAL backward difference
+            ``i``'s LMI carries the real backward difference
             ``-Ẇ = (W̄_i - W̄_j)/dt`` (both endpoints are variables of this one
             program, so no sequential chaining and no solve-order dependence), and
             samples that start no pair carry no ``Ẇ`` term at all. When ``None``,
-            EVERY sample carries Tsukamoto's ``(W̄ - I)/dt`` proxy instead.
+            every sample carries Tsukamoto's ``(W̄ - I)/dt`` proxy instead.
 
-            REQUIRED with ``pairs``: every ``j`` must ALSO be in the sample set, so
+            Required with ``pairs``: every ``j`` must also be in the sample set, so
             it carries its own contraction LMI and its own ``W̄ ⪯ χI``. Otherwise
             ``W̄_j`` is not a metric, it is a free slack variable, and since
             ``-Ẇ`` rewards ``W̄_j > W̄_i`` the solver inflates it to manufacture
@@ -1546,8 +1546,8 @@ def cvstem_joint(
         r_scaler: ``R = r_scaler·I``, shared with the deployed gain.
         chi_weight/nu_weight: ``J = chi_weight·χ + nu_weight·ν``; ``None`` →
             ``1/lbd`` (the reference's ``d₁b̄·χ/α`` with ``d₁b̄ = 1``).
-        w_lb/w_ub: OPTIONAL deployment envelope ``w_lb·I ⪯ W ⪯ w_ub·I`` on the
-            DEPLOYED ``W = W̄/ν``, the same two scalar caps ``solve_cm_metric``
+        w_lb/w_ub: Optional deployment envelope ``w_lb·I ⪯ W ⪯ w_ub·I`` on the
+            deployed ``W = W̄/ν``, the same two scalar caps ``solve_cm_metric``
             applies: ``ν ≤ 1/w_lb`` and ``χ ≤ ν·w_ub``. ``None`` (both, the
             default) leaves ν and χ free, which is Tsukamoto's program exactly —
             pass neither and this function is byte-identical to before.
@@ -1559,7 +1559,7 @@ def cvstem_joint(
 
     Returns:
         ``{"W": (n,x,x), "nu", "chi", "J"}`` with ``W_k = W̄_k/ν`` — all on the
-        SAME scale, which is what the shared ν buys — or ``None`` if the joint
+        same scale, which is what the shared ν buys — or ``None`` if the joint
         program is infeasible or the solver errors.
     """
     cp = _require_cvxpy()
@@ -1587,7 +1587,7 @@ def cvstem_joint(
             )
         successor[i] = j
     cons = []
-    # Deployment envelope on W = W̄/ν, as two scalar caps on the SHARED nu/chi —
+    # Deployment envelope on W = W̄/ν, as two scalar caps on the shared nu/chi —
     # global, not per-sample. Absent by default: that is the reference program.
     if w_lb is not None:
         cons.append(nu <= 1.0 / w_lb)
@@ -1624,7 +1624,7 @@ def cvstem_joint(
         W[k] = 0.5 * (Wb.value + Wb.value.T) / scale
     out = {"W": W, "nu": scale, "chi": float(chi.value), "J": float(prob.value)}
     if successor:
-        # How much the metric GREW along each transition. 1.0 = no inflation, so
+        # How much the metric grew along each transition. 1.0 = no inflation, so
         # no margin was manufactured; well above 1 means the certificate is
         # leaning on -Ẇ instead of on control authority.
         g = [float(np.linalg.eigvalsh(W[j])[-1] / np.linalg.eigvalsh(W[i])[-1])
@@ -1634,9 +1634,9 @@ def cvstem_joint(
 
 
 def _as_np(v) -> np.ndarray:
-    """Array-like OR a torch tensor (possibly on the GPU) -> float64 numpy.
+    """Array-like or a torch tensor (possibly on the GPU) -> float64 numpy.
 
-    The env's boxes (``X_MIN``/``U_MIN``/...) are tensors on the ENV's device, and
+    The env's boxes (``X_MIN``/``U_MIN``/...) are tensors on the env's device, and
     cvxpy is numpy/CPU-only, so every box entering this module goes through here.
     ``np.asarray`` alone raises on a CUDA tensor.
     """
@@ -1662,7 +1662,7 @@ def drift_jacobians(get_f_and_B, x_np: np.ndarray, device="cpu"):
     """``(A = ∂f/∂x, B)`` for a batch of states, as float64 numpy.
 
     The reference's ``Afun`` is a user-supplied SDC matrix; every solver in this
-    repo (``build_cm_dataset``, ``cvstem_lqr``) feeds the DRIFT Jacobian, so this
+    repo (``build_cm_dataset``, ``cvstem_lqr``) feeds the drift Jacobian, so this
     is the one place that choice is made for the joint path too.
     """
     x = torch.as_tensor(x_np, dtype=torch.float32, device=device).requires_grad_()
@@ -1679,7 +1679,7 @@ def M_to_cholvec(W: np.ndarray) -> np.ndarray:
     ``(n, x, x) -> (n, x(x+1)/2)`` in row-major upper-triangular order.
     Tsukamoto's ``M2cholM`` walks the diagonals instead; the ordering is a
     bijection either way and only matters if you compare raw weights with his.
-    Mirrors ``nn_modules.CholMetric``, which must use the SAME order.
+    Mirrors ``nn_modules.CholMetric``, which must use the same order.
     """
     W = np.asarray(W, dtype=np.float64)
     x_dim = W.shape[-1]
@@ -1714,7 +1714,7 @@ def cvstem_linesearch(
     His exact loop — λ from ``lbd_lo`` in steps of ``da``, solve the joint SDP at
     each, and the first time ``J`` fails to improve, back off one ``da`` and take
     that λ. ``J`` is the steady-state-error bound ``d₁b̄·χ/λ + d₂·ν``, so this is a
-    rate-vs-error trade-off, NOT the largest feasible rate: a faster λ costs a
+    rate-vs-error trade-off, not the largest feasible rate: a faster λ costs a
     worse bound. (``find_uniform_lambda.py`` answers the other question — the
     largest λ whose implied control still fits the actuator.)
 
@@ -1767,16 +1767,16 @@ def cvstem_metric_dataset(
     w_lb: float | None = None,
     w_ub: float | None = None,
 ) -> dict | None:
-    """Steps 1-3 of the reference pipeline: sample the box, ONE joint SDP, label.
+    """Steps 1-3 of the reference pipeline: sample the box, one joint SDP, label.
 
     Returns ``{"x", "W", "cholM", "nu", "chi", "J"}`` — regression inputs, the
     certified metrics, and the ``chol(M)`` labels ``CholMetric`` is fit to — or
     ``None`` if the joint SDP is infeasible at this λ.
 
-    There is no partial success and no feasibility RATE: one program covers every
+    There is no partial success and no feasibility rate: one program covers every
     sample, so it either certifies λ over the whole draw or it does not.
 
-    ``linesearch=(lo, hi, da)`` runs ``cvstem_linesearch`` over the SAME samples
+    ``linesearch=(lo, hi, da)`` runs ``cvstem_linesearch`` over the same samples
     first and uses its ``argmin J`` λ instead of ``lbd`` — his own λ selection.
     The returned dict carries the λ actually used under ``"lbd"``.
 
@@ -1784,13 +1784,13 @@ def cvstem_metric_dataset(
 
     * ``"proxy"`` (default, the reference): ``+(W̄-I)/dt`` at every sample.
     * ``"transition"``: propagate each sample one ``dt`` under a uniformly random
-      ``u ∈ [u_lo, u_hi]`` (the env's actuator box, REQUIRED for this mode) and
+      ``u ∈ [u_lo, u_hi]`` (the env's actuator box, required for this mode) and
       use the real difference ``-Ẇ = (W̄(x) - W̄(x_next))/dt``, with both endpoints
       as constrained samples of the same program. Doubles the program size and
       makes ``W`` a metric at ``2·n_samples`` states, of which the first
       ``n_samples`` are the ones the regression is fit to.
 
-    The regression set IS the joint program's sample set — the reference fits its
+    The regression set is the joint program's sample set — the reference fits its
     network to exactly the states it certified, so scaling the training data means
     raising ``n_samples``, not labelling extra states after the fact.
     """
@@ -1816,7 +1816,7 @@ def cvstem_metric_dataset(
                 xn,
                 torch.as_tensor(_as_np(x_lo), dtype=torch.float32, device=device),
                 torch.as_tensor(_as_np(x_hi), dtype=torch.float32, device=device))
-        # ONE sample set: [x | x_next]. x_next must carry its own LMI or the -Ẇ
+        # One sample set: [x | x_next]. x_next must carry its own LMI or the -Ẇ
         # term degenerates into free slack (see cvstem_joint's `pairs` docstring).
         x_all = np.concatenate([x_np, xn.cpu().numpy().astype(np.float32)], axis=0)
         pairs = [(k, n_samples + k) for k in range(n_samples)]
@@ -1851,7 +1851,7 @@ def cvstem_cache_path(data_path: str, *, lbd: float, r_scaler: float, w_lb, w_ub
                       eps: float, dt: float, n_samples: int) -> Path:
     """Where ``cvstem_metric_dataset``'s result is cached.
 
-    Separate from ``cm_dataset_cache_path`` because these are DIFFERENT programs:
+    Separate from ``cm_dataset_cache_path`` because these are different programs:
     this one is the single joint SDP (shared ν/χ, ``Ẇ`` proxy at ``dt``) and its
     result carries ``nu``/``chi``/``J``/``cholM``, none of which the pointwise
     cache stores. Sharing a filename would let one silently load the other's
@@ -1867,7 +1867,7 @@ def cvstem_cache_path(data_path: str, *, lbd: float, r_scaler: float, w_lb, w_ub
 def save_cvstem_dataset(cache_path: Path, dataset: dict, **cfg) -> None:
     """Persist a joint-SDP solve alongside the config it was solved under.
 
-    Config keys are stored under a ``cfg_`` prefix: ``lbd`` is BOTH an input and
+    Config keys are stored under a ``cfg_`` prefix: ``lbd`` is both an input and
     a result here (``lbd_linesearch`` makes the solve pick its own), and an
     unprefixed collision would silently overwrite one with the other.
     """
@@ -1881,7 +1881,7 @@ def save_cvstem_dataset(cache_path: Path, dataset: dict, **cfg) -> None:
 def load_cvstem_dataset(cache_path: Path, *, tag: str = "[CVSTEM-LQR]", **cfg) -> dict | None:
     """Reload a cached joint solve, or None if it is missing or was solved under
     a different config. Every knob that enters the program is checked — a stale
-    hit here would deploy a metric certifying a DIFFERENT rate than the yaml
+    hit here would deploy a metric certifying a different rate than the yaml
     claims, which no downstream check would catch."""
     cache_path = Path(cache_path)
     if not cache_path.is_file():
@@ -1927,7 +1927,7 @@ def regress_cholm(
 ) -> dict:
     """MSE-fit ``CholMetric`` to the ``chol(M)`` labels — the reference's ``model.fit``.
 
-    Loss is on the CHOLESKY VECTOR, not on ``M``: that is what the reference
+    Loss is on the cholesky vector, not on ``M``: that is what the reference
     regresses, and it keeps the objective linear in the network output (no
     ``eigh``/inverse in the loop, unlike ``regress_cmg``'s bounded-``W`` fit).
     """

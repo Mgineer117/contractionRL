@@ -52,7 +52,7 @@ class ManipulatorPathTrackingEnv(PathTrackingBase):
     @property
     def state_names(self) -> tuple[str, ...]:
         """Matches _get_physical_state's order. Deliberately uses ee_* rather
-        than pos_*: the arm base is FIXED, so the end-effector position is a
+        than pos_*: the arm base is fixed, so the end-effector position is a
         function of joint_pos, not a free translation direction -- naming it
         pos_x/pos_y would wrongly invite the quotient to drop it. No base yaw
         either, so this env gets no symmetry reduction (mode="none").

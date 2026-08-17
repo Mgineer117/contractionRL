@@ -6,7 +6,7 @@ models:
     backbone: mlp-squashed  # tanh-squashed Gaussian (SquashedGaussianActorModel) — required
                         # for SAC on this bounded [-1, 1] action space (no uref here, so this
                         # is a plain squashed MLP); skrl's stock unbounded GaussianMixin +
-                        # clip_actions is NOT equivalent (clip never reaches log_prob, so the
+                        # clip_actions is not equivalent (clip never reaches log_prob, so the
                         # entropy-coefficient tuning has no fixed point and diverges — see
                         # models.py's SquashedGaussianActorModel docstring)
     clip_log_std: true

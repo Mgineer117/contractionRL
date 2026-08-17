@@ -55,7 +55,7 @@ agent:
   random_timesteps: 0
   learning_starts: 0
   grad_norm_clip: 1.0  # Maximum permitted magnitude for gradients (prevents exploding gradients)
-  use_state_norm: false  # OFF by default — see c2rl.py module docstring / rl_glue.make_base_rl_cfg
+  use_state_norm: false  # Off by default — see c2rl.py module docstring / rl_glue.make_base_rl_cfg
   discount_factor: 0.99  # deployed policy's discount factor (single policy — no con/opt duality)
   # NOTE: the contraction-metric / Mahalanobis-reward config (cmg_method, w_ub,
   # w_lb, lbd, tracking_scaler, control_scaler, cm_eps, cm_solver) lives in the
@@ -73,14 +73,14 @@ agent:
 
 # ── Contraction metric + Mahalanobis reward ────────────────────────────────── #
 cm:
-  # Metric source — how the ENV computes the Mahalanobis reward. "online":
+  # Metric source — how the env computes the Mahalanobis reward. "online":
   # solve the CV-STEM SDP per env per step at the states the rollout visits
   # (ncm_synthesis.OnlineCVSTEMMetric), so every M is a verified feasible
   # metric and an infeasible state aborts the run — no Phase A, no CMG
   # regression. c2rl_sac uses "online", c2rl_ppo uses "cmg"; forced to "cmg"
   # when cmg_method is "ccm" (that pipeline has no per-state SDP).
   #
-  # COST, on Isaac far more than on the classic envs: the solve is a serial
+  # Cost, on Isaac far more than on the classic envs: the solve is a serial
   # per-env cvxpy loop (~7 ms/env/step measured on a 4-state classic env), so
   # it scales linearly with scene.num_envs — which here is in the thousands —
   # and each solve needs f/B/∂f/∂x from the learned NeuralDynamics. Drop
@@ -100,7 +100,7 @@ cm:
 #    true (classic envs only) to learn a NeuralDynamics instead. ─────────────── #
 empirical_dynamics:
   use_empirical_dynamics: true  # false = env analytical get_f_and_B; true = learn NeuralDynamics
-  # States×controls for ONLINE dynamics-data generation (use_empirical_dynamics=true
+  # States×controls for online dynamics-data generation (use_empirical_dynamics=true
   # with no dynamics_pretrain_data_path): samples ceil(memory_size / N) states and
   # pairs each with N distinct controls → N control-aware samples per state. Only
   # affects NeuralDynamics pretraining; ignored under analytical dynamics. Default 3.

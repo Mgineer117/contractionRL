@@ -16,16 +16,16 @@ import torch
 from ..common.env_base import BaseEnv
 
 STATE_NAMES = ("pos_x", "pos_y", "yaw", "vel")
-# angle_idx / pos_dimension are DERIVED from STATE_NAMES by BaseEnv (see
+# angle_idx / pos_dimension are derived from STATE_NAMES by BaseEnv (see
 # agents/skrl/state_symmetry.py) -- the names are the single source of truth for
 # which dims wrap, which translate, and which co-rotate under a yaw rotation.
 
 v_l, v_h = 1.0, 2.0
-# The reference START position is randomized over the whole POS_SPREAD box, not
+# The reference start position is randomized over the whole POS_SPREAD box, not
 # pinned near the origin. Why: f(x) = [v cos(theta), v sin(theta), 0, 0] and B are
 # independent of (p_x, p_y), so the tracking problem is exactly translation
 # invariant — but the policy backbone's gain nets (CLActor's w1/w2 read the
-# ABSOLUTE [x, xref] pair; only the feedback error e = wrap_diff(x - xref) is
+# Absolute [x, xref] pair; only the feedback error e = wrap_diff(x - xref) is
 # relative) have no such structure and must learn it from data. With a +-2.0
 # start box the reference spends the episode drifting out to ~22 m while tracking
 # error has already decayed, so every large-error training sample sits within a
@@ -46,7 +46,7 @@ POS_BOUND = POS_SPREAD + 1.5 * 15.0 + 2.5
 X_MIN = [-POS_BOUND, -POS_BOUND, -math.pi, v_l]
 X_MAX = [POS_BOUND, POS_BOUND, math.pi, v_h]
 
-# Episode ENDS the first step x leaves this box (opt-in: --terminate_out_of_box).
+# Episode ends the first step x leaves this box (opt-in: --terminate_out_of_box).
 # Defaults to the state box itself, i.e. it fires exactly where env_base.step's
 # clamp already silently pins a diverged env -- the same event, reported instead
 # of hidden. Tighten it here to end failing episodes sooner.
@@ -60,7 +60,7 @@ XE_INIT_MAX = [1.0, 1.0, 1.0, 1.0]
 lim = 1.0
 XE_MIN = [-lim, -lim, -lim, -lim]
 XE_MAX = [lim, lim, lim, lim]
-# u = [omega (rad/s), a (m/s^2)]; the APPLIED box is 2x this (env_base.py:37).
+# u = [omega (rad/s), a (m/s^2)]; the applied box is 2x this (env_base.py:37).
 # omega: an RC-car-scale platform (wheelbase L=0.3 m, max steer 30 deg) at the
 # reference speed v=1.5 gives omega_max = v*tan(30)/L = 2.9 rad/s, so +-3 applied.
 # The old +-6 applied meant a 0.25 m turn radius at 1.5 m/s -- not a car.
@@ -127,9 +127,9 @@ class CarEnv(BaseEnv):
         return torch.clamp(uref, self.UREF_MIN, self.UREF_MAX)
 
     def set_held_out_mode(self, seed: int | None, n_trajectories: int = 64) -> None:
-        """Fix a REPRODUCIBLE bank of ``n_trajectories`` reference-trajectory
+        """Fix a reproducible bank of ``n_trajectories`` reference-trajectory
         weight vectors (the mixing coefficients over the 10 fixed sinusoidal
-        steering components — see ``system_reset``), drawn from a DEDICATED
+        steering components — see ``system_reset``), drawn from a dedicated
         ``torch.Generator`` seeded independently of the run's own training
         seed/RNG stream. As long as ``seed`` differs from the training seed,
         these specific path shapes are guaranteed never drawn during
@@ -142,11 +142,11 @@ class CarEnv(BaseEnv):
         random weights while active. ``seed=None`` reverts to that historic
         i.i.d.-random behavior exactly (disables held-out mode).
 
-        Only the steering WEIGHTS are fixed — the initial state
+        Only the steering weights are fixed — the initial state
         (``define_initial_state``: start position/heading/velocity, initial
         tracking error) still draws from the ordinary global RNG every reset,
         same as training. The "goal" being held out is the reference PATH
-        SHAPE, not the starting condition.
+        shape, not the starting condition.
         """
         if seed is None:
             self._held_out_weights = None

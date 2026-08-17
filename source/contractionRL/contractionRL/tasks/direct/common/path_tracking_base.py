@@ -59,25 +59,25 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
             state that hold a wrapping angle (e.g. yaw). Default () — most
             path-tracking states (proj_gravity + joint pos/vel) have no raw
             angle. Networks embed these continuously ((cos, sin), see
-            agents/skrl/angle_utils.py); the tracking ERROR computed here stays
-            in raw coordinates but has these dims shortest-angle WRAPPED before
+            agents/skrl/angle_utils.py); the tracking error computed here stays
+            in raw coordinates but has these dims shortest-angle wrapped before
             any norm/reward/metric — otherwise a wraparound (e.g. a yaw U-turn)
             would spike the error by ~2*pi.
     """
     angle_idx: Sequence[int] = ()
 
-    # One name per PHYSICAL state dim (see agents/skrl/state_symmetry.py for the
+    # One name per physical state dim (see agents/skrl/state_symmetry.py for the
     # vocabulary). Declaring names rather than raw indices is what lets the
     # networks quotient out the symmetry of the tracking problem: which dims are
     # pure translation directions, which is the planar heading, and which co-
-    # rotate under a yaw rotation. Crucially the FRAME suffix matters --
-    # root_lin_vel_b / root_ang_vel_b / projected_gravity_b are BODY frame and so
+    # rotate under a yaw rotation. Crucially the frame suffix matters --
+    # root_lin_vel_b / root_ang_vel_b / projected_gravity_b are body frame and so
     # already yaw invariant, whereas a world-frame velocity would have to be
     # co-rotated with the position pair. Left empty -> angle_idx below is used as
     # before and no quotient is applied.
     #
     # Subclasses whose width depends on the robot (joint count) should override
-    # the ``state_names`` PROPERTY instead of this attribute.
+    # the ``state_names`` property instead of this attribute.
     _state_names: Sequence[str] = ()
 
     @property
@@ -100,7 +100,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
     # trajectory the contraction metrics are fit over), any non-finite element
     # is replaced by the same element from the last known-finite state and the
     # episode keeps running — see carry_forward_nonfinite(). This env family
-    # NEVER terminates on divergence (see _get_dones() in each subclass);
+    # Never terminates on divergence (see _get_dones() in each subclass);
     # falling (terminate_on_fall) is the only termination path, and it is off
     # by default for path tracking.
     _ERROR_CLAMP = 1.0e3              # cap on ||error|| feeding reward/AUC/metrics
@@ -165,18 +165,18 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         self._last_valid_state: torch.Tensor | None = None
 
         # ── Early-termination box — the Isaac twin of BaseEnv's ──────────── #
-        # Same name, same semantics, same default (ON), so
+        # Same name, same semantics, same default (on), so
         # set_terminate_out_of_box / terminate_out_of_box / X_TERMINATION_*
         # resolve identically on both families (tests/test_isaac_parity.py's
         # rule). Two real differences, both from Isaac Sim rather than choice:
         #
         #   * The box defaults to _state_bounds(), which is ±inf for most Isaac
         #     envs (they have no physical state box the way car/segway do). An
-        #     all-infinite box can never be crossed, so the feature is INERT
+        #     all-infinite box can never be crossed, so the feature is inert
         #     there until a subclass declares finite bounds — announced once at
         #     construction rather than left to look armed.
         #   * There is no clamp to fire at. The classic pathology is a diverged
-        #     env silently PINNED at its box; here it is a diverged env running
+        #     env silently pinned at its box; here it is a diverged env running
         #     on under the carry-forward guard. A non-finite state therefore
         #     counts as out-of-box: it is the same event this is meant to end.
         _bounds_lo, _bounds_hi = self._state_bounds()
@@ -188,7 +188,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
             terminal=bool(getattr(self.cfg, "x_termination_terminal", False)),
             tag="PathTracking")
         # Every subclass owns its own _get_dones (fall detection, task-specific
-        # limits), so the box is folded in by wrapping the bound method ONCE
+        # limits), so the box is folded in by wrapping the bound method once
         # here rather than editing each subclass — the same post-construction
         # patching idiom agent_patches.py uses for skrl, and for the same
         # reason: one place to change, and no subclass can forget to call it.
@@ -198,7 +198,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         # Streaming (memory-efficient) accumulators for the unified contraction
         # metrics — running sum of error norms (_episode_auc), first/last/peak
         # error and step count — so auc/contraction_rate/overshoot/
-        # contraction_score are computed for EVERY finished env without storing
+        # contraction_score are computed for every finished env without storing
         # the full per-step error curve (see contraction_metrics.per_env_metrics;
         # the same streaming math C3M/C2RL eval use).
         self._episode_auc = torch.zeros(n, device=self.device)
@@ -214,7 +214,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         # --- PathTracking wandb figure: position + error^2 across up to
         # _VIZ_MAX_ENVS envs (CPU, pre-allocated). "live" buffers accumulate the
         # in-progress episode per viz env; "hist" holds each viz env's most
-        # recently COMPLETED episode (snapshotted at that env's own reset,
+        # recently completed episode (snapshotted at that env's own reset,
         # since viz envs can terminate/reset at different times) — the plot
         # renders from "hist", not "live".
         self._viz_n = min(_VIZ_MAX_ENVS, n)
@@ -239,7 +239,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         self.tracking_scaler = 1.0
         self.control_scaler = 0.0
         # Certified/target contraction rate + metric-conditioning inputs for
-        # the THEORETICAL exponential bound on the PathTracking figure. All
+        # the theoretical exponential bound on the PathTracking figure. All
         # None by default (curve omitted) — set via set_contraction_certificate().
         self.target_lambda: float | None = None
         self._rl_discount_factor: float | None = None
@@ -255,7 +255,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         self._dynamics_model = model
 
     def _metric_from_cmg(self, x):
-        """M(x) from the CMG, inverting ONLY when the head emits W.
+        """M(x) from the CMG, inverting only when the head emits W.
 
         Mirrors classic env_base._metric_from_cmg exactly — see
         tests/test_isaac_parity.py, which requires both families to convert the
@@ -320,10 +320,10 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
             e(t) <= sqrt(m_bar / m_underbar) * [1/(1-gamma)] * e(0) * exp(-lbd*t)
 
         differing only in where (m_bar, m_underbar) come from:
-          - THEORETICAL: the CMG's configured hard limits (w_lb/w_ub), i.e.
+          - Theoretical: the CMG's configured hard limits (w_lb/w_ub), i.e.
             what the metric is *guaranteed* to satisfy by construction,
             regardless of what the network has actually learned so far.
-          - EMPIRICAL: the CURRENT metric's eigenvalue extremes, *measured* on
+          - Empirical: the current metric's eigenvalue extremes, *measured* on
             the actually-visited states — reflects the real (possibly looser
             or tighter) network today, not the worst-case design limit.
 
@@ -334,7 +334,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         Args:
             lbd: certified/target contraction rate (e.g. cfg.lbd).
             discount_factor: RL discount gamma of the policy actually being
-                deployed/plotted — inflates BOTH bounds by 1/(1-gamma) since a
+                deployed/plotted — inflates both bounds by 1/(1-gamma) since a
                 *discounted* objective enforces the certificate on average
                 rather than as a hard per-step constraint. None (or 0) for
                 C3M, which has no discounting at all — gamma > 0 only for an
@@ -342,11 +342,11 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
                 discount_factor — i.e. the policy whose rollout the figure
                 is actually showing).
             static_metric_bounds: (m_bar, m_underbar) from the CMG's configured
-                w_lb/w_ub (m_bar=1/w_lb, m_underbar=1/w_ub) — the THEORETICAL
+                w_lb/w_ub (m_bar=1/w_lb, m_underbar=1/w_ub) — the theoretical
                 bound's fixed conditioning factor.
             cmg_bounds_fn: callable (x_batch) -> (m_bar, m_underbar), evaluating
-                the CURRENT contraction metric's eigenvalue extremes on a batch
-                of states — the EMPIRICAL bound's measured conditioning factor.
+                the current contraction metric's eigenvalue extremes on a batch
+                of states — the empirical bound's measured conditioning factor.
         """
         self.target_lambda = None if lbd is None else float(lbd)
         self._rl_discount_factor = discount_factor
@@ -370,17 +370,17 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         """Render the "PathTracking" wandb figure from the viz envs' most
         recently completed episodes:
           left  — attempted-trajectory position (world xy) per env
-          right — ||error||_I^2 per step, plus THREE reference curves (each
+          right — ||error||_I^2 per step, plus three reference curves (each
                   only drawn if its inputs are available):
             1. fitted envelope — fit_exponential_envelope (CAC-dev style),
                a pure data fit of the observed error trajectories: no CMG,
                no gamma, just the tightest C*exp(-lambda*t) that bounds them.
             2. theoretical bound — sqrt(m_bar/m_underbar) * [1/(1-gamma)] *
                e(0) * exp(-lbd*t), where m_bar/m_underbar come from the CMG's
-               CONFIGURED hard limits (w_lb/w_ub) — the worst-case guarantee
+               configured hard limits (w_lb/w_ub) — the worst-case guarantee
                by construction, regardless of what the network currently does.
             3. empirical bound — same shape, but m_bar/m_underbar are
-               MEASURED (max/min eigenvalues of the CURRENT CMG evaluated on
+               measured (max/min eigenvalues of the current CMG evaluated on
                the actually-visited states) — reflects the real network today.
           Both (2)/(3) use set_contraction_certificate()'s lbd/gamma; gamma=0
           (no inflation) for non-discounted certificates like C3M, gamma>0 for
@@ -442,7 +442,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
                     label=f"theoretical bound (C={C_theory:.2g}, λ={self.target_lambda:.2g})",
                 )
 
-            # 3. empirical — CURRENT CMG's eigenvalues, measured on visited states.
+            # 3. empirical — current CMG's eigenvalues, measured on visited states.
             if self._cmg_bounds_fn is not None:
                 state_traces = [self._viz_state_hist[i, : self._viz_len_hist[i]] for i in valid]
                 states = np.concatenate(state_traces, axis=0)
@@ -559,8 +559,8 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         The classic twin is ``BaseEnv.set_fix_ref_trajectories``; both exist so
         the training entry point can set this uniformly (see
         tests/test_isaac_parity.py). Isaac references come from a fixed dataset,
-        so "fixing" here means pinning each env slot to ONE sampled traj id for
-        the whole run rather than redrawing every episode. Turning it ON clears
+        so "fixing" here means pinning each env slot to one sampled traj id for
+        the whole run rather than redrawing every episode. Turning it on clears
         the assignment so the next reset re-mints it.
         """
         self.fix_ref_trajectories = bool(flag)
@@ -572,7 +572,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
                  if self.fix_ref_trajectories else " (resampled every episode)"))
 
     def get_reference_trajectory(self) -> torch.Tensor:
-        """WHOLE reference path per env: ``(num_envs, T, x_dim)``.
+        """whole reference path per env: ``(num_envs, T, x_dim)``.
 
         The classic twin is ``BaseEnv.get_reference_trajectory``; both exist so
         logging code plots the complete reference against the policy rollout
@@ -611,7 +611,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         """Declare ``{x, xrefs, urefs}`` as the observation space.
 
         Isaac's DirectRLEnv takes an integer width from the env cfg, so the
-        FLAT width is what it is told; the Dict is exposed alongside it for
+        flat width is what it is told; the Dict is exposed alongside it for
         ``RefWindow.from_space``. Both agree by construction (``flat_dim``).
         """
         lo, hi = self._state_bounds()
@@ -657,7 +657,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
                              gamma: float | None = None) -> None:
         """Resize the reference window and rebuild ``observation_space`` —
         the Isaac twin of ``BaseEnv.configure_ref_window``. Must be called
-        BEFORE the agent/memory are built. Idempotent."""
+        before the agent/memory are built. Idempotent."""
         self.ref_window = RefWindow(x_dim=self.ref_window.x_dim, u_dim=self.ref_window.u_dim,
                                     length=int(length), offset=int(offset))
         self._rebuild_observation_space()
@@ -673,7 +673,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
     def _get_observations(self) -> dict:
         step = self.episode_length_buf.long()
         x_refs, u_refs = self._traj_buf.get_window(self._traj_ids, step, self.ref_window)
-        # Slot 0 is the CURRENT reference — what the reward and every metric use.
+        # Slot 0 is the current reference — what the reward and every metric use.
         self._x_ref, self._u_ref = x_refs[:, 0], u_refs[:, 0]
         # sanitize so the policy never receives NaN/Inf from a diverging env
         x = self._sanitize_state(self._get_physical_state())
@@ -683,23 +683,23 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         return {"policy": self.ref_window.flatten(x, x_refs, u_refs)}
 
     def _get_rewards(self) -> torch.Tensor:
-        # Refresh _x_ref/_u_ref for THIS step here rather than relying on
+        # Refresh _x_ref/_u_ref for this step here rather than relying on
         # _get_observations() to have set them: DirectRLEnv.step() calls
-        # _get_rewards() BEFORE _get_observations() (after incrementing
+        # _get_rewards() before _get_observations() (after incrementing
         # episode_length_buf), so without this, _x_ref/_u_ref would still hold
-        # the PREVIOUS step's values — pairing the post-transition physical
+        # the previous step's values — pairing the post-transition physical
         # state x below against a one-step-stale reference. _traj_buf.get is a
         # pure lookup (no side effects), so recomputing it again in
         # _get_observations() with the same episode_length_buf is harmless.
         step = self.episode_length_buf.long()
         self._x_ref, self._u_ref = self._traj_buf.get(self._traj_ids, step)
 
-        # sanitize + clamp so a diverging env yields a large-but-FINITE penalty
+        # sanitize + clamp so a diverging env yields a large-but-Finite penalty
         # (never NaN/Inf) into the reward, AUC, and Stability curves — the
         # episode is never reset/terminated because of it (see _sanitize_state).
         x = self._sanitize_state(self._get_physical_state())
         # angle_idx dims (e.g. yaw) are wrapped to the shortest-angle difference
-        # BEFORE any norm/reward/metric — a raw difference would spike by ~2*pi
+        # Before any norm/reward/metric — a raw difference would spike by ~2*pi
         # whenever the physical angle wraps (e.g. a yaw U-turn). Non-angle dims
         # are unaffected (wrap_diff is a no-op there, and a no-op entirely when
         # angle_idx is empty).
@@ -737,7 +737,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
             # - control_scaler*||u||^2, V = error^T M error, M = the frozen
             # CMG's metric at the corresponding state — mirrors classic
             # env_base.py's get_rewards exactly. _get_rewards only ever sees
-            # the POST-transition state (no separate "prev x" lookup buffer
+            # the post-transition state (no separate "prev x" lookup buffer
             # like the reference trajectory has), so the previous step's
             # error vector + metric are cached explicitly in
             # _prev_error/_prev_M (seeded at _reset_idx) rather than
@@ -784,13 +784,13 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
             contraction_flag = self._episode_contraction_steps[finished].float() / valid_steps
             self.extras["log"]["Stability/contraction_flag"] = contraction_flag.mean()
 
-            # --- Unified streaming contraction metrics for EVERY finished env ---
+            # --- Unified streaming contraction metrics for every finished env ---
             # auc (normalized dt-weighted trapezoid), contraction_rate (lambda),
             # overshoot (e_max/e0) and contraction_score — each mean + 95% CI,
-            # using the SAME streaming computation and wandb keys as C3M/C2RL
+            # using the same streaming computation and wandb keys as C3M/C2RL
             # (contraction_metrics), so PPO/SAC/LQR/SD-LQR share the same
             # Stability/* tab, formula and CI as the contraction algorithms.
-            # Computed over ALL finished envs (not just the few viz envs the old
+            # Computed over all finished envs (not just the few viz envs the old
             # fit_exponential_envelope path used), for tighter statistics.
             from contractionRL.agents.skrl.contraction_metrics import (
                 per_env_metrics,

@@ -32,7 +32,7 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     #           VelCommands.get() — the last 4 make the yaw-rate generator's
     #           own future Markov, not just its instantaneous value)
     # gait:    sin(gait_phase), cos(gait_phase) = 2 — the phase-clock signal the
-    #           trot reward is scheduled against; MUST be observable or the
+    #           trot reward is scheduled against; Must be observable or the
     #           phase-locked gait reward is non-Markov and unlearnable.
     # obs:     state(33) + commands(8) + gait(2) + prev_actions(12) = 55
     action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(12,), dtype=np.float32)
@@ -135,12 +135,12 @@ class QuadrupedVelTrackingEnvCfg(DirectRLEnvCfg):
     # ── trot gait (phase-clock) ──────────────────────────────────────────────
     # A per-env gait phase advances at `gait_freq` full cycles/sec. The two
     # diagonal pairs (FL+RR, FR+RL) are scheduled a half-cycle apart; each foot
-    # is scheduled STANCE for `gait_duty` of its cycle and SWING otherwise. The
+    # is scheduled stance for `gait_duty` of its cycle and swing otherwise. The
     # reward matches actual (force-based) contact against this schedule, so —
-    # unlike a diagonal-symmetry penalty — standing and pronking are NOT
+    # unlike a diagonal-symmetry penalty — standing and pronking are not
     # zero-penalty: their swing-scheduled feet mismatch.
     #
-    # gait_duty > 0.5 makes the two diagonals' stance windows OVERLAP, giving a
+    # gait_duty > 0.5 makes the two diagonals' stance windows overlap, giving a
     # double-support ("all four allowed down") buffer around each diagonal swap
     # — what makes this a walk, not an instantaneous-swap run. At duty=0.6 that
     # buffer is 20% of the cycle (two ~0.1 s windows at 1 Hz) with no flight

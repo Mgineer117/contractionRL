@@ -18,7 +18,7 @@ from .state_symmetry import StateSymmetry
 
 
 def _sym_from_names(names):
-    """Rebuild the symmetry a checkpoint was TRAINED with, so a reload cannot
+    """Rebuild the symmetry a checkpoint was trained with, so a reload cannot
     silently change the network input layout."""
     if not names:
         return None
@@ -104,9 +104,9 @@ class CCM_Generator(nn.Module):
         if isinstance(activation, str):
             activation = {"tanh": nn.Tanh(), "relu": nn.ReLU()}[activation.lower()]
 
-        # Network sees the CONTINUOUS (cos, sin) embedding of any angle dims, with
+        # Network sees the continuous (cos, sin) embedding of any angle dims, with
         # the translation directions dropped; W(x) itself is still indexed/shaped
-        # by the RAW x_dim (see forward).
+        # by the raw x_dim (see forward).
         self.backbone = MLP((sym.single_dim() if sym is not None else embedded_dim(x_dim, self.angle_idx)),
                             list(hidden_dim), activation=activation)
         h = self.backbone.output_dim
@@ -140,20 +140,20 @@ class CCM_Generator(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
-# CholMetric — the ORIGINAL NCM network: x -> chol(M), M = RᵀR
+# CholMetric — the original NCM network: x -> chol(M), M = RᵀR
 # ─────────────────────────────────────────────────────────────────────────── #
 
 class CholMetric(nn.Module):
     """Tsukamoto's NCM network (``classncm.train`` + ``ncm``/``cholM2M``).
 
     A plain MLP ``x ↦ vec(R)`` with ``R`` upper-triangular and ``M = RᵀR``, so
-    the deployed metric is SPD by CONSTRUCTION at every state — including ones
+    the deployed metric is SPD by construction at every state — including ones
     the SDP never sampled — with no eigenvalue clamp anywhere. That is the whole
     reason the reference regresses ``chol(M)`` rather than ``W``: ``ν`` is free in
     its SDP, so no ``[w_lb, w_ub]`` envelope exists to clamp to, and clamping a
     regressed ``W`` would silently deploy a metric the SDP never certified.
 
-    Deliberately NOT ``CCM_Generator``: that one outputs ``W`` and relies on
+    Deliberately not ``CCM_Generator``: that one outputs ``W`` and relies on
     ``bound_W`` for definiteness, which is the repo's envelope-bearing variant
     (still what C2RL uses). This one is only for CV-STEM-LQR.
 
@@ -177,7 +177,7 @@ class CholMetric(nn.Module):
                        activation=activation if activation is not None else nn.ReLU())
         iu = torch.triu_indices(self.x_dim, self.x_dim)
         # Same row-major upper-triangular order as ncm_synthesis.M_to_cholvec —
-        # the labels and the reconstruction MUST agree on it.
+        # the labels and the reconstruction must agree on it.
         self.register_buffer("_iu", iu, persistent=False)
 
     def chol(self, x: torch.Tensor) -> torch.Tensor:
@@ -198,7 +198,7 @@ class CholMetric(nn.Module):
 
 class CVSTEMLQRBase:
     """The certified CV-STEM-LQR control law, packaged as a fixed baseline the
-    C2RL actor learns a RESIDUAL on top of.
+    C2RL actor learns a residual on top of.
 
         u_base = uref - K(x)·e,   K(x) = (1/r)·B(x)ᵀ·M(x),   M(x) = W(x)⁻¹,
         e = wrap_diff(x - xref)
@@ -207,10 +207,10 @@ class CVSTEMLQRBase:
     frozen CMG, same analytic ``B(x)``, same ``R = r_scaler·I``. That controller
     already scores near the analytic tracking floor (~0.9 AUC on car), yet C2RL
     normally ignores it and learns feedback from scratch. As the baseline, the
-    policy STARTS there and PPO can only improve it (clamped reward, actuator
+    policy starts there and PPO can only improve it (clamped reward, actuator
     limits, preview, discrete-dt and nonlinear corrections the linear gain misses).
 
-    Deliberately NOT an ``nn.Module``: it references the frozen CMG but must not
+    Deliberately not an ``nn.Module``: it references the frozen CMG but must not
     register it as a policy submodule, which would double-count the CMG in the
     policy's parameters/checkpoint and in the optimizer. No learnable parameters
     — ``u_base`` is a fixed detached offset like ``uref``, so gradients flow only
@@ -229,7 +229,7 @@ class CVSTEMLQRBase:
         self.angle_idx = list(angle_idx or [])
 
     def __call__(self, state: torch.Tensor) -> torch.Tensor:
-        # Analytic feedback is myopic: it needs only the CURRENT reference, so
+        # Analytic feedback is myopic: it needs only the current reference, so
         # it reads xrefs[0]/urefs[0] and ignores the rest of the window.
         x, xrefs, urefs = self.window.split(state)
         xref, uref = xrefs[:, 0], urefs[:, 0]
@@ -248,16 +248,16 @@ class CVSTEMLQRBase:
 
 # ─────────────────────────────────────────────────────────────────────────── #
 # Structured preview residuals — π(s) variants for residual RL on the
-# CV-STEM-LQR base. Each explicitly SEPARATES the roles of the current state x
+# CV-STEM-LQR base. Each explicitly separates the roles of the current state x
 # (physics / stabilizing gains), the future preview P (path planning), and the
 # invariant tracking error e (what the feedback acts on) — versus the original
-# CLActor, which blends x, xref and P into ONE context feeding both W1 and W2.
+# CLActor, which blends x, xref and P into one context feeding both W1 and W2.
 #
 # Contract (all variants): forward(state_feats, e, preview) -> residual (b, u_dim),
 # added on top of the analytic base u_base = uref - K·e. state_feats (b, S) are
 # the invariant current-config features (CLActor._state_feats), e (b, x_dim) the
 # canonical-frame error (CLActor._error_vec), preview (b, P) the future-reference
-# tail. All are zero-initialized (W2's output layer) so the actor STARTS exactly
+# tail. All are zero-initialized (W2's output layer) so the actor starts exactly
 # at the CV-STEM-LQR base and PPO grows the residual from there. c = 3·x_dim is
 # the bilinear latent width (matches CLActor).
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -274,7 +274,7 @@ def _zero_last_linear(mlp: MLP) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────── #
-# SUPERSEDED by the single actor architecture  u = urefs[0] + W2(xrefs)·tanh(W1(x)·e)
+# Superseded by the single actor architecture  u = urefs[0] + W2(xrefs)·tanh(W1(x)·e)
 # (see CLActor below). These were residual heads for warm-starting on an analytic
 # CV-STEM-LQR base; kept commented rather than deleted.
 # ─────────────────────────────────────────────────────────────────────── #
@@ -283,9 +283,9 @@ def _zero_last_linear(mlp: MLP) -> None:
 #
 #         π = W2(P) · tanh( W1(x) · e )
 #
-#     ``W1`` (error → latent) is generated from the CURRENT STATE only — it
+#     ``W1`` (error → latent) is generated from the current state only — it
 #     transforms the error according to the robot's present physical configuration.
-#     ``W2`` (latent → control) is generated from the PREVIEW only — it allocates
+#     ``W2`` (latent → control) is generated from the preview only — it allocates
 #     control effort for the upcoming path geometry. Physics and path-planning are
 #     thus produced by disjoint sub-networks."""
 #
@@ -296,7 +296,7 @@ def _zero_last_linear(mlp: MLP) -> None:
 #         self.w2 = MLP(preview_dim, hidden, self.u_dim * self.c, activation=activation)  # W2(P)
 #
 #     def zero_output(self):
-#         """Zero W2's output so π starts at 0 — used ONLY when warm-starting on an
+#         """Zero W2's output so π starts at 0 — used only when warm-starting on an
 #         analytic base (u = base + π). For the default u = uref + π (learn feedback
 #         from scratch) the standard init is kept so the policy starts with feedback."""
 #         _zero_last_linear(self.w2)
@@ -314,8 +314,8 @@ def _zero_last_linear(mlp: MLP) -> None:
 #
 #         π = W2(x) · tanh( W1(x) · e + f_prev(P) )
 #
-#     ``W1``/``W2`` are STRICT state-dependent gain schedulers (physics only). The
-#     preview enters as an additive bias ``f_prev(P)`` in the latent PRE-tanh space,
+#     ``W1``/``W2`` are strict state-dependent gain schedulers (physics only). The
+#     preview enters as an additive bias ``f_prev(P)`` in the latent pre-tanh space,
 #     so it preemptively nudges the error signal while remaining bounded by the tanh
 #     saturation the state-dependent physical gains set. The preview can never alter
 #     the stabilizing gains themselves — only bias what they act on — which is why
@@ -342,19 +342,19 @@ def _zero_last_linear(mlp: MLP) -> None:
 #
 #
 class PreviewSequenceEncoder(nn.Module):
-    """Encodes the preview tail as a SEQUENCE of ``num_points`` future
+    """Encodes the preview tail as a sequence of ``num_points`` future
     reference rows (each ``point_dim`` wide), instead of flattening it into
     one vector for a plain MLP. Drop-in replacement for
     ``MLP(preview_dim, hidden, out_dim)`` — same ``(n, preview_dim) -> (n,
     out_dim)`` signature — so it can be swapped in for any FiLMResidual γ-gate
     that reads "preview" without touching FiLMResidual.forward at all.
 
-    "gru": fed FARTHEST POINT FIRST (the tail is stored nearest-first, so this
+    "gru": fed farthest point first (the tail is stored nearest-first, so this
     reverses it). The final hidden state is then dominated by the near-term
     point, the far future having already been squashed by the forget gates —
     which is what makes "an RNN's forgetting resembles discounting" literally
     true here. Fed nearest-first the final state would be dominated by the
-    FARTHEST point, the opposite of what discounting wants. The encoder is never
+    farthest point, the opposite of what discounting wants. The encoder is never
     told gamma, unlike env_base's explicit geometric ladder, so any horizon-like
     behavior is purely learned.
 
@@ -366,7 +366,7 @@ class PreviewSequenceEncoder(nn.Module):
     plain MLP — no order/recency structure at all, a deliberate contrast to
     "gru"/"attn".
 
-    ``stride`` applies UNIFORMLY to all three modes (keep every stride-th
+    ``stride`` applies uniformly to all three modes (keep every stride-th
     point, nearest-first — offset 0 is never skipped): "mlp" sees fewer,
     wider-spaced points to flatten (bounds its input width, which otherwise
     scales with ``num_points`` and gets wasteful once the tail is a full
@@ -403,7 +403,7 @@ class PreviewSequenceEncoder(nn.Module):
     def zero_output(self) -> None:
         """Zero the final Linear so the encoder's output starts at exactly 0.
 
-        Used to warm-start ``u = base + pi`` AT an analytic base (CVSTEMLQRBase):
+        Used to warm-start ``u = base + pi`` at an analytic base (CVSTEMLQRBase):
         with ``W2(xrefs) == 0`` the feedback is identically 0, so training starts
         exactly at the base. Not frozen — the layer still receives gradient on
         the first update, since its input is nonzero.
@@ -423,13 +423,13 @@ class PreviewSequenceEncoder(nn.Module):
     def train(self, mode: bool = True) -> PreviewSequenceEncoder:
         """Keep the GRU submodule permanently in train mode, regardless of
         what the surrounding policy is set to. cuDNN's RNN kernel refuses to
-        run backward at all when its OWN training flag is False (either a
+        run backward at all when its own training flag is False (either a
         flat "called in eval mode" error, or — if a caller upstream needs
         create_graph=True — a hard "double backwards not supported"
         NotImplementedError) — and skrl's own act()/update() cycle toggles
         eval()/train() on the whole policy in ways this module has no control
         over (including inside vendored skrl/ code, off-limits to edit). This
-        GRU has no dropout, so train vs eval never changes its OUTPUT — only
+        GRU has no dropout, so train vs eval never changes its output — only
         whether cuDNN allows differentiating through it — so forcing it to
         stay in train mode is free."""
         super().train(mode)
@@ -461,17 +461,17 @@ class PreviewSequenceEncoder(nn.Module):
 #         π = ( W2(x) ⊙ γ2(G2) ) · tanh( ( W1(x) ⊙ γ1(G1) ) · e )
 #
 #     ``W1(x)``/``W2(x)`` are the baseline stabilizing matrices; ``γ1(G1)``/``γ2(G2)``
-#     are POSITIVE per-latent scales (softplus) that stiffen or relax the gains.
+#     are positive per-latent scales (softplus) that stiffen or relax the gains.
 #     Scaling is element-wise over the latent dimension ``c``. Crucially, ``e``
-#     enters MULTIPLICATIVELY inside the tanh (``(W1⊙γ1)·e``), so at e=0 the tanh
-#     argument is exactly 0 REGARDLESS of the gate inputs — u(e=0)=uref always holds,
+#     enters multiplicatively inside the tanh (``(W1⊙γ1)·e``), so at e=0 the tanh
+#     argument is exactly 0 regardless of the gate inputs — u(e=0)=uref always holds,
 #     unlike LatentPreviewResidual's additive pre-tanh bias (see project memory:
 #     that design breaks u(e=0)=uref once preview is nonzero → diverges).
 #
 #     ``gate1_source``/``gate2_source`` independently pick ``G1``/``G2``:
-#     "preview" (default, future-UREF window), "xref_preview" (future-XREF-relative
+#     "preview" (default, future-Uref window), "xref_preview" (future-Xref-relative
 #     window, needs ``xref_preview_dim>0``), "xref" (invariant features of the
-#     CURRENT reference point — NOT raw xref, which would break translation/SE(2)
+#     Current reference point — not raw xref, which would break translation/SE(2)
 #     invariance), or "uref" (already frame-safe raw).
 #
 #     The two preview sources are not separate tensors: ``preview`` is the combined
@@ -502,8 +502,8 @@ class PreviewSequenceEncoder(nn.Module):
 #                              f"{self._GATE_ENCODERS}, got {gate_encoder!r}")
 #         self.gate1_source, self.gate2_source = gate1_source, gate2_source
 #         self.gate_encoder = gate_encoder
-#         # "preview" reads the FIRST (preview_dim - xref_preview_dim) columns of
-#         # the combined tail (the uref block); "xref_preview" reads the LAST
+#         # "preview" reads the first (preview_dim - xref_preview_dim) columns of
+#         # the combined tail (the uref block); "xref_preview" reads the last
 #         # xref_preview_dim columns (see construct_state's tail ordering).
 #         self.xref_preview_dim = int(xref_preview_dim)
 #         self.uref_preview_dim = preview_dim - self.xref_preview_dim
@@ -567,18 +567,18 @@ class CLActor(nn.Module):
 
         u = urefs[0] + W2(xrefs) @ tanh( W1(x) @ e ),   e = error(x, xrefs[0])
 
-    Roles are DISJOINT by construction, which is the whole point of the split:
+    Roles are disjoint by construction, which is the whole point of the split:
 
-    ``W1(x)``      reads the current configuration ONLY (``Feats.single`` — the
+    ``W1(x)``      reads the current configuration only (``Feats.single`` — the
                    symmetry directions dropped). It shapes how the tracking error
                    is weighted according to the present physics.
     ``W2(xrefs)``  reads the reference PATH only, as a sequence of ``length``
-                   points each expressed RELATIVE to the current ``x``
+                   points each expressed relative to the current ``x``
                    (``Feats.sequence`` — relative position, wrapped angles). It
                    allocates control effort for the geometry that is coming. The
                    sequence goes through ``PreviewSequenceEncoder``, so mlp/gru/
                    attn is a searchable architectural choice.
-    ``e``          the canonical-frame tracking error, the ONLY thing the
+    ``e``          the canonical-frame tracking error, the only thing the
                    feedback multiplies — so ``e == 0 => u == urefs[0]`` exactly,
                    which is what the contraction certificate requires.
 
@@ -609,7 +609,7 @@ class CLActor(nn.Module):
         self.c = 3 * self.x_dim          # bilinear latent width
 
         self.w1 = MLP(feats.single_dim, hidden, self.c * self.x_dim, activation=activation)
-        # W2 consumes the window as a SEQUENCE of `length` points, each
+        # W2 consumes the window as a sequence of `length` points, each
         # `feats.pair_dim` wide. point_dim is what makes gru/attn see points
         # rather than one flat vector.
         self.w2 = PreviewSequenceEncoder(
@@ -661,7 +661,7 @@ class CLActor(nn.Module):
         """Deterministic control law bounded into ``(low, high)`` by construction.
 
         ``u = urefs[0] + rescale_residual(tanh(feedback), urefs[0], low, high)`` —
-        the feedback (not ``uref``) is squashed and ``uref`` added AFTER, so
+        the feedback (not ``uref``) is squashed and ``uref`` added after, so
         ``feedback == 0`` still gives exactly ``u == uref`` (see
         ``math_utils.rescale_residual``). Unlike ``torch.clamp``, ``tanh``'s
         gradient never hits exact zero, so ``K = jacobian(u, x)`` stays
@@ -718,8 +718,8 @@ class NeuralDynamics(nn.Module):
         self.angle_idx = list(angle_idx)
 
         act = _ACT_MAP.get(activation, nn.ReLU)()
-        # Nets see the CONTINUOUS embedding of x's angle dims; f/B are still
-        # shaped/indexed by the RAW x_dim (outputs are raw-coordinate ẋ / rows).
+        # Nets see the continuous embedding of x's angle dims; f/B are still
+        # shaped/indexed by the raw x_dim (outputs are raw-coordinate ẋ / rows).
         emb_dim = (sym.single_dim() if sym is not None else embedded_dim(x_dim, self.angle_idx))
         self.f_net = MLP(emb_dim, list(hidden_dim), x_dim, activation=act)
         self.B_net = MLP(emb_dim, list(hidden_dim), x_dim * u_dim, activation=act)
@@ -799,15 +799,15 @@ class NeuralDynamics(nn.Module):
 class BoundedCCM_Generator(nn.Module):
     """CMG with hard eigenvalue bounds baked into the forward pass.
 
-    ``outputs_metric`` selects WHICH of the two mutually-inverse matrices the
+    ``outputs_metric`` selects which of the two mutually-inverse matrices the
     forward pass produces, and it is set from ``cmg_method``:
 
-      * ``cvstem`` -> ``outputs_metric=True``: the head emits ``M`` DIRECTLY,
+      * ``cvstem`` -> ``outputs_metric=True``: the head emits ``M`` directly,
         with eigenvalues squashed into ``[1/w_ub, 1/w_lb]``. The reward needs
         ``e^T M e``, so emitting ``M`` removes a batched SPD inverse from every
         env step (env_base.get_rewards used to call ``spd_inverse(W)`` per step
         per env, on top of the eigh this forward already does). The regression
-        target is inverted ONCE offline instead.
+        target is inverted once offline instead.
       * ``ccm`` -> ``outputs_metric=False``: the head emits ``W``, because the
         C1/C2 contraction losses are written in ``W`` and there is no SDP
         dataset to pre-invert. The reward inverts per step, as before.
@@ -850,7 +850,7 @@ class BoundedCCM_Generator(nn.Module):
             activation = {"tanh": nn.Tanh(), "relu": nn.ReLU()}.get(
                 activation.lower(), nn.Tanh()
             )
-        # Network sees the CONTINUOUS embedding minus the translation directions;
+        # Network sees the continuous embedding minus the translation directions;
         # W(x) itself stays x_dim x x_dim.
         self.model = MLP(
             input_dim=(sym.single_dim() if sym is not None else embedded_dim(x_dim, self.angle_idx)),
@@ -880,14 +880,14 @@ class BoundedCCM_Generator(nn.Module):
         output momentarily produces repeated eigenvalues. Adding a tiny diagonal
         jitter breaks the degeneracy without meaningfully moving the bounded
         eigenvalues (they pass through a sigmoid), turning a hard crash into a
-        negligible numerical nudge. Falls back to CPU (MPS lacks eigh).
+        negligible numerical nudge. Falls back to CPU (mps lacks eigh).
 
         Also sanitizes actual non-finite entries (NaN/Inf) in ``S`` before
         decomposing: a raw ``mu`` head can overflow float32 for one unlucky
         batch during a long regression (the training loop's grad-norm clip
-        gates the OPTIMIZER step, not the forward pass, so one bad batch's
+        gates the optimizer step, not the forward pass, so one bad batch's
         activations can still overflow even though no bad weight update ever
-        lands). Both eigh AND its SVD last-resort raise LinAlgError on
+        lands). Both eigh and its SVD last-resort raise LinAlgError on
         non-finite input ("failed to converge") rather than just misordering
         eigenvalues, so without this the fallback chain above is defeated by
         the exact failure mode it exists to survive."""
@@ -941,7 +941,7 @@ class BoundedCCM_Generator(nn.Module):
         }
 
 
-# REMOVED 2026-07-30: GainNet / CVSTEMBoundedLQRBase (hard-control-bound gain).
+# Removed 2026-07-30: GainNet / CVSTEMBoundedLQRBase (hard-control-bound gain).
 # Measured worse than the post-hoc actuator filter once deployed through regressed
 # networks: 98.4% held-out violation vs 24.6%. See ncm_synthesis.py's matching note.
 # Recover with `git log -S CVSTEMBoundedLQRBase`.

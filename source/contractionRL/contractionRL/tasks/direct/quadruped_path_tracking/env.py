@@ -26,7 +26,7 @@ class QuadrupedPathTrackingEnv(PathTrackingBase):
     "Option A": world SE(2) pose (xy, yaw) + body-frame twist — xy/yaw are
     cyclic w.r.t. the dynamics (never appear in f(x)/B(x), only their
     derivatives do via base_lin/ang_vel_b), so this is the minimal Markov
-    floating-base state that ALSO tracks the world path. yaw is the only raw
+    floating-base state that also tracks the world path. yaw is the only raw
     (wrapping) angle — angle_idx=[2] — every network embeds it continuously.
     """
 
@@ -60,7 +60,7 @@ class QuadrupedPathTrackingEnv(PathTrackingBase):
     def state_names(self) -> tuple[str, ...]:
         """Matches _get_physical_state's concatenation order exactly.
 
-        xy_rel and yaw are the only WORLD-frame quantities; projected gravity,
+        xy_rel and yaw are the only world-frame quantities; projected gravity,
         the joint states and both root velocities are body frame, hence already
         yaw invariant -- which is what makes the full SE(2) quotient valid here.
         """
@@ -135,8 +135,8 @@ class QuadrupedPathTrackingEnv(PathTrackingBase):
         quat = quat_from_euler_xyz(zeros, zeros, yaw_ref + yaw_noise)
         root[:, 3:7] = quat
 
-        # base twist is stored BODY-frame in x, but write_root_velocity_to_sim
-        # expects WORLD frame — rotate by the (yaw-only) orientation we just set.
+        # base twist is stored body-frame in x, but write_root_velocity_to_sim
+        # expects world frame — rotate by the (yaw-only) orientation we just set.
         root_vel = torch.cat(
             [quat_apply(quat, base_lin_vel_ref), quat_apply(quat, base_ang_vel_ref)], dim=-1
         )

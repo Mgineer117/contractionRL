@@ -6,7 +6,7 @@
 # best_agent.pt is reloaded and rolled out, and the resulting Stability numbers
 # (AUC, overshoot C, contraction rate lambda, contraction score, total reward)
 # land in eval_results.json inside that run's log dir. Nothing here re-runs the
-# evaluation; --skip_final_eval is therefore NEVER passed, since that json IS
+# evaluation; --skip_final_eval is therefore never passed, since that json is
 # the thing being aggregated.
 #
 # Every run is stamped with the same CRL_RUN_TAG (see train_utils._run_metadata),
@@ -23,7 +23,7 @@
 #   ./run_seeds.sh --aggregate-only --tag seeds_20260720_120000
 #
 # Flags (all optional; anything omitted is prompted for):
-#   --algorithms LIST    comma/space separated: ppo, sac, c3m, lqr, sdlqr,
+#   --algorithms list    comma/space separated: ppo, sac, c3m, lqr, sdlqr,
 #                        cvstem-lqr, c2rl-ppo, c2rl-sac
 #   --env NAME           car|cartpole|segway|turtlebot|quadrotor, an Isaac Lab
 #                        task id, or 'all' for every classic env
@@ -302,7 +302,7 @@ for ENV in "${ENVS[@]}"; do
 
             DONE=$((DONE + 1))
             # Throttle to --parallel concurrent runs. `wait -n` returns as soon
-            # as ANY child finishes, which keeps the pipe full instead of
+            # as any child finishes, which keeps the pipe full instead of
             # stalling on the slowest run of each batch of N.
             while [[ "$(jobs -rp | wc -l)" -ge "$PARALLEL" ]]; do
                 wait -n 2>/dev/null || true

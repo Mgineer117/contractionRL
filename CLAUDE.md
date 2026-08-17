@@ -83,9 +83,9 @@ is in README.md — read it before guessing at a flag.
 
 **Observation**: `obs = {x, xrefs, urefs}` (a gymnasium `Dict`), where
 `xrefs[k] = xref[t + k*ref_offset]` for `k = 0..ref_length-1`, clamped at the episode end.
-`xrefs[0]`/`urefs[0]` are the CURRENT reference. `agents/skrl/ref_window.py` owns the layout:
+`xrefs[0]`/`urefs[0]` are the current reference. `agents/skrl/ref_window.py` owns the layout:
 `RefWindow.from_space` is how every model learns its input shape (nothing infers a layout from
-`obs_dim`), `RefWindow.split` is the ONLY place that knows the flat ordering skrl produces
+`obs_dim`), `RefWindow.split` is the only place that knows the flat ordering skrl produces
 (`sorted(keys)` -> `[urefs, x, xrefs]`), and `Feats` owns the relative-position /
 wrapped-angle / SE(2) feature maps that every network input goes through.
 `RefWindow.check_markov` warns when the window is too short to span `1/(1-gamma)` — a shorter

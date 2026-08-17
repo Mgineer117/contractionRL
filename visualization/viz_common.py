@@ -1,6 +1,6 @@
 """Shared utilities for the standalone visualization scripts (classic envs only).
 
-Everything here is READ-ONLY with respect to the main codebase: it imports the
+Everything here is read-Only with respect to the main codebase: it imports the
 classic envs and the agents' network/math modules but never modifies them, and
 none of the training/eval code imports this package back.
 
@@ -28,8 +28,8 @@ Normalized error (the quantity every plot shows):
     r(t) = sqrt( e_tᵀ M(x_t) e_t / e_0ᵀ M(x_0) e_0 ),   e_t = wrap(x_t - xref_t)
 
 Scope — u_dim <= 2 only (car/turtlebot 2, cartpole/segway 1). A deliberate
-restriction, not a limitation to work around: at one or two inputs the FULL
-control space is plottable, so the landscape is COMPLETE, with no projection and
+restriction, not a limitation to work around: at one or two inputs the full
+control space is plottable, so the landscape is complete, with no projection and
 no information loss (u_dim 1 -> a t x u surface; u_dim 2 -> a u0 x u1 surface
 animated over t).
 
@@ -37,7 +37,7 @@ Projecting down to a scalar axis (an earlier design) is provably worse: no
 continuous injection R^m -> R^1 exists for m >= 2, so a bijection like
 digit-interleaving is necessarily discontinuous and destroys exactly the
 neighborhood structure the plot's shape depends on. For m > 2 the principled
-reduction is a LINEAR projection onto span(B^T(2Me + w)), the one direction the
+reduction is a linear projection onto span(B^T(2Me + w)), the one direction the
 contraction rate depends on to first order — but at m <= 2 none is needed.
 """
 
@@ -78,7 +78,7 @@ POLICIES_DIR = os.path.join(_VIZ_DIR, "policies")
 OUTPUT_DIR = os.path.join(_VIZ_DIR, "output")
 
 # Fixed categorical hue order from the reference palette. Verified mutually
-# separable for normal vision AND simulated deuteranopia/protanopia (OKLab ΔE),
+# separable for normal vision and simulated deuteranopia/protanopia (OKLab ΔE),
 # so identity never rests on a hue a CVD reader can't resolve. The surface uses
 # viridis, which overlaps these hues, so every overlay additionally carries a
 # white halo/edge for figure-ground separation.
@@ -88,7 +88,7 @@ SERIES_COLORS = {
     "ccm": "#2a78d6",                # blue
     "cvstem_pretrained": "#e87ba4",  # magenta
     "cvstem_online": "#008300",      # green
-    # Deliberately gray: random is the untrained BASELINE, not a fourth
+    # Deliberately gray: random is the untrained baseline, not a fourth
     # competing metric, and gray says so. It is the one entry that intentionally
     # fails the palette chroma floor (chroma 0 "reads as gray" — here that is the
     # message), so like uref it carries secondary encoding (dashed) rather than
@@ -97,7 +97,7 @@ SERIES_COLORS = {
     # against magenta (ΔE 4.0 protan), and a darker #4a4a4a leaves the band.
     "random": "#6e6e6e",
     # The unconditioned M = I baseline (bound_sweep.py). Gray for the same reason
-    # random is, and the SAME gray deliberately: both are reference baselines, not
+    # random is, and the same gray deliberately: both are reference baselines, not
     # competing series, and no figure shows the two together (random is an
     # untrained CMG, so it only appears where CMG objectives are compared, while
     # euclidean only appears where they are all held fixed). If one ever does, this
@@ -108,7 +108,7 @@ SERIES_COLORS = {
     "cvstem_lqr": "#e87ba4",  # magenta
     "lqr": "#eda100",        # yellow
     # Purple, validated against the other four policies (worst all-pairs ΔE 13.0
-    # protan / 16.3 normal). NOT orange, the intuitive "next" hue: #eb6834 fails
+    # protan / 16.3 normal). Not orange, the intuitive "next" hue: #eb6834 fails
     # hard against both green (ΔE 3.2 protan) and magenta (12.9 normal vision).
     "sd_lqr": "#4a3aa7",
     # Near-black, not mid-gray: a mid-gray collides with green under simulated
@@ -129,7 +129,7 @@ METRIC_KINDS = ("ccm", "cvstem_pretrained", "cvstem_online", "random")
 def make_env(env_name: str, seed: int, time_bound: float | None = None):
     """Instantiate a classic env (num_envs=1, cpu) with a seeded reset.
 
-    Seeding happens BEFORE construction: BaseEnv.__init__ calls reset(), and
+    Seeding happens before construction: BaseEnv.__init__ calls reset(), and
     reset draws x0/xref/uref through torch.rand — so the seed fully determines
     the scenario.
     """
@@ -203,7 +203,7 @@ def control_grid(env, scen: Scenario, num_chunks: int, u_range: str = "physical"
 
     Spanning the real actuator box matters: the one-step-optimal control
     satisfies B·u ≈ -e/dt, i.e. ‖u*‖ ~ ‖e‖/dt, so early in an episode the
-    optimum lies OUTSIDE the box (the landscape is a monotone wall — more
+    optimum lies outside the box (the landscape is a monotone wall — more
     feedback is always better) and only comes inside once ‖e‖ has decayed
     enough. A sweep window narrower than the box hides that transition.
     """
@@ -227,13 +227,13 @@ class CCMMetric:
     one forward pass covers any number of states, so geometry code evaluates M
     at every candidate next-state.
 
-    ``random_init`` builds the SAME architecture with the SAME w_lb/w_ub bounds
-    from the SAME config, then simply does not load the trained weights: the
+    ``random_init`` builds the same architecture with the same w_lb/w_ub bounds
+    from the same config, then simply does not load the trained weights: the
     untrained-CMG control baseline. Holding everything but the weights fixed is
     what makes the comparison attributable to training rather than to
     architecture or bounds. Note the baseline is not "no metric" — a random CMG
     is still a bounded SPD field, so any structure its landscape shows is
-    structure the ARCHITECTURE AND BOUNDS impose for free, before learning. That
+    structure the architecture and bounds impose for free, before learning. That
     is the point: it is the floor a trained CCM has to beat.
     """
 
@@ -263,7 +263,7 @@ class CCMMetric:
         if bounded:
             kwargs.update(w_lb=self.w_lb, w_ub=self.w_ub)
         if random_init:
-            # Seeded LOCALLY: a fresh generator's draw must be reproducible
+            # Seeded locally: a fresh generator's draw must be reproducible
             # without perturbing the global RNG the scenario/env were seeded from.
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(seed)
@@ -276,7 +276,7 @@ class CCMMetric:
             p.requires_grad_(False)
         self._x_dim = scen.x_dim
         # Contraction rate the CMG was trained against — for the e^{-λt} guide.
-        # Kept for the random baseline too: it is the rate the TRAINED net targets,
+        # Kept for the random baseline too: it is the rate the trained net targets,
         # drawn as the same reference line, not a claim the baseline achieves it.
         self.lbd = float(cfg.get("cm", {}).get("lbd", cfg.get("agent", {}).get("lbd", 0.5)))
         self.name = (f"random (untrained, seed {seed}, arch of "
@@ -293,7 +293,7 @@ class CCMMetric:
 class CVSTEMMetric:
     """M(x) from the pointwise CV-STEM SDP solved online at each queried state
     (same LMI cvstem_lqr's metric_source="online" deploys). One cvxpy solve per
-    state — NOT batched, so geometry code reuses a single per-timestep M for
+    state — not batched, so geometry code reuses a single per-timestep M for
     all control candidates of that step (the metric varies with the state, not
     the candidate control, and one dt of state spread is small)."""
 
@@ -352,8 +352,8 @@ class CVSTEMPretrainedMetric:
     Batched: once fitted, M(x) is a network forward pass, so the metric is
     evaluated at every candidate next-state like the CCM one. The certificate
     is only as tight as the regression fit — which is precisely what makes this
-    worth showing NEXT TO the online SDP metric: the gap between the two
-    geometries IS the regression error.
+    worth showing next to the online SDP metric: the gap between the two
+    geometries is the regression error.
 
     The per-state SDP solve is the expensive part, so the {x, W*} dataset is
     cached (keyed on the full SDP config — any knob change re-solves).
@@ -439,18 +439,18 @@ class CVSTEMPretrainedMetric:
 
 
 class CCMTrainedMetric:
-    """M(x) from a CMG trained to MINIMIZE THE C1/C2 CONTRACTION LOSSES —
+    """M(x) from a CMG trained to minimize the C1/C2 contraction losses —
     ``ncm_synthesis.train_cmg_ccm``, i.e. c2rl's ``cmg_method="ccm"`` path: the
     Manchester CCM conditions enforced pointwise by gradient descent, with no
     per-state SDP and no MSE regression.
 
     This is the exact counterpart of ``CVSTEMPretrainedMetric``: same network,
-    same bounds, same state sampling — the ONLY difference is the objective the
+    same bounds, same state sampling — the only difference is the objective the
     CMG was fitted with (C1/C2 contraction losses here vs MSE onto CV-STEM SDP
     solutions there). That is what makes the two geometries a clean comparison
     of the two synthesis formulations rather than of two arbitrary checkpoints.
 
-    Deliberately NOT loaded from a checkpoint. c3m.pt's CMG is trained jointly
+    Deliberately not loaded from a checkpoint. c3m.pt's CMG is trained jointly
     with its controller on ``pd_loss + c1_loss + c2_loss (+ os_loss)``, so it is
     co-adapted to that controller and is not "the C1/C2 metric"; c2rl_ppo.pt's
     CMG is a genuine C1/C2 fit, but only when its config says cmg_method=ccm,
@@ -487,7 +487,7 @@ class CCMTrainedMetric:
         lr = float(cmg.get("cmg_regress_lr", 1e-3))
         batch_size = int(cmg.get("cmg_regress_batch_size", 1024))
         random_ratio = float(cmg.get("cmg_random_ratio", 0.0))
-        # Default to the config's OWN budget (what c2rl trains this CMG with),
+        # Default to the config's own budget (what c2rl trains this CMG with),
         # not to --cmg-samples: that flag sizes the CV-STEM SDP dataset, where
         # every sample costs a solve, whereas the C1/C2 path has no SDP and is
         # cheap per sample. Undersizing it here silently starves the fit —
@@ -504,8 +504,8 @@ class CCMTrainedMetric:
 
         if random_init:
             # The untrained control baseline: identical network, bounds and
-            # config to the C1/C2 fit above — the ONLY difference is that
-            # train_cmg_ccm never runs. Seeded LOCALLY so a fresh draw cannot
+            # config to the C1/C2 fit above — the only difference is that
+            # train_cmg_ccm never runs. Seeded locally so a fresh draw cannot
             # perturb the global RNG the scenario/env were seeded from.
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(seed)
@@ -570,8 +570,8 @@ def make_metric(kind: str, env, scen: Scenario, *, metric_ckpt: str | None = Non
                 metric_cfg: dict | None = None, solver: str | None = None,
                 cmg_samples: int = 16384, ccm_samples: int | None = None,
                 cache_dir: str | None = None, random_seed: int = 0):
-    """Build a conditioning metric. Each kind is defined by THE OBJECTIVE ITS CMG
-    MINIMIZES, not by whichever checkpoint happens to be on disk — that is what
+    """Build a conditioning metric. Each kind is defined by the objective its CMG
+    minimizes, not by whichever checkpoint happens to be on disk — that is what
     makes the geometries a comparison of synthesis formulations:
 
       * "ccm"              — CMG trained to minimize the C1/C2 contraction losses
@@ -581,16 +581,16 @@ def make_metric(kind: str, env, scen: Scenario, *, metric_ckpt: str | None = Non
                              regress_cmg). Batched.
       * "cvstem_online"    — no CMG at all: the CV-STEM SDP re-solved at every
                              state. Not batched.
-      * "random"           — UNTRAINED CMG: "ccm"'s architecture, config and
+      * "random"           — untrained CMG: "ccm"'s architecture, config and
                              w_lb/w_ub bounds with no training at all. The
                              control baseline: structure the trained metrics show
                              is only creditable to their objective insofar as it
                              exceeds this.
 
     ``metric_ckpt`` overrides "ccm" with a stored CMG instead. Use it knowingly:
-    c3m.pt's CMG is trained JOINTLY with its controller on
+    c3m.pt's CMG is trained jointly with its controller on
     ``pd_loss + c1_loss + c2_loss (+ os_loss)``, so it is co-adapted to that
-    controller and is NOT a pure C1/C2 metric; c2rl_ppo.pt's is a real C1/C2 fit
+    controller and is not a pure C1/C2 metric; c2rl_ppo.pt's is a real C1/C2 fit
     only when its config sets cmg_method=ccm.
     """
     env_name = getattr(env, "task", None)
@@ -649,7 +649,7 @@ _CFG_FILENAMES = {
 
 def load_algo_cfg(env_name: str, algo: str) -> dict:
     """Resolve an algorithm's yaml config: visualization/policies/<env>/<algo>.yaml
-    first (the config stored NEXT TO the checkpoint — authoritative for actor
+    first (the config stored next to the checkpoint — authoritative for actor
     dims), then the task's default agent yaml."""
     local = os.path.join(POLICIES_DIR, env_name, f"{algo}.yaml")
     if os.path.exists(local):
@@ -767,10 +767,10 @@ def load_checkpoint_policy(env, scen: Scenario, env_name: str, algo: str):
 
 
 def make_lqr_policy(env, scen: Scenario, env_name: str, *, at_state: bool = False):
-    """LQR-family control law: A = ∂f/∂x|_z + Σⱼ urefⱼ·∂Bⱼ/∂x|_z, CARE gain,
+    """LQR-family control law: A = ∂f/∂x|_z + Σⱼ urefⱼ·∂Bⱼ/∂x|_z, care gain,
     u = uref - K·e.
 
-    ``at_state`` picks the linearisation point z, which is the ONLY difference
+    ``at_state`` picks the linearisation point z, which is the only difference
     between the two agents this mirrors:
       * False → z = xref: classic LQR (sdlqr.LQRAgent). One fixed gain per
         reference point; the gain does not know where the state actually is.
@@ -867,17 +867,17 @@ def trunk_states(env, scen: Scenario, mode: str = "cvstem_lqr", *, env_name: str
                  ) -> tuple[torch.Tensor, torch.Tensor]:
     """The state/control sequence the error geometry is built along ("the trunk").
 
-    The trunk fixes WHERE the landscape is sampled; the candidate grid swept at
+    The trunk fixes where the landscape is sampled; the candidate grid swept at
     each trunk state is a throwaway branch that never feeds back. A real
     modelling choice, since the trunk decides which region you end up looking at:
 
-      * ``uref`` — zero feedback. The only fully algorithm- AND
+      * ``uref`` — zero feedback. The only fully algorithm- And
         metric-independent mode, so all metrics are compared at identical states.
         Not the default because the error grows unchecked into a badly-tracked
         region no working controller would visit.
       * ``greedy`` — the grid control minimising the ``horizon``-step-ahead
         normalized error, i.e. the best a grid-confined controller could do under
-        ``metric``. Metric-DEPENDENT, so ONE designated metric must drive the
+        ``metric``. Metric-Dependent, so one designated metric must drive the
         trunk for all panels (error_geometry.py --trunk-metric) or the panels sit
         on different trajectories and differences stop being attributable to it.
       * ``cvstem_lqr`` (default) / ``lqr`` / ``sd_lqr`` — follow that analytical
@@ -901,7 +901,7 @@ def trunk_states(env, scen: Scenario, mode: str = "cvstem_lqr", *, env_name: str
         V0 = _V0(scen, metric)   # same normalizer the landscapes use
         xs, us = [scen.x0.unsqueeze(0)], []
         for k in range(scen.T - 1):
-            # Look `h` steps ahead but COMMIT only one step: receding-horizon,
+            # Look `h` steps ahead but commit only one step: receding-horizon,
             # so the trunk is a real trajectory rather than a chain of stale
             # h-step plans.
             h = min(horizon, scen.T - 1 - k)
@@ -988,13 +988,13 @@ def _landscape_step(env, scen: Scenario, metric, x_k: torch.Tensor,
     """Normalized error after holding each candidate control for ``horizon``
     steps from ``x_k``, measured against ``xref[k+horizon]``.
 
-    ``horizon`` exists because a ONE-step lookahead cannot show a basin here.
+    ``horizon`` exists because a one-step lookahead cannot show a basin here.
     The error-minimizing control over a lookahead of ``H`` steps must satisfy
     ``B·u ≈ -e/(H·dt)``, i.e. ``‖u*‖ ~ ‖e‖/(H·dt)``. At H=1 and dt=0.03 that is
     ~33‖e‖, far outside the actuator box for any realistic error, so "more
     feedback is always better" and every slice is a monotone wall — the control
     simply has no time to act. Raising H shrinks the required ‖u*‖ into the box
-    and the true interior optimum becomes visible, WITHOUT reintroducing any
+    and the true interior optimum becomes visible, without reintroducing any
     dependence on a controller.
 
     M is evaluated at each candidate's end-state when the metric is batched
@@ -1021,11 +1021,11 @@ def landscape_steps(scen: Scenario, horizon: int) -> int:
 def compute_landscape_1d(env, scen: Scenario, metric, x: torch.Tensor,
                          u: torch.Tensor, levels: torch.Tensor,
                          horizon: int = 1) -> np.ndarray:
-    """u_dim == 1: the COMPLETE t × u error landscape → ``(C, K)``.
+    """u_dim == 1: the complete t × u error landscape → ``(C, K)``.
 
     ``heat[c, k]`` = normalized error after holding the single control
     ``levels[0, c]`` for ``horizon`` steps from the visited state ``x[k]``.
-    With one input the swept axis IS the whole control space, so this loses
+    With one input the swept axis is the whole control space, so this loses
     nothing.
     """
     C = levels.shape[1]
@@ -1042,7 +1042,7 @@ def compute_landscape_1d(env, scen: Scenario, metric, x: torch.Tensor,
 def compute_landscape_2d(env, scen: Scenario, metric, x: torch.Tensor,
                          u: torch.Tensor, levels: torch.Tensor,
                          frames: np.ndarray, horizon: int = 1) -> np.ndarray:
-    """u_dim == 2: the COMPLETE u0 × u1 error landscape per frame → ``(C, C, F)``.
+    """u_dim == 2: the complete u0 × u1 error landscape per frame → ``(C, C, F)``.
 
     ``heat[i, j, f]`` = normalized error after holding
     ``(levels[0, i], levels[1, j])`` for ``horizon`` steps from the visited

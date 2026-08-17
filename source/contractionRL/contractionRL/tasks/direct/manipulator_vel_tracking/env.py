@@ -137,7 +137,7 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
         self._episode_vel_auc += err_norm
         self._episode_vel_last = err_norm.detach().clone()
 
-        # episode_length_buf is incremented to 1 BEFORE _get_rewards runs (see
+        # episode_length_buf is incremented to 1 before _get_rewards runs (see
         # DirectRLEnv.step), so it is never 0 here — use <= 1 to capture the
         # first reward step. Matches quadruped_vel_tracking.
         is_first_step = self.episode_length_buf <= 1
@@ -185,7 +185,7 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
                 # Same "Reward/total_reward_*" keys, and same per-episode-reset
                 # cadence as the Stability tab, that C3M's eval loop emits via
                 # track_reward_summary — skrl's own "Reward / Total reward
-                # (mean)" tracker uses a DIFFERENT key name and can't be unified
+                # (mean)" tracker uses a different key name and can't be unified
                 # with it, so it was leaving total_reward_mean written only once
                 # (by the post-training evaluator) instead of throughout training.
                 from contractionRL.agents.skrl.contraction_metrics import reward_log_dict, reward_summary

@@ -76,7 +76,7 @@ agent:
   kl_threshold: 0.02 # Early stopping threshold based on Kullback-Leibler divergence
   time_limit_bootstrap: true  # Bootstrap value at episode truncation instead of treating it as terminal
   rewards_shaper_scale: 1.0
-  use_state_norm: false  # OFF by default — see c2rl.py module docstring / rl_glue.make_base_rl_cfg
+  use_state_norm: false  # Off by default — see c2rl.py module docstring / rl_glue.make_base_rl_cfg
   use_value_norm: true   # Same, but for the value function's output (PPO only)
   use_reward_norm: false  # Non-biasing running-std reward normalizer (r/std, no centering) — tames the
                           # w_lb/w_ub-dependent Mahalanobis-reward scale/heavy-tail before GAE; see rl_glue.
@@ -129,7 +129,7 @@ cm:
   #              action range — see ncm_synthesis.py module docstring.
   cmg_method: ccm
   cvstem_r_scaler: 1.0  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only
-  # On SDP infeasibility AT A GIVEN STATE, retry that state alone with λ
+  # On SDP infeasibility at a given state, retry that state alone with λ
   # halved, up to this many times, before giving up on it and dropping it from
   # the dataset — 0 disables this and reverts to dropping immediately. Warns
   # per reduced state + an aggregate summary (build_cm_dataset). "cvstem" only.
@@ -163,7 +163,7 @@ cmg:
 #    true (classic envs only) to learn a NeuralDynamics instead. ─────────────── #
 empirical_dynamics:
   use_empirical_dynamics: false  # false = env analytical get_f_and_B; true = learn NeuralDynamics
-  # States×controls for ONLINE dynamics-data generation (use_empirical_dynamics=true
+  # States×controls for online dynamics-data generation (use_empirical_dynamics=true
   # with no dynamics_pretrain_data_path): samples ceil(memory_size / N) states and
   # pairs each with N distinct controls → N control-aware samples per state. Only
   # affects NeuralDynamics pretraining; ignored under analytical dynamics. Default 3.

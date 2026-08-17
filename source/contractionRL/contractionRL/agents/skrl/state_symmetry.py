@@ -3,7 +3,7 @@
 Why names instead of index lists
 --------------------------------
 An env used to declare its structure as two integer facts: ``pos_dimension``
-(how many LEADING dims are position) and ``angle_idx`` (which dims wrap). That
+(how many leading dims are position) and ``angle_idx`` (which dims wrap). That
 was enough for the translation quotient but not for rotation, and it was easy to
 get wrong silently — nothing tied index 2 to "this is a yaw", so a reader (or a
 new env) had no way to know which dims must co-rotate.
@@ -16,13 +16,13 @@ Instead each env now declares ``state_names``: one name per state dim, e.g.
     quadrotor  = ("pos_x", "pos_y", "pos_z", "vel_x_w", "vel_y_w", "vel_z_w",
                   "thrust", "roll", "pitch", "yaw")
 
-``pos_dimension`` and ``angle_idx`` are then DERIVED from the names (and kept as
+``pos_dimension`` and ``angle_idx`` are then derived from the names (and kept as
 properties, so every existing consumer keeps working).
 
 The frame suffix on velocities is load-bearing
 ----------------------------------------------
-``vel_x_w`` is a WORLD-frame component: rotating the scene rotates it, so it
-must be co-rotated with the position pair. ``vel_x_b`` is a BODY-frame
+``vel_x_w`` is a world-frame component: rotating the scene rotates it, so it
+must be co-rotated with the position pair. ``vel_x_b`` is a body-frame
 component: it is already yaw-invariant and must be left alone. Getting this
 backwards silently breaks the rotation quotient, so an unrecognised name
 disables the quotient rather than being assumed invariant (see
@@ -38,7 +38,7 @@ The two symmetries
 ``se2``          translation + rotation about z. Additionally requires a
                  ``yaw`` dim and a ``pos_x``/``pos_y`` pair, and that every
                  other dim is yaw-invariant. Canonicalizing means rotating the
-                 whole scene so the REFERENCE yaw is zero, which turns the
+                 whole scene so the reference yaw is zero, which turns the
                  position error into (longitudinal, lateral) error in the
                  reference frame and drops the absolute heading entirely.
 
@@ -57,7 +57,7 @@ import torch
 from .angle_utils import embed_angles, embedded_dim, wrap_diff
 
 # ── Name vocabulary ──────────────────────────────────────────────────────── #
-# World-frame planar position: translates AND rotates.
+# World-frame planar position: translates and rotates.
 _POS_XY = ("pos_x", "pos_y")
 # Translates but does not rotate (the rotation axis).
 _POS_Z = ("pos_z",)
@@ -67,7 +67,7 @@ _YAW = "yaw"
 _VEL_XY_W = ("vel_x_w", "vel_y_w")
 # Dims that hold a raw wrapping angle and so need (cos, sin) embedding.
 _ANGULAR = frozenset({"roll", "pitch", "yaw"})
-# Everything below is invariant to BOTH translation and yaw rotation. Body-frame
+# Everything below is invariant to both translation and yaw rotation. Body-frame
 # quantities (suffix _b), joint states, and projected gravity are yaw-invariant
 # by construction; scalar speeds and forces have no planar direction at all.
 _INVARIANT_EXACT = frozenset({
@@ -89,7 +89,7 @@ def _is_invariant(name: str) -> bool:
 class StateSymmetry:
     """The symmetry the networks may quotient out, plus the feature maps.
 
-    ``mode`` is the ONLY thing callers branch on: "none" reproduces the historic
+    ``mode`` is the only thing callers branch on: "none" reproduces the historic
     absolute-observation behaviour exactly, so an env whose names are not fully
     understood, or whose dynamics fail the numerical equivariance check, keeps
     the previous semantics rather than being mis-modelled.
@@ -113,7 +113,7 @@ class StateSymmetry:
         if not pos_idx:
             return cls(x_dim, names, "none", angle_idx=angle_idx)
 
-        # Rotation additionally needs a yaw, a full pos_x/pos_y pair, and EVERY
+        # Rotation additionally needs a yaw, a full pos_x/pos_y pair, and every
         # remaining dim to be a recognised yaw-invariant name. An unknown name
         # fails closed to translation.
         idx = {n: i for i, n in enumerate(names)}
@@ -151,7 +151,7 @@ class StateSymmetry:
     # ── derived legacy views ────────────────────────────────────────────── #
     @property
     def pos_dimension(self) -> int:
-        """Back-compat: the historic LEADING-block position count. Only equal to
+        """Back-compat: the historic leading-block position count. Only equal to
         ``len(pos_idx)`` when the position dims really are the leading block —
         which they are in every env here, but the feature maps below use
         ``pos_idx`` directly so they do not depend on it."""
@@ -184,9 +184,9 @@ class StateSymmetry:
         d/d(dropped dim) is identically 0 by construction rather than a small
         number the optimiser has to push down.
 
-        NOTE for SE(2): this drops the absolute yaw WITHOUT rotating anything,
+        NOTE for SE(2): this drops the absolute yaw without rotating anything,
         so it is a valid map only for quantities that are themselves yaw
-        invariant. W(x) is NOT — a metric transforms as a tensor, W(g.x) =
+        invariant. W(x) is not — a metric transforms as a tensor, W(g.x) =
         dg W(x) dg^T — so the CMG deliberately stays on the translation quotient
         (see contraction_runner._resolve_symmetry).
         """
@@ -222,7 +222,7 @@ class StateSymmetry:
                               self.single_features(x),
                               self.single_features(xref)], dim=-1)
 
-        # ── SE(2): rotate the whole scene so the REFERENCE yaw is zero ──── #
+        # ── SE(2): rotate the whole scene so the reference yaw is zero ──── #
         yaw_ref = xref[..., self.yaw_idx]
         cos, sin = torch.cos(-yaw_ref), torch.sin(-yaw_ref)
         x_r, xref_r = self._rotate(x, cos, sin), self._rotate(xref, cos, sin)
@@ -238,7 +238,7 @@ class StateSymmetry:
         """Apply the planar rotation to every co-rotating (x, y) pair and to yaw.
 
         ``cos``/``sin`` are per-sample (shape ``x.shape[:-1]``), so each sample is
-        rotated into its OWN reference frame.
+        rotated into its own reference frame.
         """
         out = x.clone()
         for ix, iy in self.rot_pairs:
@@ -256,14 +256,14 @@ class StateSymmetry:
     def error_features(self, x: torch.Tensor, xref: torch.Tensor) -> torch.Tensor:
         """The tracking error CLActor's bilinear feedback multiplies, expressed in
         the canonical frame. Full ``x_dim`` width — every state dim still gets
-        feedback; only the FRAME changes.
+        feedback; only the frame changes.
 
         Canonicalizing the gain-net inputs is not enough on its own: the control
         law is ``u = W2(feats) tanh(W1(feats) e)``, so if ``e`` stays in world
         coordinates its position components rotate with the scene and ``u`` moves
         even when the features do not. Under SE(2) the position pairs are rotated
-        by ``R(-yaw_ref)``, which makes the feedback act on the LONGITUDINAL /
-        LATERAL error in the reference frame — the physically meaningful
+        by ``R(-yaw_ref)``, which makes the feedback act on the longitudinal /
+        lateral error in the reference frame — the physically meaningful
         parameterisation for a planar vehicle — and the heading term on the
         shortest-angle yaw error.
 
@@ -299,7 +299,7 @@ class StateSymmetry:
 
     def verify_rotation(self, get_f_and_B, x_min, x_max, *, samples=256,
                         atol=1e-4) -> bool:
-        """f and B must be EQUIVARIANT, not invariant: rotating the state must
+        """f and B must be equivariant, not invariant: rotating the state must
         rotate f and B's rows the same way.
 
             f(R.x) = R f(x)      B(R.x) = R B(x)
@@ -325,7 +325,7 @@ class StateSymmetry:
             return False
 
     def _rotate_tangent(self, v: torch.Tensor, cos, sin) -> torch.Tensor:
-        """Rotate a TANGENT vector (f, or a column of B). Same planar pairs as
+        """Rotate a tangent vector (f, or a column of B). Same planar pairs as
         the state, but yaw's tangent component is a rate, which is rotation
         invariant — so unlike ``_rotate`` there is no additive yaw shift."""
         out = v.clone()

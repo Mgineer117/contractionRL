@@ -1,10 +1,10 @@
 """Feature 2 — policy controls on a shared error geometry.
 
-The landscape here is the SAME geometry error_geometry.py draws: one metric,
+The landscape here is the same geometry error_geometry.py draws: one metric,
 evaluated along one trunk trajectory (``viz_common.trunk_states``, default
-``cvstem_lqr``). Every policy is overlaid on that ONE shared landscape, which is
-what makes them comparable: each is asked what it would command AT THE SAME
-STATE, and you read off who picks the better control.
+``cvstem_lqr``). Every policy is overlaid on that one shared landscape, which is
+what makes them comparable: each is asked what it would command at the same
+state, and you read off who picks the better control.
 
 ``--trunk`` moves those shared states without ever breaking that sharing, but it
 is a real trade-off here and worth choosing knowingly. The default
@@ -157,7 +157,7 @@ def main():
     print(f"[overlay] env={args.env} T={scen.T} u_dim={scen.u_dim} "
           f"metric={metric.name} policies={names}")
 
-    # ── the shared geometry: ONE trunk, ONE landscape, every policy on it ── #
+    # ── the shared geometry: One trunk, one landscape, every policy on it ── #
     levels = control_grid(env, scen, args.num_chunks, args.u_range)
     x_ol, u_ol = trunk_states(env, scen, args.trunk, env_name=args.env,
                               metric=metric, levels=levels,
@@ -168,7 +168,7 @@ def main():
             if scen.u_dim == 1 else
             compute_landscape_2d(env, scen, metric, x_ol, u_ol, levels, frames, args.lookahead))
 
-    # ── per policy: commanded control AT the shared states, + own rollout ─── #
+    # ── per policy: commanded control at the shared states, + own rollout ─── #
     cmd: dict[str, np.ndarray] = {}
     own: dict[str, dict] = {}
     for name in names:

@@ -33,17 +33,17 @@ def fit_exponential_envelope(
     at 1 and C >= 1 is a pure overshoot factor (xe(t) <= C * exp(-lambda * t)).
     Then, following the paper's "Convergence rate" procedure verbatim:
 
-      (1) The curve with the HIGHEST OVERSHOOT (largest peak of the normalized
-          error) is selected. On that curve ALONE we search the convergence
+      (1) The curve with the highest overshoot (largest peak of the normalized
+          error) is selected. On that curve alone we search the convergence
           rate lambda > 0 and overshoot C >= 1 such that xe(t) <= C*exp(-lambda*t)
           for all t in [0, T] and the AUC of C*exp(-lambda*t) over [0, T] is
           minimized. This fixes C = C*.
-      (2) With C* fixed, the convergence rate lambda is computed for EACH curve
+      (2) With C* fixed, the convergence rate lambda is computed for each curve
           as the tightest rate that keeps it under the C* envelope:
               lambda_j = min_t (ln C* - ln xe_j(t)) / t.
 
     Args:
-        error_trajectories: list of 1-D arrays of RAW tracking-error norms
+        error_trajectories: list of 1-D arrays of raw tracking-error norms
             (normalization by e(0) is done here); sample i is at time (i+1)*dt.
         dt: environment step time [s].
 

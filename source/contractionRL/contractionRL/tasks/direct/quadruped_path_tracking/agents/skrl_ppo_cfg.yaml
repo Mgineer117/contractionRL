@@ -67,9 +67,9 @@ agent:
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.01
   use_state_norm: false
-  # OFF, measured 2026-08-08. Turning these ON to tame the Mahalanobis
-  # reward was REFUTED by the 4-gamma x 20-seed grid: paired on gamma AND
-  # seed (n=38), normalization was WORSE in 26/38 (median AUC +0.215), and
+  # Off, measured 2026-08-08. Turning these on to tame the Mahalanobis
+  # reward was refuted by the 4-gamma x 20-seed grid: paired on gamma and
+  # seed (n=38), normalization was worse in 26/38 (median AUC +0.215), and
   # every auc>8 outlier in the whole grid was a normalized run (4/53 vs
   # 0/44). r/std keeps rescaling as the frozen-CMG reward drifts, and the
   # value preprocessor's +-5 sigma clamp truncates exactly the large-error

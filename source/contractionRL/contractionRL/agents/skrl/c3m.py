@@ -24,14 +24,14 @@ see ``update()`` and ``_learn()`` below):
   2. **``_learn()``** — one full pass over ``self._data`` (a static/periodically
      -refreshed buffer of ``(x, xref, uref)`` triples from
      ``get_rollout(..., "c3m")``) in ``batch_size`` chunks. For each chunk,
-     ``_compute_loss`` builds the SAME combined loss (``pd_loss + c1_loss +
+     ``_compute_loss`` builds the same combined loss (``pd_loss + c1_loss +
      c2_loss (+ os_loss)``) over both networks, and ``_optimize_params`` takes
-     ONE joint gradient step — CMG and controller updated simultaneously from
+     one joint gradient step — CMG and controller updated simultaneously from
      the same backward pass, matching the reference C3M training script. (An
      earlier version alternated — CMG-only step, then controller-only step,
      each with a fresh forward/backward — mirroring a different, unrelated
      codebase's convention; that alternation made training a stale-view
-     chasing dynamic between the two networks, similar to GAN training
+     chasing dynamic between the two networks, similar to gan training
      instability, and was found to be substantially more seed-sensitive than
      the reference's simultaneous update — see git history for the A/B.)
 
@@ -39,7 +39,7 @@ Normalization: **none**. Unlike C2RL, C3M's policy/CMG are bare
 ``nn.Module``s wrapped directly in skrl ``Model``s — they are never wrapped in
 a ``PPO``/``SAC`` base agent, so there is no ``observation_preprocessor``/
 ``value_preprocessor`` anywhere in this file. Every network call
-(``_compute_loss``, ``_train_dynamics``) sees the SAME raw ``(x, xref, uref)``
+(``_compute_loss``, ``_train_dynamics``) sees the same raw ``(x, xref, uref)``
 physical-unit values everywhere, at both training and eval time (``eval()``
 below, and ``C3MSkrlTrainer.eval()``) — there is no train/eval or
 loss-vs-inference input-distribution gap to worry about (contrast with
@@ -94,16 +94,16 @@ class C3MCfg(AgentCfg):
     # QR-orthonormalize the control annihilator B_null before the C1/C2
     # projections. The envs supply B_null as a non-orthonormal basis (turtlebot's
     # columns carry factors like k₂·sinθ·k₃), so the C1_reg = C1 + ε·I margin
-    # means a different thing at every state AND the random-projection PD loss
+    # means a different thing at every state and the random-projection PD loss
     # weights each state by ‖B_null‖² — the same inconsistency
     # ncm_synthesis.train_cmg_ccm's own orthonormalize_bbot option fixes via QR.
-    # OFF by default here (unlike there, where QR is free): C1/C2 are the
-    # TRAINING SIGNAL, so orthonormalizing
+    # Off by default here (unlike there, where QR is free): C1/C2 are the
+    # Training signal, so orthonormalizing
     # reweights the loss across states and shifts C3M's (seed-sensitive) training
     # dynamics — enable to A/B, not silently. Feasible set is unchanged either way.
     orthonormalize_bbot: bool = False
     # Multiplies (c1_loss + c2_loss) before summing into the total loss, e.g.
-    # 0.1 → loss = os_loss + pd_loss + 0.1 * (c1_loss + c2_loss). Does NOT touch
+    # 0.1 → loss = os_loss + pd_loss + 0.1 * (c1_loss + c2_loss). Does not touch
     # pd_loss/os_loss — only C1/C2 (the open-loop metric-feasibility conditions),
     # letting the closed-loop controller term (pd_loss, Cu) dominate training
     # when C1/C2 are noisy/dominant early on. Defaults to 1.0 (no-op, matches
@@ -118,9 +118,9 @@ class C3MCfg(AgentCfg):
     detach_warmup_frac: float = 1.0 / 3.0
     # Random directions sampled per loss_pos_matrix_random_sampling() call (the
     # PD-violation hinge loss for pd_loss/c1_loss/os_loss). This is a pure
-    # statistical-coverage knob — it does NOT affect numerical stability
+    # statistical-coverage knob — it does not affect numerical stability
     # (unlike an eigenvalue-decomposition loss, this method never
-    # differentiates through an eigendecomposition at ANY sample count).
+    # differentiates through an eigendecomposition at any sample count).
     # The reference script used 1024, but that's overkill for a loss called
     # every SGD step (not a one-shot certificate): for low-dimensional systems
     # (x_dim ~4-6, e.g. classic car/cartpole/segway/turtlebot) 1024 directions
@@ -132,7 +132,7 @@ class C3MCfg(AgentCfg):
     # Defaults to always-on: an unbounded LR indefinitely re-visiting the same
     # static offline buffer (see module docstring) is a major driver of the
     # late-training drift/degradation this schedule is meant to damp. Configs
-    # may still override to "" to opt out. Shared across ALL optimizers (CMG,
+    # may still override to "" to opt out. Shared across all optimizers (CMG,
     # controller, and — when use_empirical_dynamics — NeuralDynamics); there is
     # no separate dynamics-only scheduler knob.
     learning_rate_scheduler: str = "ExponentialLR"
@@ -141,7 +141,7 @@ class C3MCfg(AgentCfg):
     dynamics_batch_size: int = 4096
     dynamics_pretrain_epochs: int = 5
     dynamics_pretrain_data_path: str = ""
-    # Fixed pretraining buffer size — sampled ONCE (offline-data subsample when
+    # Fixed pretraining buffer size — sampled once (offline-data subsample when
     # dynamics_pretrain_data_path is set, else a fresh get_rollout draw), then
     # multi-epoch trained over, mirroring cmg_memory_size's role in C2RL's CMG
     # synthesis (see dynamics_pretrain.pretrain_dynamics). Classic envs can
@@ -222,7 +222,7 @@ class C3MAgent(Agent):
             device=device,
         )
 
-        # The observation space DECLARES its layout ({x, xrefs, urefs}), so
+        # The observation space declares its layout ({x, xrefs, urefs}), so
         # x_dim/u_dim are read, never guessed from obs_dim (the old
         # (obs_dim - u_dim)//2 parity rule silently mis-split any other layout).
         self._window = RefWindow.from_space(observation_space)
@@ -364,7 +364,7 @@ class C3MAgent(Agent):
         return torch.as_tensor(arr).to(torch.float32).to(dev)
 
     def _c3m_pools(self):
-        """(xref, uref) pools for the FUTURE window slots — reuses ``self._data``,
+        """(xref, uref) pools for the future window slots — reuses ``self._data``,
         the same random-triple draw the loss already batches over, so no extra
         rollout is needed. ``None`` when the window is a single point (nothing to
         fill) — ``RefWindow.synth_obs`` then holds the current reference."""
@@ -417,23 +417,23 @@ class C3MAgent(Agent):
         # "backbone name selects the class, class defines the behavior"
         # convention SAC's control-squashed backbone already uses, rather than
         # a boolean flag threaded through here. A hard torch.clamp instead of
-        # the tanh squash would NOT be equivalent: clamp's gradient is exactly
+        # the tanh squash would not be equivalent: clamp's gradient is exactly
         # zero at saturation, so K = jacobian(u, x) collapses to zero there
-        # too, and the certificate degrades to checking the OPEN-LOOP drift
+        # too, and the certificate degrades to checking the open-Loop drift
         # alone in every state that needed feedback most — this is what caused
         # the real AUC divergence documented in project memory
         # (project_c3m_clip_actions_divergence.md,
         # project_c3m_env_divergence_2026-07-10.md).
-        # Window slots 1.. are RANDOM plausible references (see
+        # Window slots 1.. are random plausible references (see
         # RefWindow.synth_obs): the certificate must hold for the window content
         # the actor actually meets, not just a constant one.
         state = self._window.synth_obs(x, xref, uref, *self._c3m_pools())
-        # cuDNN's RNN kernel has NO double-backward support (a hard cuDNN API
+        # cuDNN's RNN kernel has no double-backward support (a hard cuDNN API
         # limitation, not a train/eval-mode issue) and this loss needs exactly
         # that: K = jacobian(u, x, create_graph=True) is itself a backward
         # through this forward, and _optimize_params then backprops through K.
         # Only bites when the reference-window encoder is a GRU (--encoder gru),
-        # which since the window refactor sits inside the CERTIFIED control path
+        # which since the window refactor sits inside the certified control path
         # (CLActor.w2) for every algorithm, C3M included. Disabling cuDNN for
         # this one call switches PyTorch to its generic RNN path, which does
         # support double-backward, at some extra compute cost here only.
@@ -491,7 +491,7 @@ class C3MAgent(Agent):
             os_loss = torch.zeros((), device=device)
         else:
             # Only an upper-bound penalty is needed: W = VᵀV + w_lb·I is bounded
-            # BELOW by construction (bound_W), so a lower-bound loss on it would
+            # Below by construction (bound_W), so a lower-bound loss on it would
             # be a permanent zero-gradient no-op (zᵀ(VᵀV)z = ‖Vz‖² ≥ 0 always).
             overshoot = W - cfg.w_ub * I
             os_loss = loss_pos_matrix_random_sampling(-overshoot, num_samples=n_samp)
@@ -618,7 +618,7 @@ class C3MSkrlTrainer(Trainer):
         timesteps = self.cfg.timesteps
         eval_interval = getattr(self.cfg, "eval_interval", 1)
 
-        # Must be set on the instance attribute BEFORE init(): base Agent.init()
+        # Must be set on the instance attribute before init(): base Agent.init()
         # only creates self.writer when self.write_interval > 0 *at that moment*
         # (self.write_interval starts out as the literal "auto" string from
         # __init__, and init()'s "auto" resolution — timesteps // 100, which is
@@ -658,7 +658,7 @@ class C3MSkrlTrainer(Trainer):
             agent.pre_interaction(timestep=t, timesteps=timesteps)
             agent.update(timestep=t, timesteps=timesteps)
 
-            # Evaluate metrics occasionally. track_*_summary writes the SAME
+            # Evaluate metrics occasionally. track_*_summary writes the same
             # "Stability/..."/"Reward/..." keys (no space around "/") that
             # path_tracking_base.py emits for PPO/SAC, so every algorithm lands
             # on the same wandb tabs for the same metric.
@@ -694,7 +694,7 @@ class C3MSkrlTrainer(Trainer):
         the batched sim, e.g. ``max_episode_length``/``step_dt``). Classic
         envs are N separate Python instances behind a gymnasium
         ``SyncVectorEnv`` (attr named e.g. ``max_episode_len``/``dt``), which
-        does NOT forward arbitrary attribute access — only ``get_attr(name)``
+        does not forward arbitrary attribute access — only ``get_attr(name)``
         reaches the underlying sub-envs.
         """
         for name in names:
@@ -712,11 +712,11 @@ class C3MSkrlTrainer(Trainer):
     def _force_env_reset(self) -> None:
         """Force skrl to genuinely re-reset the underlying vector env.
 
-        skrl's ``GymnasiumWrapper.reset()`` resets the vector env only ONCE and
+        skrl's ``GymnasiumWrapper.reset()`` resets the vector env only once and
         thereafter returns a cached ``self._observation`` (it assumes vector envs
         autoreset inside ``step()``). Under **gymnasium 1.x next-step autoreset**
         (Isaac Sim 5.1 pins gymnasium 1.2.1), that cache holds the previous
-        episode's PARKED terminal observation — where the controller has already
+        episode's parked terminal observation — where the controller has already
         converged, so ``x ≈ xref`` and the initial tracking error ``e0 ≈ 0``.
         The eval AUC is ``(dt / e0)·Σe``, so a near-zero e0 makes AUC explode to
         ~1e7 even though the controller is perfectly stable (a metric artifact,
@@ -755,7 +755,7 @@ class C3MSkrlTrainer(Trainer):
         max_steps = int(self._env_scalar_attr("max_episode_length", "max_episode_len")) + 1
         finished = torch.zeros(num_envs, dtype=torch.bool, device=device)
         total_reward = torch.zeros((num_envs, 1), device=device)
-        # Snapshot the wrapper's compute counter so we can tell whether THIS
+        # Snapshot the wrapper's compute counter so we can tell whether this
         # rollout actually produced fresh metrics (see check after the loop).
         computes_before = getattr(self.env, "_compute_count", None)
 
@@ -790,7 +790,7 @@ class C3MSkrlTrainer(Trainer):
         # Only envs that finished their (first) episode carry valid reward info.
         f_mask = finished if finished.any() else torch.ones_like(finished)
 
-        # Tracking plots are NOT pushed from here: C3M never steps the env
+        # Tracking plots are not pushed from here: C3M never steps the env
         # outside this eval() rollout (see C3MSkrlTrainer.train() docstring —
         # "no env interaction during training"), so WandbPlotWrapper (scripts/
         # skrl/wandb_plot_wrapper.py), which hooks every env.step() call

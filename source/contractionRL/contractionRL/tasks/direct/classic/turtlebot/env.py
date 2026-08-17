@@ -8,24 +8,24 @@ import torch
 
 from ..common.env_base import BaseEnv
 
-# TURTLEBOT PARAMETERS
+# Turtlebot parameters
 k1, k2, k3 = 1.0, 1.0, 1.0
 
 # Denote angle indices to handle smooth transition
 STATE_NAMES = ("pos_x", "pos_y", "yaw")
-# angle_idx / pos_dimension are DERIVED from STATE_NAMES by BaseEnv (see
+# angle_idx / pos_dimension are derived from STATE_NAMES by BaseEnv (see
 # agents/skrl/state_symmetry.py) -- the names are the single source of truth for
 # which dims wrap, which translate, and which co-rotate under a yaw rotation.
 
 # X bounds
-# yaw spans [-pi, pi) to MATCH wrap_angles, which maps into that range
+# yaw spans [-pi, pi) to match wrap_angles, which maps into that range
 # before step()/_rollout_reference clamp to this box. With [0, 2*pi] every
 # negative heading was clamped to exactly 0.0 -- measured 18% of reference
 # steps pinned there, and only 0.1% above pi where ~50% was expected.
 X_MIN = [-10.0, -10.0, -math.pi]
 X_MAX = [10.0, 10.0, math.pi]
 
-# Episode ENDS the first step x leaves this box (opt-in: --terminate_out_of_box).
+# Episode ends the first step x leaves this box (opt-in: --terminate_out_of_box).
 # Defaults to the state box itself, i.e. it fires exactly where env_base.step's
 # clamp already silently pins a diverged env -- the same event, reported instead
 # of hidden. Tighten it here to end failing episodes sooner.

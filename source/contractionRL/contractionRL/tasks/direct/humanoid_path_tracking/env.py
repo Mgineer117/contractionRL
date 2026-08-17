@@ -60,7 +60,7 @@ class HumanoidPathTrackingEnv(PathTrackingBase):
     def state_names(self) -> tuple[str, ...]:
         """Matches _get_physical_state's concatenation order exactly.
 
-        xy_rel and yaw are the only WORLD-frame quantities; projected gravity,
+        xy_rel and yaw are the only world-frame quantities; projected gravity,
         the joint states and both root velocities are body frame, hence already
         yaw invariant -- which is what makes the full SE(2) quotient valid here.
         """
@@ -135,8 +135,8 @@ class HumanoidPathTrackingEnv(PathTrackingBase):
         quat = quat_from_euler_xyz(zeros, zeros, yaw_ref + yaw_noise)
         root[:, 3:7] = quat
 
-        # base twist is stored BODY-frame in x, but write_root_velocity_to_sim
-        # expects WORLD frame — rotate by the (yaw-only) orientation we just set.
+        # base twist is stored body-frame in x, but write_root_velocity_to_sim
+        # expects world frame — rotate by the (yaw-only) orientation we just set.
         root_vel = torch.cat(
             [quat_apply(quat, base_lin_vel_ref), quat_apply(quat, base_ang_vel_ref)], dim=-1
         )

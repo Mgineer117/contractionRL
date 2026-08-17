@@ -190,8 +190,8 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     # angle_idx columns (e.g. yaw) wrap at ±pi in states_arr — a raw finite
     # difference across that wrap would spike x_dot by ~2*pi/dt for one sample,
     # corrupting the NeuralDynamics fit on the angle dimension. Difference an
-    # UNWRAPPED copy instead (np.unwrap makes each angle continuous over time);
-    # the SAVED states_arr stays wrapped (that's the physical observation), so
+    # Unwrapped copy instead (np.unwrap makes each angle continuous over time);
+    # the saved states_arr stays wrapped (that's the physical observation), so
     # this is purely a finite-difference cleanup, not a change to x. Mirrors
     # train.py's _generate_ref_trajs.
     angle_idx = list(getattr(unwrapped, "angle_idx", []) or [])

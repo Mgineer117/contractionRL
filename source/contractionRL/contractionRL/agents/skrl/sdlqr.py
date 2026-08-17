@@ -9,7 +9,7 @@ SDLQRAgent: linearises at the *current* state x.
 LQRAgent: linearises at the *reference* xref.
   A(xref) = ∂f/∂x|_{xref} + Σⱼ uref_j ∂Bⱼ/∂x|_{xref},  B = B(xref)
 
-Both solve the continuous-time algebraic Riccati equation (CARE) to get the
+Both solve the continuous-time algebraic Riccati equation (care) to get the
 optimal gain K and apply u = uref - K·(x - xref).
 
 Per-``act()`` workflow (there is no training loop — every step is this,
@@ -22,7 +22,7 @@ see ``_compute_action``):
      SD-LQR, ``xref`` for LQR) to get ``f, B`` and their Jacobians
      ``∂f/∂x, ∂B/∂x``.
   3. Form ``A = ∂f/∂x + Σⱼ uref_j·∂Bⱼ/∂x`` per-environment (batched).
-  4. Solve the CARE (``scipy.linalg.solve_continuous_are``, CPU-only, one
+  4. Solve the care (``scipy.linalg.solve_continuous_are``, CPU-only, one
      linear system per environment in a Python loop — see ``_care_gain``) for
      the gain ``K = R⁻¹BᵀP``; falls back to zero feedback (``u = uref``) if
      ``(A, B)`` isn't stabilizable at that linearization point rather than
@@ -32,7 +32,7 @@ see ``_compute_action``):
 Normalization: **none**, and none is meaningful here — there are no learned
 weights whose input distribution could drift, only a per-step closed-form
 solve on the raw physical state. ``_compute_device = "cpu"`` is unrelated to
-normalization: it exists only because ``scipy``'s CARE solver requires CPU
+normalization: it exists only because ``scipy``'s care solver requires CPU
 numpy arrays, so the Jacobian computation for this step is done on CPU
 regardless of the environment's own device.
 """
@@ -69,12 +69,12 @@ LQRCfg = SDLQRCfg
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
-# Shared CARE solver
+# Shared care solver
 # ─────────────────────────────────────────────────────────────────────────── #
 
 def _care_gain(A: torch.Tensor, B_mat: torch.Tensor,
                Q_scaler: float, R_scaler: float, x_dim: int, u_dim: int) -> torch.Tensor:
-    """Solve CARE and return gain K = R⁻¹BᵀP → (u_dim, x_dim)."""
+    """Solve care and return gain K = R⁻¹BᵀP → (u_dim, x_dim)."""
     dtype = A.dtype
     Q = (Q_scaler + 1e-5) * torch.eye(x_dim, dtype=dtype, device=A.device)
     R = (R_scaler + 1e-5) * torch.eye(u_dim, dtype=dtype, device=A.device)
@@ -86,7 +86,7 @@ def _care_gain(A: torch.Tensor, B_mat: torch.Tensor,
             R.detach().cpu().numpy(),
         )
     except (np.linalg.LinAlgError, ValueError):
-        # (A, B) not stabilizable / no finite CARE solution at this linearization
+        # (A, B) not stabilizable / no finite care solution at this linearization
         # point → fall back to zero feedback (u = uref) rather than aborting the
         # entire batched rollout for one bad env.
         return torch.zeros(u_dim, x_dim, dtype=dtype, device=A.device)
@@ -101,7 +101,7 @@ def _care_gain(A: torch.Tensor, B_mat: torch.Tensor,
 class SDLQRAgent(Agent):
     """State-Dependent LQR wrapped as a native skrl Agent.
 
-    Linearises at the current state x, solves CARE per step, applies
+    Linearises at the current state x, solves care per step, applies
     u = uref - K(x)·(x - xref).  No learnable parameters.
 
     Extra constructor kwarg:
@@ -135,7 +135,7 @@ class SDLQRAgent(Agent):
             device=device,
         )
 
-        # The observation space DECLARES its layout ({x, xrefs, urefs}), so
+        # The observation space declares its layout ({x, xrefs, urefs}), so
         # x_dim/u_dim are read, never guessed from obs_dim (the old
         # (obs_dim - u_dim)//2 parity rule silently mis-split any other layout).
         self._window = RefWindow.from_space(observation_space)
@@ -151,10 +151,10 @@ class SDLQRAgent(Agent):
         self._angle_idx = angle_idx or []
         self._cfg = cfg
         self._get_f_and_B = get_f_and_B
-        self._compute_device = "cpu"  # Jacobians must be on CPU for scipy CARE
+        self._compute_device = "cpu"  # Jacobians must be on CPU for scipy care
 
     def _compute_action(self, obs: torch.Tensor) -> torch.Tensor:
-        """Linearise at x, solve CARE, return u = uref - K·(x - xref)."""
+        """Linearise at x, solve care, return u = uref - K·(x - xref)."""
         x_dim, u_dim = self._x_dim, self._u_dim
         cfg = self._cfg
         batch_size = obs.shape[0]
@@ -192,7 +192,7 @@ class SDLQRAgent(Agent):
 
     def act(self, observations, states, *, timestep: int, timesteps: int):
         orig_device = observations.device
-        # Jacobians need grad enabled; scipy CARE is non-differentiable so safe.
+        # Jacobians need grad enabled; scipy care is non-differentiable so safe.
         with torch.enable_grad():
             actions = self._compute_action(observations)
         actions = actions.detach().to(orig_device)
@@ -260,7 +260,7 @@ class LQRAgent(Agent):
             device=device,
         )
 
-        # The observation space DECLARES its layout ({x, xrefs, urefs}), so
+        # The observation space declares its layout ({x, xrefs, urefs}), so
         # x_dim/u_dim are read, never guessed from obs_dim (the old
         # (obs_dim - u_dim)//2 parity rule silently mis-split any other layout).
         self._window = RefWindow.from_space(observation_space)
@@ -279,7 +279,7 @@ class LQRAgent(Agent):
         self._compute_device = "cpu"
 
     def _compute_action(self, obs: torch.Tensor) -> torch.Tensor:
-        """Linearise at xref, solve CARE, return u = uref - K·(x - xref)."""
+        """Linearise at xref, solve care, return u = uref - K·(x - xref)."""
         x_dim, u_dim = self._x_dim, self._u_dim
         cfg = self._cfg
         batch_size = obs.shape[0]

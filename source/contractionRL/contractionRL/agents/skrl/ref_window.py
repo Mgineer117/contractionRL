@@ -3,27 +3,27 @@
 Replaces the old flat ``[x, xref, uref, preview]`` Box layout and all of its
 inference machinery (``_preview_width``, the ``obs_dim/2`` parity guess, the
 ``preview_includes_xref`` / ``preview_includes_uref`` flags). The layout is now
-DECLARED by the observation space and read back from it, so an env and a model
+declared by the observation space and read back from it, so an env and a model
 can no longer silently disagree about where a block starts.
 
 Layout
 ------
 ``xrefs[k] = xref[t + k*offset]``, ``urefs[k] = uref[t + k*offset]``, for
-``k = 0 .. length-1``. ``k=0`` is the CURRENT reference point, so ``xrefs[0]``
+``k = 0 .. length-1``. ``k=0`` is the current reference point, so ``xrefs[0]``
 is the old ``xref`` and ``urefs[0]`` is the old ``uref`` — the control law
 ``u = urefs[0] + pi`` and the tracking error ``e = x - xrefs[0]`` are unchanged.
-Indices past the end of the episode CLAMP to the last one (the reference "stops
+Indices past the end of the episode clamp to the last one (the reference "stops
 and holds" at the terminal setpoint).
 
 Flat ordering (load-bearing)
 ----------------------------
-skrl stores a ``gymnasium.spaces.Dict`` observation FLATTENED, and
+skrl stores a ``gymnasium.spaces.Dict`` observation flattened, and
 ``unflatten_tensorized_space`` walks ``sorted(space.keys())`` — so the flat
 tensor a model receives in ``inputs["observations"]`` is ordered
 
     [ urefs (length*u_dim) | x (x_dim) | xrefs (length*x_dim) ]
 
-alphabetically, NOT in declaration order. ``RefWindow.split`` is the single
+alphabetically, not in declaration order. ``RefWindow.split`` is the single
 place that knows this; nothing else may slice the observation by hand.
 
 Markov-ness
@@ -115,7 +115,7 @@ class RefWindow:
         ``(N, x_dim)``, ``(N, length, x_dim)``, ``(N, length, u_dim)``.
 
         The slice order follows skrl's ``sorted(space.keys())`` flattening —
-        see the module docstring. This is the ONLY place that encodes it."""
+        see the module docstring. This is the only place that encodes it."""
         if obs.shape[-1] != self.flat_dim:
             raise ValueError(
                 f"RefWindow.split: expected flat width {self.flat_dim} "
@@ -139,9 +139,9 @@ class RefWindow:
         certificate, C2RL's pretraining/distillation), which sample states from
         ``get_rollout`` rather than stepping the env.
 
-        Slot 0 is the REAL current reference, so ``e`` and the feedforward are
+        Slot 0 is the real current reference, so ``e`` and the feedforward are
         exactly what the certificate is about. Slots 1.. are drawn i.i.d. from
-        the pools when given, else the current reference is HELD across the
+        the pools when given, else the current reference is held across the
         window (a locally-constant reference).
 
         Prefer passing pools: certifying only against a constant/zero window
@@ -179,7 +179,7 @@ class RefWindow:
 
     @classmethod
     def length_for_horizon(cls, gamma: float, max_episode_len: int, offset: int = 1) -> int:
-        """The window length whose SPAN covers the effective horizon.
+        """The window length whose span covers the effective horizon.
 
         ``span = (length-1)*offset >= H``, so ``length = ceil(H/offset) + 1``.
         This is the smallest window for which ``check_markov`` reports no
@@ -197,8 +197,8 @@ class RefWindow:
         function, and report the reason if it is not.
 
         The reward ``-||x - xrefs[0]||^2_M - ||u - urefs[0]||^2`` depends only on
-        the observation and the action, so the REWARD is Markov by construction.
-        The VALUE is not automatically: ``V(s_t)`` integrates the reward over the
+        the observation and the action, so the reward is Markov by construction.
+        The value is not automatically: ``V(s_t)`` integrates the reward over the
         discount's effective horizon ``H = 1/(1-gamma)`` steps, so every
         reference point within ``H`` must be recoverable from the window.
 
@@ -212,7 +212,7 @@ class RefWindow:
 
         ``offset > 1``  the window skips the intermediate points between its
                         samples. Those are never observed, so the window is a
-                        SUBSAMPLING of the horizon, exact only to the extent the
+                        subsampling of the horizon, exact only to the extent the
                         reference is smooth over ``offset`` steps. Reported as a
                         warning, never an error: it is the deliberate trade the
                         offset knob exists to make (wider span per point).
@@ -245,7 +245,7 @@ class RefWindow:
 
 
 class Feats:
-    """The symmetry feature maps, with the ``sym is None`` fallback in ONE place.
+    """The symmetry feature maps, with the ``sym is None`` fallback in one place.
 
     Every model previously inlined ``sym.pair_features(x, xref) if sym is not
     None else cat([embed_angles(x), embed_angles(xref)])`` — the same three-line
@@ -275,7 +275,7 @@ class Feats:
 
     # maps ---------------------------------------------------------------- #
     def single(self, x: torch.Tensor) -> torch.Tensor:
-        """Invariant features of ONE state block (drops the symmetry directions)."""
+        """Invariant features of one state block (drops the symmetry directions)."""
         return self.sym.single_features(x) if self.sym is not None else embed_angles(x, self.angle_idx)
 
     def pair(self, x: torch.Tensor, xref: torch.Tensor) -> torch.Tensor:
@@ -293,9 +293,9 @@ class Feats:
         return wrap_diff(x - xref, self.angle_idx)
 
     def sequence(self, x: torch.Tensor, xrefs: torch.Tensor) -> torch.Tensor:
-        """``(N, L, pair_dim)`` — every window point expressed RELATIVE to the
+        """``(N, L, pair_dim)`` — every window point expressed relative to the
         current ``x``: relative position, wrapped angle difference, and both
-        bodies' invariant features. This is the ONE input the reference-path
+        bodies' invariant features. This is the one input the reference-path
         networks see (the actor's ``W2`` and the critic's ``psi``), so neither
         ever reads an absolute position or a raw wrapping angle.
         """

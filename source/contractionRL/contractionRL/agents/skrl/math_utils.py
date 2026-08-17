@@ -67,7 +67,7 @@ def rescale_residual(
     ``tanh_u >= 0`` maps into ``[0, high - residual]``, ``tanh_u < 0`` into
     ``[-(residual - low), 0]``, using a different per-sample half-width for
     each side (``residual`` varies per state, so these half-widths do too).
-    Guarantees, for EVERY ``residual`` in ``[low, high]``: ``tanh_u == 0 =>
+    Guarantees, for every ``residual`` in ``[low, high]``: ``tanh_u == 0 =>
     action == residual`` exactly (feedback=0 preserves the reference law),
     and ``action`` lands in ``(low, high)`` for every ``tanh_u``, with no
     post-hoc clamping ever required (unlike a fixed-scale rescale-then-add,
@@ -125,7 +125,7 @@ def build_lr_scheduler(optimizer: torch.optim.Optimizer, name: str, kwargs: dict
     Shared by every pretraining loop that anneals an Adam LR by epoch (C2RL's
     NeuralDynamics fit in ``dynamics_pretrain.py`` and CMG regression in
     ``ncm_synthesis.regress_cmg``) so they build schedulers the same way — each
-    still configures its OWN ``name``/``kwargs`` independently, this just avoids
+    still configures its own ``name``/``kwargs`` independently, this just avoids
     duplicating the ``getattr(torch.optim.lr_scheduler, ...)`` lookup.
     """
     if not name:

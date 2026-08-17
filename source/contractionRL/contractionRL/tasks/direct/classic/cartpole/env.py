@@ -8,7 +8,7 @@ import torch
 
 from ..common.env_base import BaseEnv
 
-# CARTPOLE PARAMETERS
+# Cartpole parameters
 mc = 1.0
 mp = 1.0
 g = 9.81
@@ -16,7 +16,7 @@ l = 1.0
 
 # Denote angle indices to handle smooth transition
 STATE_NAMES = ("pos_x", "pitch", "vel_x_b", "pitch_rate")
-# angle_idx / pos_dimension are DERIVED from STATE_NAMES by BaseEnv (see
+# angle_idx / pos_dimension are derived from STATE_NAMES by BaseEnv (see
 # agents/skrl/state_symmetry.py) -- the names are the single source of truth for
 # which dims wrap, which translate, and which co-rotate under a yaw rotation.
 
@@ -24,7 +24,7 @@ STATE_NAMES = ("pos_x", "pitch", "vel_x_b", "pitch_rate")
 X_MIN = [-5.0, -math.pi / 3, -1.0, -1]
 X_MAX = [5.0, math.pi / 3, 1.0, 1]
 
-# Episode ENDS the first step x leaves this box (opt-in: --terminate_out_of_box).
+# Episode ends the first step x leaves this box (opt-in: --terminate_out_of_box).
 # Defaults to the state box itself, i.e. it fires exactly where env_base.step's
 # clamp already silently pins a diverged env -- the same event, reported instead
 # of hidden. Tighten it here to end failing episodes sooner.
@@ -45,20 +45,20 @@ lim = 1.0
 XE_MIN = [-lim, -lim, -lim, -lim]
 XE_MAX = [lim, lim, lim, lim]
 
-# reference control bounds. u is a FORCE on the cart (N); the APPLIED box is 2x
+# reference control bounds. u is a force on the cart (N); the applied box is 2x
 # this (env_base.py:37). Statically holding the pole at tilt theta needs
 # u = (mc+mp)*g*tan(theta) = 19.62*tan(theta), so the old +-6 applied could not
 # hold even the XE_INIT pitch of 0.3 rad (19.62*tan(0.3) = 6.07 N) -- reset could
-# place the pole past what ANY gain could recover, making the actuator check
+# place the pole past what any gain could recover, making the actuator check
 # infeasible by arithmetic, not by the SDP. +-12 N applied holds 0.55 rad and
 # matches real hardware (Gym cartpole uses 10 N, Quanser's linear pendulum ~15).
 UREF_MIN = [-6.0]
 UREF_MAX = [6.0]
 
-# Initial state drawn DIRECTLY from this box (see env_base.X_INIT_MIN),
-# placing every episode start in the plant's LOW-lambda region:
+# Initial state drawn directly from this box (see env_base.X_INIT_MIN),
+# placing every episode start in the plant's low-lambda region:
 # lbd*(x0) median 1.3194 -> 0.5625. The sign dims are
-# mirrored by ONE shared sign, because the slow set is two lobes on a
+# mirrored by one shared sign, because the slow set is two lobes on a
 # diagonal that no single box can cover.
 X_INIT_MIN = [-5.0, 0.8286, -1.0, 0.0168]
 X_INIT_MAX = [5.0, 1.0467, 1.0, 0.9676]

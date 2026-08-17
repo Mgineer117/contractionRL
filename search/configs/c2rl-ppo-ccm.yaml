@@ -54,7 +54,7 @@ parameters:
   # w_lb < w_ub — sweeping them as two independent flat parameters risks
   # bayes sampling an inverted/degenerate pair. A categorical parameter
   # whose values are {w_lb, w_ub} dicts is wandb's nested-parameter form —
-  # it flattens to the SAME "cm.w_lb"/"cm.w_ub" CLI flags as flat keys
+  # it flattens to the same "cm.w_lb"/"cm.w_ub" CLI flags as flat keys
   # would (see W&B sweep docs on nested parameters), but samples each pair
   # jointly so w_lb < w_ub always holds. ccm-only: cvstem already fixes them
   # indirectly via its cm_data_path cache key.

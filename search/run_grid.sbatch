@@ -1,20 +1,20 @@
 #!/bin/bash
-# Plain-run gamma x seed grid for c2rl-ppo. NOT a wandb sweep.
+# Plain-run gamma x seed grid for c2rl-ppo. Not a wandb sweep.
 #
 # A sweep hands a worker a grid cell before the trial proves it can run, so a
-# node that OOMs in the first seconds SPENDS the cell and the grid finishes with
-# holes -- 15 of 80 went that way in five minutes. Here the cell IS the SLURM
+# node that OOMs in the first seconds spends the cell and the grid finishes with
+# holes -- 15 of 80 went that way in five minutes. Here the cell is the SLURM
 # array index: nothing is consumed by failing, and re-running a lost cell is
 # `sbatch --array=<idx>`.
 #
 #   sbatch --array=0-159%14 --partition=scavenger search/run_grid.sbatch
 #
 # Index layout (160 = 2 arms x 4 gammas x 20 seeds):
-#   arm   = idx % 2          0 = normalization ON, 1 = OFF
-#   gamma = GAMMAS[idx/2/20]
+#   arm   = idx % 2          0 = normalization on, 1 = off
+#   gamma = gammas[idx/2/20]
 #   seed  = (idx/2) % 20
-# Arm alternates on CONSECUTIVE indices on purpose: any contiguous slice of the
-# array is ~half ON and half OFF, so splitting the range across partitions
+# Arm alternates on consecutive indices on purpose: any contiguous slice of the
+# array is ~half on and half off, so splitting the range across partitions
 # cannot align the treatment with the hardware.
 #
 #SBATCH --job-name=crl-grid
@@ -47,7 +47,7 @@ fi
 NAME="c2rl_${TAG}_g${GAMMA}_s${SEED}"
 echo "[$(date '+%F %T')] idx=$IDX -> $NAME on $(hostname), CUDA=$CUDA_VISIBLE_DEVICES"
 
-# Wait for real room on THIS device before starting. Asked through torch, not
+# Wait for real room on this device before starting. Asked through torch, not
 # nvidia-smi: on a MIG node CUDA_VISIBLE_DEVICES is a UUID, which `nvidia-smi -i`
 # rejects -- it returns empty and a naive check then passes. mem_get_info()
 # resolves index and MIG UUID alike. ~2.1 GiB steady + the CMG regression's
@@ -75,11 +75,11 @@ for attempt in 1 2 3; do
         --wandb_project contractionRL --wandb_run_name "$NAME" --wandb_batch grid_plain
     rc=$?
     # Reap the local run cache regardless of outcome: ~1 GB per trial against a
-    # 103 GB home quota, and a full disk kills every OTHER job on the node too.
-    # BOTH locations: train.py defaults WANDB_DIR to ~/scratch/wandb (so runs
+    # 103 GB home quota, and a full disk kills every other job on the node too.
+    # Both locations: train.py defaults WANDB_DIR to ~/scratch/wandb (so runs
     # land in ~/scratch/wandb/wandb/run-*), but a caller that pre-sets WANDB_DIR
     # -- as `wandb agent` does -- puts them in $REPO/wandb instead. ~/scratch is
-    # on the SAME /u quota, so cleaning only one of the two still fills the disk.
+    # on the same /u quota, so cleaning only one of the two still fills the disk.
     for d in "$REPO/wandb" "$HOME/scratch/wandb/wandb"; do
         [[ -d "$d" ]] && find "$d" -maxdepth 1 -name 'run-*' -type d -mmin +1 \
             -exec rm -rf {} + 2>/dev/null

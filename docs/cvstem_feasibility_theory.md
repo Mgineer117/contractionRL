@@ -100,7 +100,7 @@ infeasible at every `λ` down to 0.01, at every `cm_dt ∈ {0.02, 1, 10, 100, 1e
 and every `w_lb ∈ {1e-3, 1e-5, 1e-8}`, and 0 of 40 states certify even
 individually. The prediction is exact.
 
-**Nilpotency alone is NOT the problem** — a double integrator (`A` nilpotent,
+**Nilpotency alone is not the problem** — a double integrator (`A` nilpotent,
 `B` rank 1 of 2, fully controllable) certifies immediately (`ν = 3.1, χ = 1.2` at
 `λ = 0.01`). Rank deficiency is the problem.
 

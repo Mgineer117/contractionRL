@@ -9,29 +9,29 @@ answer different questions::
 
     --mode certificate   read the binding states off the SDP, shrink away from
                          exactly them. Maximum λ gain per unit volume removed.
-                         DIAGNOSTIC: tells you what the certificate is limited by.
+                         Diagnostic: tells you what the certificate is limited by.
 
     --mode tube          nest by tube radius around the reference. The subset the
                          closed loop actually visits, so it is not chosen to
-                         flatter the number. DEPLOYMENT claim.
+                         flatter the number. Deployment claim.
 
-WHY BOTH MODES USE NESTED *SAMPLE* SETS
+Why both MODES use nested *Sample* Sets
 ---------------------------------------
 λ_max over a smaller set is mathematically ≥ λ_max over a larger one — fewer
 constraints, larger feasible set. Draw fresh i.i.d. samples per level and that
 guarantee evaporates: each level estimates its own box's worst case from its own
 finite draw, so a smaller box can draw a nastier point than its parent did and
-the curve goes DOWN. Measured on cartpole with no envelope, N=100 per level:
+the curve goes down. Measured on cartpole with no envelope, N=100 per level:
 λ = 4.89, 8.86, 13.31, 11.02, 11.08 — the drop at level 3 is pure resampling
 noise, and it is indistinguishable by eye from a real effect.
 
-So both modes draw ONCE at the top and filter. Level k's samples are a literal
+So both modes draw once at the top and filter. Level k's samples are a literal
 subset of level k-1's, monotonicity holds by construction, and any increase is
 signal. The cost is depth: an isotropic 0.6 shrink in d active dims keeps 0.6^d
 of the points per level, so ``--num-samples`` has to be large enough that the
 deepest level still has enough left (``--min-samples`` enforces it).
 
-WHAT "BINDING" MEANS HERE
+What "binding" means here
 -------------------------
 ``cvstem_joint`` returns only ``{W, nu, chi, J}`` — no duals. It does not need
 to: every constraint is reconstructible from the solution. For each sample::
@@ -44,8 +44,8 @@ slack, and the samples with slack ≈ 0 are the ones the rate is resting on.
 
 The envelope constraints ``I ⪯ W̄_k ⪯ χI`` are reported the same way, and that
 distinction is the whole point: if the tight samples are tight on the LMI, the
-STATE BOX is what caps λ and shrinking it will help. If they are pinned against
-χI instead, the DEPLOYMENT ENVELOPE is the cap, and no amount of shrinking moves
+state box is what caps λ and shrinking it will help. If they are pinned against
+χI instead, the deployment envelope is the cap, and no amount of shrinking moves
 the number — measured on the car, where λ_max was 2.1183 at every nesting level
 of a 5-level shrink, but ≥40 with the envelope dropped.
 """
@@ -110,7 +110,7 @@ def binding_mask(slacks, *, frac):
 def what_binds(slacks, sol, *, w_lb, w_ub, tol=1e-6, rel=2e-2):
     """What the certificate is actually limited by.
 
-    Checks the two GLOBAL scalar caps first, and that ordering is the whole
+    Checks the two global scalar caps first, and that ordering is the whole
     point. ``ν ≤ 1/w_lb`` and ``χ ≤ ν·w_ub`` are single constraints shared by
     every sample, so they never show up as per-sample tightness — a run can
     report "1 of 200 samples tight on the LMI" while ν sits exactly on its cap
@@ -121,7 +121,7 @@ def what_binds(slacks, sol, *, w_lb, w_ub, tol=1e-6, rel=2e-2):
     does shrinking the state box have anything to bite on.
 
     ``rel`` is 2% rather than a tight tolerance because an interior-point solver
-    lands NEAR an active cap, not on it: measured on the car, ν came back at
+    lands near an active cap, not on it: measured on the car, ν came back at
     99.78% and 98.46% of ``1/w_lb`` at two different envelopes, and both were
     genuinely envelope-limited (λ tracked the cap, 11.24 -> 53.23 as the cap went
     1e4 -> 1e6). At 0.1% both were misreported as state-box-limited.
@@ -142,7 +142,7 @@ def what_binds(slacks, sol, *, w_lb, w_ub, tol=1e-6, rel=2e-2):
 
 
 # ───────────────────────────────────────────────────────────────────────── #
-# λ_max by bisection over a FIXED sample set
+# λ_max by bisection over a fixed sample set
 # ───────────────────────────────────────────────────────────────────────── #
 def solve_at(A, B, lbd, kw):
     return cvstem_joint(A, B, lbd=lbd, **kw)
@@ -190,7 +190,7 @@ def active_dims_auto(env, *, n=64, seed=0, tol=1e-9):
 
 
 def jacobians(env, x_np):
-    """``(A, B)`` at each state — the DRIFT Jacobian, matching real synthesis."""
+    """``(A, B)`` at each state — the drift Jacobian, matching real synthesis."""
     x = torch.as_tensor(x_np, dtype=torch.float32, device=env.device)
     x = x.clone().requires_grad_(True)
     f, B, _ = env.get_f_and_B(x)
@@ -203,7 +203,7 @@ def jacobians(env, x_np):
 # Mode 1 — certificate-driven: shrink away from exactly what binds
 # ───────────────────────────────────────────────────────────────────────── #
 def run_certificate(env, x_all, kw, args, active):
-    """Level k+1's box = bounding box of level k's NON-binding samples.
+    """Level k+1's box = bounding box of level k's non-binding samples.
 
     That is the greedy "maximum λ per unit volume removed" step: the binding
     samples are, by definition, the only ones whose removal can raise λ.
@@ -247,11 +247,11 @@ def run_certificate(env, x_all, kw, args, active):
                   "envelope rather than the plant.")
         if args.drop_mode == "samples":
             # Drop the tightest `drop_frac` outright, keeping no box at all.
-            # This is the LOOSEST honest subset rule and the fastest-rising
+            # This is the loosest honest subset rule and the fastest-rising
             # curve: it removes every binding state each level instead of one,
             # and is not restricted to axis-aligned cuts. The price is that the
             # retained set is a point cloud, not a region you can write down —
-            # so it upper-bounds what ANY subset of this size could certify,
+            # so it upper-bounds what any subset of this size could certify,
             # rather than describing a set you could deploy on. Use it to show
             # the headroom exists; use --drop-mode box to get a usable region.
             tight = idx[binding_mask(slacks, frac=args.drop_frac)]
@@ -264,29 +264,29 @@ def run_certificate(env, x_all, kw, args, active):
             print(f"[cert]      dropped {tight.size} tightest "
                   f"({idx.size} -> {int(keep.sum())} samples)")
             continue
-        # Cut the box so the tightest samples fall OUTSIDE it.
+        # Cut the box so the tightest samples fall outside it.
         #
         # The obvious version — drop the tight samples, take the bounding box of
         # what is left — silently stalls: `keep` is then recomputed from the box,
-        # so any tight sample that was INTERIOR is back inside it and nothing
+        # so any tight sample that was interior is back inside it and nothing
         # changed. Measured on segway, whose binding states are interior: levels
         # 2, 3 and 4 were byte-identical (n=94, λ=6.9815) and the "curve" was an
         # artifact of the same solve repeated three times.
         #
-        # So cut along ONE face instead, excluding only the SINGLE tightest
+        # So cut along one face instead, excluding only the single tightest
         # sample and scoring candidates by how few samples they cost.
         #
-        # Both of those details are load-bearing. Excluding the whole tight SET
+        # Both of those details are load-bearing. Excluding the whole tight set
         # (drop_frac = 10% of samples) demands a cut past all of them at once,
         # and when they are spread along an axis the cheapest such cut is still
         # enormous: measured on cartpole, one step went 100 -> 14 samples and
-        # ended the run at level 1. And scoring by VOLUME picks cuts through
+        # ended the run at level 1. And scoring by volume picks cuts through
         # dense regions, since volume says nothing about where the samples are.
         # One sample at a time, scored by sample loss, is the actual greedy step.
         # Repeat that single-sample cut until ~drop_frac of the level's samples
         # are gone, so a box level is a step comparable to a `samples` level
-        # while the retained set stays a BOX that can be written down and
-        # checked at runtime. Ranking comes from THIS level's solve and is not
+        # while the retained set stays a box that can be written down and
+        # checked at runtime. Ranking comes from this level's solve and is not
         # refreshed between cuts inside a level — refreshing would cost one SDP
         # per cut. The ranking goes stale as the set shrinks, which makes this a
         # cheaper approximation of the greedy step, never an invalid region:
@@ -358,16 +358,16 @@ def names_of(env):
 # Mode 2 — tube: nest by radius around the reference
 # ───────────────────────────────────────────────────────────────────────── #
 def run_tube(env, kw, args, active):
-    """Tube of radius ρ about the reference, as a genuinely NESTED sample family.
+    """Tube of radius ρ about the reference, as a genuinely nested sample family.
 
     The obvious construction — ``x = xref + ρ·xe`` for shrinking ρ — is not
-    nested. Scaling ρ MOVES every sample to a new location instead of dropping
+    nested. Scaling ρ moves every sample to a new location instead of dropping
     any, so each level is a fresh draw of its own region and λ_max is re-
     estimated from scratch. Measured on cartpole: 0.0304, 0.0441, 0.0384, 0.0347
     — the dips are resampling noise, exactly the artifact the box mode already
     taught us to avoid.
 
-    So draw ONE cloud with radii ``s ~ U(0,1)`` and let level k keep the samples
+    So draw one cloud with radii ``s ~ U(0,1)`` and let level k keep the samples
     with ``s <= ρ_k``. Those points lie in the radius-ρ_k tube, each level's set
     is a literal subset of the last, and λ_max is monotone by construction.
     Sample count falls off as ρ_k, which is what ``--min-samples`` guards.
@@ -400,7 +400,7 @@ def run_tube(env, kw, args, active):
         t0 = time.time()
         lbd, sol, calls = max_lambda(A, B, kw, hi=args.lbd_hi, tol=args.tol)
         if sol is None:
-            # A SMALLER tube is strictly easier, so one infeasible radius says
+            # A smaller tube is strictly easier, so one infeasible radius says
             # nothing about the next. Breaking here would throw the experiment
             # away because its widest level happened not to certify.
             print(f"[tube] L{k} rho={rho:6.4f}: INFEASIBLE at lambda>={args.lbd_min} "
@@ -534,7 +534,7 @@ def main(argv=None):
     active = (np.array([int(d) for d in args.active_dims.split(",")])
               if args.active_dims else active_dims_auto(env, seed=args.seed))
 
-    # An ABSENT cm_w_lb/cm_w_ub is not an error: it means the reference program
+    # An absent cm_w_lb/cm_w_ub is not an error: it means the reference program
     # with no envelope, which is what segway ships. cm_dt absent would silently
     # fall back to the env integrator step and solve a 30x harsher LMI, so that
     # one is called out rather than defaulted quietly.
@@ -576,7 +576,7 @@ def self_check():
     """Cheap end-to-end checks on the two things that can silently be wrong."""
     rng = np.random.default_rng(0)
     n, d = 6, 3
-    # UNSTABLE drift, or lambda_max runs off to the bisection ceiling and the
+    # Unstable drift, or lambda_max runs off to the bisection ceiling and the
     # monotonicity test below is vacuous.
     A = rng.normal(size=(n, d, d)) * 0.5 + 0.5 * np.eye(d)
     B = rng.normal(size=(n, d, 1))
@@ -594,7 +594,7 @@ def self_check():
     assert s["lmi_abs"].min() > -1e-4, f"LMI reconstructed as violated: {s['lmi_abs'].min()}"
     assert s["eye"].min() > -1e-4, f"W >= I reconstructed as violated: {s['eye'].min()}"
     assert s["chi"].min() > -1e-4, f"W <= chiI reconstructed as violated: {s['chi'].min()}"
-    # ...and at lambda_max at least one sample must be AT the LMI, or the
+    # ...and at lambda_max at least one sample must be at the LMI, or the
     # bisection stopped early and "binding" means nothing.
     assert s["lmi_abs"].min() < 1e-2, f"nothing is tight at lambda_max: {s['lmi_abs'].min()}"
 

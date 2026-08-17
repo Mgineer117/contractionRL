@@ -275,7 +275,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        # Fall = base dropped too low OR body tilted past the limit. projected
+        # Fall = base dropped too low or body tilted past the limit. projected
         # gravity z is -1 upright and rises toward 0/+1 as the base tilts, so
         # ``> fall_grav_z_max`` (default -0.5) fires at ~>60 deg from upright —
         # catches side/back falls that a height check alone would miss.
@@ -309,7 +309,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
                 # Same "Reward/total_reward_*" keys, and same per-episode-reset
                 # cadence as the Stability tab, that C3M's eval loop emits via
                 # track_reward_summary — skrl's own "Reward / Total reward
-                # (mean)" tracker uses a DIFFERENT key name and can't be unified
+                # (mean)" tracker uses a different key name and can't be unified
                 # with it, so it was leaving total_reward_mean written only once
                 # (by the post-training evaluator) instead of throughout training.
                 from contractionRL.agents.skrl.contraction_metrics import reward_log_dict, reward_summary
@@ -394,7 +394,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
                 cmd_cfg = self._make_arrow_markers_cfg("/Visuals/QuadrupedVelCmd", (0.0, 0.0, 1.0))
                 cur_cfg = self._make_arrow_markers_cfg("/Visuals/QuadrupedVelCur", (0.0, 1.0, 0.0))
                 # Yellow yaw-rate arrow: tangential to heading, pointing the way the
-                # nose is commanded to swing (left = CCW / positive yaw rate).
+                # nose is commanded to swing (left = ccw / positive yaw rate).
                 yaw_cfg = self._make_arrow_markers_cfg("/Visuals/QuadrupedYawCmd", (1.0, 0.9, 0.0))
                 self._cmd_vel_marker = VisualizationMarkers(cmd_cfg)
                 self._cur_vel_marker = VisualizationMarkers(cur_cfg)

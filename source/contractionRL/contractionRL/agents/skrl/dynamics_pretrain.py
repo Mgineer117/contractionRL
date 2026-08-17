@@ -72,7 +72,7 @@ def load_offline_dynamics_data(data_path: str, tag: str = "") -> dict:
 
 
 def load_offline_trajectories(data_path: str, tag: str = "") -> dict:
-    """Load an offline ``dynamics_data.npz`` WITHOUT flattening — returns
+    """Load an offline ``dynamics_data.npz`` without flattening — returns
     trajectory-structured ``x`` ``(N, T, x_dim)`` and each trajectory's valid
     length ``lengths`` ``(N,)``, preserving both the within- and
     across-trajectory order/boundaries that ``load_offline_dynamics_data``
@@ -82,7 +82,7 @@ def load_offline_trajectories(data_path: str, tag: str = "") -> dict:
     Used by ``ncm_synthesis.build_cm_dataset``'s ``cm_wdot_trajectory=True``
     path (see ``C2RLAgent.synthesize_cmg`` / ``c2rl.py``'s ``cm_wdot_trajectory``
     docstring) to thread a real ``Ẇ ≈ (W̄_t − W̄_{t−1})/dt`` through the CV-STEM
-    SDP using the ACTUAL previous state of the SAME reference trajectory,
+    SDP using the actual previous state of the same reference trajectory,
     instead of dropping ``Ẇ`` or using Tsukamoto's static ``(W̄-I)/dt`` proxy.
 
     Raises if the file has no ``lengths`` array — that means it isn't a
@@ -116,8 +116,8 @@ def pretrain_dynamics(agent, *, epochs: int, data_path: str | None,
                       tag: str = "",
                       val_frac: float = 0.1,
                       early_stop_patience: int = 10) -> None:
-    """Pretrain ``agent._neural_dynamics`` for ``epochs`` epochs over a FIXED
-    ``memory_size``-sized buffer of ``(x, u, x_dot)`` samples, drawn ONCE before
+    """Pretrain ``agent._neural_dynamics`` for ``epochs`` epochs over a fixed
+    ``memory_size``-sized buffer of ``(x, u, x_dot)`` samples, drawn once before
     the epoch loop — the same "sample a fixed dataset, then multi-epoch it"
     structure ``ncm_synthesis.build_cm_dataset``/``regress_cmg`` use for CMG
     synthesis (see ``C2RLAgent._sample_cmg_x``/``synthesize_cmg``), so both
@@ -125,18 +125,18 @@ def pretrain_dynamics(agent, *, epochs: int, data_path: str | None,
 
     The buffer comes from ``load_offline_dynamics_data(data_path)`` when
     ``data_path`` points at an offline ``dynamics_data.npz`` — uniformly
-    SUBSAMPLED (without replacement) to ``memory_size``, with a warning and a
+    subsampled (without replacement) to ``memory_size``, with a warning and a
     cap to what's on disk if ``memory_size`` asks for more (Isaac envs
     typically only have this fixed on-disk supply). Otherwise it's drawn fresh
     via ``agent._get_rollout(memory_size, "dynamics", num_control_per_state=...)``
-    — classic envs can feasibly sample ANY ``memory_size`` since it's synthetic
+    — classic envs can feasibly sample any ``memory_size`` since it's synthetic
     analytic sampling, no cap needed; Isaac envs without a data_path instead
     draw from their in-memory reference-trajectory buffer (also no fixed cap).
 
     No-op when the agent has no NeuralDynamics (analytical dynamics) or
     epochs<=0. Pretraining metrics (dynamics MSE + LR) are flushed to the
     agent's writer at negative timesteps (so they precede training on the
-    ``global_step`` x-axis). The flush cadence is derived from ``epochs`` — NOT
+    ``global_step`` x-axis). The flush cadence is derived from ``epochs`` — not
     the agent's training ``write_interval``, which is typically
     ``timesteps//100`` and would never fire within a short pretraining loop —
     and the final epoch always flushes. ``log_interval`` optionally caps that

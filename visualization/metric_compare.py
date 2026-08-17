@@ -1,5 +1,5 @@
-"""ccm vs cvstem_pretrained CMG — where the two SYNTHESIS OBJECTIVES actually
-disagree, in STATE space rather than control space.
+"""ccm vs cvstem_pretrained CMG — where the two synthesis objectives actually
+disagree, in state space rather than control space.
 
 bound_sweep.py's control-space landscape is blind to most of M by construction
 (see its docstring): an H-step-held-control sweep only explores a ~2-D
@@ -7,7 +7,7 @@ reachable slice of state space, magnitude (‖e‖) dominates the surface over
 direction, and the normalized-error ratio cancels scale. Two metrics that
 differ sharply in cond(M) or eigenvector field can produce near-identical
 control-space landscapes for exactly that reason. This script instead compares
-M(x) DIRECTLY along a shared trunk:
+M(x) directly along a shared trunk:
 
   1. Ellipse field  — level sets of e^T M(x) e at sampled trunk states,
      projected onto (x, y) and (theta, v). Shows orientation/anisotropy
@@ -15,8 +15,8 @@ M(x) DIRECTLY along a shared trunk:
      produce visibly different ellipse shapes even when their cond(M) traces
      coincide.
   2. Eigenvalue trace — eigenvalues of M(x) and the angle of top/bottom
-     eigenvectors to the STATE axes, both metrics on one time axis. Shows
-     WHERE along the episode the metrics diverge, not just that they do.
+     eigenvectors to the state axes, both metrics on one time axis. Shows
+     where along the episode the metrics diverge, not just that they do.
   3. Empirical contraction rate — log(V_{t+1}/V_t) along the trunk (V = e^T M e,
      the Mahalanobis reward's own quantity, env_base.get_rewards), the
      certificate-relevant comparison: two metrics with similar ellipses can
@@ -80,7 +80,7 @@ def parse_args():
 
 
 def ellipse_xy(M2: np.ndarray, center: np.ndarray, n: int = 200, scale: float = 1.0) -> np.ndarray:
-    """Points on {e : e^T M2 e = scale} for a 2x2 SPD M2, in the ORIGINAL
+    """Points on {e : e^T M2 e = scale} for a 2x2 SPD M2, in the original
     (unrotated) coordinate frame, centered at ``center``."""
     eigval, eigvec = np.linalg.eigh(M2)
     theta = np.linspace(0, 2 * np.pi, n)
@@ -190,7 +190,7 @@ def draw_eigen_trace(scen, labels, x, Ms, metrics, t):
         color = SERIES_COLORS.get(m.name)
         ax_eig.plot(t, eigval[:, -1].numpy(), color=color, lw=1.6, label=f"{m.name} λ_max")
         ax_eig.plot(t, eigval[:, 0].numpy(), color=color, lw=1.0, ls="--", label=f"{m.name} λ_min")
-        # angle of the TOP eigenvector to the first state axis, per state —
+        # angle of the top eigenvector to the first state axis, per state —
         # a state-space orientation trace, independent of any reachable slice.
         top = eigvec[:, :, -1]
         ref = torch.zeros_like(top); ref[:, 0] = 1.0

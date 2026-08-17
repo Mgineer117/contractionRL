@@ -7,7 +7,7 @@ one of those into what ``wandb sweep`` actually wants: it copies the config's
 ``metric:``/``parameters:`` blocks through verbatim and synthesizes the
 ``program:``/``project:``/``name:``/``command:`` lines around them.
 
-Every sweep goes into the SAME W&B project (``contractionRL-Search``) and is
+Every sweep goes into the same w&B project (``contractionRL-Search``) and is
 identified by its ``name:``, ``<env>-<algorithm>`` — so all the runs for a given
 env+algorithm accumulate in one place across relaunches, rather than being split
 across a project per launch.
@@ -34,14 +34,14 @@ _ROOT = Path(__file__).resolve().parent.parent
 _CONFIGS = Path(__file__).resolve().parent / "configs"
 
 # The single W&B project every sweep lands in. Set explicitly (rather than left
-# to wandb) because an unset project does NOT fall back to a shared default —
+# to wandb) because an unset project does not fall back to a shared default —
 # wandb auto-derives one from the local path (observed:
 # "contractionRL-scripts_skrl"), which silently splits runs by where they were
 # launched from. Sweeps are told apart by their `name:` (env-algorithm) instead.
 DEFAULT_PROJECT = "contractionRL-Search"
 
 # Classic envs run through train.py's --classic route; everything else is an
-# Isaac Lab task and must NOT get that flag.
+# Isaac Lab task and must not get that flag.
 CLASSIC_ENVS = (
     "classic-car-v0",
     "classic-cartpole-v0",
@@ -60,7 +60,7 @@ ISAACLAB_ENVS = (
 
 
 def available_algorithms() -> list[str]:
-    """Algorithm names discoverable in configs/ — the file stem IS the name."""
+    """Algorithm names discoverable in configs/ — the file stem is the name."""
     return sorted(p.stem for p in _CONFIGS.glob("*.yaml"))
 
 
@@ -78,7 +78,7 @@ def load_config(algorithm: str) -> dict:
         if required not in (cfg.get("metric") or {}):
             raise SystemExit(f"{path}: metric is missing required key '{required}'.")
 
-    # Validate the runner block HERE rather than letting a missing key surface as
+    # Validate the runner block here rather than letting a missing key surface as
     # a KeyError traceback deep in build(). A sweep is launched detached, so a
     # config mistake that only trips at build time would otherwise show up as a
     # traceback in a nohup log nobody is watching.
@@ -96,7 +96,7 @@ def load_config(algorithm: str) -> dict:
         )
     if runner.get("wrapper"):
         # A poison value pointing the wrong way is the worst kind of silent
-        # failure: bayes would treat infeasible trials as the BEST observations
+        # failure: bayes would treat infeasible trials as the best observations
         # and drive the whole search into the infeasible region.
         bad = float(runner["bad_value"])
         goal = str(cfg["metric"]["goal"]).lower()
@@ -117,7 +117,7 @@ def load_config(algorithm: str) -> dict:
 def assert_method_compatible(cfg: dict, path) -> None:
     """Reject a ``method: grid`` config that still declares a continuous range.
 
-    W&B's grid search enumerates the CROSS PRODUCT of discrete value lists; it
+    W&B's grid search enumerates the cross product of discrete value lists; it
     has no way to enumerate a ``distribution:``. Given one, the controller does
     not error — it silently drops that parameter, so the sweep runs a grid over
     everything else with the continuous knob pinned at its yaml default and
@@ -142,7 +142,7 @@ def grid_size(cfg: dict) -> int:
     """Number of trials a ``method: grid`` sweep will enumerate (0 if not grid).
 
     Printed by ``--count`` so an accidentally combinatorial grid is visible
-    BEFORE launch rather than after a week of agents chewing through it.
+    before launch rather than after a week of agents chewing through it.
     """
     if str(cfg.get("method", "")).lower() != "grid":
         return 0
@@ -154,7 +154,7 @@ def grid_size(cfg: dict) -> int:
 
 
 def episode_length(env: str) -> int:
-    """Steps in ONE episode of ``env``, read from the env's own definition.
+    """Steps in one episode of ``env``, read from the env's own definition.
 
     Classic envs expose ENV_CONFIG with dt/time_bound, so this is derived rather
     than tabulated — a hardcoded table would silently go stale the moment an
@@ -201,7 +201,7 @@ def build(algorithm: str, env: str, *, method: str, project: str) -> dict:
     ]
 
     if runner.get("wrapper"):
-        # The wrapper needs to know WHICH key to poison; reading it off the
+        # The wrapper needs to know which key to poison; reading it off the
         # metric block rather than repeating it means the two can never drift
         # into a sweep that optimizes a metric no bad trial ever writes.
         command += ["--metric-name", cfg["metric"]["name"]]
@@ -220,13 +220,13 @@ def build(algorithm: str, env: str, *, method: str, project: str) -> dict:
         # episode — so exactly one episode is also exactly what it takes for
         # Stability/auc_mean to be computed once, from all num_envs envs.
         command += ["--num_timesteps", str(episode_length(env))]
-        # And drop the post-training rollout: it is sequential over ONE env and
+        # And drop the post-training rollout: it is sequential over one env and
         # feeds eval.json rather than the swept Stability/* metric, so in a
         # one-episode trial it would dominate the cost while contributing
         # nothing the sweep reads.
         command.append("--skip_final_eval")
 
-    # Static store_true flags every trial gets, verbatim — NOT swept params.
+    # Static store_true flags every trial gets, verbatim — not swept params.
     # A store_true flag can't be a wandb `parameters:` entry: wandb always
     # emits `--flag=<value>`, and argparse's store_true action raises on the
     # explicit `=value` even for a recognized flag (unlike the dotted
@@ -239,7 +239,7 @@ def build(algorithm: str, env: str, *, method: str, project: str) -> dict:
 
     return {
         "program": program,
-        # Every sweep lands in ONE project. What distinguishes them is the sweep
+        # Every sweep lands in one project. What distinguishes them is the sweep
         # NAME below, so all runs for a given env+algorithm stay comparable in a
         # single place instead of being scattered across per-launch projects.
         "project": project,

@@ -9,7 +9,7 @@ straight lines, giving richer coverage of the state space.
 where A, omega, phi are sampled uniformly at reset.
 
 Markov note: ``get()`` also returns (A, omega, sin(phase), cos(phase)) — the
-scalar yaw_rate VALUE alone does not determine its own future (the same value
+scalar yaw_rate value alone does not determine its own future (the same value
 is consistent with many (A, omega, phase) combinations, and even knowing all
 three, a single sin() value has two solutions per period with opposite
 derivative sign). Exposing the full generator (continuously embedded via

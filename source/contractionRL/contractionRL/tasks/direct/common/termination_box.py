@@ -9,7 +9,7 @@ drifted on the argument name alone within an hour of existing.
 
 What the box is for
 -------------------
-An episode ENDS the first step the state leaves [X_TERMINATION_MIN,
+An episode ends the first step the state leaves [X_TERMINATION_MIN,
 X_TERMINATION_MAX]. Without it a diverged env keeps producing off-distribution
 transitions for the rest of the horizon — on segway, 500 steps of already-fallen
 data per failure — and those transitions dominate the rollout batch, which is a
@@ -17,9 +17,9 @@ large part of why that env's outcome swings with the seed.
 
 Which done flag
 ---------------
-The excursion is reported as TRUNCATION, not termination. skrl's GAE is
+The excursion is reported as truncation, not termination. skrl's GAE is
 ``not_done = ~terminated`` (agents/skrl/agent_patches.compute_gae), so
-``terminated`` replaces the true continuation value V(x) with ZERO. Every reward
+``terminated`` replaces the true continuation value V(x) with zero. Every reward
 in this repo is a cost (V < 0), so that would make ending the episode strictly
 better than continuing — a suicide bonus, which some seeds find and others do
 not, i.e. exactly the variance the box exists to remove. On the truncation
@@ -58,7 +58,7 @@ class TerminationBoxMixin:
 
         ``clamp_box`` is the host's own (X_MIN, X_MAX) when its step clamps the
         state into that box before anything else sees it — the termination
-        bounds must then lie INSIDE it or they could never be crossed. Pass None
+        bounds must then lie inside it or they could never be crossed. Pass None
         when the host does no clamping (the Isaac family).
         """
         self._term_tag = tag

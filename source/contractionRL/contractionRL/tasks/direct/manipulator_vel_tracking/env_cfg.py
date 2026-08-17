@@ -50,7 +50,7 @@ class ManipulatorVelTrackingEnvCfg(DirectRLEnvCfg):
     # action: deviation from default joint positions [rad] — matches quadruped/humanoid_vel_tracking's convention
     # Both groups run at FRANKA_PANDA_HIGH_PD_CFG's stiffness=400.0, but effort_limit_sim
     # differs sharply per group (87 Nm vs 12 Nm), so a single action_scale=0.25 (needing
-    # 100 Nm at full-scale action) saturates BOTH: panda_shoulder by 15%, panda_forearm by
+    # 100 Nm at full-scale action) saturates both: panda_shoulder by 15%, panda_forearm by
     # 8.3x. Scaled below each group's own limit/stiffness ratio, with ~15-20% margin left
     # for the PD law's damping*velocity_error term (not captured by this static torque estimate).
     action_scale_shoulder = 0.20   # panda_joint[1-4]: 400*0.20=80 Nm vs 87 Nm limit

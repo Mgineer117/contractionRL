@@ -3,7 +3,7 @@ path-tracking layout used throughout this repo.
 
 Never edit vendored skrl code (see ``skrl.resources.preprocessors.torch.
 RunningStandardScaler``) — this module wraps it instead, because standardizing
-the FULL observation vector is wrong for this layout.
+the full observation vector is wrong for this layout.
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ class RunningRewardScaler(nn.Module):
     ``tracking_scaler·(eᵀM e − next_eᵀM next_e)`` (``M = W⁻¹`` has eigenvalues in
     ``[1/w_ub, 1/w_lb]``, so its magnitude — and its heavy tail — grows as
     ``1/w_lb``; see ``env_base.get_rewards`` and c2rl.py). This tames both that
-    scale and the early-training transient BEFORE the cumulative ``value_norm``
+    scale and the early-training transient before the cumulative ``value_norm``
     (``RunningStandardScaler`` on the value) can catch up, which it lags because
     the frozen-CMG reward is non-stationary as the policy improves.
 
@@ -102,7 +102,7 @@ class PathTrackingObservationScaler(nn.Module):
       - ``urefs``: the residual backbones (``control``/``mlp``, squashed or
         not) take ``urefs[0]`` straight out of the observation and add it to the
         network's feedback — for the squashed backbones, that add happens
-        AFTER tanh-squashing (see ``models.py``'s ``_TanhSquashMixin``).
+        after tanh-squashing (see ``models.py``'s ``_TanhSquashMixin``).
         Normalizing ``uref`` would make the applied control law
         ``uref_norm + feedback`` instead of ``uref + feedback``, distorting
         the reference-tracking residual.
@@ -114,7 +114,7 @@ class PathTrackingObservationScaler(nn.Module):
 
     Everything else in ``x``/``xrefs`` (non-angle physical states) is
     standardized exactly like the stock ``RunningStandardScaler``, using its
-    own running mean/std fit ONLY over that normalized subset.
+    own running mean/std fit only over that normalized subset.
     """
 
     def __init__(
@@ -131,7 +131,7 @@ class PathTrackingObservationScaler(nn.Module):
         super().__init__()
         from .ref_window import RefWindow
 
-        # The layout is whatever the space declares; build the mask off the SAME
+        # The layout is whatever the space declares; build the mask off the same
         # flat ordering RefWindow.split uses (sorted keys: urefs, x, xrefs).
         window = RefWindow(x_dim=int(x_dim), u_dim=int(u_dim),
                            length=_window_length(size, x_dim, u_dim))

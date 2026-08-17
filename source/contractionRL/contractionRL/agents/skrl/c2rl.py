@@ -1,33 +1,33 @@
 """C2RL — single-policy contraction-metric RL against a Neural Contraction
 Metric (NCM) reward.
 
-C2RLAgent trains ONE real skrl PPO/SAC sub-agent (per ``base_algorithm``)
+C2RLAgent trains one real skrl PPO/SAC sub-agent (per ``base_algorithm``)
 against a Mahalanobis tracking reward
 
     ``tracking_scaler·(V_t - V_{t+1}) - control_scaler·||u||²``,   V = eᵀM(x)e
 
-with ``e = x - xref``. The tracking term is the per-step DECREASE of ``V`` — a
+with ``e = x - xref``. The tracking term is the per-step decrease of ``V`` — a
 contraction signal, not a level penalty — computed identically by both env
 families. The control term is disabled (``control_scaler = 0``) in every
 shipped config.
 
-METRIC SOURCE (``metric_source``) decides how the ENV computes that reward,
+Metric source (``metric_source``) decides how the env computes that reward,
 since the chosen object is injected into the env and called from its
 ``get_rewards()``:
 
-  * "cmg" (default) — a CMG network ``W(x)`` synthesized in Phase A then FROZEN
+  * "cmg" (default) — a CMG network ``W(x)`` synthesized in Phase A then frozen
     for the whole run (Tsukamoto's NCM recipe). Mandatory ``models["cmg"]``.
   * "online" — no Phase A. ``OnlineCVSTEMMetric`` solves the CV-STEM SDP per env
-    per step at the visited states, so every deployed ``M`` is VERIFIED feasible
+    per step at the visited states, so every deployed ``M`` is verified feasible
     rather than a regression of one. Costs num_envs solves per env-step (~12 ms
     each, MOSEK, 4-state), so it's a single-run research config, not a sweep
-    one; an infeasible state ABORTS — a reward has no "open loop" fallback the
+    one; an infeasible state aborts — a reward has no "open loop" fallback the
     way CV-STEM-LQR's control law does.
 
 ``cmg_method="ccm"`` forces ``metric_source="cmg"`` (it has no per-state SDP),
 so the pair is three real configurations, not four.
 
-CMG TRAINING (``cmg_method``), both in ``ncm_synthesis.py``:
+CMG training (``cmg_method``), both in ``ncm_synthesis.py``:
 
   * "cvstem" — sample ``cmg_memory_size`` states, solve one SDP per state for
     ``W*(x)`` (``build_cm_dataset``), MSE-regress the CMG onto the feasible
@@ -43,25 +43,25 @@ States are drawn from the classic env's analytic state space (``get_rollout``,
 unlimited) or, with ``dynamics_pretrain_data_path`` set, from that offline
 ``dynamics_data.npz`` (capped to its size, warning if it's short).
 
-PHASE B is identical across all three configurations: each hands off one object
+Phase b is identical across all three configurations: each hands off one object
 with the same ``W, _ = metric(x)`` contract. The reward is never overwritten
 agent-side — ``_inject_ccm`` puts that object in the env via ``set_ccm``, and
 the env's own ``get_rewards()`` returns the Mahalanobis reward natively. So what
 reaches ``record_transition`` (and thus PPO's GAE / SAC's replayed critic
 target) is already correct, with no per-algorithm reward plumbing to keep in
-sync. ``_inject_ccm`` RAISES if no env accepted it — silently missing it would
+sync. ``_inject_ccm`` raises if no env accepted it — silently missing it would
 mean training on the plain baseline reward.
 
-NORMALIZATION: the metric and reward always use RAW observations. ``M(x)`` and
+Normalization: the metric and reward always use raw observations. ``M(x)`` and
 ``e = x - xref`` are defined in physical coordinates, and per-dimension
 normalization would scale ``x`` and ``xref`` independently, distorting ``e``.
 ``uref`` and ``angle_idx`` columns are likewise excluded (see
 ``rl_glue.make_base_rl_cfg``). ``use_state_norm`` is False in every config.
 
-LEARNED DYNAMICS (Isaac / ``use_empirical_dynamics``): a ``NeuralDynamics``
+Learned dynamics (Isaac / ``use_empirical_dynamics``): a ``NeuralDynamics``
 model supplies f/B/B_null and ∂f/∂x, pretrained once before Phase A. Under
 "cmg" that is its only consumer (synthesis needs them; Phase B never touches it
-again, the CMG being frozen). Under "online" the opposite — queried EVERY step.
+again, the CMG being frozen). Under "online" the opposite — queried every step.
 Classic envs use analytical ``get_f_and_B`` and skip pretraining.
 """
 
@@ -90,10 +90,10 @@ from .rl_glue import filter_cfg_fields, make_base_rl_cfg
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────── #
 
-# NOTE: base_algorithm is NOT a field on either cfg below — it's an explicit
+# NOTE: base_algorithm is not a field on either cfg below — it's an explicit
 # C2RLAgent constructor kwarg (see ContractionRunner._setup_c2rl), set by which
 # entry point you use (skrl_c2rl_ppo_cfg.yaml / skrl_c2rl_sac_cfg.yaml). Each
-# cfg's base-algorithm fields mirror the REAL skrl PPO_CFG/SAC_CFG field names
+# cfg's base-algorithm fields mirror the real skrl PPO_CFG/SAC_CFG field names
 # 1:1, so a c2rl-sac.yaml actually validates against SAC's own parameter names.
 # make_base_rl_cfg() still reads from the raw yaml dict (self._raw_cfg) and
 # filters against whichever of PPO_CFG/SAC_CFG applies, so any valid field works
@@ -126,38 +126,38 @@ class C2RLPPOCfg(AgentCfg):
     rewards_shaper_scale: float = 1.0  # yaml convenience for PPO_CFG's rewards_shaper — see rl_glue.make_base_rl_cfg
     std_dev_annealing_kwargs: dict | None = None  # forwarded to patch_ppo_std_annealing()
     # True (default): log_std follows the fixed schedule in
-    # std_dev_annealing_kwargs and is NOT learned (CLActor builds it with
+    # std_dev_annealing_kwargs and is not learned (CLActor builds it with
     # requires_grad=False and the patch overwrites it every step).
     # False: PPO learns log_std through the policy loss, as in stock PPO. The
     # schedule then does not apply, and entropy_loss_scale is left as configured
     # (the annealing patch zeroes it, since a bonus would fight the schedule).
-    # OFF: PPO LEARNS log_std (the False branch in __init__ flips requires_grad
+    # Off: PPO learns log_std (the False branch in __init__ flips requires_grad
     # so it is a real parameter, not a frozen constant). Annealing drives sigma
     # down a fixed schedule regardless of what the policy needs, which fights
     # the exploration a swept discount factor requires -- a gamma=0.999 run and
     # a gamma=0.01 run want very different exploration at the same step count.
     std_dev_annealing: bool = False
-    # CAPS action-smoothness regularization on the POLICY LOSS (both 0 = off).
+    # CAPS action-smoothness regularization on the policy loss (both 0 = off).
     # Not a reward term: it leaves the MDP, the observation and the dynamics
     # untouched, so the offline CV-STEM synthesis stays valid. See
     # agent_patches.patch_caps_regularizer.
     caps_temporal_scale: float = 0.0  # weight on ||pi(s_t) - pi(s_{t+1})||^2
     caps_spatial_scale: float = 0.0   # weight on ||pi(s) - pi(s_bar)||^2, s_bar ~ N(s, sigma^2)
-    caps_spatial_std: float = 0.05    # sigma, in RAW observation units (see patch_caps_regularizer)
-    # Set by ContractionRunner from the yaml `memory:` block's memory_size, NOT
+    caps_spatial_std: float = 0.05    # sigma, in raw observation units (see patch_caps_regularizer)
+    # Set by ContractionRunner from the yaml `memory:` block's memory_size, not
     # read from `agent:` directly; declared purely so filter_cfg_fields()
     # recognizes it instead of warning.
     memory_size: int = -1
     # Deployed policy's discount factor — a single policy trained against the
     # Mahalanobis reward, so there is no con/opt duality here.
     discount_factor: float = 0.99
-    # ── Metric source: WHERE the env's Mahalanobis reward gets M(x) ──────── #
+    # ── Metric source: Where the env's Mahalanobis reward gets M(x) ──────── #
     # "cmg" (default): a CMG network synthesized in Phase A (cmg_method selects
     # how) and frozen for the whole run. "online": no Phase A at all — solve the
     # CV-STEM SDP per env per step at the visited states
     # (ncm_synthesis.OnlineCVSTEMMetric), so every deployed M is a verified
     # feasible metric instead of a regression of one, at the cost of num_envs
-    # SDP solves per step. cmg_method="ccm" FORCES "cmg" (there is no per-state
+    # SDP solves per step. cmg_method="ccm" forces "cmg" (there is no per-state
     # SDP to solve online under the C1/C2 pipeline).
     metric_source: str = "cmg"
     w_ub: float = 10.0
@@ -182,41 +182,41 @@ class C2RLPPOCfg(AgentCfg):
     cvstem_r_scaler: float = 1.0
     # Residual RL over the analytic controller. When True, the actor mean is
     # u = CV-STEM-LQR(K=R⁻¹BᵀW⁻¹)·baseline + learned bilinear residual (residual
-    # zero-initialized) — the policy STARTS at the certified contraction controller
+    # zero-initialized) — the policy starts at the certified contraction controller
     # (the same frozen CMG from Phase A) and PPO learns only the correction. Needs
     # the 'control' backbone (a CLActor policy). See nn_modules.CVSTEMLQRBase.
     cvstem_residual_base: bool = False
-    # INERT since the actor architecture was fixed to W2(xrefs)·tanh(W1(x)·e).
+    # Inert since the actor architecture was fixed to W2(xrefs)·tanh(W1(x)·e).
     # Kept so an older yaml carrying these keys still parses (a key the dataclass
     # does not declare is silently dropped — see rl_glue.filter_cfg_fields).
     # ── superseded ──
-    # π-network variant: make the residual a pure ANTICIPATORY FEEDFORWARD head
+    # π-network variant: make the residual a pure anticipatory feedforward head
     # (an MLP of the reference preview [uref, future-uref] only) instead of the
-    # bilinear e-feedback. LQ-preview-optimal control = feedback(−K·e) [the base]
+    # bilinear e-feedback. Lq-preview-optimal control = feedback(−K·e) [the base]
     # + feedforward(future reference) [this head]. Being independent of e, it can
-    # ADD the anticipation the myopic CV-STEM-LQR base lacks WITHOUT reshaping (and
+    # Add the anticipation the myopic CV-STEM-LQR base lacks without reshaping (and
     # corrupting) its certified feedback — the failure mode of the bilinear
     # residual (∝ e), which PPO drifts to AUC 1.19. Needs cvstem_residual_base +
     # a reference preview (--num_preview>0). Trained on the Mahalanobis reward at a
     # high discount_factor so anticipation is actually rewarded. See
     # models.CLActorModel.ff_head / compute.
     residual_feedforward: bool = False
-    # π-network architecture for residual RL on the CV-STEM-LQR base. Selects HOW
+    # π-network architecture for residual RL on the CV-STEM-LQR base. Selects how
     # the learned residual is generated from the current state x, the reference
     # preview P, and the invariant error e (all zero-init → start at the base):
     #   "bilinear"    — original CLActor W₂(x,xref,P)·tanh(W₁(x,xref,P)·e) (blended)
-    #   "feedforward" — FF(P) only, independent of e (== residual_feedforward)
+    #   "feedforward" — ff(P) only, independent of e (== residual_feedforward)
     #   "decoupled"   — W₂(P)·tanh(W₁(x)·e)                     (physical/geometric split)
     #   "latent_bias" — W₂(x)·tanh(W₁(x)·e + f_prev(P))         (recommended)
     #   "film"        — (W₂(x)⊙γ₂(P))·tanh((W₁(x)⊙γ₁(P))·e)     (gain scheduling)
     # See nn_modules DecoupledResidual / LatentPreviewResidual / FiLMResidual.
     residual_variant: str = "bilinear"
-    # Contraction PRETRAINING of π before PPO (the fix for u = uref + π, which
+    # Contraction pretraining of π before PPO (the fix for u = uref + π, which
     # otherwise can't learn a stabilizing feedback from scratch — it diverges on
     # high-dim systems). Minimizes the C3M closed-loop contraction condition
-    # Cu = Ṁ + 2·sym(M(A+BK)) + 2λM ≺ 0 (the C3M pd_loss) over π ONLY, against the
-    # FROZEN Phase-A CMG metric M(x) — a contraction certificate learned from the
-    # metric geometry, NOT from CV-STEM-LQR. Puts PPO in the basin of a stabilizing
+    # Cu = Ṁ + 2·sym(M(A+BK)) + 2λM ≺ 0 (the C3M pd_loss) over π only, against the
+    # Frozen Phase-A CMG metric M(x) — a contraction certificate learned from the
+    # metric geometry, not from CV-STEM-LQR. Puts PPO in the basin of a stabilizing
     # controller so it refines rather than has to discover one. Preview is zeroed
     # during pretraining (certify the stabilizing feedback; PPO adds anticipation).
     # See C2RLAgent._pretrain_residual_contraction.
@@ -228,17 +228,17 @@ class C2RLPPOCfg(AgentCfg):
     # Which objective _pretrain_residual_contraction uses: "contraction" (default,
     # legacy) minimizes the C3M Cu≺0 SDP violation above; "cvstemlqr" instead
     # directly MSE-regresses u = uref + π(s) onto the analytic CV-STEM-LQR control
-    # law CVSTEMLQRBase(x,xref,uref) computed from the SAME frozen Phase-A metric.
+    # law CVSTEMLQRBase(x,xref,uref) computed from the same frozen Phase-A metric.
     # This is plain supervised regression against a fixed, deterministic target —
     # well-posed (drives to ~0 MSE) unlike the SDP violation loss, which plateaus
     # well above 0 (observed ~2.6-3.3 across seeds) and correlates with how much
     # residual overshoot/AUC variance each seed ends up with. The analytic base is
-    # NEVER attached to the policy here (policy.base_controller stays unset) — the
+    # Never attached to the policy here (policy.base_controller stays unset) — the
     # deployed control law is always u = uref + π, exactly as in "contraction"
     # mode; CVSTEMLQRBase is used only to generate a regression target during this
     # pretraining phase. See C2RLAgent._pretrain_residual_cvstemlqr.
     residual_pretrain_method: str = "contraction"
-    # Clamp the "cvstemlqr" regression TARGET to the box the env actually
+    # Clamp the "cvstemlqr" regression target to the box the env actually
     # applies, before the MSE.
     #
     # At cvstem_r_scaler=0.01, K = R⁻¹BᵀM gives ‖K‖₂ ≈ 53 (measured, cached car
@@ -251,12 +251,12 @@ class C2RLPPOCfg(AgentCfg):
     # plateaus well above 0 at any epoch count; (2) the pretrained policy
     # deploys deep in saturation, so ∂(applied u)/∂π = 0 almost everywhere —
     # PPO's task gradient vanishes while CAPS and the residual anchor (acting on
-    # π's RAW O(20) output) do not. The annealed std (exp(-3) ≈ 0.05) can't
+    # π's raw o(20) output) do not. The annealed std (exp(-3) ≈ 0.05) can't
     # escape an O(20) mean, so each seed's saturation pattern is frozen in from
     # pretraining. A direct mechanism for seed-wise AUC spread.
     #
     # Clamping makes the regression well-posed against the executable control
-    # law WITHOUT re-solving the SDP (unlike raising cvstem_r_scaler, which
+    # law without re-solving the SDP (unlike raising cvstem_r_scaler, which
     # changes the metric and invalidates the cached dataset). Pretraining only;
     # the deployed law is unchanged.
     residual_pretrain_clamp_target: bool = False
@@ -266,23 +266,23 @@ class C2RLPPOCfg(AgentCfg):
     # though a contraction/cvstem-lqr pretrain already left π at (near-)optimal
     # mean actions. Three suspects, three knobs:
     #
-    # Ablation A — exploration std is NOT pretrained (_pretrain_residual_* excludes
+    # Ablation A — exploration std is not pretrained (_pretrain_residual_* excludes
     # log_std from the trained params by design — the certificate is about the
     # deterministic control law), so Phase B can start with an init std comparable
-    # to the FULL control range (car's control box is lim=1.0, default
+    # to the full control range (car's control box is lim=1.0, default
     # initial_log_std=0.0 => std=1.0) even though the mean is already optimal —
     # the rollout data PPO trains its first updates on is then generated by a
     # near-random controller. Set this to override log_std_parameter to a small
     # value right after pretraining (see C2RLAgent._maybe_attach_residual_base);
     # None (default) leaves whatever the yaml's initial_log_std says. Needs
-    # patch_ppo_std_annealing's LAZY initial_log_std capture (see agent_patches.py)
+    # patch_ppo_std_annealing's lazy initial_log_std capture (see agent_patches.py)
     # to not be immediately overwritten on the first post_interaction call.
     residual_pretrain_init_log_std: float | None = None
     # Ablation B — critic cold-start: the critic starts random while the
     # near-optimal policy's true advantages are ~0, and GAE normalization divides
     # by that near-zero std, manufacturing a full-scale, confident gradient out
     # of noise. >0: after Phase A/residual-pretrain, roll out the frozen
-    # pretrained actor in the REAL env for this many steps and MSE-regress the
+    # pretrained actor in the real env for this many steps and MSE-regress the
     # critic onto the resulting (short-horizon, since discount_factor is small
     # here) Monte-Carlo returns before Phase B's PPO updates start. 0 (default)
     # = off (critic starts from its random init, as before). See
@@ -300,10 +300,10 @@ class C2RLPPOCfg(AgentCfg):
     # the contraction certificate is provided by the baseline, so the residual
     # optimizes the true tracking objective. See env_base.get_rewards.
     reward_euclidean: bool = False
-    # With reward_euclidean: LEVEL form r=-‖e‖ (tightest AUC alignment) vs the
-    # default DECREMENT form. See env_base.get_rewards.
+    # With reward_euclidean: Level form r=-‖e‖ (tightest AUC alignment) vs the
+    # default decrement form. See env_base.get_rewards.
     reward_level: bool = False
-    # Supervised warm-start of the residual so the actor reproduces the ONLINE
+    # Supervised warm-start of the residual so the actor reproduces the online
     # CV-STEM-LQR controller (per-state SDP metric W_online, which the frozen CMG
     # only approximates), then PPO fine-tunes from there. Reuses the Phase-A SDP
     # solutions — no new solves. Needs cvstem_residual_base + cmg_method=cvstem.
@@ -311,15 +311,15 @@ class C2RLPPOCfg(AgentCfg):
     cvstem_residual_distill: bool = False
     residual_distill_epochs: int = 300
     residual_frozen: bool = False  # ablation: keep residual at 0 (pure base)
-    # REMOVED 2026-07-30: hard_control_bound* / gain_net_* knobs, for the
+    # Removed 2026-07-30: hard_control_bound* / gain_net_* knobs, for the
     # hard-control-bound base (free SDP gain Y + Boyd bounded-peak-input LMI).
-    # Measured WORSE than the post-hoc actuator filter (cvstem_u_bound/rho,
+    # Measured worse than the post-hoc actuator filter (cvstem_u_bound/rho,
     # also since removed 2026-07-30 — never set by any config): 98.4% held-out
     # violation rate vs 24.6%. Recover with `git log -S hard_control_bound` /
     # `git log -S cvstem_u_bound`.
     residual_anchor_scale: float = 0.0  # penalize ‖u-u_base‖² in reward (residual trust anchor)
     # Weights of the CV-STEM objective J = cm_chi_weight·χ + cm_nu_weight·ν, which
-    # solve_cm_metric ALWAYS minimizes (Tsukamoto's classncm.cvstem0). χ and ν are
+    # solve_cm_metric always minimizes (Tsukamoto's classncm.cvstem0). χ and ν are
     # the metric's condition number and scale, and they are decision variables:
     # W̄ ⪰ I, W̄ ⪯ χI, deployed W = W̄/ν. "cvstem" method only.
     cm_chi_weight: float | None = None  # None → 1/lbd, mirroring Tsukamoto's chi/alp
@@ -330,11 +330,11 @@ class C2RLPPOCfg(AgentCfg):
     # difference against — see ncm_synthesis.py's module docstring). "cvstem" method
     # only; superseded by cm_wdot_trajectory when that's on.
     cm_wdot_dt: float = 0.0
-    # Real Ẇ from OFFLINE REFERENCE TRAJECTORIES ("cvstem" method only): instead of
+    # Real Ẇ from offline reference trajectories ("cvstem" method only): instead of
     # dropping Ẇ or using the static cm_wdot_dt proxy above, sample states as
     # trajectory-ordered chunks from dynamics_pretrain_data_path (which must be
     # set — raises otherwise) and difference each state's solved normalized W̄
-    # against the ACTUAL PREVIOUS state's along that same reference trajectory —
+    # against the actual previous state's along that same reference trajectory —
     # Ẇ ≈ (W̄_t − W̄_{t−1})/cm_temporal_dt, the real material derivative rather
     # than an approximation (see ncm_synthesis.build_cm_dataset's
     # traj_x/traj_lengths/temporal_dt and dynamics_pretrain.load_offline_trajectories).
@@ -343,12 +343,12 @@ class C2RLPPOCfg(AgentCfg):
     # cmg_method="ccm" (train_cmg_ccm has no per-state SDP to add Ẇ to; raises).
     cm_wdot_trajectory: bool = False
     # Integration step between consecutive states in the offline trajectory data —
-    # NOT auto-derived from the env (dynamics_data.npz doesn't record it); set it
+    # Not auto-derived from the env (dynamics_data.npz doesn't record it); set it
     # to the same dt used to generate that file (scripts/skrl/train.py's
     # _generate_ref_trajs: env_cfg.sim.dt * env_cfg.decimation). Only read when
     # cm_wdot_trajectory=True.
     cm_temporal_dt: float = 0.05
-    # On SDP infeasibility at a state, retry that state ALONE with λ halved,
+    # On SDP infeasibility at a state, retry that state alone with λ halved,
     # up to this many times, before giving up on it (0 = old behavior, drop
     # immediately). See ncm_synthesis._solve_cm_metric_with_backoff. "cvstem" method only.
     max_lambda_reductions: int = 5
@@ -389,7 +389,7 @@ class C2RLPPOCfg(AgentCfg):
     # / math_utils.EarlyStopper). <=0 disables both (always regress the full budget).
     cmg_val_frac: float = 0.1
     cmg_early_stop_patience: int = 10
-    # Fraction (0..1) of the CMG-dataset states drawn from the BROAD/off-reference
+    # Fraction (0..1) of the CMG-dataset states drawn from the broad/off-reference
     # distribution (states an early chaotic policy actually visits) rather than the
     # reference-trajectory tube — the rest are reference states. 0 = old behavior
     # (all reference, or all of the offline pool). Random states come from the
@@ -406,7 +406,7 @@ class C2RLPPOCfg(AgentCfg):
     dynamics_batch_size: int = 4096
     dynamics_pretrain_epochs: int = 5
     dynamics_pretrain_data_path: str = ""
-    # Fixed pretraining buffer size — sampled ONCE (offline-data subsample when
+    # Fixed pretraining buffer size — sampled once (offline-data subsample when
     # dynamics_pretrain_data_path is set, else a fresh get_rollout draw), then
     # multi-epoch trained over, mirroring cmg_memory_size's role in CMG
     # synthesis (see dynamics_pretrain.pretrain_dynamics). Classic envs can
@@ -431,7 +431,7 @@ class C2RLPPOCfg(AgentCfg):
 @dataclass
 class C2RLSACCfg(AgentCfg):
     """C2RL config for base_algorithm="SAC". SAC fields mirror skrl's SAC_CFG."""
-    # Not a real SAC_CFG field, and NOT the replay buffer size (that's
+    # Not a real SAC_CFG field, and not the replay buffer size (that's
     # memory_size): it's how many env steps C2RLSkrlTrainer takes per outer
     # iteration, i.e. the cadence of the outer agent's checkpoint/flush pass.
     # SAC still updates every single step within that chunk.
@@ -472,7 +472,7 @@ class C2RLSACCfg(AgentCfg):
     cvstem_r_scaler: float = 1.0
     cvstem_residual_base: bool = False  # actor = CV-STEM-LQR baseline + learned residual (see C2RLPPOCfg)
     reward_euclidean: bool = False       # AUC-aligned Euclidean-decrement reward (see C2RLPPOCfg)
-    reward_level: bool = False           # LEVEL (r=-‖e‖) vs decrement euclidean reward (see C2RLPPOCfg)
+    reward_level: bool = False           # Level (r=-‖e‖) vs decrement euclidean reward (see C2RLPPOCfg)
     cvstem_residual_distill: bool = False # warm-start residual to online CV-STEM-LQR (see C2RLPPOCfg)
     residual_distill_epochs: int = 300
     # Weights of the CV-STEM objective J (always minimized) — see
@@ -523,8 +523,8 @@ def cm_dataset_target(cfg) -> tuple[Path | None, dict]:
     """Where this config's offline ``{x → W*(x)}`` dataset lives, and its key.
 
     The single source of truth for both sides of the contract: the agent
-    (``_synthesize_cmg_cvstem``) LOADS from here, and
-    ``scripts/build_cm_dataset.py`` WRITES here. Deriving the path or the
+    (``_synthesize_cmg_cvstem``) loads from here, and
+    ``scripts/build_cm_dataset.py`` writes here. Deriving the path or the
     ``cache_kwargs`` twice is how a generator silently produces a file the agent
     then key-misses and refuses — the two must be computed by one function.
 
@@ -535,16 +535,16 @@ def cm_dataset_target(cfg) -> tuple[Path | None, dict]:
 
     data_path = getattr(cfg, "dynamics_pretrain_data_path", "") or None
     explicit_cache_path = getattr(cfg, "cm_data_path", "") or None
-    # cm_wdot_trajectory (see C2RLPPOCfg's docstring): real Ẇ from OFFLINE
-    # REFERENCE TRAJECTORIES instead of dropping it or Tsukamoto's static
+    # cm_wdot_trajectory (see C2RLPPOCfg's docstring): real Ẇ from offline
+    # Reference trajectories instead of dropping it or Tsukamoto's static
     # cm_wdot_dt proxy. random_ratio is meaningless there (the whole point is
-    # NOT mixing in i.i.d. states) so it is forced to 0 in the cache key too.
+    # Not mixing in i.i.d. states) so it is forced to 0 in the cache key too.
     wdot_trajectory = bool(getattr(cfg, "cm_wdot_trajectory", False))
     temporal_dt = cfg.cm_temporal_dt if wdot_trajectory else 0.0
     random_ratio = 0.0 if wdot_trajectory else getattr(cfg, "cmg_random_ratio", 0.0)
 
     if explicit_cache_path:
-        # An explicit cm_data_path is treated as a BASE name: the swept SDP
+        # An explicit cm_data_path is treated as a base name: the swept SDP
         # knobs are appended (cm_dataset_filename) so different lbd/w_lb/w_ub
         # runs never clobber or wrongly reuse each other's cache.
         base = Path(explicit_cache_path)
@@ -577,11 +577,11 @@ class C2RLAgent(Agent):
     """C2RL agent — native skrl Agent, single deployed policy.
 
     Models in ``models`` dict:
-      ``"policy"``   — the REAL deployed SAC/PPO policy.
+      ``"policy"``   — the real deployed SAC/PPO policy.
       ``"value"`` (PPO) or ``"critic_1"``/``"critic_2"``/``"target_critic_1"``/
         ``"target_critic_2"`` (SAC) — the deployed policy's own critic(s).
       ``"dynamics"`` — optional NeuralDynamics (use_empirical_dynamics=True).
-      ``"cmg"``      — REQUIRED. MetricModel (``BoundedCCM_Generator``, i.e.
+      ``"cmg"``      — required. MetricModel (``BoundedCCM_Generator``, i.e.
         ``constrain_eigenvalues=True``) synthesized offline (see synthesize_cmg)
         and frozen before Phase B; read for the Mahalanobis reward.
 
@@ -626,7 +626,7 @@ class C2RLAgent(Agent):
             device=device,
         )
 
-        # The observation space DECLARES its layout ({x, xrefs, urefs}), so
+        # The observation space declares its layout ({x, xrefs, urefs}), so
         # x_dim/u_dim are read, never guessed from obs_dim (the old
         # (obs_dim - u_dim)//2 parity rule silently mis-split any other layout).
         self._window = RefWindow.from_space(observation_space)
@@ -649,7 +649,7 @@ class C2RLAgent(Agent):
         # This agent always owns the (optional) learned dynamics directly — Phase
         # A's CMG synthesis needs f/B/∂f/∂x (SDP dataset for "cvstem", C1/C2
         # gradient computation for "ccm"). The CMG network (models["cmg"]) is
-        # fit OFFLINE (see C2RLSkrlTrainer.train / synthesize_cmg) and frozen
+        # fit offline (see C2RLSkrlTrainer.train / synthesize_cmg) and frozen
         # before Phase B — see module docstring.
         self._setup_dynamics(parsed_cfg, models, get_f_and_B, x_dim, u_dim, device)
         if "cmg" not in models:
@@ -677,7 +677,7 @@ class C2RLAgent(Agent):
             )
         if self._metric_source == "online" and parsed_cfg.cmg_method == "ccm":
             # Not an error: "ccm" simply has no per-state SDP to solve online (it
-            # trains the CMG by C1/C2 gradient descent), so the CMG network IS the
+            # trains the CMG by C1/C2 gradient descent), so the CMG network is the
             # only metric that pipeline can produce. Downgrade and say so, rather
             # than making every ccm sweep restate a metric_source it cannot vary.
             print(
@@ -761,7 +761,7 @@ class C2RLAgent(Agent):
             disable_advantage_norm=bool(getattr(parsed_cfg, "disable_advantage_norm", False)),
         )
         patch_sac_entropy_clamp(self._rl_agent)
-        # Applied to the INNER PPO/SAC sub-agent: C2RL's outer agent has no
+        # Applied to the inner PPO/SAC sub-agent: C2RL's outer agent has no
         # .policy/.scaler of its own for the patch to hook.
         patch_caps_regularizer(
             self._rl_agent,
@@ -845,7 +845,7 @@ class C2RLAgent(Agent):
     def act(self, observations, states, *, timestep: int, timesteps: int):
         """Evaluation entry point (play.py / train_utils' rollouts call this).
 
-        Goes to the policy MODEL rather than delegating to ``self._rl_agent.act``
+        Goes to the policy model rather than delegating to ``self._rl_agent.act``
         so a nonzero ``random_timesteps`` can't turn an eval rollout — which
         always passes ``timestep=0`` — into uniform random actions. The
         observation preprocessor is applied by hand for the same reason it is
@@ -861,7 +861,7 @@ class C2RLAgent(Agent):
 
     # act/pre_interaction/post_interaction/update are all abstract on skrl's
     # Agent, so they must be defined even where the base behavior is all we
-    # want. record_transition is NOT abstract and we add nothing to it, so it's
+    # want. record_transition is not abstract and we add nothing to it, so it's
     # left inherited. C2RLSkrlTrainer drives the actual Phase B update itself
     # (see update_policy), so update() here stays a no-op.
     def pre_interaction(self, *, timestep: int, timesteps: int) -> None:
@@ -1028,7 +1028,7 @@ class C2RLAgent(Agent):
 
     def _maybe_attach_residual_base(self) -> None:
         """After the CMG is frozen (Phase A), configure the actor's residual π(s).
-        The control law is u = base + π(s): by DEFAULT base = the reference
+        The control law is u = base + π(s): by default base = the reference
         feedforward uref (u = uref + π — π learns the whole feedback and the
         deployed policy stands on its own); with ``cvstem_residual_base`` the base
         becomes the analytic CV-STEM-LQR controller (warm-start, off by default).
@@ -1046,11 +1046,11 @@ class C2RLAgent(Agent):
 
         use_base = bool(getattr(self._cfg, "cvstem_residual_base", False))
 
-        # The control law is u = base + π. DEFAULT base = the reference feedforward
+        # The control law is u = base + π. Default base = the reference feedforward
         # urefs[0] (u = uref + π — π learns the whole feedback, the deployed policy
         # standing on its own). Attach the analytic CV-STEM-LQR controller as the
-        # base ONLY when explicitly requested (cvstem_residual_base warm-start).
-        # Hard-control-bound dispatch DISABLED 2026-07-30 — see
+        # base only when explicitly requested (cvstem_residual_base warm-start).
+        # Hard-control-bound dispatch disabled 2026-07-30 — see
         # C2RLPPOCfg.hard_control_bound's (commented) docstring above.
         # if use_base and getattr(self._cfg, "hard_control_bound", False):
         #     policy.base_controller = self._build_hard_bound_base()
@@ -1061,10 +1061,10 @@ class C2RLAgent(Agent):
                 r_scaler=self._cfg.cvstem_r_scaler, w_lb=self._cfg.w_lb,
                 window=self._window, angle_idx=self._angle_idx,
             )
-            # Warm-start: zero W2's output so π starts at 0 and training STARTS
+            # Warm-start: zero W2's output so π starts at 0 and training starts
             # exactly at the analytic base.
             cl_actor.w2.zero_output()
-        # else: base = urefs[0] (compute()), π keeps its STANDARD init so the policy
+        # else: base = urefs[0] (compute()), π keeps its standard init so the policy
         # starts with feedback and learns the full contraction law from scratch.
 
         _base_desc = "CV-STEM-LQR(K=R⁻¹BᵀW⁻¹)" if use_base else "urefs[0] (reference feedforward)"
@@ -1075,8 +1075,8 @@ class C2RLAgent(Agent):
         if use_base and getattr(self._cfg, "cvstem_residual_distill", False):
             self._distill_residual_from_online()
         if use_base and getattr(self._cfg, "residual_frozen", False):
-            # Ablation (base only): keep π at 0 so the deployed actor IS the pure
-            # CV-STEM-LQR base — measures the base's own AUC. Freeze EVERY residual
+            # Ablation (base only): keep π at 0 so the deployed actor is the pure
+            # CV-STEM-LQR base — measures the base's own AUC. Freeze every residual
             # param; logstd stays trainable so PPO still has policy params.
             for name, p in policy.named_parameters():
                 if any(k in name for k in ("cl_actor.w1.", "cl_actor.w2.")):
@@ -1097,12 +1097,12 @@ class C2RLAgent(Agent):
 
         # Ablation A (Phase-0 collapse diagnostics — see
         # residual_pretrain_init_log_std's docstring in C2RLPPOCfg): pretraining
-        # above leaves the MEAN action near-optimal but never touches
+        # above leaves the mean action near-optimal but never touches
         # log_std_parameter, so Phase B would otherwise start exploring at
         # whatever the yaml's initial_log_std says — comparable to the full
         # control range at the default 0.0. Overriding it here, before Phase B's
         # rollout loop starts, is picked up correctly by
-        # patch_ppo_std_annealing's LAZY initial-value capture (its schedule
+        # patch_ppo_std_annealing's lazy initial-value capture (its schedule
         # anchors to whatever log_std_parameter holds at the first real
         # post_interaction call, which is after this).
         init_std = getattr(self._cfg, "residual_pretrain_init_log_std", None)
@@ -1124,7 +1124,7 @@ class C2RLAgent(Agent):
         if value is None or not getattr(value, "use_analytic_potential", False):
             return
         value._pot_ccm_gen = self._ccm_gen
-        # A DISABLED preprocessor is skrl's ``_empty_preprocessor`` BOUND METHOD;
+        # A disabled preprocessor is skrl's ``_empty_preprocessor`` bound method;
         # an enabled one is a RunningStandardScaler, i.e. an nn.Module. Testing
         # the callable's type name is not enough (a bound method's type is
         # "method", never "function"), so the warning fired even with
@@ -1143,34 +1143,34 @@ class C2RLAgent(Agent):
               "(analytic potential from the frozen CMG).", flush=True)
 
     def pretrain_critic(self, env, *, num_steps: int, epochs: int, lr: float) -> None:
-        """Ablation B: warm-start the critic on the FROZEN, already-pretrained
+        """Ablation B: warm-start the critic on the frozen, already-pretrained
         actor's own Monte-Carlo returns, before Phase B's PPO updates start.
 
-        After pretraining π's mean is already near-optimal, so the TRUE
+        After pretraining π's mean is already near-optimal, so the true
         advantage is ~0 almost everywhere while the critic is still at random
         init. GAE divides by that near-zero advantage std, turning noise into a
         full-scale confident gradient the moment the critic produces its first
         coherent (but wrong) value landscape. A head start on the real return
         scale removes that source of the single destructive update.
 
-        Rolls the frozen actor out in the REAL env for ``num_steps`` (the CMG
-        must already be injected — the Mahalanobis reward IS the fit target),
-        computes each step's MC return discounting to the END OF THE WINDOW only
+        Rolls the frozen actor out in the real env for ``num_steps`` (the CMG
+        must already be injected — the Mahalanobis reward is the fit target),
+        computes each step's MC return discounting to the end of the window only
         (no bootstrap past it; negligible bias at this discount_factor, and a
         longer window shrinks it further), then MSE-regresses ``value`` onto it.
 
-        ``_value_preprocessor`` is NOT bypassed. Its ``inverse=True`` path (what
-        compute_gae uses) CLAMPS to ±clip_threshold (default 5) BEFORE scaling
+        ``_value_preprocessor`` is not bypassed. Its ``inverse=True`` path (what
+        compute_gae uses) clamps to ±clip_threshold (default 5) Before scaling
         by sqrt(running_variance) — never an identity map for an output fit
         directly to MC-return scale, which here runs well past ±5. Regressing
         the raw output onto ``ret_all`` (an earlier version) meant the first
         live act() truncated most of the fitted landscape at the clamp, and the
         scale mismatch against the untouched running stats fed a runaway
         compute_gae: raw advantage std grew ~2 -> ~1e16 in one run while
-        grad_norm_clip kept the POLICY bounded and the reward curve looked
-        stable. So: fit the preprocessor's stats to ``ret_all`` ONCE up front
+        grad_norm_clip kept the policy bounded and the reward curve looked
+        stable. So: fit the preprocessor's stats to ``ret_all`` once up front
         (one large representative batch, better calibrated than accumulating
-        from tiny per-rollout ones), then regress onto the FORWARD-standardized
+        from tiny per-rollout ones), then regress onto the forward-standardized
         target in that same space. Network output and preprocessor stats then
         agree, and the first live inverse call is near-identity.
         """
@@ -1193,7 +1193,7 @@ class C2RLAgent(Agent):
                 next_obs, rewards, terminated, truncated, infos = env.step(actions)
                 obs_buf.append(observations)
                 # The privileged critic (TrajectoryAwareValueModel, built when
-                # --critic_encoder is set) reads inputs["states"], NOT
+                # --critic_encoder is set) reads inputs["states"], not
                 # inputs["observations"] — so the warmstart has to buffer that
                 # channel too, or its value.act() below raises KeyError.
                 if states is not None:
@@ -1217,8 +1217,8 @@ class C2RLAgent(Agent):
 
         if value_pre is not None:
             with torch.no_grad():
-                value_pre(ret_all, train=True)                    # fit running stats ONCE, from the full batch
-                target_all = value_pre(ret_all, train=False).detach()  # regression target lives in the SAME
+                value_pre(ret_all, train=True)                    # fit running stats once, from the full batch
+                target_all = value_pre(ret_all, train=False).detach()  # regression target lives in the same
         else:                                                          # normalized space compute_gae's
             target_all = ret_all                                       # inverse=True will map back from
 
@@ -1233,7 +1233,7 @@ class C2RLAgent(Agent):
                 inputs = {"observations": obs_pre(obs_all[idx], train=False)}
                 if state_all is not None:
                     # Mirror skrl PPO's own act()/_update(), which always pass
-                    # BOTH channels through their respective preprocessors.
+                    # Both channels through their respective preprocessors.
                     inputs["states"] = state_pre(state_all[idx], train=False)
                 pred, _ = rl_agent.value.act(inputs, role="value")
                 loss = ((pred - target_all[idx]) ** 2).mean()
@@ -1247,7 +1247,7 @@ class C2RLAgent(Agent):
         print("[C2RL] critic WARM-STARTED on frozen-actor Monte-Carlo returns.", flush=True)
 
     def _window_pool(self, n: int, dev) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pools of plausible (xref, uref) rows to fill the FUTURE window slots
+        """Pools of plausible (xref, uref) rows to fill the future window slots
         during pretraining — see the call sites. Empty when length == 1 (the
         window is then just the current reference and there is nothing to fill)."""
         if self._window.length <= 1:
@@ -1257,13 +1257,13 @@ class C2RLAgent(Agent):
                 torch.as_tensor(roll["uref"], dtype=torch.float32, device=dev))
 
     def _pretrain_residual_contraction(self) -> None:
-        """Pretrain π so u = base + π CONTRACTS w.r.t. the FROZEN Phase-A metric
+        """Pretrain π so u = base + π contracts w.r.t. the frozen Phase-A metric
         M(x): minimize the C3M closed-loop condition Cu = Ṁ + 2·sym(M(A+BK)) + 2λM
-        ≺ 0 (the C3M pd_loss) over π ONLY. This is a contraction certificate learned
-        from the metric geometry — NOT CV-STEM-LQR — so it respects u = uref + π
+        ≺ 0 (the C3M pd_loss) over π only. This is a contraction certificate learned
+        from the metric geometry — not CV-STEM-LQR — so it respects u = uref + π
         while putting PPO in the basin of a stabilizing controller (PPO from scratch
         can't find one, esp. in high dim → divergence). When the actor has a
-        preview tail, each pretrain step draws RANDOM plausible preview content
+        preview tail, each pretrain step draws random plausible preview content
         (get_rollout's own uref distribution) rather than P=0 — certifying Cu≺0
         under a nonzero preview bias is what stops deployment-time preview from
         pushing the actor out of the certified region (P=0-only pretraining
@@ -1281,14 +1281,14 @@ class C2RLAgent(Agent):
         )
         cfg = self._cfg
         policy = self._policy_model
-        # cuDNN's RNN backward requires the module to be in TRAIN mode at
+        # cuDNN's RNN backward requires the module to be in train mode at
         # forward time (it only saves the reserve buffers backward needs when
         # training=True) — models otherwise default to eval here, which is
         # silently fine for every other backbone but raises "cudnn RNN backward
         # can only be called in training mode" the moment a FiLM gate uses a
         # GRU (film_gate_encoder="gru") and this loop's jacobian()/backward()
         # runs through it. Plain Linear/Tanh/GRU-with-no-dropout compute
-        # IDENTICAL values in train vs eval, so this has no effect beyond
+        # Identical values in train vs eval, so this has no effect beyond
         # unlocking that backward pass.
         policy.train()
         dev = self.device
@@ -1314,10 +1314,10 @@ class C2RLAgent(Agent):
         XR = torch.as_tensor(data["xref"], dtype=torch.float32, device=dev)
         UR = torch.as_tensor(data["uref"], dtype=torch.float32, device=dev)
         I = torch.eye(x_dim, device=dev)
-        # Future-window pool: the window slots k>=1 are drawn i.i.d. from the SAME
+        # Future-window pool: the window slots k>=1 are drawn i.i.d. from the same
         # uniform reference distribution get_rollout("c3m") samples — a proxy for
         # "a plausible future reference" without needing trajectory structure.
-        # Certifying Cu≺0 against RANDOM (not just zero / constant) window content
+        # Certifying Cu≺0 against random (not just zero / constant) window content
         # is what prevents the deployment-time window from pushing the actor out of
         # the certified region (zero-preview-only pretraining diverged once a real,
         # nonzero window was fed in — see project memory).
@@ -1346,11 +1346,11 @@ class C2RLAgent(Agent):
                 DBDx = b_jacobian(B, x, u_dim, create_graph=False).detach()
                 f = f.detach(); B = B.detach()
                 state = self._window.synth_obs(x, xref, uref, pool_xr, pool_ur)
-                # cuDNN's RNN kernel has NO double-backward support at all (not a
+                # cuDNN's RNN kernel has no double-backward support at all (not a
                 # train/eval-mode thing — a hard cuDNN API limitation) and this
                 # loop needs exactly that: K=jacobian(u,x, create_graph=True) is
                 # itself a backward through the forward below, and pd.backward()
-                # below then differentiates through THAT. Only matters when the
+                # below then differentiates through that. Only matters when the
                 # window encoder is a GRU (--encoder gru); harmless/no-op
                 # otherwise. Disabling cuDNN for this one forward call switches
                 # PyTorch to its generic (non-cuDNN) RNN path, which does support
@@ -1377,15 +1377,15 @@ class C2RLAgent(Agent):
               "PPO now fine-tunes it on the Mahalanobis reward.", flush=True)
 
     def _pretrain_residual_cvstemlqr(self) -> None:
-        """Pretrain π so u = uref + π(s) MATCHES the analytic CV-STEM-LQR control
+        """Pretrain π so u = uref + π(s) matches the analytic CV-STEM-LQR control
         law u_cvstemlqr(x,xref,uref) = uref - K(x)·e, K = R⁻¹BᵀW⁻¹, computed from
-        the SAME frozen Phase-A metric M(x) as _pretrain_residual_contraction's
+        the same frozen Phase-A metric M(x) as _pretrain_residual_contraction's
         certificate. Plain supervised MSE regression — no SDP, no jacobians, no
         C3M loss — so it is well-posed and actually converges near 0, unlike the
         Cu≺0 violation loss (observed to plateau ~2.6-3.3 regardless of epochs;
         that residual violation correlates with per-seed overshoot/AUC variance,
         see project memory). Reuses the CVSTEMLQRBase class the analytic baseline
-        eval uses, but only to generate targets here — it is NEVER attached to
+        eval uses, but only to generate targets here — it is never attached to
         policy.base_controller, so the deployed law stays u = uref + π exactly as
         in "contraction" mode. Same rollout/preview-pool sampling as
         _pretrain_residual_contraction, for a fair like-for-like comparison."""
@@ -1417,8 +1417,8 @@ class C2RLAgent(Agent):
         UR = torch.as_tensor(data["uref"], dtype=torch.float32, device=dev)
         pool_xr, pool_ur = self._window_pool(max(N, 8192), dev)
         # Actuator box the env actually applies. env_base.step clamps to
-        # U_MIN/U_MAX = 2 * UREF_MIN/MAX, while self.action_space is declared at
-        # the UREF bounds — hence the factor 2 here, which mirrors that step()
+        # U_MIN/U_MAX = 2 * UREF_MIN/max, while self.action_space is declared at
+        # the uref bounds — hence the factor 2 here, which mirrors that step()
         # rather than the declared space. See residual_pretrain_clamp_target.
         clamp_target = bool(getattr(cfg, "residual_pretrain_clamp_target", False))
         u_lo = u_hi = None
@@ -1458,7 +1458,7 @@ class C2RLAgent(Agent):
 
     def _distill_residual_from_online(self) -> None:
         """Supervised warm-start: regress the actor's residual so the actor
-        reproduces the ONLINE CV-STEM-LQR controller — the one that uses the exact
+        reproduces the online CV-STEM-LQR controller — the one that uses the exact
         per-state SDP metric W_online(x), which the frozen CMG only approximates
         (the residual base's remaining AUC gap is precisely that approximation,
         amplified by W⁻¹ near w_lb). Since
@@ -1466,8 +1466,8 @@ class C2RLAgent(Agent):
             u_online = uref - (1/r)Bᵀ W_online⁻¹ e,
         the target residual is u_online - u_base = -(K_online - K_frozen)·e, a
         state-dependent linear map the bilinear residual regresses onto. Reuses
-        the Phase-A per-state SDP solutions (self._cm_dataset) — NO new solves.
-        The actor then STARTS at online-LQR quality and PPO fine-tunes below it
+        the Phase-A per-state SDP solutions (self._cm_dataset) — no new solves.
+        The actor then starts at online-LQR quality and PPO fine-tunes below it
         with preview-aware anticipation the myopic per-state controller lacks."""
         ds = getattr(self, "_cm_dataset", None)
         policy = self._policy_model
@@ -1570,9 +1570,9 @@ class C2RLAgent(Agent):
         }
 
     def _synthesize_cmg_cvstem(self, *, timesteps: int = 0) -> dict:
-        """CV-STEM path: LOAD the offline ``{x → W*(x)}`` dataset, then MSE-regress.
+        """CV-STEM path: Load the offline ``{x → W*(x)}`` dataset, then MSE-regress.
 
-        The per-state SDP is NOT solved here. C2RL consumes a dataset generated
+        The per-state SDP is not solved here. C2RL consumes a dataset generated
         ahead of time by ``scripts/build_cm_dataset.py`` and committed under
         ``data/``; a missing cache raises instead of silently re-solving.
 
@@ -1581,7 +1581,7 @@ class C2RLAgent(Agent):
         same file — 14 minutes each, multiplied by the whole grid, for a dataset
         that depends on none of the things being swept (the cache key is
         lbd/w_lb/w_ub/r/eps/solver/N, and gamma and seed appear in none of them).
-        Generating it once offline also makes the metric an INPUT to the
+        Generating it once offline also makes the metric an input to the
         experiment rather than a per-run artifact, so two runs cannot disagree
         about what W they were certified against.
         """
@@ -1613,7 +1613,7 @@ class C2RLAgent(Agent):
                 f"_synthesize_cmg_cvstem."
             )
         # Kept for the optional residual distillation (cvstem_residual_distill):
-        # the per-state SDP solutions W_online(x) are the EXACT online CV-STEM-LQR
+        # the per-state SDP solutions W_online(x) are the exact online CV-STEM-LQR
         # metric the frozen CMG only approximates. See _distill_residual_from_online.
         self._cm_dataset = dataset
 
@@ -1706,16 +1706,16 @@ class C2RLSkrlTrainer(Trainer):
     def _inject_ccm(env, agent, metric=None) -> None:
         """Hand a frozen copy of the synthesized CMG to the env(s) so their own
         ``get_rewards()`` returns the Mahalanobis reward natively (see the
-        module docstring — this is the ONLY reward path).
+        module docstring — this is the only reward path).
 
         Raises if no env accepted it: a missing ``set_ccm`` means the run would
         silently train on the plain baseline reward, which is exactly the
-        classic-vs-isaaclab parity bug this guard exists to prevent. A DEEPCOPY,
+        classic-vs-isaaclab parity bug this guard exists to prevent. A deepcopy,
         not the agent's own module, so the env holds a stable frozen metric even
         if the agent's ``_ccm_gen`` were ever touched again.
 
         ``metric`` overrides what is injected (``metric_source="online"`` passes
-        an ``OnlineCVSTEMMetric``). It is injected AS-IS: it is stateless apart
+        an ``OnlineCVSTEMMetric``). It is injected as-Is: it is stateless apart
         from counters, and deep-copying it would drag along whatever
         ``get_f_and_B`` is bound to — the env itself, under analytical dynamics.
         """
@@ -1766,7 +1766,7 @@ class C2RLSkrlTrainer(Trainer):
         log_raw_config(getattr(self, "_wandb_raw_cfg", None))
         agent.enable_training_mode(True)
 
-        # Pretrain learned dynamics (if any) BEFORE Phase A's CMG synthesis, so it
+        # Pretrain learned dynamics (if any) before Phase A's CMG synthesis, so it
         # has meaningful f/B/∂f/∂x (SDP dataset for "cvstem", C1/C2 gradient
         # computation for "ccm"). No-op for analytical dynamics (classic envs).
         from .dynamics_pretrain import pretrain_dynamics
@@ -1826,18 +1826,18 @@ class C2RLSkrlTrainer(Trainer):
         observations, infos = env.reset()
         states = env.state() if hasattr(env, "state") else None
         global_step = 0
-        # Coarse flush cadence for the INNER rl_agent — flushing every step/chunk
+        # Coarse flush cadence for the inner rl_agent — flushing every step/chunk
         # would collapse the 100-episode reward/timestep deques to a spiky curve.
         flush_interval = max(1, timesteps // 100)
         next_flush = flush_interval
 
         # ── Outer-agent checkpointing ──────────────────────────────────────
-        # The outer agent is stepped once per rollout CHUNK, so skrl's
+        # The outer agent is stepped once per rollout chunk, so skrl's
         # `(timestep + 1) % checkpoint_interval` gate in Agent.post_interaction
         # can never line up (stride `rollout_steps` vs. interval 2000) — it
         # would silently write no checkpoints at all. Drive them off the real
         # step count instead. The best-model comparison also needs episode
-        # returns, and `record_transition` runs on the INNER rl_agent, so the
+        # returns, and `record_transition` runs on the inner rl_agent, so the
         # outer agent's own tracking_data never holds them: mirror the inner
         # agent's running mean across (captured per chunk, since
         # write_tracking_data clears `_track_rewards`).
@@ -1901,7 +1901,7 @@ class C2RLSkrlTrainer(Trainer):
                     rl_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
                     next_flush = global_step + flush_interval
 
-            # Outer agent: drives ITS OWN checkpoint cadence (checkpoint_modules)
+            # Outer agent: drives its own checkpoint cadence (checkpoint_modules)
             # and flushes whatever Stability/* logs _forward_env_log collected.
             agent.post_interaction(timestep=global_step, timesteps=timesteps)
             if getattr(agent, "writer", None) is not None:

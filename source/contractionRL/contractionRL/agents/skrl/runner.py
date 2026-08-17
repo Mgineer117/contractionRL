@@ -29,10 +29,10 @@ YAML policy config:
       class: GaussianMixin
       backbone: control-squashed  # tanh-squashed CLActor (SquashedCLActorModel) — same
                                    # bilinear feedback architecture as "control", but bounded
-                                   # + log_prob-corrected; requires the SAME [x, xref, uref]
+                                   # + log_prob-corrected; requires the same [x, xref, uref]
                                    # layout as "control". See models.py's SquashedCLActorModel /
                                    # _TanhSquashMixin docstrings for why this is required for
-                                   # SAC (skrl's stock GaussianMixin + clip_actions is NOT
+                                   # SAC (skrl's stock GaussianMixin + clip_actions is not
                                    # equivalent — clip never reaches log_prob).
       clip_log_std: True
       min_log_std: -20.0
@@ -47,7 +47,7 @@ YAML policy config:
     policy:
       class: GaussianMixin
       backbone: mlp-squashed      # tanh-squashed plain-MLP actor (SquashedMLPActorModel).
-                                   # Adds uref like "mlp" does IF the observation layout has one
+                                   # Adds uref like "mlp" does if the observation layout has one
                                    # ([x, xref, uref]); otherwise (e.g. velocity-tracking) it's a
                                    # plain squashed MLP over the full observation. State-dependent
                                    # log_std, so no initial_log_std/clip_actions (silently
@@ -91,7 +91,7 @@ CONTROL_BACKBONES = frozenset({"control", "contraction"})
 def _assert_backbone_algo_compatible(backbone: str, agent_class: str | None) -> None:
     """Raise on (algorithm, backbone) pairings that would silently mistrain.
 
-    - SAC / C2RL-SAC need a BOUNDED (tanh-squashed) action distribution: an
+    - SAC / C2RL-SAC need a bounded (tanh-squashed) action distribution: an
       unbounded Gaussian's log_prob is unbounded below, so SAC's automatic
       entropy-coefficient tuning has no fixed point and diverges. Unbounded
       backbones (mlp / control / contraction) are rejected for SAC.
@@ -141,7 +141,7 @@ def _gaussian_factory(observation_space, state_space, action_space, device,
     # (unbounded + SAC → divergence; squashed + PPO → no analytic entropy).
     _assert_backbone_algo_compatible(backbone, agent_class)
 
-    # x_dim is now only a CROSS-CHECK against what the observation space
+    # x_dim is now only a cross-Check against what the observation space
     # declares (models raise on a mismatch) — never the source of the layout.
     x_dim = kwargs.pop("x_dim", None)
     is_window = _is_window_space(observation_space)

@@ -50,7 +50,7 @@ class TrajectoryBuffer:
         return torch.randint(0, self.num_trajs, (num_envs,), device=self.device)
 
     def full(self, traj_ids: torch.Tensor) -> torch.Tensor:
-        """The WHOLE reference trajectory per env: ``(N, traj_len, state_dim)``.
+        """The whole reference trajectory per env: ``(N, traj_len, state_dim)``.
 
         Plot/metric code needs the complete reference path, not the windowed
         slice ``get_window`` returns — a window is sampled at the ref offset
@@ -83,7 +83,7 @@ class TrajectoryBuffer:
         step: torch.Tensor,
         window,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The reference WINDOW at steps ``t + k*offset``, ``k = 0..length-1``.
+        """The reference window at steps ``t + k*offset``, ``k = 0..length-1``.
 
         The Isaac counterpart of ``BaseEnv.construct_state``'s window lookup —
         same clamping (hold the trajectory's final valid reference rather than

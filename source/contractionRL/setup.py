@@ -33,7 +33,7 @@ INSTALL_REQUIRES = [
     # Optional interior-point SDP solver for C2RL's contraction-metric SDP
     # (cm_solver: MOSEK in the yaml's `cm:` block; default is cm_solver: SCS,
     # which needs no license). The `mosek` package installs fine on its own,
-    # but actually SOLVING with it needs a license file — see README.md's
+    # but actually solving with it needs a license file — see README.md's
     # Installation section for how to get and install one.
     "mosek",
 ]

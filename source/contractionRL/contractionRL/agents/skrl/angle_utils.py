@@ -1,28 +1,28 @@
 """Shared continuous-angle embedding + wrapped-difference math.
 
-Design (see conversation): the RAW state (with plain angle scalars at
+Design (see conversation): the raw state (with plain angle scalars at
 ``angle_idx``) is what the environment, the contraction loss, the dynamics
 integration, and the tracking error are computed in — nothing about the
-physics or the certificate math changes. The embedding below is applied ONLY
+physics or the certificate math changes. The embedding below is applied only
 at the *input* of each neural network, replacing every raw angle ``theta``
 with the continuous ``(cos(theta), sin(theta))`` pair so the network sees no
-discontinuity at +-pi and is automatically periodic. Network OUTPUTS (e.g.
+discontinuity at +-pi and is automatically periodic. Network outputs (e.g.
 NeuralDynamics' f, B) stay in raw coordinates.
 
-``wrap_diff`` is the complementary piece: whenever a state DIFFERENCE is taken
+``wrap_diff`` is the complementary piece: whenever a state difference is taken
 (tracking error x - xref, or CLActor's bilinear feedback error), the angle
 dims of that difference must be wrapped to the shortest-angle representative
 in (-pi, pi] before it is used in a norm/reward/metric/matmul — otherwise a
 raw wraparound (e.g. a U-turn) spikes the difference by ~2*pi.
 
-The SYMMETRY QUOTIENT is the third piece, and it lives in
+The symmetry quotient is the third piece, and it lives in
 ``state_symmetry.py`` (which builds on the two functions here). Every env in this repo declares a leading
 block of ``pos_dimension`` state dims that ``f`` and ``B`` provably do not
 depend on (verified numerically for car/turtlebot/segway/quadrotor: perturbing
 those dims changes f and B by exactly 0). The tracking problem is therefore
 invariant to translating ``x`` and ``xref`` together along that block, and the
-canonical (complete, lossless) invariant replaces the two ABSOLUTE position
-blocks with the single RELATIVE one. Networks that see only ``x`` drop the
+canonical (complete, lossless) invariant replaces the two absolute position
+blocks with the single relative one. Networks that see only ``x`` drop the
 block outright.
 
 Without this, a network reading absolute positions has to relearn the same

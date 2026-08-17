@@ -137,7 +137,7 @@ architecture and bounds impose *for free*, before any learning. Only the excess
 over it is creditable to the objective. Across `--random-seed 0/1/2` it gives a
 tight spread, so it reflects the architecture rather than one lucky draw.
 
-> ### ⚠ Do not read the error panel as a ranking ACROSS metrics
+> ### ⚠ Do not read the error panel as a ranking across metrics
 >
 > Normalized error is `r = √(eᵀM(x)e / e₀ᵀM(x₀)e₀)` — **each metric normalizes by
 > its own `M`**, so each panel's curve is measured with a different ruler. On car

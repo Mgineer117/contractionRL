@@ -57,14 +57,14 @@ agent:
   learning_epochs: 5  # Number of gradient descent passes over the collected batch
   mini_batches: 4  # Number of subsets to divide the batch into for stochastic optimization
   gae_lambda: 0.95  # Lambda parameter for Generalized Advantage Estimation (GAE)
-  learning_rate: 1.0e-5   # Global step size, FIXED — no scheduler (see below)
+  learning_rate: 1.0e-5   # Global step size, fixed — no scheduler (see below)
   # No KL-adaptive schedule: the LR is constant at learning_rate above.
   # (KLAdaptiveLR was steering toward kl_threshold 0.008, but with the PPO
-  # early-stop at 0.01 its DECREASE branch could never fire — that needs
+  # early-stop at 0.01 its decrease branch could never fire — that needs
   # mean KL > 0.016 (kl_factor=2), above the stop — so it only ratcheted the
   # LR upward. A fixed LR is the honest version of that behavior.)
   learning_rate_scheduler: null
-  # OFF — PPO learns log_std instead of following a fixed schedule.
+  # Off — PPO learns log_std instead of following a fixed schedule.
   # std_dev_annealing_kwargs below is inert while this is false.
   std_dev_annealing: false
   std_dev_annealing_kwargs:
@@ -81,10 +81,10 @@ agent:
   kl_threshold: 0.01 # Early stopping threshold based on Kullback-Leibler divergence
   time_limit_bootstrap: true  # Bootstrap value at episode truncation instead of treating it as terminal
   rewards_shaper_scale: 1.0
-  use_state_norm: false  # OFF by default — see c2rl.py module docstring / rl_glue.make_base_rl_cfg
-  # OFF, measured 2026-08-08. Turning these ON to tame the Mahalanobis
-  # reward was REFUTED by the 4-gamma x 20-seed grid: paired on gamma AND
-  # seed (n=38), normalization was WORSE in 26/38 (median AUC +0.215), and
+  use_state_norm: false  # Off by default — see c2rl.py module docstring / rl_glue.make_base_rl_cfg
+  # Off, measured 2026-08-08. Turning these on to tame the Mahalanobis
+  # reward was refuted by the 4-gamma x 20-seed grid: paired on gamma and
+  # seed (n=38), normalization was worse in 26/38 (median AUC +0.215), and
   # every auc>8 outlier in the whole grid was a normalized run (4/53 vs
   # 0/44). r/std keeps rescaling as the frozen-CMG reward drifts, and the
   # value preprocessor's +-5 sigma clamp truncates exactly the large-error
@@ -94,7 +94,7 @@ agent:
                          # w_lb/w_ub-dependent Mahalanobis-reward scale/heavy-tail before GAE; see rl_glue.
 
   # ── CAPS action smoothness (Mysore et al. 2021) ─────────────────────────── #
-  # Added to the POLICY LOSS, not the reward: pi's MEAN is penalized for
+  # Added to the policy loss, not the reward: pi's mean is penalized for
   # changing between consecutive states (temporal) and under a small state
   # perturbation (spatial). Because it is not a reward term, the MDP, the
   # observation layout and the dynamics are all untouched — so the offline
@@ -105,7 +105,7 @@ agent:
   # --caps_spatial_std. See patch_caps_regularizer.
   caps_temporal_scale: 0.001  # weight on ||pi(s_t) - pi(s_t+1)||^2
   caps_spatial_scale: 0.0    # weight on ||pi(s) - pi(s_bar)||^2, s_bar ~ N(s, sigma^2)
-  caps_spatial_std: 0.05     # sigma, in RAW observation units (see patch_caps_regularizer)
+  caps_spatial_std: 0.05     # sigma, in raw observation units (see patch_caps_regularizer)
 
   discount_factor: 0.01  # deployed policy's discount factor (single policy — no con/opt duality)
   # NOTE: the contraction-metric / Mahalanobis-reward config (cmg_method, w_ub,
@@ -124,7 +124,7 @@ agent:
 
 # ── Contraction metric + Mahalanobis reward ────────────────────────────────── #
 cm:
-  # Metric source — how the ENV computes the Mahalanobis reward. "cmg": the
+  # Metric source — how the env computes the Mahalanobis reward. "cmg": the
   # frozen Phase-A network below (cmg_method selects how it is trained).
   # "online" instead solves the CV-STEM SDP per env per step (what c2rl_sac
   # does) — impractical here at this num_envs. See c2rl.py's module docstring.
@@ -157,16 +157,16 @@ cm:
   #              W = M⁻¹ congruence — it is what makes K above the certified gain.)
   #              Control is penalized via this Riccati term, not bounded over an
   #              action range — see ncm_synthesis.py module docstring.
-  # ccm, NOT cvstem: the turtlebot is a DRIFTLESS unicycle (f(x) == 0 identically,
+  # ccm, not cvstem: the turtlebot is a driftless unicycle (f(x) == 0 identically,
   # measured max|f| = 0 over the sampled state space). CV-STEM imposes its LMI at
   # the drift Jacobian A = df/dx, which is then also 0, so the program reduces to
-  # 2*lbd*W <= -eps*I with W >= 0 — infeasible at EVERY lambda, w_lb/w_ub and
+  # 2*lbd*W <= -eps*I with W >= 0 — infeasible at every lambda, w_lb/w_ub and
   # r_scaler (measured 0/32 across all of them). That is a structural property of
   # CV-STEM on a driftless plant, not a tuning failure. The ccm pipeline trains the
   # CMG through C1/C2 losses with no per-state SDP, so it has no such requirement.
   cmg_method: ccm
   cvstem_r_scaler: 1.0  # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ term (mirrors skrl_sdlqr_cfg.yaml's R_scaler); "cvstem" only
-  # On SDP infeasibility AT A GIVEN STATE, retry that state alone with λ
+  # On SDP infeasibility at a given state, retry that state alone with λ
   # halved, up to this many times, before giving up on it and dropping it from
   # the dataset — 0 disables this and reverts to dropping immediately. Warns
   # per reduced state + an aggregate summary (build_cm_dataset). "cvstem" only.
@@ -200,7 +200,7 @@ cmg:
 #    true (classic envs only) to learn a NeuralDynamics instead. ─────────────── #
 empirical_dynamics:
   use_empirical_dynamics: false  # false = env analytical get_f_and_B; true = learn NeuralDynamics
-  # States×controls for ONLINE dynamics-data generation (use_empirical_dynamics=true
+  # States×controls for online dynamics-data generation (use_empirical_dynamics=true
   # with no dynamics_pretrain_data_path): samples ceil(memory_size / N) states and
   # pairs each with N distinct controls → N control-aware samples per state. Only
   # affects NeuralDynamics pretraining; ignored under analytical dynamics. Default 3.

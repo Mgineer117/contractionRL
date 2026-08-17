@@ -8,17 +8,17 @@ proportional to the square of the relative speed).
 
 Why this plant is here
 ----------------------
-CATEGORY A, dynamic-pressure scaling -- the most extreme case in this repo.
+category a, dynamic-pressure scaling -- the most extreme case in this repo.
 Stern-plane authority is proportional to 0.5*rho*V^2, and an AUV's operating
-speed range is much wider RELATIVELY than an aircraft's: at 0.3 m/s the fins do
+speed range is much wider relatively than an aircraft's: at 0.3 m/s the fins do
 essentially nothing, at 3.0 m/s they dominate.  Over a 10x speed range the fin
 moment varies 100x, and the measured sv(B) spread is 98.691 -- versus the
 aircraft's 17.249, whose envelope is only 4.2x in speed.
 
-The thruster (surge) keeps CONSTANT authority, so this plant also has the
+The thruster (surge) keeps constant authority, so this plant also has the
 property that the two input channels scale completely differently with state.
 The certificate over the whole envelope is therefore governed by the slow,
-almost-unactuated-in-pitch corner, which is exactly the regime a state SUBSET
+almost-unactuated-in-pitch corner, which is exactly the regime a state subset
 can exclude.
 """
 
@@ -30,7 +30,7 @@ import torch
 
 from ..common.env_base import BaseEnv
 
-# AUV PARAMETERS (Fossen 2011, small survey-class vehicle)
+# AUV parameters (Fossen 2011, small survey-class vehicle)
 RHO = 1025.0        # kg/m^3, seawater
 MASS = 80.0         # kg (including added mass in surge)
 IYY = 40.0          # kg m^2 (including added inertia in pitch)
@@ -42,7 +42,7 @@ C_M_DELTA = 0.80    # 1/rad, fin lift-curve slope
 C_Q = 5.0           # N m s/rad, pitch damping
 BG_RESTORE = 12.0   # N m/rad, metacentric restoring moment (righting couple)
 
-# Inputs are NORMALISED commands in [-1, 1]; u[0] = 1 is full stern plane
+# Inputs are normalised commands in [-1, 1]; u[0] = 1 is full stern plane
 # (DELTA_MAX rad), u[1] = 1 is full thrust (THRUST_MAX N). Same reason as the
 # aircraft: R = r*I cannot weight a fin deflection and a thruster force sensibly
 # when their raw units differ by two orders of magnitude, and the measured
@@ -58,7 +58,7 @@ STATE_NAMES = ("pitch", "vel", "pitch_rate")
 X_MIN = [-0.40, 0.30, -0.50]
 X_MAX = [0.40, 3.00, 0.50]
 
-# Episode ENDS the first step x leaves this box (opt-in: --terminate_out_of_box).
+# Episode ends the first step x leaves this box (opt-in: --terminate_out_of_box).
 # Defaults to the state box itself, i.e. it fires exactly where env_base.step's
 # clamp already silently pins a diverged env -- the same event, reported instead
 # of hidden. Tighten it here to end failing episodes sooner.
@@ -75,7 +75,7 @@ lim = 1.0
 XE_MIN = [-lim, -lim, -lim]
 XE_MAX = [lim, lim, lim]
 
-# reference control bounds -- [stern plane (rad), thruster (N)]. APPLIED box 2x.
+# reference control bounds -- [stern plane (rad), thruster (N)]. Applied box 2x.
 UREF_MIN = [-1.0, -1.0]
 UREF_MAX = [1.0, 1.0]
 
@@ -134,7 +134,7 @@ class AUVEnv(BaseEnv):
         n = x.shape[0]
         V = x[:, 1]
         B = self._zeros((n, self.num_dim_x, self.num_dim_control), x)
-        # thruster: CONSTANT authority
+        # thruster: Constant authority
         B[:, 1, 1] = THRUST_MAX / MASS
         # stern plane: authority ~ V^2, a 100x swing over the speed range
         B[:, 2, 0] = 0.5 * RHO * V ** 2 * S_FIN * L_ARM * C_M_DELTA * DELTA_MAX / IYY

@@ -2,7 +2,7 @@
 # SLURM entry point for every W&B sweep in this repo — the cluster twin of
 # ./search.sh.
 #
-# The design rests on ONE fact about W&B sweeps: the controller lives on W&B's
+# The design rests on one fact about W&B sweeps: the controller lives on W&B's
 # servers, and a worker is just `wandb agent --count 1 <sweep_id>` pulling the
 # next trial from that shared queue. Workers never coordinate with each other,
 # so a "cluster search" is simply a bag of those workers spread across SLURM
@@ -12,7 +12,7 @@
 # scheduling layer:
 #
 #   1. discover partitions / free GPUs / queue pressure and pick where to run;
-#   2. create the sweep ONCE on the login node (compute nodes then join it live);
+#   2. create the sweep once on the login node (compute nodes then join it live);
 #   3. smoke-test one trial to measure real GPU memory → agents-per-GPU;
 #   4. generate a self-contained, self-resubmitting sbatch worker script;
 #   5. submit N independent copies of it.
@@ -22,7 +22,7 @@
 # Time-limit behaviour
 # --------------------
 # Each job asks SLURM for `--signal=B:USR1@180`, so ~3 min before the wall-time
-# kill it catches USR1 and resubmits ITSELF (one job → one replacement), then
+# kill it catches USR1 and resubmits itself (one job → one replacement), then
 # exits cleanly. The sweep state is server-side, so the only thing ever lost is
 # the handful of trials in flight at that moment — which the controller simply
 # reissues. The pool therefore renews indefinitely until you stop it:
@@ -44,26 +44,26 @@
 #                        task id, or 'all' for every classic env
 #   --method M           bayes (default) | grid | random
 #   --project NAME       W&B project for the sweep (default: build_sweep.py's
-#                        contractionRL-Search). Use the MAIN project for a fixed
+#                        contractionRL-Search). Use the main project for a fixed
 #                        factorial design -- a gamma x seed grid is an experiment
 #                        whose runs belong beside the other results, not a
 #                        hyperparameter search to be kept apart from them.
 #   --partition NAME     SLURM partition (default: recommended by discovery)
 #   --num-jobs N         independent sbatch jobs to submit (default: prompted)
 #   --gpus-per-job N     GPUs each job requests via --gres=gpu:N (default 1)
-#   --gpu-type NAME      pin the GPU MODEL: --gres=gpu:NAME:N (e.g. a100). Use it
+#   --gpu-type NAME      pin the GPU model: --gres=gpu:NAME:N (e.g. a100). Use it
 #                        on heterogeneous partitions to keep jobs off GPUs your
 #                        torch build has no kernels for (e.g. V100 / CC 7.0 under
 #                        a CUDA-13 build). Applies to the smoke test too.
-#   --constraint FEAT    --constraint=FEAT for sbatch/srun, if the site defines
+#   --constraint feat    --constraint=feat for sbatch/srun, if the site defines
 #                        node features instead of typed gres. Unlike --gres this
-#                        DOES support OR: --constraint 'H100|L40S'
+#                        Does support or: --constraint 'H100|L40S'
 #   --exclude-gpu-type T resolve every node carrying gres type T to a nodelist and
-#                        --exclude it. This is how you say "any GPU EXCEPT V100",
-#                        which --gres cannot express (it takes ONE type only).
+#                        --exclude it. This is how you say "any GPU except V100",
+#                        which --gres cannot express (it takes one type only).
 #                        Repeatable. NOTE: by default this is done automatically —
 #                        every model too old for the installed torch is detected
-#                        and excluded, so all the SUPPORTED models stay usable.
+#                        and excluded, so all the supported models stay usable.
 #   --min-cc X.Y         compute-capability floor (default: read from the local
 #                        torch's get_arch_list, else 7.5)
 #   --no-auto-exclude    don't auto-exclude old GPU models
@@ -125,7 +125,7 @@ WALLTIME="24:00:00"; ACCOUNT=""; QOS=""; CPUS_PER_GPU=8; MEM=""
 ACTIVATE=""; PER_RUN_TIMEOUT=24h; RUNS_PER_AGENT=0
 PROBE=1; YES=0; STOP_TAG=""; SAFETY="0.85"
 # GPU selection. On a heterogeneous partition (scavenger is), a bare
-# --gres=gpu:N can land a job on ANY model — including a V100 (compute
+# --gres=gpu:N can land a job on any model — including a V100 (compute
 # capability 7.0), which a CUDA-13 torch build has no kernels for: every CUDA op
 # then dies with cudaErrorNoKernelImageForDevice at the first tensor op, before
 # wandb logs anything, so the trial shows up as an empty "crashed" run. Pinning
@@ -179,8 +179,8 @@ done
 need() { command -v "$1" >/dev/null 2>&1 || { _error "Required command '$1' not found — are you on a SLURM login node?"; exit 1; }; }
 
 # ── --stop: halt a running search ─────────────────────────────────────────── #
-# Order matters: drop the STOP sentinel FIRST so any worker whose USR1 trap fires
-# mid-scancel sees it and declines to resubmit, THEN scancel every job sharing
+# Order matters: drop the STOP sentinel first so any worker whose USR1 trap fires
+# mid-scancel sees it and declines to resubmit, then scancel every job sharing
 # the name (running + queued + already-resubmitted).
 if [[ -n "$STOP_TAG" ]]; then
     need scancel
@@ -238,10 +238,10 @@ _success "Env(s): ${C_BOLD}${ENVS[*]}${C_RESET}"
 # gracefully and the raw `sinfo` is always printed for a human sanity check.
 #
 # free GPUs: walk `scontrol show nodes -o` (one node per line), and for nodes in
-# an allocatable state (IDLE/MIXED) subtract GresUsed=gpu:… from Gres=gpu:…,
+# an allocatable state (idle/mixed) subtract GresUsed=gpu:… from Gres=gpu:…,
 # crediting the difference to each of the node's Partitions.
 # PART_TYPES  — models on allocatable (idle/mix) nodes, for the "what's free now"
-#               table. PART_TYPES_ALL — models on EVERY node regardless of state,
+#               table. PART_TYPES_ALL — models on every node regardless of state,
 #               which is what the old-GPU auto-exclusion must key off: a V100 that
 #               is merely alloc/down right now would otherwise go unclassified and
 #               happily take a job the moment it frees up.
@@ -252,7 +252,7 @@ _gres_gpu_count() {  # extract the trailing integer of a gpu:[type:]N token
 }
 # Model name out of a typed gres token: "gpu:a100:4" -> "a100" ("" when untyped,
 # e.g. a bare "gpu:4"). Surfaced per partition so a heterogeneous queue is
-# VISIBLE at selection time rather than discovered by a job dying on the wrong model.
+# Visible at selection time rather than discovered by a job dying on the wrong model.
 _gres_gpu_type() {
     grep -oE 'gpu:[A-Za-z][A-Za-z0-9_.-]*:' <<<"$1" | head -n1 | cut -d: -f2
 }
@@ -265,7 +265,7 @@ _header "Partition / GPU discovery"
         gused=$(grep -oE 'GresUsed=[^ ]+' <<<"$line" | cut -d= -f2-)
         parts=$(grep -oE 'Partitions=[^ ]+' <<<"$line" | cut -d= -f2-)
         [[ "$gres" == *gpu:* ]] || continue
-        # Record the model for EVERY state first — auto-exclusion needs the full
+        # Record the model for every state first — auto-exclusion needs the full
         # inventory, not just what happens to be free at this instant.
         _t_all=$(_gres_gpu_type "$gres")
         if [[ -n "$_t_all" ]]; then
@@ -284,7 +284,7 @@ _header "Partition / GPU discovery"
         for p in "${plist[@]}"; do
             PART_TOTAL[$p]=$(( ${PART_TOTAL[$p]:-0} + total ))
             PART_FREE[$p]=$(( ${PART_FREE[$p]:-0} + free ))
-            # accumulate DISTINCT models so a mixed partition shows "a100,v100"
+            # accumulate distinct models so a mixed partition shows "a100,v100"
             if [[ -n "$gtype" && " ${PART_TYPES[$p]:-} " != *" $gtype "* ]]; then
                 PART_TYPES[$p]="${PART_TYPES[$p]:-}${PART_TYPES[$p]:+ }$gtype"
             fi
@@ -328,12 +328,12 @@ fi
 _success "Partition: ${C_BOLD}$PARTITION${C_RESET}"
 
 # ── GPU model ─────────────────────────────────────────────────────────────── #
-# A bare --gres=gpu:N on a MIXED partition is a silent trial-killer: land on a
+# A bare --gres=gpu:N on a mixed partition is a silent trial-killer: land on a
 # model the torch build has no kernels for (V100 = CC 7.0 under a CUDA-13 build)
 # and every CUDA op raises cudaErrorNoKernelImageForDevice at the first tensor
 # op — before wandb logs anything, so the run is recorded as an empty "crashed".
-# Rather than making the user pin ONE model (which forfeits every other GPU in a
-# mixed partition), keep EVERY model the local torch has kernels for and exclude
+# Rather than making the user pin one model (which forfeits every other GPU in a
+# mixed partition), keep every model the local torch has kernels for and exclude
 # only the too-old ones. That is strictly better on a queue like scavenger: the
 # job can land on whichever supported GPU frees up first.
 _avail_types="${PART_TYPES[$PARTITION]:-}"
@@ -351,7 +351,7 @@ declare -A GPU_CC=(
     [B200]=100 [B100]=100
 )
 
-# The floor: the lowest arch the INSTALLED torch was built for. Asking torch
+# The floor: the lowest arch the installed torch was built for. Asking torch
 # itself (get_arch_list -> sm_75/sm_90/...) beats hardcoding, because the answer
 # changes with the wheel's CUDA build — a cu130 wheel has no sm_70, a cu126 one
 # does. Best-effort: if torch isn't importable on the login node, fall back to
@@ -402,7 +402,7 @@ if [[ "$AUTO_EXCLUDE" -eq 1 && -n "$_all_types" ]]; then
     fi
 fi
 # A gres type is a single token. Catching a multi-token answer here matters:
-# "gpu:A B C:1" is not an OR — sbatch would split it on whitespace and silently
+# "gpu:A B C:1" is not an or — sbatch would split it on whitespace and silently
 # request only the first, or reject the directive outright.
 if [[ -n "$GPU_TYPE" && ! "$GPU_TYPE" =~ ^[A-Za-z0-9_.-]+$ ]]; then
     _error "--gpu-type must be ONE gres type name (got: '$GPU_TYPE')."
@@ -416,8 +416,8 @@ if [[ -n "$GPU_TYPE" && -n "$_avail_types" && " $_avail_types " != *" $GPU_TYPE 
     _warn "'$GPU_TYPE' is not among partition '$PARTITION' types ($_avail_types) — gres names are case-sensitive."
 fi
 
-# Resolve every excluded model to the nodes carrying it. ONE pass over the node
-# list for all types. Scans ALL nodes (not just idle/mix like the discovery walk)
+# Resolve every excluded model to the nodes carrying it. One pass over the node
+# list for all types. Scans all nodes (not just idle/mix like the discovery walk)
 # so a currently-busy bad node is still excluded when it later frees up.
 if [[ -n "$EXCLUDE_GPU_TYPES" ]]; then
     _ex_nodes=""
@@ -452,16 +452,16 @@ fi
 _success "Jobs: ${C_BOLD}$NUM_JOBS${C_RESET}  (×${GPUS_PER_JOB} GPU each)"
 
 # ── Stage 2: create the sweep(s) on the login node ────────────────────────── #
-# ONE sweep per env. Compute nodes join it live over the internet, so this is the
+# One sweep per env. Compute nodes join it live over the internet, so this is the
 # only step that needs login-node connectivity. Parsing mirrors search.sh.
 cd "$REPO_DIR"
 
-# Every sbatch worker must authenticate to W&B as THIS account, or it silently
+# Every sbatch worker must authenticate to W&B as this account, or it silently
 # runs detached from the sweep — the classic "jobs run but the sweep stays empty"
 # failure. Verify credentials here, once: `wandb login` persists them to a
 # shared-home ~/.netrc that the compute nodes read, so a login-node check is a
 # check for every job. (If WANDB_API_KEY is exported instead, sbatch's default
-# --export=ALL carries it; only a site with a NON-shared home needs that.)
+# --export=all carries it; only a site with a non-shared home needs that.)
 if ! wandb login --verify >/dev/null 2>&1; then
     _error "wandb is not authenticated here — run 'wandb login' first."
     _info  "Every sbatch worker joins the sweep with these same credentials."
@@ -501,27 +501,27 @@ done
 [[ "${#ENV_SWEEP[@]}" -eq 0 ]] && { _error "No sweeps created — nothing to submit."; exit 1; }
 
 # ── Stage 3: smoke test → agents-per-GPU ──────────────────────────────────── #
-# Measure the REAL per-run footprint instead of guessing it. Run ONE trial under
+# Measure the real per-run footprint instead of guessing it. Run one trial under
 # srun on the chosen partition with a single GPU, and sample the peak GPU memory
-# of THAT run's process subtree via `--query-compute-apps` — NOT a per-GPU
+# of that run's process subtree via `--query-compute-apps` — not a per-GPU
 # `memory.used` row, because nvidia-smi orders those by device index, not by
 # owner, so on a non-isolated multi-GPU node "row 0" can be an idle neighbour
 # (this is what produced the 1 MB → 20889 agents/GPU nonsense). Then:
 #
-#   agents_per_gpu = min( MAX_AGENTS_PER_GPU, floor( total_MB × SAFETY / peak_MB ) )
+#   agents_per_gpu = min( MAX_AGENTS_PER_GPU, floor( total_MB × safety / peak_MB ) )
 #
-# SAFETY leaves headroom for PyTorch's caching allocator + fragmentation, and for
+# Safety leaves headroom for PyTorch's caching allocator + fragmentation, and for
 # SAC's replay buffer still growing past the sampling window; a peak below
 # MIN_PROBE_MB means the run never reached the GPU (crash / wrong env) and is
 # rejected rather than trusted. Probed once on the first env as representative;
-# override with --agents-per-gpu, or skip with --no-probe (which REQUIRES it).
+# override with --agents-per-gpu, or skip with --no-probe (which requires it).
 if [[ -z "$AGENTS_PER_GPU" ]]; then
     if [[ "$PROBE" -ne 1 ]]; then
         _error "--no-probe requires --agents-per-gpu N."; exit 1
     fi
     PROBE_ENV="${ENVS[0]}"
     _header "Smoke test  ${C_DIM}(${ALGORITHM} on ${PROBE_ENV}, 1 GPU, ~2 min)${C_RESET}"
-    # The config FILENAME stem (e.g. c2rl-ppo-cvstem) selects the search SPACE;
+    # The config filename stem (e.g. c2rl-ppo-cvstem) selects the search space;
     # the train.py --algorithm value is the yaml's `algorithm:` field (e.g.
     # c2rl-ppo). build_sweep.py passes the latter, so the probe must too — the
     # stem is not a registered cfg entry point (only cvstem-lqr happens to match).
@@ -536,7 +536,7 @@ PY
     PROBE_LOG="${ENV_LOGDIR[${ENVS[0]}]}/probe.log"
     # The probe body runs on the compute node: launch one training run in the
     # background, poll for ~120s recording the max GPU memory used by the run's
-    # OWN process subtree (pid-matched, so it can't read an idle neighbour GPU),
+    # Own process subtree (pid-matched, so it can't read an idle neighbour GPU),
     # kill the tree, and print a single MEM=peak/total line the launcher greps for.
     # Same gres/constraint as the real jobs: probing on a different GPU model
     # would size agents-per-GPU against memory the jobs never actually get.
@@ -574,7 +574,7 @@ PY
             sleep 2; kill -KILL "$child" 2>/dev/null || true
             echo "MEM=${peak}/${total}"
         ' 2>>"$PROBE_LOG") || true
-    _probe_failed() {  # shared failure exit: show WHY, then how to proceed
+    _probe_failed() {  # shared failure exit: show why, then how to proceed
         _error "$1"
         _info  "Likely causes: the env wasn't activated (pass --activate 'conda activate <env>'),"
         _info  "the run crashed, or this site doesn't expose per-process GPU accounting."
@@ -643,7 +643,7 @@ for ENV in "${!ENV_SWEEP[@]}"; do
     # The sweep id is fully qualified (entity/project/sweepid). Pull entity+project
     # out so the job can export them: `wandb agent entity/project/sweepid` already
     # forces sweep membership, but pinning WANDB_ENTITY/WANDB_PROJECT too keeps
-    # sweep_runner.py's bad-trial resume in the SAME project instead of a default
+    # sweep_runner.py's bad-trial resume in the same project instead of a default
     # wandb auto-derives from the cwd. Empty (and thus skipped) if a non-qualified
     # id ever comes back.
     WB_ENTITY=""; WB_PROJECT=""
@@ -689,7 +689,7 @@ MIN_FREE_MB=\${MIN_FREE_MB:-3500}
 ${WB_ENTITY:+export WANDB_ENTITY="$WB_ENTITY"}
 ${WB_PROJECT:+export WANDB_PROJECT="$WB_PROJECT"}
 
-# One job → one replacement: on the pre-kill USR1, resubmit THIS script (unless a
+# One job → one replacement: on the pre-kill USR1, resubmit this script (unless a
 # STOP sentinel says the search is being torn down), then exit cleanly. The sweep
 # state is server-side, so only the trials in flight right now are lost — the
 # controller just reissues them to the replacement.
@@ -704,7 +704,7 @@ resubmit() {
 }
 trap resubmit USR1
 
-# Pin each worker to a GPU SLURM actually gave THIS job. SLURM sets
+# Pin each worker to a GPU SLURM actually gave this job. SLURM sets
 # CUDA_VISIBLE_DEVICES to the allocated device ids; nvidia-smi ignores that and
 # lists the whole node, so counting with nvidia-smi would let workers spill onto
 # GPUs the job doesn't own (clobbering other users). Read the allocation instead,
@@ -729,7 +729,7 @@ for gpu in "\${JOB_GPUS[@]}"; do
                 # Preflight the GPU before asking for a trial. On scavenger the
                 # card is shared with jobs SLURM does not account for, and one
                 # that is already full makes the trial die inside the CMG
-                # regression's eigh (840 MiB) — AFTER wandb has handed it a grid
+                # regression's eigh (840 MiB) — after wandb has handed it a grid
                 # cell, which is then spent. A worker in that state respawns
                 # every ~20 s and can eat a whole 80-cell grid in minutes, so
                 # waiting for room is strictly cheaper than starting blind.
@@ -742,7 +742,7 @@ for gpu in "\${JOB_GPUS[@]}"; do
                 free_mb=\$(CUDA_VISIBLE_DEVICES=\$gpu python -c \\
                     'import torch;print(torch.cuda.mem_get_info()[0]//1048576)' 2>/dev/null | tail -1)
                 if [[ ! "\$free_mb" =~ ^[0-9]+\$ ]]; then
-                    # Unreadable is NOT a pass. Wait instead, but give up after a
+                    # Unreadable is not a pass. Wait instead, but give up after a
                     # few tries so a broken probe idles the pool loudly rather
                     # than deadlocking it forever.
                     probe_fail=\$(( probe_fail + 1 ))
@@ -761,21 +761,21 @@ for gpu in "\${JOB_GPUS[@]}"; do
                     probe_fail=0
                 fi
                 echo "[\$(date '+%F %T')] gpu \$gpu agent \$a: (re)starting wandb agent"
-                # PRIVATE wandb dir per (job, gpu, agent). Every worker used to
+                # Private wandb dir per (job, gpu, agent). Every worker used to
                 # share \$REPO_DIR/wandb, and the reaper below deletes run-* older
                 # than a minute -- so with several workers running concurrently,
-                # one worker's reaper deleted ANOTHER worker's LIVE run directory.
+                # one worker's reaper deleted another worker's live run directory.
                 # The victim then died at wandb.finish() with
                 # "OSError: [Errno 116] Stale file handle", after training had
                 # completed and its metric was already logged. Measured: 14 of 70
                 # trials. Scoping the directory makes the reaper touch only runs
                 # this agent created.
-                # On SCRATCH, not in the repo. /u is quota'd at 103 GB and 500k
+                # On scratch, not in the repo. /u is quota'd at 103 GB and 500k
                 # inodes and is shared with conda envs and other projects; a
                 # single active run's run-*.wandb transaction log can reach
                 # several GB, and 15 concurrent workers put /u at 94 GB of 103 GB
                 # within an hour. ~/scratch is a separate filesystem with 10 TB
-                # and NO inode cap, so the sweep's local cache cannot exhaust the
+                # and no inode cap, so the sweep's local cache cannot exhaust the
                 # home quota and take the cluster session down with it.
                 export WANDB_DIR="\$HOME/scratch/wandb_sweeps/\${SLURM_JOB_ID:-nojob}_g\${gpu}_a\${a}"
                 mkdir -p "\$WANDB_DIR"
@@ -786,8 +786,8 @@ for gpu in "\${JOB_GPUS[@]}"; do
                 # every worker dies writing checkpoints, and the failure looks
                 # like a training bug rather than a full disk. Only run-* is
                 # removed (already streamed to the server); offline-run-* is
-                # left alone because for those the local copy IS the data.
-                # Scoped to THIS agent's private dir -- see above.
+                # left alone because for those the local copy is the data.
+                # Scoped to this agent's private dir -- see above.
                 find "\$WANDB_DIR" -maxdepth 1 -name 'run-*' -type d \\
                     -mmin +1 -exec rm -rf {} + 2>/dev/null || true
                 run_count=\$(( run_count + 1 ))

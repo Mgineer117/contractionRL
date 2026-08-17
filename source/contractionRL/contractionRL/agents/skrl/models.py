@@ -5,8 +5,8 @@ model here recovers its own input shape from the Dict observation space via
 ``RefWindow.from_space``; none of them infers a layout from ``obs_dim``, which
 is what the old ``_preview_width`` / ``obs_dim/2`` parity guessing did.
 
-ACTOR   u = urefs[0] + W2(xrefs) @ tanh(W1(x) @ e)            (nn_modules.CLActor)
-CRITIC  V = MLP([phi(x, e) || psi(xrefs)])                    (RefWindowValueModel)
+Actor   u = urefs[0] + W2(xrefs) @ tanh(W1(x) @ e)            (nn_modules.CLActor)
+critic  v = MLP([phi(x, e) || psi(xrefs)])                    (RefWindowValueModel)
 
 Both route the reference window through ``PreviewSequenceEncoder`` (mlp | gru |
 attn, selected by ``--encoder``) and both see it through ``Feats.sequence``, so
@@ -38,7 +38,7 @@ _MIN_LOG_STD = math.log(0.001)  # ≈ -6.908; matches CLActor annealing floor
 def _layout(observation_space, x_dim=None, angle_idx=None, sym=None, ref_offset=1):
     """``(window, feats)`` for a model, from its Dict observation space.
 
-    ``x_dim`` is accepted only to CROSS-CHECK what the space declares — a
+    ``x_dim`` is accepted only to cross-Check what the space declares — a
     mismatch means the env and the runner disagree about the state layout,
     which used to be an entirely silent mis-slicing.
     """
@@ -53,9 +53,9 @@ def _layout(observation_space, x_dim=None, angle_idx=None, sym=None, ref_offset=
 class _AnalyticPotentialMixin:
     """Critic parameterization V(s) = ||e||^2_M + f_theta(s)  (O6).
 
-    The Mahalanobis reward is the DECREMENT form r_t = Phi(s_t+1) - Phi(s_t),
+    The Mahalanobis reward is the decrement form r_t = Phi(s_t+1) - Phi(s_t),
     Phi(s) = -||e||^2_M. Telescoping gives V_shaped = (1-gamma) V_orig - Phi, so
-    the decrement form makes the REWARD O(dt) but does NOT remove the O(1)
+    the decrement form makes the reward o(dt) but does not remove the O(1)
     potential — it moves it into the critic's regression target, where
     -Phi(s) = ||e||^2_M is analytically known and dominates what the network must
     fit. Adding the closed form back lets f_theta represent only the genuinely
@@ -64,7 +64,7 @@ class _AnalyticPotentialMixin:
     Needs the frozen Phase-A CMG (attached by C2RLAgent post-synthesis); until
     then the term is absent and the model behaves as a plain critic.
 
-    SCALE: the added term is in REAL value units, so this is consistent only with
+    Scale: the added term is in real value units, so this is consistent only with
     the value preprocessor off (``use_value_norm=false``).
     """
 
@@ -101,11 +101,11 @@ class RefWindowValueModel(_AnalyticPotentialMixin, DeterministicMixin, Model):
         psi = Encoder(sequence(x, xrefs))    reference path  — mirrors W2(xrefs)
         V   = MLP([phi || psi])              combine
 
-    The actor's ``W2(xrefs)`` emits a MATRIX that multiplies the error latent;
+    The actor's ``W2(xrefs)`` emits a matrix that multiplies the error latent;
     a critic must emit a scalar, so the two embeddings meet in a joint MLP
     instead. ``phi`` sees both the invariant configuration of ``x`` (current
     speed etc. genuinely change the value beyond the error alone) and the
-    tracking error; ``psi`` sees the reference window ONLY, each point relative
+    tracking error; ``psi`` sees the reference window only, each point relative
     to the current ``x`` with wrapped angles.
 
     ``use_actions=True`` appends the action, making this a Q-function (SAC).
@@ -266,7 +266,7 @@ def _build_cl_actor(observation_space, action_space, x_dim, angle_idx, sym,
 
 class CLDeterministicActorModel(DeterministicMixin, Model):
     """CLActor as a skrl Deterministic policy — C3M's default policy class
-    (``class: DeterministicMixin`` in each ``skrl_c3m_cfg.yaml``). UNBOUNDED;
+    (``class: DeterministicMixin`` in each ``skrl_c3m_cfg.yaml``). Unbounded;
     see ``SquashedCLDeterministicActorModel`` for ``backbone: control-squashed``.
     """
 
@@ -290,11 +290,11 @@ class SquashedCLDeterministicActorModel(DeterministicMixin, Model):
     """Tanh-squashed CLActor, deterministic — ``backbone: control-squashed`` for C3M.
 
     ``compute()`` returns ``cl_actor.mean_control_squashed`` (feedback
-    tanh-bounded into the action space, ``urefs[0]`` added AFTER squashing).
+    tanh-bounded into the action space, ``urefs[0]`` added after squashing).
 
     C3M needs this rather than a hard ``clip_actions`` clamp: ``torch.clamp``'s
     gradient is exactly zero at saturation, so ``K = jacobian(u, x)`` collapses
-    there too and the certificate silently degrades to checking OPEN-LOOP drift
+    there too and the certificate silently degrades to checking open-Loop drift
     in exactly the states that most need feedback — a confirmed real AUC
     divergence. ``tanh``'s gradient never hits exact zero.
     """
@@ -319,7 +319,7 @@ class SquashedCLDeterministicActorModel(DeterministicMixin, Model):
 class CLActorModel(GaussianMixin, Model):
     """CLActor as a skrl Gaussian policy — ``backbone: control``.
 
-    ``u = urefs[0] + W2(xrefs) @ tanh(W1(x) @ e)``. UNBOUNDED; see
+    ``u = urefs[0] + W2(xrefs) @ tanh(W1(x) @ e)``. Unbounded; see
     ``SquashedCLActorModel`` for ``backbone: control-squashed``.
     """
 
@@ -347,7 +347,7 @@ class CLActorModel(GaussianMixin, Model):
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
         GaussianMixin.__init__(self, clip_actions=clip_actions, clip_log_std=clip_log_std,
                                min_log_std=min_log_std, max_log_std=max_log_std)
-        # anneal_stddev=False -> logstd is a LEARNED parameter (requires_grad=True)
+        # anneal_stddev=False -> logstd is a learned parameter (requires_grad=True)
         # and CLActor.anneal_stddev() becomes inert, so nothing overwrites what
         # the policy gradient learns. True (default) is the frozen/scheduled path.
         self.cl_actor = _build_cl_actor(observation_space, action_space, x_dim, angle_idx, sym,
@@ -368,8 +368,8 @@ class CLActorModel(GaussianMixin, Model):
     def compute(self, inputs: dict, role: str = "policy"):
         state = inputs["observations"]
         if self.base_controller is not None and getattr(self, "_eval_base_only", False):
-            # Controlled-comparison eval: bypass the residual to measure the PURE
-            # analytic base on the IDENTICAL frozen CMG the trained residual used.
+            # Controlled-comparison eval: bypass the residual to measure the pure
+            # analytic base on the identical frozen CMG the trained residual used.
             return self.base_controller(state), {"log_std": self.log_std_parameter}
         feedback, uref = self.cl_actor._feedback(state)
         base = self.base_controller(state) if self.base_controller is not None else uref
@@ -386,9 +386,9 @@ class MLPResidualActorModel(GaussianMixin, Model):
     Same control law as CLActor, but one generic MLP over the whole (encoded)
     observation instead of the bilinear W1/W2 factorization — the deliberate
     architectural contrast. Reuses the same ``Feats`` maps and sequence encoder,
-    so the two backbones differ ONLY in how they combine the same inputs.
+    so the two backbones differ only in how they combine the same inputs.
 
-    Log-prob stays correct: the uref shift happens INSIDE ``compute()``, so the
+    Log-prob stays correct: the uref shift happens inside ``compute()``, so the
     mean GaussianMixin samples from already includes it.
     """
 
@@ -447,7 +447,7 @@ class _TanhSquashMixin:
     wrong, so it is not copy-pasted per backbone.
 
     Necessary for SAC (any off-policy method with an entropy term) on a bounded
-    action space. skrl's stock ``GaussianMixin.act()`` samples an UNBOUNDED
+    action space. skrl's stock ``GaussianMixin.act()`` samples an unbounded
     ``Normal(mean, std)`` and merely hard-clamps the sample afterwards —
     ``log_prob`` still comes from the unclamped Normal. SAC's ``-alpha *
     log_prob`` appears in both the Bellman target and the policy loss, so an
@@ -472,29 +472,29 @@ class _TanhSquashMixin:
       2. call ``self._init_tanh_squash_bounds()`` (checks the action space is
          fully bounded and registers ``_action_low``/``_action_high``);
       3. implement ``compute(inputs, role) -> (mean, {"log_std", ["residual"]})``
-         where ``mean`` locates the PRE-squash Normal — the *feedback* only,
-         NOT including uref.
+         where ``mean`` locates the pre-squash Normal — the *feedback* only,
+         not including uref.
 
-    RESIDUAL (uref) is added AFTER squashing::
+    Residual (uref) is added after squashing::
 
         action = residual + rescale_residual(tanh(u), residual)
 
     preserving ``u = uref + bounded_feedback`` exactly. Adding uref to ``mean``
-    (before tanh) would give ``rescale(tanh(uref + feedback))`` — a SATURATED
+    (before tanh) would give ``rescale(tanh(uref + feedback))`` — a saturated
     uref that returns ``rescale(tanh(uref))``, not ``uref``, at zero feedback,
     silently destroying the reference-tracking structure.
 
-    ``rescale_residual`` is ASYMMETRIC: ``tanh(u) >= 0`` maps into
+    ``rescale_residual`` is asymmetric: ``tanh(u) >= 0`` maps into
     ``[0, high - residual]`` and ``tanh(u) < 0`` into ``[-(residual - low), 0]``,
     a different per-sample scale each side (residual varies per state). For
     every residual in [low, high] this guarantees ``tanh(u) == 0 => action ==
     residual`` exactly, and ``action`` inside ``(low, high)`` for every ``u``
-    with NO post-hoc clamping. A single constant rescale-then-add-then-clamp
+    with no post-hoc clamping. A single constant rescale-then-add-then-clamp
     would push the sum out of bounds whenever residual is off-center, silently
     decoupling the clamped action from the log_prob of the unclamped one — SAC's
     entropy term would score the wrong sample. Both half-scales are positive
     constants w.r.t. ``u``, so the change-of-variables Jacobian is as simple as
-    the fixed-scale case (just swap in the applicable half-scale): an EXACT
+    the fixed-scale case (just swap in the applicable half-scale): an exact
     closed-form log_prob for the applied action, not an approximation.
 
     act() is overridden entirely, not just compute(): squash-then-correct
@@ -557,7 +557,7 @@ class _TanhSquashMixin:
         self._g_distribution = Normal(mean, log_std.exp())
 
         # Optional post-squash residual (e.g. uref for the [x, xref, uref]
-        # path-tracking layout). Added to the action AFTER squashing — see the
+        # path-tracking layout). Added to the action after squashing — see the
         # class docstring for why (residual law preservation + exact,
         # clamp-free log_prob). Popped so it doesn't leak into the returned
         # outputs dict.
@@ -589,7 +589,7 @@ class _TanhSquashMixin:
         # log(1 - tanh(u)^2) (Haarnoja et al. 2018, eq. 21).
         log_prob = log_prob - 2.0 * (math.log(2.0) - u - F.softplus(-2.0 * u))
         # Second correction for the rescale tanh_u -> action: d(action)/d(tanh_u)
-        # is `scale` per dimension — a CONSTANT half-width (0.5*(high-low)) with
+        # is `scale` per dimension — a constant half-width (0.5*(high-low)) with
         # no residual, or the residual-dependent half-width from
         # _rescale_residual/_unrescale_residual above. Either way this is exact
         # for the action actually returned below (no clamping follows).
@@ -620,10 +620,10 @@ class _TanhSquashMixin:
 class SquashedMLPActorModel(_TanhSquashMixin, GaussianMixin, Model):
     """Tanh-squashed plain-MLP actor — ``backbone: mlp-squashed``.
 
-    ``action = urefs[0] + rescale(tanh(MLP(...) + noise))``, uref added AFTER
+    ``action = urefs[0] + rescale(tanh(MLP(...) + noise))``, uref added after
     squashing (see ``_TanhSquashMixin`` — before tanh would saturate uref).
 
-    log_std is STATE-DEPENDENT (the network outputs both), the SAC convention —
+    log_std is state-Dependent (the network outputs both), the SAC convention —
     unlike the other actors' single global log_std_parameter, which is fine for
     PPO's trust-region updates but not for SAC's entropy tuning.
     """
@@ -677,8 +677,8 @@ class SquashedMLPActorModel(_TanhSquashMixin, GaussianMixin, Model):
         e = self.feats.error(x, xrefs[:, 0])
         psi = self.psi(self.feats.sequence(x, xrefs).reshape(n, -1))
         features = self.net(torch.cat([self.feats.single(x), e, psi], dim=-1))
-        mean = self.mean_head(features)  # pre-squash FEEDBACK mean (no uref)
-        # urefs[0] is added AFTER squashing (the mixin consumes "residual"), so
+        mean = self.mean_head(features)  # pre-squash feedback mean (no uref)
+        # urefs[0] is added after squashing (the mixin consumes "residual"), so
         # the action is uref + rescale(tanh(feedback)).
         return mean, {"log_std": self.log_std_head(features), "residual": urefs[:, 0]}
 
@@ -686,13 +686,13 @@ class SquashedMLPActorModel(_TanhSquashMixin, GaussianMixin, Model):
 class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
     """Tanh-squashed CLActor — ``backbone: control-squashed``.
 
-    ``action = urefs[0] + rescale(tanh(feedback + noise))`` — the FEEDBACK is
+    ``action = urefs[0] + rescale(tanh(feedback + noise))`` — the feedback is
     squashed, uref added after, preserving ``u = uref + feedback`` exactly.
 
     ``anneal_stddev`` is always False: this backbone is for SAC, which learns
     log_std through the policy loss, and CLActor's annealing freezes ``logstd``
     and expects an external caller to step it — which would fight SAC's entropy
-    optimizer. Same reason ``control-squashed`` is deliberately NOT in
+    optimizer. Same reason ``control-squashed`` is deliberately not in
     ``runner.CONTROL_BACKBONES`` (that set auto-enables std annealing).
     """
 
@@ -734,7 +734,7 @@ class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
-# SUPERSEDED — the flat [x, xref, uref, preview] critics. EmbeddedDeterministicModel
+# Superseded — the flat [x, xref, uref, preview] critics. EmbeddedDeterministicModel
 # inferred its layout from obs_dim; TrajectoryAwareValueModel read a separate
 # privileged `states` channel and carried the "bilinear" (UVFA) and "film"
 # combine modes. Both are replaced by RefWindowValueModel (concat) above.
@@ -743,10 +743,10 @@ class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
 #     """Value/critic MLP with angle-embedded input — the DeterministicMixin
 #     counterpart to MLPResidualActorModel/SquashedMLPActorModel.
 #
-#     skrl's own model-instantiator DSL (``deterministic_model``, driven by the
+#     skrl's own model-instantiator dsl (``deterministic_model``, driven by the
 #     yaml ``network: input: OBSERVATIONS`` / ``concatenate([OBSERVATIONS,
 #     ACTIONS])`` keys) is vendored library code — it has no notion of an
-#     angle-bearing state, so a value/critic built through it would see the RAW
+#     angle-bearing state, so a value/critic built through it would see the raw
 #     (discontinuous-at-+-pi) angle. This class is this repo's drop-in
 #     replacement, wired in by CLActorRunner._component for "deterministicmixin"
 #     (see runner.py) whenever the env carries a non-empty angle_idx.
@@ -806,7 +806,7 @@ class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
 #         self._sym = sym if is_path_tracking else None
 #         self._use_actions = use_actions
 #         # Future-uref preview tail (0 without preview / for a flat obs). The
-#         # critic is the ESSENTIAL consumer: V^pi depends on the future
+#         # critic is the essential consumer: V^pi depends on the future
 #         # reference, so previewing it is what makes a high discount_factor a
 #         # well-posed (Markov) value target rather than a POMDP.
 #         self._preview_dim = _preview_width(obs_dim, self._x_dim, act_dim) if is_path_tracking else 0
@@ -856,8 +856,8 @@ class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
 #     """Asymmetric (privileged) PPO critic: V(x, future-xref trajectory), read
 #     from skrl's separate ``states``/``state_space`` channel — see
 #     ``env_base.BaseEnv.configure_value_state``/``state()`` — completely
-#     DECOUPLED from whatever preview the ACTOR's own ``observations`` happens
-#     to carry. skrl's PPO already passes both ``observations`` AND ``states``
+#     Decoupled from whatever preview the actor's own ``observations`` happens
+#     to carry. skrl's PPO already passes both ``observations`` and ``states``
 #     to every model's ``inputs`` dict (``ppo.py``'s ``act()``); this is simply
 #     the first model here that reads ``inputs["states"]`` instead of
 #     ``inputs["observations"]``. The actor is completely unaffected either way.
@@ -878,7 +878,7 @@ class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
 #     embedding psi(traj) are turned into a scalar value:
 #
 #       "concat" (default) — cat([phi, psi]) through one joint MLP. Free to mix
-#       the embeddings however it likes, so it CAN (and empirically does) fit
+#       the embeddings however it likes, so it can (and empirically does) fit
 #       specific (x, traj) pairs jointly rather than learning independently
 #       meaningful phi/psi — not actually factorized despite the separate encoders.
 #
@@ -886,13 +886,13 @@ class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
 #       V = w^T(phi ⊙ psi) + u^T phi + v^T psi + b. Never concatenated, so the two
 #       interact only through the elementwise product and each embedding must be
 #       useful on its own (the additive terms cover state-only / goal-only value).
-#       This is what should generalize to a NEW (x, traj) pair resembling two
+#       This is what should generalize to a new (x, traj) pair resembling two
 #       different training points — concat+MLP has no structural pressure to.
 #
 #       "film" — middle ground, mirroring the actor's FiLMResidual: psi modulates
-#       phi BEFORE a small joint head, V = head(phi * softplus(gamma(psi)) +
+#       phi before a small joint head, V = head(phi * softplus(gamma(psi)) +
 #       beta(psi)). Keeps a nonlinear head after the interaction (no
-#       encoder_hidden rank ceiling, unlike bilinear) while still FORCING the
+#       encoder_hidden rank ceiling, unlike bilinear) while still forcing the
 #       interaction through an explicit trajectory-conditioned gate (unlike
 #       concat). Untested at scale.
 #     """
@@ -950,7 +950,7 @@ class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
 #                            list(hidden_dim), 1, activation=act_module)
 #         elif self.combine == "film":
 #             # phi(x) gets the same depth as "bilinear"'s phi; psi(traj) (already
-#             # produced by traj_encoder above) drives a FiLM gate on phi BEFORE a
+#             # produced by traj_encoder above) drives a FiLM gate on phi before a
 #             # small joint head -- see class docstring's "film" entry.
 #             self.phi = MLP(embedded_dim(self.x_dim, self.angle_idx),
 #                            list(hidden_dim), encoder_hidden, activation=act_module)
@@ -961,10 +961,10 @@ class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
 #             # phi(x): state embedding, same width as psi(traj) (encoder_hidden)
 #             # so they can be combined elementwise.
 #             #
-#             # EMBEDDING WIDTH MATTERS HERE, much more than it does for "concat".
+#             # Embedding width matters here, much more than it does for "concat".
 #             # The value this head can represent is
 #             #     V = w^T(phi ⊙ psi) + u^T phi + v^T psi + b,
-#             # i.e. a DIAGONAL bilinear form whose rank is bounded by
+#             # i.e. a diagonal bilinear form whose rank is bounded by
 #             # encoder_hidden — that width is the entire capacity of the
 #             # state x goal interaction, exactly the quantity UVFA (Schaul et al.
 #             # 2015) treats as a primary hyperparameter. "concat" has no such

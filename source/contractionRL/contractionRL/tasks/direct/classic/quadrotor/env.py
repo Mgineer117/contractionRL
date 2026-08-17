@@ -13,7 +13,7 @@ STATE_NAMES = (
     "vel_x_w", "vel_y_w", "vel_z_w",
     "thrust", "roll", "pitch", "yaw",
 )
-# angle_idx / pos_dimension are DERIVED from STATE_NAMES by BaseEnv (see
+# angle_idx / pos_dimension are derived from STATE_NAMES by BaseEnv (see
 # agents/skrl/state_symmetry.py) -- the names are the single source of truth for
 # which dims wrap, which translate, and which co-rotate under a yaw rotation.
 
@@ -31,7 +31,7 @@ _X6_LIM = 1.5
 X_MIN = [-30.0, -30.0, -30.0, -_X4_LIM, -_X5_LIM, -_X6_LIM, _X7_LOW, -_X8_LIM, -_X9_LIM, -_X10_LIM]
 X_MAX = [30.0, 30.0, 30.0, _X4_LIM, _X5_LIM, _X6_LIM, _X7_HIGH, _X8_LIM, _X9_LIM, _X10_LIM]
 
-# Episode ENDS the first step x leaves this box (opt-in: --terminate_out_of_box).
+# Episode ends the first step x leaves this box (opt-in: --terminate_out_of_box).
 # Defaults to the state box itself, i.e. it fires exactly where env_base.step's
 # clamp already silently pins a diverged env -- the same event, reported instead
 # of hidden. Tighten it here to end failing episodes sooner.
@@ -56,7 +56,7 @@ XE_MIN = [-_lim] * 10
 XE_MAX = [_lim] * 10
 
 # u = [d(thrust)/dt (m/s^3), roll/pitch/yaw rate (rad/s)] -- B puts ones on rows
-# 6..9, so u drives the RATES of thrust and attitude, not forces. The APPLIED box
+# 6..9, so u drives the rates of thrust and attitude, not forces. The applied box
 # is 2x this (env_base.py:37).
 # thrust rate: thrust spans _X7_LOW..._X7_HIGH = 0.5g..2g = 4.9..19.6 m/s^2; at
 # the old +-6 applied, traversing that range took 2.4 s, while a real quadrotor

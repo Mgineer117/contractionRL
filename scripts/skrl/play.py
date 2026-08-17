@@ -5,7 +5,7 @@
 
 """Evaluate trained checkpoints and report their Stability/* metrics.
 
-Unlike a single-checkpoint viewer, this script is a MULTI-MODEL stability
+Unlike a single-checkpoint viewer, this script is a multi-Model stability
 evaluator: given one ``--task``, it discovers every trained model for that env
 (one per algorithm) and rolls each out for a single episode across
 ``num_envs_for_eval`` parallel envs, reading the batched contraction metrics
@@ -40,7 +40,7 @@ import os
 import sys
 
 # ── Argument parsing ─────────────────────────────────────────────────────── #
-# Parsed BEFORE any Isaac import so the classic route never touches Isaac Sim.
+# Parsed before any Isaac import so the classic route never touches Isaac Sim.
 
 parser = argparse.ArgumentParser(description="Multi-model Stability evaluation of skrl checkpoints.")
 parser.add_argument("--task", type=str, required=True, help="Name of the task/env.")
@@ -150,7 +150,7 @@ def _discover_models(task: str, classic: bool, models_dir: str,
 # ── Rollout ──────────────────────────────────────────────────────────────── #
 
 def _rollout_stability(env, agent, *, max_steps: int) -> dict:
-    """Roll out ONE deterministic episode across all envs; return stability_summary().
+    """Roll out one deterministic episode across all envs; return stability_summary().
 
     Mirrors C3MSkrlTrainer.eval(): reset (which invalidates any in-flight slots),
     step with the agent's deterministic action until every env has finished its
@@ -252,10 +252,10 @@ def run_classic(args) -> list[dict]:
         num_envs = max(num_envs, args.num_envs_for_eval)
 
         env = gym.make(args.task, num_envs=num_envs, device=device)
-        # Playback is a MEASUREMENT, same as train.py's evaluator — see
+        # Playback is a measurement, same as train.py's evaluator — see
         # _disarm_termination_for_eval for why a truncated horizon inverts AUC.
         _disarm_termination_for_eval(env, "[play]")
-        # Rebuild the SAME reference window the checkpoint was trained with.
+        # Rebuild the same reference window the checkpoint was trained with.
         # train.py sizes it AUTO from gamma (RefWindow.length_for_horizon) unless
         # --ref_length was given, and its evaluator mirrors the training env's
         # window explicitly. play.py did neither, so it built a length-1 window

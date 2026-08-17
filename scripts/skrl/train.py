@@ -13,14 +13,14 @@ import argparse
 import os
 import sys
 
-# Local wandb run files (config/history/media, NOT the same as tensorboard
+# Local wandb run files (config/history/media, not the same as tensorboard
 # events) rack up one small file per run and are the #1 inode-quota killer on
 # the cluster's home filesystem (~72k files observed, see search sweeps).
 # ~/scratch has no file-count limit, so park them there instead — cloud
 # syncing is unaffected. Must be set before wandb is ever imported.
 os.environ.setdefault("WANDB_DIR", os.path.expanduser("~/scratch/wandb"))
 
-# ─── Pre-parse: must know --classic BEFORE any Isaac Sim imports ──────────── #
+# ─── Pre-parse: must know --classic before any Isaac Sim imports ──────────── #
 _pre = argparse.ArgumentParser(add_help=False)
 _pre.add_argument("--classic", action="store_true", default=False)
 _pre.add_argument("--task", type=str, default="")
@@ -111,9 +111,9 @@ parser.add_argument("--ml_framework", type=str, default="torch", choices=["torch
 parser.add_argument("--ray-proc-id", "-rid", type=int, default=None)
 parser.add_argument("--debug_vis", action="store_true", default=False)
 # ── Agent-config overrides — flag name == YAML key under `agent:` ─────────── #
-# Each dest is spelled EXACTLY like the key it writes in agents/skrl_*_cfg.yaml,
+# Each dest is spelled exactly like the key it writes in agents/skrl_*_cfg.yaml,
 # so `--discount_factor 0.1` does what editing `discount_factor: 0.1` would.
-# Applied to agent_cfg["agent"] in BOTH the classic and Isaac branches via
+# Applied to agent_cfg["agent"] in both the classic and Isaac branches via
 # _apply_agent_overrides (previously only the Isaac branch honored them, so a
 # classic run silently ignored everything but --learning_rate/--discount_factor).
 # The older --ppo_*/--sac_*/--lr/--epochs spellings are kept as aliases on the
@@ -144,7 +144,7 @@ _ov.add_argument("--value_loss_scale", "--value-loss-scale", type=float, default
 # c2rl.C2RLPPOCfg.cvstem_residual_base / nn_modules.CVSTEMLQRBase).
 _ov.add_argument("--cvstem_residual_base", "--cvstem-residual-base",
                  dest="cvstem_residual_base", action="store_true", default=None)
-# C2RL only: contraction-pretrain π before PPO (Cu≺0 vs the frozen CMG, NOT
+# C2RL only: contraction-pretrain π before PPO (Cu≺0 vs the frozen CMG, not
 # cvstem-lqr) so u = uref + π starts stabilizing — see C2RLPPOCfg.
 _ov.add_argument("--residual_contraction_pretrain", "--residual-contraction-pretrain",
                  dest="residual_contraction_pretrain", action="store_true", default=None)
@@ -152,21 +152,21 @@ _ov.add_argument("--residual_pretrain_epochs", "--residual-pretrain-epochs",
                  dest="residual_pretrain_epochs", type=int, default=None)
 _ov.add_argument("--residual_pretrain_batch", "--residual-pretrain-batch",
                  dest="residual_pretrain_batch", type=int, default=None)
-# C2RL only: pretrain OBJECTIVE — "contraction" (default, Cu⮠ SDP violation vs
+# C2RL only: pretrain objective — "contraction" (default, Cu⮠ SDP violation vs
 # frozen CMG) or "cvstemlqr" (supervised MSE regression of u=uref+π onto the
-# analytic CV-STEM-LQR control law; base is NOT attached, deployed law stays
+# analytic CV-STEM-LQR control law; base is not attached, deployed law stays
 # u=uref+π). See C2RLPPOCfg.residual_pretrain_method.
 _ov.add_argument("--residual_pretrain_method", "--residual-pretrain-method",
                  dest="residual_pretrain_method", type=str, default=None,
                  choices=["contraction", "cvstemlqr"])
-# C2RL only: clamp the "cvstemlqr" pretrain TARGET to the actuator box env_base.step
-# actually applies (2*UREF). Unclamped, the r=0.01 CV-STEM-LQR law is ~2.7x outside
+# C2RL only: clamp the "cvstemlqr" pretrain target to the actuator box env_base.step
+# actually applies (2*Uref). Unclamped, the r=0.01 CV-STEM-LQR law is ~2.7x outside
 # that box on most samples, which pretrains the policy straight into saturation —
 # see C2RLPPOCfg.residual_pretrain_clamp_target.
 _ov.add_argument("--residual_pretrain_clamp_target", "--residual-pretrain-clamp-target",
                  dest="residual_pretrain_clamp_target", action="store_true", default=None)
-# C2RL only: after the trained eval, ALSO evaluate with the residual bypassed
-# (= pure CV-STEM-LQR base) on the IDENTICAL frozen CMG — a controlled base-vs-
+# C2RL only: after the trained eval, also evaluate with the residual bypassed
+# (= pure CV-STEM-LQR base) on the identical frozen CMG — a controlled base-vs-
 # residual comparison free of CMG-regression nondeterminism. See models.CLActorModel.
 parser.add_argument("--eval_base_too", "--eval-base-too",
                     dest="eval_base_too", action="store_true", default=False)
@@ -179,7 +179,7 @@ _ov.add_argument("--reward_level", "--reward-level",
                  dest="reward_level", action="store_true", default=None)
 # End the episode when the state leaves the env's X_TERMINATION_* box, instead of
 # silently pinning it there for the rest of the horizon (env_base.step's clamp).
-# ON by default (env_base) — `--no_terminate_out_of_box` restores the old
+# On by default (env_base) — `--no_terminate_out_of_box` restores the old
 # never-terminating behaviour, which is what any pre-flip number was measured
 # under. None means "not specified", so the env keeps its own default.
 parser.add_argument("--terminate_out_of_box", "--terminate-out-of-box",
@@ -198,7 +198,7 @@ _ov.add_argument("--residual_frozen", "--residual-frozen",
                  dest="residual_frozen", action="store_true", default=None)
 _ov.add_argument("--residual_anchor_scale", "--residual-anchor-scale",
                  dest="residual_anchor_scale", type=float, default=None)
-# Hard-control-bound CV-STEM-LQR base — DISABLED 2026-07-30 (measured worse
+# Hard-control-bound CV-STEM-LQR base — disabled 2026-07-30 (measured worse
 # than the post-hoc actuator filter, itself removed 2026-07-30 — never set by
 # any config; see c2rl.C2RLPPOCfg's commented hard_control_bound docstring).
 # _ov.add_argument("--hard_control_bound", "--hard-control-bound",
@@ -227,16 +227,16 @@ _ov.add_argument("--use_state_norm", "--use-state-norm", "--ppo_use_state_norm",
                  "--ppo-use-state-norm", type=str, default=None)
 _ov.add_argument("--use_value_norm", "--use-value-norm", "--ppo_use_value_norm",
                  "--ppo-use-value-norm", type=str, default=None)
-# Its partner knob (rl_glue installs them through DIFFERENT hooks:
+# Its partner knob (rl_glue installs them through different hooks:
 # value_preprocessor vs rewards_shaper), so an A/B on the reward normalizer
 # needs its own flag — without one the only way to toggle it is editing the
 # yaml, which is shared by every concurrently-running sweep worker.
 _ov.add_argument("--use_reward_norm", "--use-reward-norm", "--ppo_use_reward_norm",
                  "--ppo-use-reward-norm", type=str, default=None)
-# "false" makes PPO LEARN log_std through the policy loss instead of following
+# "false" makes PPO learn log_std through the policy loss instead of following
 # the fixed std_dev_annealing_kwargs schedule (C2RL-PPO only; see C2RLPPOCfg).
 _ov.add_argument("--std_dev_annealing", "--std-dev-annealing", type=str, default=None)
-# Train on a FIXED set of num_envs reference trajectories (one minted per env
+# Train on a fixed set of num_envs reference trajectories (one minted per env
 # slot on its first reset) instead of drawing a fresh one every episode. The
 # initial error stays random — this fixes the task, not the initial condition.
 _ov.add_argument("--fix_ref_trajectories", "--fix-ref-trajectories",
@@ -257,7 +257,7 @@ parser.add_argument("--ppo_activations", "--ppo-activations", type=str, default=
 parser.add_argument("--ppo_network_arch", "--ppo-network-arch", type=str, default=None)
 
 # ── Reference window: the observation s = {x, xrefs, urefs} ──────────────── #
-# xrefs[k] = xref[t + k*ref_offset], k = 0..ref_length-1 (k=0 is the CURRENT
+# xrefs[k] = xref[t + k*ref_offset], k = 0..ref_length-1 (k=0 is the current
 # reference). This is the POMDP fix that makes a high discount_factor valid:
 # V(s) integrates the reward over ~1/(1-gamma) steps, so every reference point
 # inside that horizon must be in the observation. RefWindow.check_markov warns
@@ -276,10 +276,10 @@ parser.add_argument("--ref_offset", "--ref-offset", type=int, default=1,
                          "Widens the span per point, at the cost of subsampling the "
                          "horizon (>1 is reported as non-Markov — see RefWindow.check_markov).")
 
-# How BOTH the actor's W2(xrefs) and the critic's psi(xrefs) turn the reference
+# How both the actor's W2(xrefs) and the critic's psi(xrefs) turn the reference
 # window into a fixed vector. Shared by design — the critic's independence comes
 # from its own architecture (phi/psi/combine), not a second encoder choice.
-# default=None, NOT "mlp"/1, so "explicitly passed" is distinguishable from "not
+# default=None, not "mlp"/1, so "explicitly passed" is distinguishable from "not
 # passed". With a non-None default the apply site could only use setdefault (a
 # plain assignment would clobber a sweep-sampled value back to the CLI default
 # every trial) -- and setdefault means the YAML silently wins over an explicit
@@ -310,7 +310,7 @@ parser.add_argument("--critic_combine", "--critic-combine", type=str, default="c
 # O6: parameterize the critic as V(s) = f_theta(s) + ||e||^2_M, with the second
 # term computed analytically from the frozen CMG instead of learned. The
 # decrement reward's telescoping identity is V_shaped = (1-gamma)V_orig - Phi(s),
-# so the O(1) potential the shaping removes from the REWARD reappears in the
+# so the O(1) potential the shaping removes from the reward reappears in the
 # critic's target; adding it back in closed form leaves f_theta only the O(dt)
 # part. Pair with --use_value_norm false (the term is in real value units).
 parser.add_argument("--critic_analytic_potential", "--critic-analytic-potential",
@@ -321,11 +321,11 @@ parser.add_argument("--critic_embed_dim", "--critic-embed-dim", type=int, defaul
                     help="Embedding width for the privileged critic's phi/psi "
                          "(default 64). Bounds the bilinear form's rank.")
 
-# UVFA-style generalization test: ALSO evaluate the trained policy on a FIXED
+# UVFA-style generalization test: Also evaluate the trained policy on a fixed
 # bank of reference-trajectory shapes drawn from a generator seeded
 # independently of training (see env.CarEnv.set_held_out_mode) — guaranteed
 # never encountered during training, unlike the normal post-training eval's
-# i.i.d.-random trajectories (a different draw from the SAME distribution).
+# i.i.d.-random trajectories (a different draw from the same distribution).
 # None (default) = skip this second eval pass entirely.
 parser.add_argument("--eval_held_out_seed", "--eval-held-out-seed", type=int, default=None,
                     help="Generator seed for a FIXED, held-out bank of reference-"
@@ -461,8 +461,8 @@ def _apply_agent_overrides(agent_cfg, args):
         val = getattr(args, key, None)
         if val is not None:
             a[key] = (str(val).lower() == "true")
-    # One switch, two places: the agent flag controls the annealing PATCH, while
-    # the CLActor must also be BUILT with a learnable logstd. Setting only the
+    # One switch, two places: the agent flag controls the annealing patch, while
+    # the CLActor must also be built with a learnable logstd. Setting only the
     # former leaves self.anneal=True on the model, so CLActor.anneal_stddev()
     # would still overwrite whatever the policy gradient learned.
     if getattr(args, "std_dev_annealing", None) is not None:
@@ -483,7 +483,7 @@ def _apply_agent_overrides(agent_cfg, args):
         a["residual_pretrain_method"] = args.residual_pretrain_method
     if getattr(args, "residual_pretrain_clamp_target", None):
         a["residual_pretrain_clamp_target"] = True
-    # Encoder settings are MODEL kwargs (models.policy.* / models.critic.*), not
+    # Encoder settings are model kwargs (models.policy.* / models.critic.*), not
     # agent-config keys — contraction_runner passes those blocks through verbatim
     # as model kwargs. setdefault, never assignment: a wandb sweep parameter under
     # models.policy.* already landed in agent_cfg via apply_wandb_sweep_overrides,
@@ -491,7 +491,7 @@ def _apply_agent_overrides(agent_cfg, args):
     # every trial.
     _policy_block = agent_cfg.get("models", {}).get("policy")
     if isinstance(_policy_block, dict):
-        # Explicit flag WINS over the yaml; absent flag leaves the yaml (or a
+        # Explicit flag wins over the yaml; absent flag leaves the yaml (or a
         # sweep-sampled value) alone and falls back to mlp/1 only if neither set
         # it. Both halves matter: assignment-always clobbers sweeps, and
         # setdefault-always makes the flag a no-op on any env that pins these.
@@ -513,7 +513,7 @@ def _apply_agent_overrides(agent_cfg, args):
         a["residual_frozen"] = True
     if getattr(args, "residual_anchor_scale", None) is not None:
         a["residual_anchor_scale"] = args.residual_anchor_scale
-    # Hard-control-bound overrides DISABLED 2026-07-30 (flags commented out above).
+    # Hard-control-bound overrides disabled 2026-07-30 (flags commented out above).
     # if getattr(args, "hard_control_bound", None):
     #     a["hard_control_bound"] = True
     # if getattr(args, "hard_control_u_bound", None) is not None:
@@ -587,12 +587,12 @@ if _is_classic:
     entry_key = f"skrl_{algorithm.replace('-', '_')}_cfg_entry_point"
     agent_cfg = _load_cfg(entry_key, args_cli.cfg)
     # Hand-pinned `--agent.mini_batches=16`-style knobs, applied the same way a
-    # sweep would. BEFORE the seed read and every model build below, so an
+    # sweep would. Before the seed read and every model build below, so an
     # overridden value is what actually gets used. A wandb sweep still wins: it
     # applies later (search "apply_wandb_sweep_overrides"), which is correct —
     # the sweep is the one sampling that axis.
     apply_cli_dotted_overrides(agent_cfg, hydra_args)
-    # --seed CLI arg wins; otherwise fall back to the yaml's own seed (NOT the
+    # --seed CLI arg wins; otherwise fall back to the yaml's own seed (not the
     # random.randint(...) module-level `seed` computed at line 164 before the
     # yaml was even loaded — using that unconditionally silently discarded
     # every config's `seed:` field and made "the same command" produce a
@@ -614,7 +614,7 @@ if _is_classic:
     # Classic contraction envs use the env's exact analytical get_f_and_B by
     # default (use_empirical_dynamics=False); pass --use_empirical_dynamics to
     # learn a NeuralDynamics instead. Classic envs only (Isaac forces empirical).
-    # _CONTRACTION_ALGOS (not a hand-written list): it carries BOTH the hyphen
+    # _CONTRACTION_ALGOS (not a hand-written list): it carries both the hyphen
     # and underscore spellings of the c2rl variants. The old inline list had
     # only "c2rl_ppo"/"c2rl_sac", so the README-documented "--algorithm c2rl-ppo"
     # silently dropped --use_empirical_dynamics and trained on analytical
@@ -655,7 +655,7 @@ if _is_classic:
         # Consistent run name: CLI override > YAML-provided name > deterministic
         # default that matches the local log directory (logs/classic/<algo>/<ts>).
         _wkw["name"] = args_cli.wandb_run_name or _wkw.get("name") or f"classic_{algorithm}_{_run_ts}"
-        # wandb.run.name is NOT a config key, so it can't be filtered/grouped on
+        # wandb.run.name is not a config key, so it can't be filtered/grouped on
         # in the runs table — mirror it into the config, alongside a batch label
         # that defaults to the run date so a relaunch is separable from the
         # previous day's runs without passing anything.
@@ -664,7 +664,7 @@ if _is_classic:
             "run_batch": args_cli.wandb_batch or _run_ts.split("_")[0],
         })
 
-        # A sweep must init EARLY: its sampled hyperparameters only exist on
+        # A sweep must init early: its sampled hyperparameters only exist on
         # wandb.config once the run is live, and they have to reach agent_cfg
         # before any model is built from it.
         if "WANDB_SWEEP_ID" in os.environ:
@@ -703,7 +703,7 @@ if _is_classic:
     if not _is_contraction and (args_cli.reward_euclidean or args_cli.reward_level):
         raw_env.unwrapped.reward_euclidean = bool(args_cli.reward_euclidean)
         raw_env.unwrapped.reward_level = bool(args_cli.reward_level)
-    # None = not specified, so the env keeps its own default (ON). Only an
+    # None = not specified, so the env keeps its own default (on). Only an
     # explicit flag reaches through here.
     if args_cli.terminate_out_of_box is not None or args_cli.terminate_as_terminal:
         if not hasattr(raw_env.unwrapped, "set_terminate_out_of_box"):
@@ -720,8 +720,8 @@ if _is_classic:
         print(f"[train] eig_reshape ACTIVE: Mahalanobis reward's M reshaped to "
               f"cond(M) = {args_cli.eig_reshape:g} every step")
 
-    # Reference window: size it for THIS run and rebuild observation_space.
-    # Must run BEFORE the wrappers/runner so the new space propagates to the
+    # Reference window: size it for this run and rebuild observation_space.
+    # Must run before the wrappers/runner so the new space propagates to the
     # models and the memory. discount_factor is already finalized here (CLI
     # overrides at _apply_agent_overrides + any wandb-sweep overrides above), so
     # the Markov check below reports against the gamma actually used.
@@ -729,12 +729,12 @@ if _is_classic:
     if hasattr(raw_env.unwrapped, "configure_ref_window"):
         # Imported unconditionally: the window CONFIG block below calls
         # _RW.effective_horizon() on both paths, and it used to be imported only
-        # inside the AUTO branch -- so every PINNED run died with
+        # inside the AUTO branch -- so every pinned run died with
         # "NameError: name '_RW' is not defined" before reaching training.
         from contractionRL.agents.skrl.ref_window import RefWindow as _RW
         _len = args_cli.ref_length
         if _len is None:
-            # AUTO: size the window to THIS run's gamma. Done here, after every
+            # AUTO: size the window to this run's gamma. Done here, after every
             # gamma override (CLI + wandb sweep) has landed, so a swept
             # discount_factor resizes the observation to match instead of
             # being evaluated against a stale hand-picked length.
@@ -748,7 +748,7 @@ if _is_classic:
             length=_len, offset=args_cli.ref_offset, gamma=_gamma)
         # The window reaches wandb as CONFIG. Without it the gamma/window pairing
         # is invisible in the logged data: ref_length AUTO makes the observation
-        # width a FUNCTION of gamma (19-wide at 0.5, 2504-wide at 0.999), so any
+        # width a function of gamma (19-wide at 0.5, 2504-wide at 0.999), so any
         # gamma effect read off runs that do not record their window is really a
         # gamma-and-architecture effect with no way to tell after the fact.
         # ref_length_mode says whether this run pinned it or inherited AUTO.
@@ -760,13 +760,13 @@ if _is_classic:
             "ref_window_span": int(_len) * int(args_cli.ref_offset),
             "effective_horizon": int(_RW.effective_horizon(_gamma, _mel)),
             "max_episode_len": _mel,
-            # <1 means the window is SHORTER than the discount's horizon, i.e. V
+            # <1 means the window is shorter than the discount's horizon, i.e. V
             # is non-Markov in the reference -- the POMDP the window exists to
             # prevent.
             "window_over_horizon": (int(_len) * int(args_cli.ref_offset))
             / max(int(_RW.effective_horizon(_gamma, _mel)), 1),
         }
-        # Written into the PENDING wandb_kwargs, not onto wandb.run: wandb.init()
+        # Written into the pending wandb_kwargs, not onto wandb.run: wandb.init()
         # is called later, by skrl's Agent.init(), so wandb.run is still None
         # here and a live config.update() silently no-ops (measured: every window
         # key came back None on the first launch that tried it). The kwargs dict
@@ -821,7 +821,7 @@ if _is_classic:
 
     _annealing = normalize_agent_cfg(agent_cfg, algorithm=algorithm)
     # C2RL declares caps_* as real cfg fields and patches its own inner PPO/SAC
-    # sub-agent, so its keys must STAY in the dict (pop=False); skrl's Runner
+    # sub-agent, so its keys must stay in the dict (pop=False); skrl's Runner
     # would reject them, so the standalone route strips them. See _resolve_caps_kwargs.
     _caps = _resolve_caps_kwargs(agent_cfg, args_cli, pop=not _is_contraction)
 
@@ -837,7 +837,7 @@ if _is_classic:
         from contractionRL.agents.skrl.runner import CLActorRunner
         _inject_angle_idx(agent_cfg, list(getattr(raw_env.unwrapped, "angle_idx", []) or []),
                           _resolve_symmetry_for_env(raw_env))
-        # network_architecture: sweep-friendly override applied to BOTH the
+        # network_architecture: sweep-friendly override applied to both the
         # actor (models.policy) and critic (models.value) hidden layers, so a
         # PPO architecture sweep stays apples-to-apples against c3m's
         # actor_architecture (which only has a policy net to vary — C3M has no
@@ -859,7 +859,7 @@ if _is_classic:
     runner.run()
     env.close()
 
-    # Post-training reporting must NEVER void a finished run. Training is done and
+    # Post-training reporting must never void a finished run. Training is done and
     # the sweep's objective (Reward/discounted_return_mean) was logged during it,
     # so a failure in the final evaluation costs some reporting detail, not the
     # trial. Left unguarded, one FileNotFoundError writing eval_results.json
@@ -880,7 +880,7 @@ if _is_classic:
               "and its metrics are already logged. Traceback follows; exiting 0.",
               flush=True)
         traceback.print_exc()
-    # Controlled comparison: re-eval the PURE base (residual bypassed) on the same
+    # Controlled comparison: re-eval the pure base (residual bypassed) on the same
     # frozen CMG the trained residual just used — the airtight base-vs-residual delta.
     if getattr(args_cli, "eval_base_too", False):
         _pol = getattr(runner.agent, "models", {}).get("policy", None)
@@ -900,7 +900,7 @@ if _is_classic:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ISAAC SIM ROUTE  (default)
+# ISAAC sim route  (default)
 # ══════════════════════════════════════════════════════════════════════════════
 else:
     import time
@@ -1041,7 +1041,7 @@ else:
                                 # The video-watcher thread uploads asynchronously (polling every
                                 # 30s) and can land after the main loop has already logged
                                 # scalars at a later step — wandb rejects any step= that isn't
-                                # monotonically increasing across ALL calls in the run. Give the
+                                # monotonically increasing across all calls in the run. Give the
                                 # video its own x-axis instead of the shared step counter, so an
                                 # out-of-order upload is never rejected (https://wandb.me/define-metric).
                                 _wandb.define_metric("train/video_step")
@@ -1128,7 +1128,7 @@ else:
         env = StatManagerEnvWrapper(env)
         # Raw (un-plot-wrapped) reference for _evaluate_best_model/_generate_ref_trajs:
         # both toggle skrl_env._reset_once directly to force a real sim reset, which
-        # is an attribute SET — WandbPlotWrapper.__getattr__ only intercepts GETs, so
+        # is an attribute set — WandbPlotWrapper.__getattr__ only intercepts GETs, so
         # setting it through the plot wrapper would shadow it on the wrapper instance
         # instead of the real IsaacLabWrapper, silently breaking that reset.
         _skrl_env = env
@@ -1143,7 +1143,7 @@ else:
         env = WandbPlotWrapper(env, total_timesteps=agent_cfg["trainer"]["timesteps"])
 
         # angle_idx (e.g. yaw at [2] on quadruped/humanoid path-tracking) is an
-        # ENV attribute, not a cfg field — inject it into agent_cfg["models"] so
+        # Env attribute, not a cfg field — inject it into agent_cfg["models"] so
         # standalone PPO/SAC's _gaussian_factory/_deterministic_factory (which
         # only see per-block yaml kwargs) embed it too. ContractionRunner
         # (C3M/LQR/SDLQR/C2RL) reads it directly off the env and needs no
@@ -1162,7 +1162,7 @@ else:
 
         if _is_contraction:
             from contractionRL.runners import ContractionRunner
-            # Isaac envs have no closed-form dynamics, so they ALWAYS learn a
+            # Isaac envs have no closed-form dynamics, so they always learn a
             # NeuralDynamics (pretrain + online). Forcing use_empirical_dynamics=True
             # here also makes the runner's guard reject any config that tries to
             # request analytical dynamics (use_empirical_dynamics=False) for Isaac.
@@ -1205,13 +1205,13 @@ else:
             _wandb_video_thread.join(timeout=120)
 
         # Best-model evaluation (CAC-dev-style: reward/AUC/contraction-rate/
-        # overshoot with 95% CI) applies to PATH-TRACKING envs — that's where
+        # overshoot with 95% CI) applies to PATH-Tracking envs — that's where
         # a genuine reference-trajectory tracking error is defined and where
         # C3M/LQR/SD-LQR/C2RL's contraction analysis is meaningful. It also
         # runs for VelTracking (which exposes the same get_tracking_error()
         # duck-type against a velocity command instead of a trajectory) since
         # that's used as this quality gate before ref-traj generation.
-        # _evaluate_best_model no-ops with a SKIPPED message for any env that
+        # _evaluate_best_model no-ops with a skipped message for any env that
         # doesn't implement get_tracking_error(), so it's safe to always call.
         _evaluate_best_model(
             task=args_cli.task,

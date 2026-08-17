@@ -1,7 +1,7 @@
 """Generate C2RL's offline ``{x → W*(x)}`` contraction-metric dataset.
 
 C2RL no longer solves the per-state CV-STEM SDP at agent construction — it
-LOADS a dataset produced here (see ``c2rl._synthesize_cmg_cvstem``). Run this
+loads a dataset produced here (see ``c2rl._synthesize_cmg_cvstem``). Run this
 once per (task, algorithm) whose ``lbd``/``w_lb``/``w_ub``/``cvstem_r_scaler``/
 ``cm_eps``/``cm_solver``/``cmg_memory_size`` differ; everything else about a run
 — gamma, seed, network sizes, timesteps — is absent from the cache key, so one
@@ -14,7 +14,7 @@ The destination path and the cache key both come from ``c2rl.cm_dataset_target``
 — the same function the agent loads through — so a file written here cannot
 key-miss on load. Do not reimplement either here.
 
-Feasibility is a RESULT, not a warning: if fewer than ``min_feasibility_rate``
+Feasibility is a result, not a warning: if fewer than ``min_feasibility_rate``
 of states solve, this exits non-zero rather than writing a dataset the CMG would
 regress onto a biased subset of the state space.
 """

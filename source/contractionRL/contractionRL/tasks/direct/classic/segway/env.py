@@ -10,7 +10,7 @@ from ..common.env_base import BaseEnv
 
 # Denote angle indices to handle smooth transition
 STATE_NAMES = ("pos_x", "pitch", "vel_x_b", "pitch_rate")
-# angle_idx / pos_dimension are DERIVED from STATE_NAMES by BaseEnv (see
+# angle_idx / pos_dimension are derived from STATE_NAMES by BaseEnv (see
 # agents/skrl/state_symmetry.py) -- the names are the single source of truth for
 # which dims wrap, which translate, and which co-rotate under a yaw rotation.
 
@@ -18,7 +18,7 @@ STATE_NAMES = ("pos_x", "pitch", "vel_x_b", "pitch_rate")
 X_MIN = [-5.0, -math.pi / 3, -1.0, -math.pi]
 X_MAX = [5.0, math.pi / 3, 1.0, math.pi]
 
-# Episode ENDS the first step x leaves this box (opt-in: --terminate_out_of_box).
+# Episode ends the first step x leaves this box (opt-in: --terminate_out_of_box).
 # Defaults to the state box itself, i.e. it fires exactly where env_base.step's
 # clamp already silently pins a diverged env -- the same event, reported instead
 # of hidden. Tighten it here to end failing episodes sooner.
@@ -30,7 +30,7 @@ XREF_INIT_MIN = [0.0, 0, 0.0, 0]
 XREF_INIT_MAX = [0.0, 0, 0.0, 0]
 
 # Initial perturbation to the reference state.
-# pitch and pitch_rate USED to span the ENTIRE state box (+-pi/3 and +-pi, i.e.
+# pitch and pitch_rate used to span the entire state box (+-pi/3 and +-pi, i.e.
 # X_MIN/X_MAX exactly), so reset could place the segway at a 60-degree tilt
 # spinning at pi rad/s -- mid-fall, not a tracking error. Recovering 60 degrees
 # alone needs |u|=4.17 of the +-6 available, and along the CV-STEM tube
@@ -44,7 +44,7 @@ lim = 1.0
 XE_MIN = [-lim, -lim, -lim, -lim]
 XE_MAX = [lim, lim, lim, lim]
 
-# reference control bounds. The APPLIED box is 2x this (env_base.py:37). u is a
+# reference control bounds. The applied box is 2x this (env_base.py:37). u is a
 # normalized wheel torque with no direct hardware unit, so anchor it through its
 # effect: B[2,0] = (-1.8 cos(th) - 10.9)/(cos(th) - 24.7) ~ 0.54 maps u to the
 # body-frame acceleration v_dot, so +-12 applied is +-6.4 m/s^2 of wheel accel --
@@ -55,10 +55,10 @@ XE_MAX = [lim, lim, lim, lim]
 UREF_MIN = [-6.0]
 UREF_MAX = [6.0]
 
-# Initial state drawn DIRECTLY from this box (see env_base.X_INIT_MIN),
-# placing every episode start in the plant's LOW-lambda region:
+# Initial state drawn directly from this box (see env_base.X_INIT_MIN),
+# placing every episode start in the plant's low-lambda region:
 # lbd*(x0) median 0.2207 -> 0.0987. The sign dims are
-# mirrored by ONE shared sign, because the slow set is two lobes on a
+# mirrored by one shared sign, because the slow set is two lobes on a
 # diagonal that no single box can cover.
 X_INIT_MIN = [-5.0, 0.6596, 0.0098, -3.1244]
 X_INIT_MAX = [5.0, 1.0467, 0.994, -0.6786]

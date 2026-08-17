@@ -3,7 +3,7 @@
 A poor policy (random init, or an RL algorithm's early exploration) can drive
 the dynamics to a non-finite (NaN/Inf) state. Every environment in this repo
 must survive that without ending the rollout: contraction metrics (AUC,
-overshoot, contraction rate) are fit over a FULL, fixed-length trajectory, so
+overshoot, contraction rate) are fit over a full, fixed-length trajectory, so
 an early termination on divergence would truncate exactly the data the
 analysis needs. The fix used everywhere is the same: replace any non-finite
 element with the corresponding element of the previous (last known-finite)

@@ -84,7 +84,7 @@ the cluster's actual text (which drifts cosmetically from local), upload, and
 > in plaintext (visible in `git remote -v`). That token should be rotated and
 > replaced with a credential helper or SSH remote.
 
-## 5. Quota is an INODE limit, not space
+## 5. Quota is an inode limit, not space
 
 ```bash
 ssh uiuc-cc "quota -s | grep 'u/minjae5'"
@@ -177,7 +177,7 @@ Partitions other than scavenger/ic-express reject jobs without `--account`
 (`srun: error: You must specify an account`). Verify with
 `sacctmgr show associations user=minjae5 format=account,partition -p`.
 
-Standing preference: when work is PENDING on one partition and another has
+Standing preference: when work is pending on one partition and another has
 capacity, **split across both** rather than draining one first.
 
 ## 8. Launching a sweep across several partitions

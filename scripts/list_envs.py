@@ -5,17 +5,17 @@
     python scripts/list_envs.py --dynamics       # + the f(x)/B(x) source
     python scripts/list_envs.py --dynamics --keyword auv
 
-Classic envs are pure NumPy/PyTorch and are INSTANTIATED here, so x_dim, u_dim
+Classic envs are pure NumPy/PyTorch and are instantiated here, so x_dim, u_dim
 and the sv(B) spread are measured, not declared. Isaac envs need Isaac Sim to
 construct and define their dynamics through the simulator rather than an
 analytic ``get_f_and_B``; they are listed with None in those columns rather than
 omitted, so the table stays a complete inventory.
 
 The sv(B) column is the diagnostic that decides whether restricting to a state
-SUBSET can certify a faster contraction rate. B enters the CV-STEM LMI only
-through ``nu*(2/r)*B B^T`` with ``nu`` SHARED across states, so a state with
+subset can certify a faster contraction rate. B enters the CV-STEM LMI only
+through ``nu*(2/r)*B B^T`` with ``nu`` shared across states, so a state with
 weaker actuation cannot be rescued by any metric -- only excluded. What matters
-is therefore whether B's SINGULAR VALUES vary, not whether B depends on x at
+is therefore whether B's singular values vary, not whether B depends on x at
 all: a B that merely rotates (pvtol, the kinematic car) has constant singular
 values and offers nothing to a subset.
 """
@@ -63,7 +63,7 @@ def probe(task: str) -> dict:
     sv = np.linalg.svd(Bn, compute_uv=False)
     spread = float((sv.max(0) / np.maximum(sv.min(0), 1e-300)).max())
 
-    # Which dims B varies with, probed AWAY from the box centre: a term like
+    # Which dims B varies with, probed away from the box centre: a term like
     # v*sin(pitch) is invisible to a one-dim-at-a-time probe launched from the
     # centre, where pitch = 0. Segway has exactly that, and probing from the
     # centre wrongly reports vel_x_b inert.

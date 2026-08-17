@@ -2,17 +2,17 @@
 
 The loop, and that is all it is::
 
-    lbd, r = 10.0, 0.1                      # w_lb = 0.01, w_ub = 100, FIXED
+    lbd, r = 10.0, 0.1                      # w_lb = 0.01, w_ub = 100, fixed
     repeat:
         solve the joint CV-STEM SDP at (lbd, r) over N uniform state-box samples
         LMI infeasible          -> lbd /= 1.5
         >5% of controls outside -> r   *= 2  (then lbd /= 1.5 once r passes --r-max)
         otherwise               -> done
 
-Then the agent is built at that point and rolled for ONE episode, so the
+Then the agent is built at that point and rolled for one episode, so the
 certificate and the AUC it actually produces are reported together.
 
-The envelope ``w_lb·I ⪯ W ⪯ w_ub·I`` is a FIXED input, never searched: if nothing
+The envelope ``w_lb·I ⪯ W ⪯ w_ub·I`` is a fixed input, never searched: if nothing
 certifies inside it, the script reports INFEASIBLE rather than widening it. Note
 ``‖M‖₂ ≤ ν ≤ 1/w_lb``, so ``w_lb`` is a hard cap on the gain
 (``‖K‖₂ ≤ ‖B‖₂/(r·w_lb)``) and therefore also a hard limit on what the ``r``
@@ -23,15 +23,15 @@ over all samples with ``ν``/``χ`` shared and his ``(W̄-I)/dt`` term. States a
 drawn i.i.d. uniform from the env's state box, his ``xlims`` draw, which is the
 same draw ``cvstem_lqr`` synthesizes over.
 
-THE CONTROL CHECK — A 5% BUDGET, NOT A VETO
+The control check — A 5% budget, not a veto
 --------------------------------------------
 Uniform state samples carry no reference, so the error is drawn from the env's own
-RESET perturbation box ``[XE_INIT_MIN, XE_INIT_MAX]`` and the feedforward from
+reset perturbation box ``[XE_INIT_MIN, XE_INIT_MAX]`` and the feedforward from
 ``[UREF_MIN, UREF_MAX]``. (Not ``XE_MIN``/``XE_MAX`` -- that is C3M's flat +-1
 training-perturbation box, not the tracking error an episode presents; see the
 comment at the ``e_lo, e_hi`` assignment.) At every sampled state, ``--n-draws`` of each are pushed through the
 control the agent would really apply, ``u = uref - K(x)·e`` with ``K = (1/r)BᵀM``,
-and the check fails only when MORE than ``--viol-frac`` (5%) of that population
+and the check fails only when more than ``--viol-frac`` (5%) of that population
 lands outside the control box.
 
 A hard 0% veto does not work here and the reason is structural. The control box is
@@ -47,27 +47,27 @@ against ±3), because the weak gain let the tracking error grow to ~19, twenty
 times outside the error box the constraint was written over.
 
 The configurations that perform saturate transiently and rely on it. So the only
-honest form of this check is a budget on how OFTEN that happens.
+honest form of this check is a budget on how often that happens.
 
-``expand_box`` is sign-aware: a bound widens by MULTIPLYING when it already points
-outward (negative ``lo``, positive ``hi``) and by DIVIDING when it points inward,
+``expand_box`` is sign-aware: a bound widens by multiplying when it already points
+outward (negative ``lo``, positive ``hi``) and by dividing when it points inward,
 since ``2 x positive_lo`` would narrow the box. Zero is a fixed point, which is
 what turtlebot's ``v ∈ [0, 0.44]`` needs.
 
-WHEN ``r`` BITES, AND WHEN IT DOES NOT
+When ``r`` bites, and when it does not
 ---------------------------------------
 ``r`` is live only where ``χ`` has slack. The LMI sees ``ν`` and ``r`` only as
 ``ν/r``, so if the program is tight enough that ``W̄`` is pinned against ``χI``,
 the solved ``ν`` scales exactly with ``r`` and ``K = R⁻¹BᵀM`` does not move.
 Measured on the car, both regimes, same script::
 
-    lbd=10   r 0.1 -> 6554 : chi FROZEN at 422.2, nu/r = 4423 flat, violation 278 flat
+    lbd=10   r 0.1 -> 6554 : chi frozen at 422.2, nu/r = 4423 flat, violation 278 flat
     lbd=0.26 r 0.1 -> 102.4: chi 2.27 -> 5.68,   nu/r 8.31 -> 1.39, violation 5.73 -> 0.064
 
 So raising ``r`` buys a smaller gain by letting the solver trade into a
 worse-conditioned metric — until ``χ`` saturates, after which it buys nothing.
 The loop therefore doubles ``r`` up to ``--r-max`` and only then lowers ``lbd``.
-Do NOT add a "the violation stopped moving, give up on r" shortcut: the violation
+Do not add a "the violation stopped moving, give up on r" shortcut: the violation
 sits on plateaus that later break through (on the car at lbd=0.39 it stalls at
 0.66 from r=3.2 to 6.4, and at lbd=0.26 the same plateau drops to 0.086 by
 r=25.6).
@@ -108,10 +108,10 @@ def eps_for_n(n: int) -> float:
         N <=  1000 -> 0.05
         N >   1000 -> 0.01
 
-    ε is a COVERING RADIUS, not a stability requirement. Tsukamoto's own program
+    ε is a covering radius, not a stability requirement. Tsukamoto's own program
     (AstroHiro classncm.py:189) uses epsilon = 0, so the LMI need only be
-    negative semidefinite AT THE SAMPLED STATES; ε > 0 is what buys the states
-    in BETWEEN, since a margin ε at each sample still holds nearby when the
+    negative semidefinite at the sampled states; ε > 0 is what buys the states
+    in between, since a margin ε at each sample still holds nearby when the
     field is Lipschitz. The sparser the draw, the wider the gaps, and the more
     margin each sample has to carry.
 
@@ -129,9 +129,9 @@ def eps_for_n(n: int) -> float:
 def expand_box(lo, hi, factor=2.0):
     """Widen a box outward by ``factor``, per-component and sign-aware.
 
-    A bound widens by MULTIPLYING when it already points outward (negative
-    ``lo``, positive ``hi``) and by DIVIDING when it points inward (positive
-    ``lo``, negative ``hi``) — ``2 × positive_lo`` would NARROW the box, not
+    A bound widens by multiplying when it already points outward (negative
+    ``lo``, positive ``hi``) and by dividing when it points inward (positive
+    ``lo``, negative ``hi``) — ``2 × positive_lo`` would narrow the box, not
     widen it. Zero is a fixed point either way, which is what turtlebot's
     ``v ∈ [0, 0.44]`` needs (its lower bound must stay at 0).
     """
@@ -141,19 +141,19 @@ def expand_box(lo, hi, factor=2.0):
 
 
 def control_violation_rate(W, B, *, r_scaler, e_draws, uref_draws, u_lo, u_hi):
-    """Fraction of GENERATED controls ``u = uref - K(x)·e`` that leave the box.
+    """Fraction of generated controls ``u = uref - K(x)·e`` that leave the box.
 
     Not a worst case. ``e_draws``/``uref_draws`` are ``(n_states, n_draws, dim)``
     samples of the error and feedforward; this forms the control the agent would
     actually apply at each and counts how many land outside.
 
-    The worst case is a box VERTEX — every error component at its extreme at once
+    The worst case is a box vertex — every error component at its extreme at once
     — which no episode visits: it demands ``Σ_j |K_ij|·e_j`` fit the budget where
     a typical draw needs about ``‖K_i‖₂·‖e‖₂``. Vetoing on it rejected every gain
     that actually tracks (measured on the car: it drove ν to its w_lb cap and
     ``‖K‖`` to ~1, against the ~22 that reaches AUC 1.3).
 
-    The draws are made ONCE by the caller and reused at every ``(lbd, r)``, so the
+    The draws are made once by the caller and reused at every ``(lbd, r)``, so the
     accept/reject decision moves only with the metric — resampling per iteration
     would let the search accept on RNG luck near the threshold.
     """
@@ -264,18 +264,18 @@ def main() -> int:
     # perturbs by, and it is sized per env (quadrotor's is per-dimension, from
     # measured budget consumption along the CV-STEM tube).
     #
-    # XE_MIN/XE_MAX is C3M's TRAINING-perturbation box: a flat +-1 on every dim,
+    # XE_MIN/XE_MAX is C3M's training-perturbation box: a flat +-1 on every dim,
     # identical across all four envs, sampled by get_rollout(., "c3m") for the
     # contraction loss. It was never sized to represent tracking error, and on
     # segway it is 6.7x wider in pitch than reset ever produces -- a 1 rad (57
     # deg) tilt error, which the env's own comment calls "mid-fall, not a
-    # tracking error". Measured at a FIXED metric (lbd=0.0101, r=6.4), swapping
+    # tracking error". Measured at a fixed metric (lbd=0.0101, r=6.4), swapping
     # only this box moves the violation rate 35.20% -> 0.61%, i.e. it alone was
     # the difference between segway certifying and returning INFEASIBLE at every
     # (lbd, r, envelope) tried. Cartpole is insensitive: 3.01% -> 0.00%.
     e_lo, e_hi = _np(env.XE_INIT_MIN), _np(env.XE_INIT_MAX)
-    # The control box IS the uref box widened by --u-expansion, which is how every
-    # env defines it (env_base.py: "the APPLIED box is 2x this"). Derived rather
+    # The control box is the uref box widened by --u-expansion, which is how every
+    # env defines it (env_base.py: "the applied box is 2x this"). Derived rather
     # than read off U_MIN/U_MAX so the check states the relationship it relies on.
     u_lo, u_hi = expand_box(uref_lo, uref_hi, args.u_expansion)
     if not (np.allclose(u_lo, _np(env.U_MIN)) and np.allclose(u_hi, _np(env.U_MAX))):
@@ -284,7 +284,7 @@ def main() -> int:
               f"[{_np(env.U_MIN).round(3)}, {_np(env.U_MAX).round(3)}] — using the "
               f"derived one, which is what --u-expansion asks for.")
 
-    # ε per PHASE, scheduled from that phase's own sample count (eps_for_n).
+    # ε per phase, scheduled from that phase's own sample count (eps_for_n).
     # The search and the final synthesis run at different N, so pinning one ε to
     # both makes the denser program strictly harder than the margin it needs.
     pinned = args.cm_eps is not None
@@ -317,7 +317,7 @@ def main() -> int:
 
     x_np = sample_state_box(env.X_MIN, env.X_MAX, n=args.num_samples, seed=args.seed)
     A, B = drift_jacobians(env.get_f_and_B, x_np)
-    # Drawn ONCE and reused at every (lbd, r) — see control_violation_rate.
+    # Drawn once and reused at every (lbd, r) — see control_violation_rate.
     rng = np.random.default_rng(args.seed)
     shape = (args.num_samples, args.n_draws)
     e_draws = rng.uniform(e_lo, e_hi, size=(*shape, e_lo.size))

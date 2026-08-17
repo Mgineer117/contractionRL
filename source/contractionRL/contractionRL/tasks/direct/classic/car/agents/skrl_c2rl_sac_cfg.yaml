@@ -55,9 +55,9 @@ agent:
   random_timesteps: 0
   learning_starts: 0
   grad_norm_clip: 1.0  # Maximum permitted magnitude for gradients (prevents exploding gradients)
-  use_state_norm: false  # OFF by default — see c2rl.py module docstring / rl_glue.make_base_rl_cfg
+  use_state_norm: false  # Off by default — see c2rl.py module docstring / rl_glue.make_base_rl_cfg
   # ── CAPS action smoothness (Mysore et al. 2021) ─────────────────────────── #
-  # Added to the POLICY LOSS, not the reward: pi's MEAN is penalized for
+  # Added to the policy loss, not the reward: pi's mean is penalized for
   # changing between consecutive states (temporal) and under a small state
   # perturbation (spatial). Because it is not a reward term, the MDP, the
   # observation layout and the dynamics are all untouched — so the offline
@@ -68,7 +68,7 @@ agent:
   # --caps_spatial_scale / --caps_spatial_std. See patch_caps_regularizer.
   caps_temporal_scale: 0.001   # weight on ||pi(s_t) - pi(s_t+1)||^2
   caps_spatial_scale: 0.0    # weight on ||pi(s) - pi(s_bar)||^2, s_bar ~ N(s, sigma^2)
-  caps_spatial_std: 0.05     # sigma, in RAW observation units (see patch_caps_regularizer)
+  caps_spatial_std: 0.05     # sigma, in raw observation units (see patch_caps_regularizer)
   discount_factor: 0.99  # deployed policy's discount factor (single policy — no con/opt duality)
   # NOTE: the contraction-metric / Mahalanobis-reward config (cmg_method, w_ub,
   # w_lb, lbd, tracking_scaler, control_scaler, cm_eps, cm_solver) lives in the
@@ -86,7 +86,7 @@ agent:
 
 # ── Contraction metric + Mahalanobis reward ────────────────────────────────── #
 cm:
-  # Metric source — how the ENV computes the Mahalanobis reward. "online":
+  # Metric source — how the env computes the Mahalanobis reward. "online":
   # solve the CV-STEM SDP per env per step at the states the rollout visits
   # (ncm_synthesis.OnlineCVSTEMMetric), so every M is a verified feasible
   # metric and an infeasible state aborts the run. No Phase A, no CMG
@@ -127,7 +127,7 @@ cm:
   #              action range — see ncm_synthesis.py module docstring.
   cmg_method: cvstem
   cvstem_r_scaler: 1.6
-  # On SDP infeasibility AT A GIVEN STATE, retry that state alone with λ
+  # On SDP infeasibility at a given state, retry that state alone with λ
   # halved, up to this many times, before giving up on it and dropping it from
   # the dataset — 0 disables this and reverts to dropping immediately. Warns
   # per reduced state + an aggregate summary (build_cm_dataset). "cvstem" only.
@@ -156,14 +156,14 @@ cmg:
     step_size: 1  # anneal every epoch
     gamma: 0.999
   cmg_regress_batch_size: 3200
-  # In EPOCHS. The dataclass default of 10 stops before the fit starts.
+  # In epochs. The dataclass default of 10 stops before the fit starts.
   cmg_early_stop_patience: 300
 
 # ── Dynamics — analytical env get_f_and_B by default; set use_empirical_dynamics
 #    true (classic envs only) to learn a NeuralDynamics instead. ─────────────── #
 empirical_dynamics:
   use_empirical_dynamics: false  # false = env analytical get_f_and_B; true = learn NeuralDynamics
-  # States×controls for ONLINE dynamics-data generation (use_empirical_dynamics=true
+  # States×controls for online dynamics-data generation (use_empirical_dynamics=true
   # with no dynamics_pretrain_data_path): samples ceil(memory_size / N) states and
   # pairs each with N distinct controls → N control-aware samples per state. Only
   # affects NeuralDynamics pretraining; ignored under analytical dynamics. Default 3.

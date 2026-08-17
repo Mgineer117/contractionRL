@@ -13,26 +13,26 @@ purely through the rotational-translational coupling.
 
 Why this plant is here
 ----------------------
-THE NEGATIVE CONTROL THAT ACTUALLY CERTIFIES.  B(x) is genuinely state
+the negative control that actually certifies.  B(x) is genuinely state
 dependent -- the coupling ``eps*cos(theta)`` sits in the inertia matrix, so
-``B = M(theta)^-1 [0;1]`` moves with the rotor angle -- and yet its SINGULAR
-VALUES barely move: measured sv(B) spread 1.062, against cartpole's 2.213 and
+``B = M(theta)^-1 [0;1]`` moves with the rotor angle -- and yet its singular
+values barely move: measured sv(B) spread 1.062, against cartpole's 2.213 and
 the two-link arm's 5.035.
 
 That combination is what the repo was missing.  pvtol and the velocity-
 controlled turtlebot also have a state-dependent B with sv spread 1.000, but
 neither can be CV-STEM-certified at all (pvtol's linearisation is unstabilisable,
 ctrb rank 4/6; turtlebot is driftless), so neither can demonstrate "B depends on
-x, yet a state SUBSET buys nothing" -- that claim needs a feasible baseline
+x, yet a state subset buys nothing" -- that claim needs a feasible baseline
 lambda to compare against.  TORA has one: its spring term couples configuration
 back into acceleration, so ctrb rank is 4/4 at every sampled state.
 
 Reading it: B enters the CV-STEM LMI only through ``nu*(2/r)*B B^T`` with ``nu``
-SHARED across states, so excluding a state pays only if that state is genuinely
-WEAKER to actuate.  A B that changes direction, or whose magnitude barely moves,
+shared across states, so excluding a state pays only if that state is genuinely
+weaker to actuate.  A B that changes direction, or whose magnitude barely moves,
 offers nothing to exclude.  Note the predictor is directional, not proportional:
 segway's spread of 1.139 yielded a 5.63x subset gain while cartpole's 2.208
-yielded 2.52x, so sv(B) spread says WHETHER a gain exists, not how large.
+yielded 2.52x, so sv(B) spread says whether a gain exists, not how large.
 """
 
 from __future__ import annotations
@@ -43,20 +43,20 @@ import torch
 
 from ..common.env_base import BaseEnv
 
-# TORA PARAMETERS -- Bupp et al.'s normalised benchmark. In these coordinates
+# TORA parameters -- Bupp et al.'s normalised benchmark. In these coordinates
 # the cart mass, spring constant and rotor inertia are all scaled to 1, and the
 # single remaining parameter is the eccentricity coupling.
 EPS = 0.2      # rotational/translational coupling; |EPS| < 1 keeps M(theta) > 0
 
 STATE_NAMES = ("joint_pos_0", "joint_vel_0", "pitch", "pitch_rate")
 # joint_pos_0 rather than pos_x: the spring makes the dynamics depend on the
-# cart's ABSOLUTE displacement, so this plant is not translation invariant.
+# cart's absolute displacement, so this plant is not translation invariant.
 # "pitch" carries the rotor angle so it is angle-wrapped.
 
 X_MIN = [-1.0, -2.0, -math.pi, -2.0]
 X_MAX = [1.0, 2.0, math.pi, 2.0]
 
-# Episode ENDS the first step x leaves this box (opt-in: --terminate_out_of_box).
+# Episode ends the first step x leaves this box (opt-in: --terminate_out_of_box).
 # Defaults to the state box itself, i.e. it fires exactly where env_base.step's
 # clamp already silently pins a diverged env -- the same event, reported instead
 # of hidden. Tighten it here to end failing episodes sooner.
@@ -73,21 +73,21 @@ lim = 1.0
 XE_MIN = [-lim, -lim, -lim, -lim]
 XE_MAX = [lim, lim, lim, lim]
 
-# reference control bounds -- normalised rotor torque. APPLIED box is 2x this.
-# +-10 rather than the +-1 that swings the rotor alone: the rotor is the ONLY
+# reference control bounds -- normalised rotor torque. Applied box is 2x this.
+# +-10 rather than the +-1 that swings the rotor alone: the rotor is the only
 # actuator, and it reaches the cart through the weak coupling eps = 0.2, so
 # damping the (undamped) spring costs roughly 1/eps times the torque the rotor
 # needs for itself. Measured: at +-1 the certified gain |K| = 38 puts 65% of
 # controls outside the box, at +-10 it is 0.7%. These are Bupp et al.'s
-# NORMALISED units -- mass, spring and inertia all scaled to 1 -- so there is no
+# Normalised units -- mass, spring and inertia all scaled to 1 -- so there is no
 # hardware torque limit being violated here.
 UREF_MIN = [-10.0]
 UREF_MAX = [10.0]
 
-# Initial state drawn DIRECTLY from this box (see env_base.X_INIT_MIN),
-# placing every episode start in the plant's LOW-lambda region:
+# Initial state drawn directly from this box (see env_base.X_INIT_MIN),
+# placing every episode start in the plant's low-lambda region:
 # lbd*(x0) median 0.7334 -> 0.4160. The sign dims are
-# mirrored by ONE shared sign, because the slow set is two lobes on a
+# mirrored by one shared sign, because the slow set is two lobes on a
 # diagonal that no single box can cover.
 X_INIT_MIN = [0.0337, -2.0, -2.1151, 0.051]
 X_INIT_MAX = [0.9566, 2.0, -1.1153, 0.2354]
@@ -185,7 +185,7 @@ class TORAEnv(BaseEnv):
     def sample_reference_controls(self, freqs, weights, _t, infos, add_noise=False):
         n = weights.shape[0]
         uref = torch.zeros(n, self.num_dim_control, device=self.device)
-        # The origin IS an equilibrium and the spring is a restoring force, so
+        # The origin is an equilibrium and the spring is a restoring force, so
         # no trim is needed here -- unlike ball_and_beam / two_link_arm / pvtol,
         # whose references free-fall out of the box without one. The spring is
         # undamped though, so the excitation is kept small enough that the

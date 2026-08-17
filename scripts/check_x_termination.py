@@ -3,12 +3,12 @@
     python scripts/check_x_termination.py
 
 Covers the things that can silently break:
-  1. ON by default — leaving the box ends the episode, on `truncated` (not
+  1. On by default — leaving the box ends the episode, on `truncated` (not
      `terminated`), so skrl's GAE keeps bootstrapping and there is no suicide
      bonus.
-  2. Turning it OFF restores the old never-terminating behaviour exactly, which
+  2. Turning it off restores the old never-terminating behaviour exactly, which
      is what every pre-flip number was measured under.
-  3. A termination box wider than [X_MIN, X_MAX] RAISES instead of no-opping
+  3. A termination box wider than [X_MIN, X_MAX] raises instead of no-opping
      (step() clamps first, so a wider bound could never fire).
   4. StatManagerEnvWrapper drops early-ended episodes from AUC/lambda instead of
      padding them into a full-length curve, and reports the dropped fraction.
@@ -23,7 +23,7 @@ from contractionRL.agents.skrl.contraction_metrics import StatManagerEnvWrapper
 from contractionRL.tasks.direct.classic.segway.env import SegwayEnv
 
 NUM_ENVS = 8
-# pitch 1.0 is INSIDE the box (pi/3 = 1.047), but the rate carries it out in one
+# pitch 1.0 is inside the box (pi/3 = 1.047), but the rate carries it out in one
 # dt: 1.0 + 3.0*0.03 = 1.09. Setting pitch alone would not move at all — pitch
 # only changes through pitch_rate.
 OUT_OF_BOX = torch.tensor([0.0, 1.0, 0.0, 3.0])
@@ -80,7 +80,7 @@ else:
     raise AssertionError("a bound outside the clamp is a silent no-op — must raise")
 
 # ── 4. StatManager drops early-ended episodes ────────────────────────────── #
-# Through the REAL wrapper stack (train.py:737): StatManagerEnvWrapper only ever
+# Through the real wrapper stack (train.py:737): StatManagerEnvWrapper only ever
 # sees the flat observation the skrl wrapper produces, never the env's Dict.
 # Half the envs are held on the reference (they run the full horizon), half are
 # kicked out of the box, so those slots must be excluded rather than padded.
@@ -118,7 +118,7 @@ else:
 print(f"4. early-ended slots excluded         ok "
       f"(early_end_frac={frac:.2f}, valid={wrapped._recent_valid_n})")
 
-# ── 5. feature OFF is the old behaviour, metric for metric ───────────────── #
+# ── 5. feature off is the old behaviour, metric for metric ───────────────── #
 # The regression that matters most: every pre-flip number was produced with no
 # termination box, so with it off nothing may be dropped and every metric must
 # still be reported — that is what --no_terminate_out_of_box has to reproduce.
@@ -141,7 +141,7 @@ print(f"5. off == previous behaviour          ok (auc={summary['auc_mean']:.3f})
 
 # ── 6. classic <-> isaac parity, without needing Isaac Sim ───────────────── #
 # CLAUDE.md's rule: anything a contraction agent finds via getattr must exist
-# with the SAME signature on both env families. path_tracking_base imports
+# with the same signature on both env families. path_tracking_base imports
 # isaaclab, so this is checked statically on the source rather than by importing.
 import ast  # noqa: E402
 
@@ -166,7 +166,7 @@ def _bases(path, cls):
     raise AssertionError(f"class {cls} not found in {path}")
 
 
-# Parity is now structural: ONE implementation, inherited by both hosts. That is
+# Parity is now structural: One implementation, inherited by both hosts. That is
 # strictly stronger than comparing two copies' signatures — which is what this
 # check used to do, and which caught them drifting on an argument name.
 assert _defs(MIXIN) >= SHARED, f"mixin is missing {SHARED - _defs(MIXIN)}"
@@ -178,10 +178,10 @@ for side, (path, cls) in HOSTS.items():
     assert "episode_ended_early" in path.read_text(), f"{side} never publishes episode_ended_early"
 print(f"6. one shared impl, both hosts        ok ({len(SHARED)} methods)")
 
-# ── 7. evaluation always measures the FULL horizon ───────────────────────── #
+# ── 7. evaluation always measures the full horizon ───────────────────────── #
 # The nastiest failure this feature can cause: AUC = integral of ||e||/||e0||
 # over a fixed horizon, so truncating an eval episode does not merely shorten
-# the integral, it INVERTS the metric — a policy that falls at step 20 stops
+# the integral, it inverts the metric — a policy that falls at step 20 stops
 # accumulating error and outscores one that tracks imperfectly for 500 steps.
 from train_utils import _disarm_termination_for_eval  # noqa: E402
 
