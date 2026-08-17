@@ -131,11 +131,26 @@ cm:
   metric_source: cmg
   # Mahalanobis reward
   w_ub: 1000.0
+  # Lower bound of the CV-STEM envelope w_lb·I ⪯ W ⪯ w_ub·I. It normalizes W and
+  # caps nu <= 1/w_lb, and at 0.1 that cap alone makes segway 0% feasible at
+  # every lambda (measured 0/32 -> 32/32 at 0.01). segway sits ON this bound:
+  # its solution pins nu at exactly 1/w_lb = 1000, so nothing looser is available
+  # to it and the envelope is load-bearing rather than incidental.
   w_lb: 0.001
-              # normalizes W and caps nu <= 1/w_lb, and at 0.1 that cap alone makes
-              # segway 0% feasible at every lambda (measured 0/32 -> 32/32 at 0.01).
-  lbd: 0.0152
-              # "cvstem", CMG Cu/C1 loss for "ccm")
+  # Contraction rate λ — used by cmg_method's synthesis loss (CM SDP LMI for
+  # "cvstem", CMG Cu/C1 loss for "ccm").
+  #
+  # 0.0228 with r 6.4 / w=[1e-3,1e3], measured 2026-08-17 by
+  # scripts/find_uniform_lambda.py at N=100 / cm_eps=0.1 / --cm_dt 1.0 (8a64182's
+  # protocol): nu=1000, chi=1531, 0.59% of generated controls outside the
+  # 2x-expanded uref box, against the 5% budget.
+  #
+  # Was 0.0152 — one ladder rung lower (the rungs are 10/1.5^k, so 0.0228 = k15
+  # and 0.0152 = k16). 0.0152 is feasible too (0.65%), just conservative: the
+  # search walks λ DOWN from 10 and stops at the first rung that fits, so the
+  # certified rate is the highest one that fits, and 0.0152 was leaving a rung
+  # on the table.
+  lbd: 0.0228
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled)
   # SDP contraction metric (cm_eps used by both cmg_method paths; cm_solver "cvstem" only)

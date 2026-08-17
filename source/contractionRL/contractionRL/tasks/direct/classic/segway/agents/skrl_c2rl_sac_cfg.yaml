@@ -87,7 +87,12 @@ cm:
   w_lb: 0.001
               # normalizes W and caps nu <= 1/w_lb, and at 0.1 that cap alone makes
               # segway 0% feasible at every lambda (measured 0/32 -> 32/32 at 0.01).
-  lbd: 0.0152
+  # 0.0228, not 0.0152: measured 2026-08-17 by scripts/find_uniform_lambda.py
+  # at N=100 / cm_eps=0.1 / --cm_dt 1.0 (8a64182's protocol) with r 6.4 and
+  # w=[1e-3,1e3] — nu=1000, chi=1531, 0.59% of generated controls outside the
+  # 2x-expanded uref box. 0.0152 is one ladder rung lower (rungs are 10/1.5^k)
+  # and also feasible, just conservative. Shared with c2rl_ppo per 8a64182.
+  lbd: 0.0228
               # "cvstem", CMG Cu/C1 loss for "ccm")
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled)

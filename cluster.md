@@ -27,6 +27,88 @@ ssh -o BatchMode=yes -o ConnectTimeout=10 uiuc-cc echo CONNECTED
 Never accept a password typed into chat — treat it as compromised and tell the
 user to rotate it.
 
+## 1a. Do NOT compute on the login node
+
+The login node is shared by every user on the cluster, and admins email about
+accounts that load it. Sysadmins can and do kill offending processes. Treat
+`cc-login` as a control plane only.
+
+**Allowed on the login node** — cheap, sub-second, control-plane only:
+
+```bash
+sbatch / squeue / scancel / sacct / sinfo    # job control
+ls, cat, tail, head, grep, wc, stat, mkdir   # small file inspection
+ssh uiuc-cc "cat > path" < local_file        # the file-transfer recipe in §3
+```
+
+**Never on the login node** — anything that computes, allocates real memory, or
+runs for more than a second or two:
+
+```bash
+python -c "import numpy/yaml/torch ..."      # even a one-liner: imports are heavy
+python scripts/anything.py                   # solves, builds, training, plotting
+ast.parse / py_compile over the tree         # do it locally instead
+np.load of a dataset                         # a CM .npz is 8-44 MB
+pip install, conda create/activate + run
+```
+
+Two ways to run real work. Prefer the first:
+
+```bash
+# 1. Batch (preferred — survives a dropped ssh, and leaves a log)
+sbatch --export=ALL,TASK=classic-car-v0 build_cm24.sbatch
+
+# 2. A one-off interactive step, when you genuinely need the output now
+srun --partition=secondary --time=00:10:00 --cpus-per-task=2 --mem=8G \
+     --pty bash -lc 'cd ~/contractionRL && python -u scripts/whatever.py'
+```
+
+Rules of thumb that keep this honest:
+
+* **Check files locally, not remotely.** Parsing yaml, `ast.parse`, inspecting an
+  `.npz` — do it in the local checkout. The two checkouts diverge (§4), so when
+  the question is really "what does the CLUSTER copy say?", `grep` it (cheap) or
+  `srun` a job that prints it, rather than running a Python interpreter on login.
+* **`grep` a log, don't post-process it.** `grep -h 'key ' *.out` is fine;
+  piping a log through a Python script on login is not.
+* **Reading a job's own output is free.** The `.out` files are already on disk;
+  `tail`/`grep` on them costs nothing.
+* `srun` on `secondary` (4 h cap) is the quickest interactive allocation; use
+  `scavenger` when the step needs longer than that.
+
+## 1b. Always `python -u` in an sbatch script
+
+Python block-buffers stdout when it is a file, and `#SBATCH --output=` makes it
+one. SLURM ends a job at the wall limit with `SIGTERM`, whose default handler
+terminates the interpreter **without flushing** — so everything still in the
+8 KB buffer is lost.
+
+Measured cost of getting this wrong: two `find_uniform_lambda` jobs ran
+**18 h 52 m** and left 109 bytes each — just the shell `echo` before Python
+started. Nothing about how far the λ ladder got was recoverable, and it is not
+recoverable after the fact either: `gdb -p <pid> -ex 'call fflush(0)'` on the
+compute node fails with `ptrace: Operation not permitted`.
+
+```bash
+python -u scripts/find_uniform_lambda.py ...   # right
+python    scripts/find_uniform_lambda.py ...   # a timeout erases the whole run
+```
+
+Two companions to it:
+
+* **Print before a long call, not only after.** One joint CV-STEM solve at
+  N=10000 runs ~15 h inside a single cvxpy call with no progress of its own. With
+  output only on completion, a working job and a hung job look identical.
+* **Do not let a meaningful exit code look like a crash.** `set -e` plus a script
+  that returns 2 for "infeasible" marks the job FAILED. Capture it instead:
+
+```bash
+set -uo pipefail        # no -e
+python -u scripts/find_uniform_lambda.py ... ; rc=$?
+echo "[$(date)] done rc=$rc"
+exit 0
+```
+
 ## 2. Environment
 
 `wandb`, `python`, etc. are **not** on the login node's bare PATH. Every remote

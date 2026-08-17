@@ -24,7 +24,12 @@ agent:
 cm:
   # λ — the certified contraction rate. Comes from scripts/find_uniform_lambda.py
   # (the λ-selection step; the reference's own linesearch is not run here).
-  lbd: 0.0152
+  # 0.0228, not 0.0152: measured 2026-08-17 by scripts/find_uniform_lambda.py
+  # at N=100 / cm_eps=0.1 / --cm_dt 1.0 (8a64182's protocol) with r 6.4 and
+  # w=[1e-3,1e3] — nu=1000, chi=1531, 0.59% of generated controls outside the
+  # 2x-expanded uref box. 0.0152 is one ladder rung lower (rungs are 10/1.5^k)
+  # and also feasible, just conservative. Shared with c2rl_ppo per 8a64182.
+  lbd: 0.0228
   cm_eps: 0.01
   # Tsukamoto's CV-STEM sampling period, which is a synthesis hyperparameter and
   # Not the integrator step: his cart-pole notebook uses dt=1 while the sim runs
