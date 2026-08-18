@@ -132,7 +132,7 @@ cm:
   # Mahalanobis reward
   w_ub: 1000.0
   # lbd/w_lb/cm_eps/cvstem_r_scaler tuned 2026-07-29 via the real wandb sweep
-  # infra (search/search_cluster.sh --algorithm cvstem-lqr --env quadrotor —
+  # infra (commands/search_cluster.sh --algorithm cvstem-lqr --env quadrotor —
   # see search/configs/cvstem-lqr.yaml: online per-step SDP solve, full
   # 400-step/64-env rollout, aborts on the first infeasible state anywhere,
   # metric = Stability/auc_mean). An earlier local heuristic pass (checking

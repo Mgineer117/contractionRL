@@ -1,5 +1,7 @@
 # UIUC Campus Cluster runbook
 
+*(Lives in `docs/`. Shell entry points referenced here are in `commands/`.)*
+
 Everything needed to run this repo's sweeps on the UIUC Campus Cluster
 (`cc-login.campuscluster.illinois.edu`, user `minjae5`). Written so a future
 session can go from cold start to a running multi-partition sweep without
@@ -244,14 +246,14 @@ sharing the account and must never be cancelled.
 squeue -u minjae5 -h -o '%i %j' | awk '$2 ~ /^crl-/ {print $1}'
 ```
 
-Never `scancel -u $USER`. Prefer `search_cluster.sh --stop` (below) over raw
+Never `scancel -u $USER`. Prefer `commands/search_cluster.sh --stop` (below) over raw
 `scancel` for sweep jobs, because they self-resubmit.
 
 ## 7. Partitions
 
 | Partition | Wall-time cap | `--account` needed | GPU | Safe agents/GPU | Notes |
 |---|---|---|---|---|---|
-| `scavenger` | 24 h | no | H100 / H200 / L40S (≥48 GB) | 2 | Largest, heterogeneous. `search_cluster.sh` auto-excludes GPUs too old for the installed torch (V100). |
+| `scavenger` | 24 h | no | H100 / H200 / L40S (≥48 GB) | 2 | Largest, heterogeneous. `commands/search_cluster.sh` auto-excludes GPUs too old for the installed torch (V100). |
 | `eng-research-gpu` | 2 d | **`huytran1-ae-eng`** | **A10, 24 GB** | **1** | ~5 nodes × 8 A10. |
 | `IllinoisComputes-GPU` | 3 d | **`huytran1-ae-eng`** | A100 | 2 | ~5 nodes × 4 A100. |
 | `ic-express` | **8 h** | no | **H100 MIG `1g.20gb`, 20 GB** | **1** | One node, 16 slices but only **48 CPUs total** → at `--cpus-per-task=8`, max **6 concurrent jobs**. Use `--time=07:45:00`. |
@@ -298,7 +300,7 @@ capacity, **split across both** rather than draining one first.
 
 ## 8. Launching a sweep across several partitions
 
-`search_cluster.sh` creates a **brand-new W&B sweep on every invocation**, so
+`commands/search_cluster.sh` creates a **brand-new W&B sweep on every invocation**, so
 running it once per partition gives you N *separate* sweeps sharing no search
 state. To get **one** sweep with workers on several partitions: create it once,
 then clone its generated `job.sbatch`.
@@ -307,7 +309,7 @@ then clone its generated `job.sbatch`.
 
 ```bash
 ssh uiuc-cc "source /sw/apps/anaconda3/2024.10/etc/profile.d/conda.sh && conda activate env_isaaclab && \
-  cd ~/contractionRL/search && ./search_cluster.sh \
+  cd ~/contractionRL && ./commands/search_cluster.sh \
     --algorithm c2rl-ppo-cvstem --env car --partition scavenger \
     --num-jobs 6 --gpus-per-job 1 --agents-per-gpu 2 --no-probe --time 24:00:00 -y"
 ```
@@ -346,7 +348,7 @@ done
 resubmits `$0`, so each clone keeps its own partition forever.
 
 To add more workers to an already-running sweep, just `sbatch` the existing
-`job.sbatch` again — never rerun `search_cluster.sh`.
+`job.sbatch` again — never rerun `commands/search_cluster.sh`.
 
 ### Troubleshooting: `Error: Sweep <id> not found`
 
@@ -373,7 +375,7 @@ the UI to tidy up crashed runs will kill a healthy running search.
 ### Step 3 — stop it
 
 ```bash
-ssh uiuc-cc "cd ~/contractionRL/search && ./search_cluster.sh --stop <log-dir-name>"
+ssh uiuc-cc "cd ~/contractionRL && ./commands/search_cluster.sh --stop <log-dir-name>"
 ```
 
 Writes a `STOP` sentinel first (so an in-flight USR1 trap declines to

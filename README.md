@@ -414,14 +414,14 @@ python scripts/skrl/train.py --classic --task classic-car-v0 --algorithm sac --n
 
 ### Hyperparameter sweeps (W&B)
 
-All sweeps go through one entry point, `search/search.sh`. It prompts for the
+All sweeps go through one entry point, `commands/search.sh`. It prompts for the
 algorithm, env, agent count and GPU, previews the exact space it will search, and
 launches detached (`nohup`) so the sweep survives closing the terminal:
 
 ```bash
-./search/search.sh                                   # fully interactive
-./search/search.sh --algorithm c3m --env all --gpu 0 -y
-./search/search.sh --algorithm cvstem-lqr --env car --num-agents 3 --gpu 0 -y
+./commands/search.sh                                 # fully interactive
+./commands/search.sh --algorithm c3m --env all --gpu 0 -y
+./commands/search.sh --algorithm cvstem-lqr --env car --num-agents 3 --gpu 0 -y
 ```
 
 Every sweep lands in the single W&B project **`contractionRL-Search`**, named
@@ -429,7 +429,7 @@ Every sweep lands in the single W&B project **`contractionRL-Search`**, named
 env+algorithm accumulates in one place instead of scattering across per-launch projects.
 
 **The searched space is not in the script.** It lives in `search/configs/`, one yaml
-per algorithm, each applying to *every* env — so `search.sh` never needs editing to
+per algorithm, each applying to *every* env — so `commands/search.sh` never needs editing to
 change a range or add an algorithm (see `search/configs/README.md`):
 
 | config | metric optimized |
@@ -465,8 +465,8 @@ rather than a `Stability/*` metric — reward is the right target here, since th
 contraction certificate to check:
 
 ```bash
-bash search/search.sh --algorithm ppo --env Quadruped-VelTracking-v0
-bash search/search.sh --algorithm sac --env Quadruped-VelTracking-v0
+bash commands/search.sh --algorithm ppo --env Quadruped-VelTracking-v0
+bash commands/search.sh --algorithm sac --env Quadruped-VelTracking-v0
 ```
 
 ---
@@ -803,8 +803,12 @@ tasks/direct/
 
 ```
 contractionRL/
-├── search/
-│   ├── search.sh                     # THE sweep entry point (interactive; nohup-detached)
+├── commands/                         # every shell entry point lives here
+│   ├── search.sh                     # the sweep entry point (interactive; nohup-detached)
+│   ├── search_cluster.sh             # its SLURM twin
+│   ├── run.sh                        # multi-seed front-end (local or cluster)
+│   └── run_seeds.sh                  # multi-seed training + aggregated Stability CSV
+├── search/                           # the searched SPACE and its logs — data, not commands
 │   ├── build_sweep.py                # configs/<algo>.yaml + env -> a W&B sweep yaml
 │   ├── sweep_runner.py               # Trial wrapper: records a poison metric on an
 │   │                                 #   infeasible SDP instead of a metric-less run
@@ -890,7 +894,7 @@ that stops being applied still imports and still passes unit tests.
 python scripts/skrl/train.py --classic --task classic-car-v0 --algorithm c2rl-ppo
 
 # 2. Multi-seed: every algorithm x every classic env, aggregated with 95% CIs
-./run_seeds.sh                      # see the script header for seed/env selection
+./commands/run_seeds.sh             # see the script header for seed/env selection
 python scripts/aggregate_seeds.py   # -> mean +/- CI table across seeds
 
 # 3. Compare trained checkpoints head-to-head on the Stability metrics

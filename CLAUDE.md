@@ -51,10 +51,10 @@ python scripts/skrl/train.py --task Quadruped-PathTracking-v0 --algorithm c3m --
 python scripts/skrl/play.py --classic --task classic-car-v0
 
 # Hyperparameter sweeps — always go through this, never write ad-hoc sweep scripts
-./search/search.sh --algorithm c3m --env all --gpu 0 -y
+./commands/search.sh --algorithm c3m --env all --gpu 0 -y
 
 # Reproduce paper results (classic envs, all algorithms x all envs, multi-seed)
-./run_seeds.sh
+./commands/run_seeds.sh
 python scripts/aggregate_seeds.py
 ```
 
@@ -122,7 +122,7 @@ between `use_state_norm` and the `uref`-folding controllers is subtle and load-b
 algorithm's `Cfg` dataclass is **silently dropped** (`rl_glue.filter_cfg_fields`) — add the
 dataclass field in the same commit as any new yaml knob; `tests/test_configs.py` enforces this.
 
-**Sweeps**: `search/search.sh` is the one entry point; the searched space lives in
+**Sweeps**: `commands/search.sh` is the one entry point; the searched space lives in
 `search/configs/<algorithm>.yaml` and applies to every env, so the script itself never needs
 editing. C3M sweeps optimize `Stability/contraction_score`; LQR/SD-LQR/CV-STEM/C2RL-*-cvstem
 optimize `Stability/auc_mean` (minimized); PPO/SAC optimize raw reward. CV-STEM trials run

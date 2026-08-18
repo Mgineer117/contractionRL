@@ -17,18 +17,21 @@
 #   results/<tag>.csv        one row per (env, algorithm): mean/std/CI over seeds
 #
 # NOTE: for a hyperparameter sweep (W&B, search space in search/configs/), use
-# search/search_cluster.sh instead — this script trains fixed configs across
+# commands/search_cluster.sh instead — this script trains fixed configs across
 # seeds, it does not search.
 #
 # Usage:
-#   ./run.sh                 # fully interactive
-#   ./run.sh --help          # this header
+#   ./commands/run.sh                 # fully interactive
+#   ./commands/run.sh --help          # this header
 #
 # Every prompt has a sensible default in [brackets]; press Enter to accept it.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
+# This script lives in commands/ but every path it uses (scripts/, logs/,
+# search/configs/) is relative to the REPO ROOT, so cd there, not here.
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_DIR"
 
 case "${1:-}" in
     -h|--help) grep -E '^# ?' "$0" | sed -E 's/^# ?//'; exit 0 ;;
@@ -125,7 +128,7 @@ if [[ "$MODE" == local ]]; then
     CONFIRM=$(prompt_default "Launch now (detached via nohup)? [y/N]" "N")
     [[ "$CONFIRM" =~ ^[Yy]$ ]] || { _warn "Aborted."; exit 0; }
 
-    exec ./run_seeds.sh \
+    exec "$SCRIPT_DIR/run_seeds.sh" \
         --algorithms "$ALGO_ARG" \
         --env "$ENV_ARG" \
         --seeds "$SEEDS_ARG" \
@@ -244,7 +247,7 @@ mkdir -p "$LOG_DIR"
     [[ -n "$QOS" ]]     && echo "#SBATCH --qos=$QOS"
     cat <<EOF
 set -uo pipefail
-cd "$SCRIPT_DIR"
+cd "$REPO_DIR"
 ${ACTIVATE:+$ACTIVATE}
 
 export CRL_RUN_TAG="$TAG"

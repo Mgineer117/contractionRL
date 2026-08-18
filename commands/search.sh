@@ -12,9 +12,9 @@
 # (see its README.md); nothing here needs touching.
 #
 # Usage:
-#   ./search.sh                                        # fully interactive
-#   ./search.sh --algorithm cvstem-lqr --env car --gpu 0 --num-agents 3 -y
-#   ./search.sh --algorithm c2rl-ppo-cvstem --env all --gpu 0 --runs-per-agent 40 -y
+#   ./commands/search.sh                                        # fully interactive
+#   ./commands/search.sh --algorithm cvstem-lqr --env car --gpu 0 --num-agents 3 -y
+#   ./commands/search.sh --algorithm c2rl-ppo-cvstem --env all --gpu 0 --runs-per-agent 40 -y
 #
 # Flags (all optional; anything omitted is prompted for):
 #   --algorithm NAME     a stem in search/configs/ (e.g. ppo, c3m, cvstem-lqr)
@@ -29,7 +29,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG_DIR="$SCRIPT_DIR/configs"
+# The script moved to commands/, but the searched space and the sweep logs stay
+# in search/ -- they are data, not commands. Name them off the repo root so the
+# script's location and its inputs are independent.
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG_DIR="$REPO_DIR/search/configs"
+SEARCH_DIR="$REPO_DIR/search"
 
 # ── Pretty output ───────────────────────────────────────────────────────── #
 # Colors only when stdout is a real terminal — this script also runs headless
@@ -172,7 +177,7 @@ if [[ -n "$GPU_ARG" ]]; then
 fi
 [[ "$DETACHED" -ne 1 ]] && _success "GPU: ${C_BOLD}${GPU_ARG:-all detected (round-robin)}${C_RESET}"
 
-cd "$SCRIPT_DIR/.."
+cd "$REPO_DIR"
 
 # ── Preview ─────────────────────────────────────────────────────────────── #
 if [[ "$DETACHED" -ne 1 ]]; then
@@ -221,8 +226,8 @@ fi
 # explicit flags plus --detached, then exit. The child ignores SIGHUP and its
 # agent subshells inherit that, so closing the terminal leaves the sweep running.
 if [[ "$DETACHED" -ne 1 ]]; then
-    mkdir -p "$SCRIPT_DIR/logs"
-    NOHUP_LOG="$SCRIPT_DIR/logs/nohup_${ALGORITHM}_${ENV_ARG}_$(date '+%Y%m%d_%H%M%S').log"
+    mkdir -p "$SEARCH_DIR/logs"
+    NOHUP_LOG="$SEARCH_DIR/logs/nohup_${ALGORITHM}_${ENV_ARG}_$(date '+%Y%m%d_%H%M%S').log"
     nohup "$SCRIPT_DIR/search.sh" \
         --algorithm "$ALGORITHM" --env "$ENV_ARG" --num-agents "$NUM_AGENTS" \
         --method "$METHOD" --timeout "$PER_RUN_TIMEOUT" \
@@ -243,7 +248,7 @@ for i in "${!ENVS[@]}"; do
     ENV="${ENVS[$i]}"
     GPU="${GPU_ARG:-$((i % NUM_GPUS))}"
 
-    LOG_DIR="$SCRIPT_DIR/logs/${ALGORITHM}_${ENV}_${RUN_TS}"
+    LOG_DIR="$SEARCH_DIR/logs/${ALGORITHM}_${ENV}_${RUN_TS}"
     mkdir -p "$LOG_DIR"
 
     _header "$ENV  ${C_DIM}(${ALGORITHM}, GPU ${GPU})${C_RESET}"

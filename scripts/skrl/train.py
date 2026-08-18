@@ -645,7 +645,7 @@ if _is_classic:
         _wkw["sync_tensorboard"] = False
         # Force console capture even when stdout isn't a tty — sweep agents are
         # launched backgrounded with stdout/stderr redirected to a logfile
-        # (search/search.sh: `wandb agent ... > logfile 2>&1 &`), which
+        # (commands/search.sh: `wandb agent ... > logfile 2>&1 &`), which
         # is exactly the case where wandb's tty auto-detection for the Logs tab
         # can silently fail to capture anything. "wrap" forces it regardless.
         try:

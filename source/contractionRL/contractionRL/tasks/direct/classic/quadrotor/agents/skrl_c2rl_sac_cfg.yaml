@@ -85,7 +85,7 @@ cm:
   # Mahalanobis reward
   w_ub: 1000.0
   # lbd/w_lb/cm_eps/cvstem_r_scaler tuned 2026-07-29 via the real wandb sweep
-  # infra (search/search_cluster.sh --algorithm cvstem-lqr --env quadrotor) —
+  # infra (commands/search_cluster.sh --algorithm cvstem-lqr --env quadrotor) —
   # see skrl_c2rl_ppo_cfg.yaml's cm.lbd comment for the full methodology and
   # why an earlier local-heuristic pass (lbd=0.1/r_scaler=5.0) was wrong
   # (feasible but weak: AUC=9.72 vs. the sweep's AUC=1.79 best).

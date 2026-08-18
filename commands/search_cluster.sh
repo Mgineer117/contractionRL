@@ -27,16 +27,16 @@
 # the handful of trials in flight at that moment — which the controller simply
 # reissues. The pool therefore renews indefinitely until you stop it:
 #
-#   ./search_cluster.sh --stop <log-dir-or-jobname>
+#   ./commands/search_cluster.sh --stop <log-dir-or-jobname>
 #
 # writes a STOP sentinel (so no in-flight trap resubmits) and `scancel --name`s
 # every job sharing the name, including freshly resubmitted ones.
 #
 # Usage:
-#   ./search_cluster.sh                                   # fully interactive
-#   ./search_cluster.sh --algorithm c2rl-sac-cvstem --env car \
+#   ./commands/search_cluster.sh                                   # fully interactive
+#   ./commands/search_cluster.sh --algorithm c2rl-sac-cvstem --env car \
 #       --partition gpu --num-jobs 4 --gpus-per-job 1 --time 12:00:00 -y
-#   ./search_cluster.sh --stop c2rl-sac-cvstem_classic-car-v0_20260722_120000
+#   ./commands/search_cluster.sh --stop c2rl-sac-cvstem_classic-car-v0_20260722_120000
 #
 # Flags (all optional; anything omitted is prompted for):
 #   --algorithm NAME     a stem in search/configs/ (e.g. ppo, c2rl-sac-cvstem)
@@ -88,8 +88,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG_DIR="$SCRIPT_DIR/configs"
+# See commands/search.sh: the script lives in commands/, its config space and its
+# logs live in search/, and both are named off the repo root.
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG_DIR="$REPO_DIR/search/configs"
+SEARCH_DIR="$REPO_DIR/search"
 
 # ── Pretty output (identical scheme to search.sh) ─────────────────────────── #
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
@@ -184,7 +187,7 @@ need() { command -v "$1" >/dev/null 2>&1 || { _error "Required command '$1' not 
 # the name (running + queued + already-resubmitted).
 if [[ -n "$STOP_TAG" ]]; then
     need scancel
-    LOG_DIR="$SCRIPT_DIR/logs/$STOP_TAG"
+    LOG_DIR="$SEARCH_DIR/logs/$STOP_TAG"
     JOBNAME="$STOP_TAG"
     if [[ -f "$LOG_DIR/jobname" ]]; then JOBNAME="$(cat "$LOG_DIR/jobname")"; fi
     if [[ -d "$LOG_DIR" ]]; then
@@ -476,7 +479,7 @@ RUN_TS="$(date '+%Y%m%d_%H%M%S')"
 declare -A ENV_SWEEP ENV_LOGDIR ENV_JOBNAME
 
 for ENV in "${ENVS[@]}"; do
-    LOG_DIR="$SCRIPT_DIR/logs/${ALGORITHM}_${ENV}_${RUN_TS}"
+    LOG_DIR="$SEARCH_DIR/logs/${ALGORITHM}_${ENV}_${RUN_TS}"
     mkdir -p "$LOG_DIR"
     SWEEP_YAML="$LOG_DIR/sweep.yaml"
     if ! python search/build_sweep.py --algorithm "$ALGORITHM" --env "$ENV" \

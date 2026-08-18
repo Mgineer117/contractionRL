@@ -17,10 +17,10 @@
 #   results/<tag>.csv        one row per (env, algorithm): mean/std/CI across seeds
 #
 # Usage:
-#   ./run_seeds.sh                                         # fully interactive
-#   ./run_seeds.sh --algorithms ppo,sac --env car --seeds 5 --gpu 0 -y
-#   ./run_seeds.sh --algorithms c3m --env all --seeds "1 7 42" --gpu 0 -y
-#   ./run_seeds.sh --aggregate-only --tag seeds_20260720_120000
+#   ./commands/run_seeds.sh                                         # fully interactive
+#   ./commands/run_seeds.sh --algorithms ppo,sac --env car --seeds 5 --gpu 0 -y
+#   ./commands/run_seeds.sh --algorithms c3m --env all --seeds "1 7 42" --gpu 0 -y
+#   ./commands/run_seeds.sh --aggregate-only --tag seeds_20260720_120000
 #
 # Flags (all optional; anything omitted is prompted for):
 #   --algorithms list    comma/space separated: ppo, sac, c3m, lqr, sdlqr,
@@ -39,7 +39,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
+# This script lives in commands/ but every path it uses (scripts/, logs/,
+# search/configs/) is relative to the REPO ROOT, so cd there, not here.
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_DIR"
 
 # ── Pretty output ───────────────────────────────────────────────────────── #
 # Colors only when stdout is a real terminal — this script also runs headless
@@ -331,7 +334,7 @@ fi
 # ── Aggregate ───────────────────────────────────────────────────────────── #
 _header "Aggregating Stability results"
 python scripts/aggregate_seeds.py --run-tag "$TAG" --out "results/$TAG" || \
-    _error "Aggregation failed — rerun with: ./run_seeds.sh --aggregate-only --tag $TAG"
+    _error "Aggregation failed — rerun with: ./commands/run_seeds.sh --aggregate-only --tag $TAG"
 
 _header "Done"
 _info "Per-seed rows : ${C_BOLD}results/${TAG}_runs.csv${C_RESET}"
