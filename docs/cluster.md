@@ -120,20 +120,31 @@ Three properties, all measured at `eps=0.01`, `dt=1.0`, MOSEK:
 24.** MOSEK's interior point does not parallelize on this problem, so
 `--cpus-per-task` above ~4 buys nothing and just burns the allocation. Ask for 4.
 
-**Cost is ~N² and steep in state dimension.** Fitting `T = a·N^b` at
-N=100/200/400:
+**Cost is ~N² and steep in state dimension.** Exponents fitted at
+N=100/200/400, then anchored to a solve measured ON a cluster node — a compute
+node is **2.70x slower per core** than the workstation these fits were taken on
+(car at N=400: 229.0 s on `IllinoisComputes` ccc0291 and 238.2 s on `secondary`
+ccc0378, against 84.8 s locally). Quote the cluster column when sizing a wall:
 
-| plant | x_dim | fit | N=1000 | N=10000 |
+| plant | x_dim | exponent | N=10000 local | N=10000 **on cluster** |
 |---|---|---|---|---|
-| car (and car_weak, cartpole, segway) | 4 | `9.16e-4·N^1.91` | 8 min | **~11 h** |
-| quadrotor | 10 | `3.39e-3·N^1.97` | 47 min | **~74 h** |
+| car (and car_weak, cartpole, segway) | 4 | 1.91 | ~11 h | **~30 h** |
+| quadrotor | 10 | 1.97 | ~74 h | **~197 h (8.2 d)** |
+
+Getting this wrong is expensive and it already happened: three 4-dim builds were
+given `--time=23:30:00` on the strength of the ~11 h local figure, and each died
+at 23.5 h into a ~30 h solve having written nothing. A dataset build has no
+checkpoint/resume — a timeout loses the entire run, so the wall must cover the
+FULL solve, not a hoped-for one.
 
 The dimension term is not small: each sample contributes an `x_dim × x_dim` PSD
 block, so the 10-dim plant is ~5x the 4-dim one at equal N. **quadrotor at
-N=10000 does not fit any wall this cluster offers** — the ceiling is
-`IllinoisComputes`' 3 days = 72 h. Submit it with `--time=3-00:00:00` as a best
-effort and expect it to be marginal. There is no checkpoint/resume for a
-cvxpy+MOSEK solve, so a timeout loses the whole run.
+N=10000 does not fit any wall this cluster offers.** The ceiling is 3 days
+(`IllinoisComputes`, `IllinoisComputes-G`); `eng-research-gpu` is 2 days,
+`scavenger` 1 day, `ic-express` 8 h, `secondary` 4 h. At ~197 h it is not
+marginal, it is out of reach by 2.7x, so do not submit it as a "best effort" —
+that only burns a node for 72 h. Build it off-cluster, or change the program
+(fewer samples, a first-order solver) with the certificate cost that implies.
 
 **Memory, not CPU, is the resource to over-provision.** N=10000 passed 17 GB
 locally and was OOM-killed on a 30 GB box. Ask for 200 G.
