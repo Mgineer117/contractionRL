@@ -140,17 +140,21 @@ cm:
   # Contraction rate λ — used by cmg_method's synthesis loss (CM SDP LMI for
   # "cvstem", CMG Cu/C1 loss for "ccm").
   #
-  # 0.0228 with r 6.4 / w=[1e-3,1e3], measured 2026-08-17 by
-  # scripts/find_uniform_lambda.py at N=100 / cm_eps=0.1 / --cm_dt 1.0 (8a64182's
-  # protocol): nu=1000, chi=1531, 0.59% of generated controls outside the
-  # 2x-expanded uref box, against the 5% budget.
+  # 0.0152 with r 6.4 / w=[1e-3,1e3]. Verified 2026-08-18 at the protocol's
+  # STAGE 2 (N=1000, cm_eps=0.01, cm_dt=1.0): nu=1000, chi=1319, |K|max=23.43,
+  # 0.68% of generated controls outside the 2x-expanded uref box, against 5%.
   #
-  # Was 0.0152 — one ladder rung lower (the rungs are 10/1.5^k, so 0.0228 = k15
-  # and 0.0152 = k16). 0.0152 is feasible too (0.65%), just conservative: the
-  # search walks λ DOWN from 10 and stops at the first rung that fits, so the
-  # certified rate is the highest one that fits, and 0.0152 was leaving a rung
-  # on the table.
-  lbd: 0.0228
+  # 0.0228 is one rung faster (rungs are 10/1.5^k) and the STAGE-1 search does
+  # return it -- N=100 / cm_eps=0.1 gives 0.59% out of box. It is nevertheless
+  # wrong: at N=1000 / cm_eps=0.01 the LMI is INFEASIBLE at 0.0228, so it would
+  # never have survived the N=10000 build either (more samples is strictly
+  # harder). Do not promote a stage-1 result without stage 2 -- this env is the
+  # reason the protocol has two stages, and 0.0152 is the fastest rate that
+  # actually clears both.
+  #
+  # segway sits ON the envelope: nu pins at exactly 1/w_lb = 1000 at every rung
+  # that solves, so there is no slack to trade and nothing looser is available.
+  lbd: 0.0152
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled)
   # SDP contraction metric (cm_eps used by both cmg_method paths; cm_solver "cvstem" only)

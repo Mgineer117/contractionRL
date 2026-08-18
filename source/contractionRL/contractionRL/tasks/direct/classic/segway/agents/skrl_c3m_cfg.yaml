@@ -57,12 +57,12 @@ agent:
     gamma: 0.9999  # shared by the CMG (W) and policy (u) optimizers; stepped once per training iteration
   W_lr: 1.0e-3  # Learning rate for the Contraction Metric Generator (CMG) network
   u_lr: 1.0e-3  # Learning rate for the Policy (Actor) network
-  # 0.0228, not 0.0152: measured 2026-08-17 by scripts/find_uniform_lambda.py
-  # at N=100 / cm_eps=0.1 / --cm_dt 1.0 (8a64182's protocol) with r 6.4 and
-  # w=[1e-3,1e3] — nu=1000, chi=1531, 0.59% of generated controls outside the
-  # 2x-expanded uref box. 0.0152 is one ladder rung lower (rungs are 10/1.5^k)
-  # and also feasible, just conservative. Shared with c2rl_ppo per 8a64182.
-  lbd: 0.0228
+  # 0.0152, verified at the protocol's stage 2 (N=1000, cm_eps=0.01,
+  # cm_dt=1.0): nu=1000, chi=1319, 0.68% of generated controls out of box.
+  # The stage-1 search (N=100, cm_eps=0.1) returns 0.0228, but that rung is
+  # LMI-INFEASIBLE at N=1000/0.01 and so could never build at N=10000.
+  # Shared with c2rl_ppo per 8a64182.
+  lbd: 0.0152
   eps: 0.01  # Margin parameter (epsilon) ensuring strict definiteness of the metric
   w_ub: 1000.0
   w_lb: 0.001
