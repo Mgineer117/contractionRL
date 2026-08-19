@@ -67,7 +67,7 @@ from contractionRL.agents.skrl.math_utils import (  # noqa: E402
     jacobian,
     spd_inverse,
 )
-from contractionRL.agents.skrl.ncm_synthesis import _solve_cm_metric_with_backoff  # noqa: E402
+from contractionRL.agents.skrl.ncm_synthesis import cvstem_joint  # noqa: E402
 from contractionRL.agents.skrl.nn_modules import BoundedCCM_Generator, CCM_Generator  # noqa: E402
 
 # Only envs with u_dim <= 2 — the full control space is plottable without any
@@ -291,11 +291,17 @@ class CCMMetric:
 
 
 class CVSTEMMetric:
-    """M(x) from the pointwise CV-STEM SDP solved online at each queried state
-    (same LMI cvstem_lqr's metric_source="online" deploys). One cvxpy solve per
-    state — not batched, so geometry code reuses a single per-timestep M for
-    all control candidates of that step (the metric varies with the state, not
-    the candidate control, and one dt of state spread is small)."""
+    """M(x) from ONE joint CV-STEM SDP over the queried states.
+
+    Not a per-state solve. An independent SDP per state carries its own nu/chi and
+    no Wdot term, so it is a per-state feasibility statement rather than a
+    contraction certificate -- the same objection that made build_cm_dataset a
+    single joint program and removed the per-step "online" metric. This solves the
+    batch jointly, with nu/chi shared, which is also what ships.
+
+    Infeasibility is reported, never substituted. The previous version fell back to
+    the IDENTITY for any state the pointwise SDP missed, which drew an infeasible
+    region as a perfectly conditioned Euclidean one."""
 
     batched = False
 
@@ -309,10 +315,12 @@ class CVSTEMMetric:
         self.solver = solver or cm.get("cm_solver", "SCS")
         self.r_scaler = float(cfg.get("agent", {}).get("r_scaler",
                               cm.get("cvstem_r_scaler", 1.0)))
-        self.max_red = int(cm.get("max_lambda_reductions", 5))
+        # 1.0, matching build_cm_dataset's dt=(cm_wdot_dt or temporal_dt or 1.0).
+        # The env dt would inflate the (W-I)/dt term ~33x — see docs/cluster.md.
+        self.cm_dt = float(cm.get("cm_dt", 1.0) or 1.0)
         self.infeasible = 0
         self.solves = 0
-        self.name = f"cvstem (online SDP, {self.solver})"
+        self.name = f"cvstem (joint SDP, {self.solver})"
 
     def _drift_jacobian_and_B(self, x: torch.Tensor):
         x = x.detach().clone().requires_grad_()
@@ -323,25 +331,26 @@ class CVSTEMMetric:
 
     def M(self, x: torch.Tensor) -> torch.Tensor:
         A, B = self._drift_jacobian_and_B(x)
-        A_np, B_np = A.numpy(), B.numpy()
         d = x.shape[-1]
-        Ms = torch.empty(x.shape[0], d, d)
-        for i in range(x.shape[0]):
-            self.solves += 1
-            W, _lbd, _red = _solve_cm_metric_with_backoff(
-                A_np[i], B_np[i], lbd=self.lbd, w_lb=self.w_lb, w_ub=self.w_ub,
-                eps=self.eps, solver=self.solver, r_scaler=self.r_scaler,
-                max_lambda_reductions=self.max_red,
-            )
-            if W is None:
-                # Infeasible even after λ-backoff → neutral metric (identity)
-                # for this state, counted and reported by the caller.
-                self.infeasible += 1
-                Ms[i] = torch.eye(d)
-            else:
-                Ms[i] = torch.as_tensor(
-                    np.linalg.inv(W.astype(np.float64)), dtype=torch.float32)
-        return Ms
+        self.solves += 1
+        sol = cvstem_joint(
+            A.numpy().astype(np.float64), B.numpy().astype(np.float64),
+            lbd=self.lbd, eps=self.eps, dt=self.cm_dt, solver=self.solver,
+            r_scaler=self.r_scaler, w_lb=self.w_lb, w_ub=self.w_ub,
+        )
+        if sol is None:
+            # One program over the whole batch, so infeasibility is a statement
+            # about this state set, not about one point in it. Raise: silently
+            # returning the identity would draw an uncertifiable region as a
+            # perfectly conditioned Euclidean one.
+            self.infeasible += 1
+            raise RuntimeError(
+                f"joint CV-STEM SDP INFEASIBLE over the {x.shape[0]} queried states "
+                f"at lbd={self.lbd:g}, eps={self.eps:g}, w=[{self.w_lb:g},{self.w_ub:g}], "
+                f"r={self.r_scaler:g}. No metric family certifies that rate here, so "
+                f"there is no geometry to plot.")
+        W = np.asarray(sol["W"], dtype=np.float64)
+        return torch.as_tensor(np.linalg.inv(W), dtype=torch.float32).reshape(-1, d, d)
 
 
 class CVSTEMPretrainedMetric:
@@ -381,7 +390,9 @@ class CVSTEMPretrainedMetric:
         self.eps = float(cm.get("cm_eps", 0.01))
         self.solver = solver or cm.get("cm_solver", "SCS")
         self.r_scaler = float(agent.get("r_scaler", cm.get("cvstem_r_scaler", 1.0)))
-        self.max_red = int(cm.get("max_lambda_reductions", 5))
+        # 1.0, matching build_cm_dataset's dt=(cm_wdot_dt or temporal_dt or 1.0).
+        # The env dt would inflate the (W-I)/dt term ~33x — see docs/cluster.md.
+        self.cm_dt = float(cm.get("cm_dt", 1.0) or 1.0)
         tag = "[viz-cvstem-pretrain]"
 
         # Cache identity must mirror save/load exactly, or a config change would

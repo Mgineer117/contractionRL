@@ -11,20 +11,15 @@ contraction signal, not a level penalty — computed identically by both env
 families. The control term is disabled (``control_scaler = 0``) in every
 shipped config.
 
-Metric source (``metric_source``) decides how the env computes that reward,
+The env computes that reward from the frozen Phase-A CMG,
 since the chosen object is injected into the env and called from its
 ``get_rewards()``:
 
   * "cmg" (default) — a CMG network ``W(x)`` synthesized in Phase A then frozen
     for the whole run (Tsukamoto's NCM recipe). Mandatory ``models["cmg"]``.
-  * "online" — no Phase A. ``OnlineCVSTEMMetric`` solves the CV-STEM SDP per env
-    per step at the visited states, so every deployed ``M`` is verified feasible
-    rather than a regression of one. Costs num_envs solves per env-step (~12 ms
-    each, MOSEK, 4-state), so it's a single-run research config, not a sweep
-    one; an infeasible state aborts — a reward has no "open loop" fallback the
-    way CV-STEM-LQR's control law does.
 
-``cmg_method="ccm"`` forces ``metric_source="cmg"`` (it has no per-state SDP),
+
+``cmg_method="ccm"`` trains the CMG directly with C1/C2 losses (no SDP),
 so the pair is three real configurations, not four.
 
 CMG training (``cmg_method``), both in ``ncm_synthesis.py``:
@@ -155,11 +150,9 @@ class C2RLPPOCfg(AgentCfg):
     # "cmg" (default): a CMG network synthesized in Phase A (cmg_method selects
     # how) and frozen for the whole run. "online": no Phase A at all — solve the
     # CV-STEM SDP per env per step at the visited states
-    # (ncm_synthesis.OnlineCVSTEMMetric), so every deployed M is a verified
     # feasible metric instead of a regression of one, at the cost of num_envs
     # SDP solves per step. cmg_method="ccm" forces "cmg" (there is no per-state
     # SDP to solve online under the C1/C2 pipeline).
-    metric_source: str = "cmg"
     w_ub: float = 10.0
     w_lb: float = 0.1
     tracking_scaler: float = 1.0
@@ -171,13 +164,13 @@ class C2RLPPOCfg(AgentCfg):
     # "ccm" — C1/C2 loss minimization (train_cmg_ccm): Manchester-style,
     # eliminates B via the annihilator, existence-only certificate, no SDP, pure
     # gradient descent on the pointwise LMI. "cvstem" (default) — CV-STEM
-    # regression (build_cm_dataset + regress_cmg): solves a per-state SDP that
+    # regression (build_cm_dataset + regress_cmg): solves one joint SDP that
     # keeps B via a Riccati BR⁻¹Bᵀ term, then MSE-regresses the CMG onto the
     # solutions. See ncm_synthesis.py module docstring for the LMIs and module
     # docstring above for the two pipelines.
     cmg_method: str = "cvstem"
     # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ Riccati term (mirrors sdlqr.py's
-    # R_scaler); "cvstem" method only. See ncm_synthesis.solve_cm_metric — control
+    # R_scaler); "cvstem" method only. See ncm_synthesis.cvstem_joint — control
     # enters the LMI only through this penalty, not a bounded control box.
     cvstem_r_scaler: float = 1.0
     # Residual RL over the analytic controller. When True, the actor mean is
@@ -319,7 +312,7 @@ class C2RLPPOCfg(AgentCfg):
     # `git log -S cvstem_u_bound`.
     residual_anchor_scale: float = 0.0  # penalize ‖u-u_base‖² in reward (residual trust anchor)
     # Weights of the CV-STEM objective J = cm_chi_weight·χ + cm_nu_weight·ν, which
-    # solve_cm_metric always minimizes (Tsukamoto's classncm.cvstem0). χ and ν are
+    # cvstem_joint always minimizes (Tsukamoto's classncm.cvstem0). χ and ν are
     # the metric's condition number and scale, and they are decision variables:
     # W̄ ⪰ I, W̄ ⪯ χI, deployed W = W̄/ν. "cvstem" method only.
     cm_chi_weight: float | None = None  # None → 1/lbd, mirroring Tsukamoto's chi/alp
@@ -350,8 +343,6 @@ class C2RLPPOCfg(AgentCfg):
     cm_temporal_dt: float = 0.05
     # On SDP infeasibility at a state, retry that state alone with λ halved,
     # up to this many times, before giving up on it (0 = old behavior, drop
-    # immediately). See ncm_synthesis._solve_cm_metric_with_backoff. "cvstem" method only.
-    max_lambda_reductions: int = 5
     # Guards build_cm_dataset against silently regressing the CMG onto a small,
     # likely-biased subset of states — raises before regression if the SDP's
     # feasible fraction falls below this (0.0 = old behavior, only guards
@@ -370,7 +361,7 @@ class C2RLPPOCfg(AgentCfg):
     # state space (get_rollout) or, when dynamics_pretrain_data_path is set,
     # uniformly from that offline dynamics_data.npz (capped + warned if
     # cmg_memory_size exceeds the data on disk; see synthesize_cmg). "cvstem":
-    # solve one SDP per state (solve_cm_metric, reusing lbd/w_lb/w_ub/cm_eps/
+    # solve ONE joint SDP over all samples (cvstem_joint, reusing lbd/w_lb/w_ub/cm_eps/
     # cm_solver above), then MSE-regress the CMG network onto {x -> W*} for
     # cmg_regress_epochs (build_cm_dataset / regress_cmg). "ccm": train the CMG
     # directly with C1/C2 losses for cmg_regress_epochs, no SDP (train_cmg_ccm).
@@ -457,8 +448,7 @@ class C2RLSACCfg(AgentCfg):
     memory_size: int = -1
     discount_factor: float = 0.99
     # ── Metric source — "cmg" frozen CMG network (cmg_method selects how it's
-    # trained) | "online" per-step CV-STEM SDP. See C2RLPPOCfg.metric_source. ── #
-    metric_source: str = "cmg"
+    # trained). See C2RLPPOCfg for the shared cm/cmg knobs. ─────────────────── #
     w_ub: float = 10.0
     w_lb: float = 0.1
     tracking_scaler: float = 1.0
@@ -475,7 +465,7 @@ class C2RLSACCfg(AgentCfg):
     cvstem_residual_distill: bool = False # warm-start residual to online CV-STEM-LQR (see C2RLPPOCfg)
     residual_distill_epochs: int = 300
     # Weights of the CV-STEM objective J (always minimized) — see
-    # C2RLPPOCfg.cm_chi_weight above and ncm_synthesis.solve_cm_metric.
+    # C2RLPPOCfg.cm_chi_weight above and ncm_synthesis.cvstem_joint.
     cm_chi_weight: float | None = None
     cm_nu_weight: float = 1.0
     cm_wdot_dt: float = 0.0  # superseded by cm_wdot_trajectory when that's on
@@ -483,7 +473,6 @@ class C2RLSACCfg(AgentCfg):
     # / cm_temporal_dt above.
     cm_wdot_trajectory: bool = False
     cm_temporal_dt: float = 0.05
-    max_lambda_reductions: int = 5  # see ncm_synthesis._solve_cm_metric_with_backoff
     cm_data_path: str = ""
     # ── Offline CMG synthesis (Phase A, always runs before Phase B) ─────────── #
     cmg_memory_size: int = 8192
@@ -667,23 +656,6 @@ class C2RLAgent(Agent):
                 "models.cmg.network.constrain_eigenvalues: true in the yaml, or "
                 "let ContractionRunner build it (it forces this)."
             )
-        self._metric_source = str(getattr(parsed_cfg, "metric_source", "cmg")).lower()
-        if self._metric_source not in ("cmg", "online"):
-            raise ValueError(
-                f"[C2RL] metric_source must be 'cmg' (frozen network from Phase A) or "
-                f"'online' (per-step CV-STEM SDP), got {parsed_cfg.metric_source!r}."
-            )
-        if self._metric_source == "online" and parsed_cfg.cmg_method == "ccm":
-            # Not an error: "ccm" simply has no per-state SDP to solve online (it
-            # trains the CMG by C1/C2 gradient descent), so the CMG network is the
-            # only metric that pipeline can produce. Downgrade and say so, rather
-            # than making every ccm sweep restate a metric_source it cannot vary.
-            print(
-                "[C2RL] metric_source='online' is not available under cmg_method='ccm' "
-                "(no per-state SDP to solve) — falling back to metric_source='cmg'.",
-                flush=True,
-            )
-            self._metric_source = "cmg"
         if bool(getattr(parsed_cfg, "cm_wdot_trajectory", False)):
             if parsed_cfg.cmg_method != "cvstem":
                 raise ValueError(
@@ -970,25 +942,6 @@ class C2RLAgent(Agent):
               f"(bound w_ub/w_lb={self._cfg.w_ub / self._cfg.w_lb:.4g})")
         self.track_data("Loss / C2RL/cmg/cond_mean", cond_mean)
         self.track_data("Loss / C2RL/cmg/cond_q95", cond_q95)
-
-    def build_online_metric(self):
-        """The ``metric_source="online"`` stand-in for the frozen CMG network.
-
-        Replaces Phase A entirely: nothing is sampled, solved offline, cached or
-        regressed — the SDP is solved at the states the rollout actually visits,
-        inside the env's own reward (see ``OnlineCVSTEMMetric``). Returns the
-        object the trainer injects via ``set_ccm`` in place of the CMG.
-        """
-        from .ncm_synthesis import OnlineCVSTEMMetric
-        cfg = self._cfg
-        return OnlineCVSTEMMetric(
-            self._get_f_and_B,
-            x_dim=self._x_dim,
-            lbd=cfg.lbd, w_lb=cfg.w_lb, w_ub=cfg.w_ub, eps=cfg.cm_eps,
-            solver=cfg.cm_solver, r_scaler=cfg.cvstem_r_scaler,
-            max_lambda_reductions=cfg.max_lambda_reductions,
-            chi_weight=cfg.cm_chi_weight, nu_weight=cfg.cm_nu_weight,
-        )
 
     def synthesize_cmg(self, *, timesteps: int = 0) -> dict:
         """Offline CMG synthesis (Phase A, always runs before Phase B) —
@@ -1712,8 +1665,7 @@ class C2RLSkrlTrainer(Trainer):
         not the agent's own module, so the env holds a stable frozen metric even
         if the agent's ``_ccm_gen`` were ever touched again.
 
-        ``metric`` overrides what is injected (``metric_source="online"`` passes
-        an ``OnlineCVSTEMMetric``). It is injected as-Is: it is stateless apart
+        ``metric`` overrides what is injected. It is injected as-is: stateless apart
         from counters, and deep-copying it would drag along whatever
         ``get_f_and_B`` is bound to — the env itself, under analytical dynamics.
         """
@@ -1785,19 +1737,13 @@ class C2RLSkrlTrainer(Trainer):
         # (regress_cmg); "ccm" trains the CMG directly with C1/C2 losses
         # (train_cmg_ccm). Either way the CMG is frozen before Phase B reads its
         # static metric. synthesize_cmg logs feasibility/residual/loss/LR itself. ──
-        # metric_source="online" skips Phase A outright — there is nothing to
-        # synthesize or freeze, the SDP is solved per step inside the reward.
-        online_metric = None
-        if agent._metric_source == "online":
-            online_metric = agent.build_online_metric()
-            print("[C2RL] Phase A SKIPPED (metric_source=online) — the CV-STEM SDP is "
-                  f"solved per env per step at lbd={agent._cfg.lbd}, "
-                  f"solver={agent._cfg.cm_solver}; an infeasible state aborts the run.")
-        else:
-            info = agent.synthesize_cmg(timesteps=timesteps)
-            print(f"[C2RL] Phase A ({agent._cfg.cmg_method}) — CMG synthesized "
-                  f"(feasible {info['feasibility_rate']:.1%}, λ-reduced {info['lambda_reduced_rate']:.1%}, "
-                  f"loss {info['regress_mse']:.4g}) and frozen.")
+        # Phase A always runs. There is no per-step alternative: a per-state SDP
+        # carries its own nu/chi and no Wdot term, so it certifies nothing about
+        # contraction, and solving one every step just repeats that error.
+        info = agent.synthesize_cmg(timesteps=timesteps)
+        print(f"[C2RL] Phase A ({agent._cfg.cmg_method}) — CMG synthesized "
+              f"(feasible {info['feasibility_rate']:.1%}, λ-reduced {info['lambda_reduced_rate']:.1%}, "
+              f"loss {info['regress_mse']:.4g}) and frozen.")
 
         # ── Phase B: rollout + train the deployed policy against the Mahalanobis
         # reward computed from the frozen CMG. ─────────────────────────────
@@ -1805,7 +1751,7 @@ class C2RLSkrlTrainer(Trainer):
         rl_agent.enable_training_mode(True)
         rollout_steps = agent._cfg.rollouts
 
-        self._inject_ccm(env, agent, metric=online_metric)
+        self._inject_ccm(env, agent)
 
         # Ablation B (Phase-0 collapse diagnostics) — see
         # C2RLAgent.pretrain_critic / C2RLPPOCfg.pretrain_critic_steps. Needs the

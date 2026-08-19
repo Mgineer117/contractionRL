@@ -5,14 +5,14 @@ machinery from Tsukamoto, Chung & Slotine, "Neural Contraction Metrics for
 Robust Estimation and Control: A Convex Optimization Approach", plus the two
 ``cmg_method`` pipelines built on it:
 
-  * "cvstem": ``solve_cm_metric`` solves a feasibility SDP per sampled state ->
+  * "cvstem": ``cvstem_joint`` solves ONE feasibility SDP over all sampled states ->
     dual metric ``W``; ``build_cm_dataset`` assembles ``{x -> W*}``;
     ``regress_cmg`` MSE-regresses the CMG onto it.
   * "ccm" (default): ``train_cmg_ccm`` trains the CMG directly on the C1/C2
     differentiable contraction losses, bypassing the SDP entirely. Shares no
     state with any of the above.
 
-The convex program (``solve_cm_metric``)
+The convex program (``cvstem_joint``)
 ----------------------------------------
 Tsukamoto's CV-STEM (``classncm.cvstem0``) applied pointwise to
 ``ẋ = f(x) + B(x)u`` with drift Jacobian ``A(x) = ∂f/∂x``. Control enters only
@@ -147,7 +147,7 @@ _LICENSE_ERROR_WARNED = False
 def _warn_once_if_license_error(solver: str, exc: Exception) -> None:
     """Surface a solver license failure loudly, exactly once per process.
 
-    ``solve_cm_metric`` deliberately swallows every per-state solve error and
+    ``cvstem_joint`` returns ``None`` rather than raising on a solver error, and
     returns ``None`` (treated as "infeasible at this state") so one bad solve
     can't abort a whole batch — but a missing/misconfigured license (e.g.
     ``cm_solver: MOSEK`` without a valid ``mosek.lic``) fails on every solve,
@@ -195,7 +195,7 @@ def _add_wdot_term(S, Wbar, I, *, wdot_dt: float, W_prev_bar: np.ndarray | None,
       rather than differencing from an arbitrary identity. Driven by
       ``build_cm_dataset``'s ``traj_x``/``traj_lengths``/``temporal_dt`` (C2RL's
       ``cm_wdot_trajectory`` config) — also retained as a general library
-      capability via ``solve_cm_metric``'s own ``W_prev_bar``/``dt``/
+      capability via ``cvstem_joint``'s own ``pairs``/``dt``/
       ``return_wbar`` kwargs.
     * **static proxy** (``wdot_dt>0``, ``W_prev_bar`` None): Tsukamoto's literal
       ``(W̄-I)/dt``. Off by default (infeasible at the envs' small dt — see module
@@ -210,164 +210,9 @@ def _add_wdot_term(S, Wbar, I, *, wdot_dt: float, W_prev_bar: np.ndarray | None,
     return S
 
 
-def solve_cm_metric(
-    A_f: np.ndarray,
-    B: np.ndarray,
-    *,
-    lbd: float,
-    w_lb: float,
-    w_ub: float,
-    eps: float,
-    solver: str = "SCS",
-    r_scaler: float = 1.0,
-    chi_weight: float | None = None,
-    nu_weight: float = 1.0,
-    wdot_dt: float = 0.0,
-    W_prev_bar: np.ndarray | None = None,
-    dt: float = 0.0,
-    return_wbar: bool = False,
-    u_bound: float | np.ndarray | None = None,
-    rho: float = 0.0,
-    u_lo: float | np.ndarray | None = None,
-    u_hi: float | np.ndarray | None = None,
-) -> np.ndarray | None | tuple[np.ndarray | None, np.ndarray | None]:
-    """Solve the pointwise CV-STEM contraction-metric SDP at one state. See module docstring.
-
-    Args:
-        A_f:   drift Jacobian ``∂f/∂x`` at the state, ``(x_dim, x_dim)``.
-        B:     control matrix ``(x_dim, u_dim)`` at the state.
-        lbd:   contraction rate λ.
-        w_lb/w_ub: eigenvalue bounds for ``W`` (match the deployed metric's).
-        eps:   strict-definiteness margin on the contraction LMI.
-        solver: cvxpy solver name (default SCS).
-        r_scaler: ``R = r_scaler·I`` in the ``B R⁻¹ Bᵀ`` term (mirrors
-            ``sdlqr.py``'s ``R_scaler``).
-        chi_weight/nu_weight: weights of the CV-STEM objective ``J = chi_weight·χ
-            + nu_weight·ν`` (Tsukamoto's ``d₁·b̄/α`` and ``d₂``).
-            ``chi_weight=None`` → ``1/lbd``, mirroring his ``chi/alp``.
-        wdot_dt: if > 0, include Tsukamoto's ``Ẇ ≈ (W̄ - I)/dt`` proxy for the
-            material derivative (``classncm.cvstem0``). ``0`` (default) omits it.
-        W_prev_bar/dt/return_wbar: temporal ``Ẇ`` — see ``_add_wdot_term``.
-        u_bound/rho: Post-Hoc actuator-feasibility check, making "control out of
-            bound" a first-class feasibility condition without adding a control
-            variable to the SDP. The solved ``W`` implies ``K = R⁻¹BᵀW⁻¹``; if
-            the 95th-percentile ``‖Ke‖`` over isotropic ``e`` with ``‖e‖=rho``
-            exceeds ``u_bound``, the state is INFEASIBLE (returns None) and the
-            caller's λ-backoff retries. See the 95th-percentile rationale at the
-            implementation.
-        u_lo/u_hi: Signed per-channel actuator bounds (e.g. the env's actual
-            ``2·UREF_MIN``/``2·UREF_MAX``), used instead of ``u_bound`` when
-            both are given. Unlike ``u_bound`` (a symmetric magnitude, wrong
-            for an asymmetric actuator box like turtlebot's ``[0, 0.22]``
-            linear-velocity channel), this checks the signed sampled feedback
-            against ``[u_lo, u_hi]`` directly — sign-correct by construction.
-            A channel fails when more than 5% of the 512 Monte Carlo samples
-            fall outside its own ``[u_lo, u_hi]`` (95% must clear the bound).
-
-    Returns:
-        The symmetric feasible metric ``W`` ``(x_dim, x_dim)`` as float32, with
-        eigenvalues inside ``[w_lb, w_ub]``, or ``None`` if the SDP is infeasible,
-        the solver errors, or (when ``u_bound`` is set) the implied gain would
-        saturate the actuator. If ``return_wbar``, returns ``(W, W̄)`` instead.
-    """
-    cp = _require_cvxpy()
-    A_f = np.asarray(A_f, dtype=np.float64)
-    B = np.asarray(B, dtype=np.float64)
-    x_dim = A_f.shape[0]
-    r = r_scaler + 1e-5  # strictly positive — mirrors sdlqr.py's R_scaler guard
-
-    # CV-STEM's variable structure (classncm.cvstem0): solve for the normalized
-    # dual metric W̄ with I ⪯ W̄ ⪯ χ·I, then deploy W = W̄/ν. χ is therefore
-    # exactly the condition number and ν exactly the metric scale.
-    Wbar = cp.Variable((x_dim, x_dim), symmetric=True)
-    chi = cp.Variable(nonneg=True)
-    nu = cp.Variable(nonneg=True)
-    I = np.eye(x_dim)
-    # Deployment envelope w_lb·I ⪯ W ⪯ w_ub·I becomes the two linear scalar
-    # constraints below (λmin(W̄)≥1, λmax(W̄)≤χ), which also keep
-    # ν ∈ [1/w_ub, 1/w_lb] — so ν can never collapse to 0.
-    constraints = [Wbar >> I, Wbar << chi * I, nu <= 1.0 / w_lb, chi <= nu * w_ub]
-
-    riccati = (2.0 / r) * (B @ B.T)
-    S = A_f @ Wbar + Wbar @ A_f.T + 2.0 * lbd * Wbar - nu * riccati
-    S = _add_wdot_term(S, Wbar, I, wdot_dt=wdot_dt, W_prev_bar=W_prev_bar, dt=dt)
-    constraints.append(_sym(S) << -eps * I)
-
-    # CV-STEM's objective J, always — there is no "feasibility only" mode. χ and ν
-    # are the metric's condition number and scale; leaving them unpenalized
-    # (Minimize(0)) would return an arbitrary point of the feasible set, not a
-    # well-defined W*(x).
-    cw = (1.0 / lbd) if chi_weight is None else chi_weight  # Tsukamoto's chi/alp
-    obj = cp.Minimize(cw * chi + nu_weight * nu)
-
-    prob = cp.Problem(obj, constraints)
-    try:
-        prob.solve(solver=solver)
-    except Exception as e:  # noqa: BLE001 — one bad solve must not abort the whole batch
-        _warn_once_if_license_error(solver, e)
-        return (None, None) if return_wbar else None
-
-    def _fail():
-        return (None, None) if return_wbar else None
-
-    if prob.status not in ("optimal", "optimal_inaccurate") or Wbar.value is None:
-        return _fail()
-    scale = float(nu.value)
-    if not np.isfinite(scale) or scale <= 0:
-        return _fail()
-    Wbar_v = np.asarray(Wbar.value, dtype=np.float64)
-    Wbar_v = 0.5 * (Wbar_v + Wbar_v.T)
-    Wv = Wbar_v / scale
-    if not np.all(np.isfinite(Wv)):
-        return _fail()
-    if (u_lo is not None and u_hi is not None and rho > 0) or (u_bound is not None and rho > 0):
-        K = (1.0 / r) * B.T @ np.linalg.inv(Wv)
-        u_dim = K.shape[0]
-        # 95th-Percentile control magnitude under isotropic error e, ‖e‖=rho.
-        # Targets "almost always feasible, rare tail excluded": the spectral
-        # worst case (‖K‖₂·rho) is too conservative (one rare direction flags
-        # the state) and the Frobenius RMS lets a tail saturate unnoticed. The
-        # exact quantile has no closed form, so: Monte Carlo, fixed seed, so the
-        # outer search sees a reproducible feasibility signal.
-        _rng = np.random.default_rng(0)
-        _dirs = _rng.standard_normal((512, x_dim))
-        _dirs /= np.linalg.norm(_dirs, axis=1, keepdims=True)
-        _u_samples = (rho * _dirs) @ K.T
-        if u_lo is not None and u_hi is not None:
-            # Signed, asymmetric bound (the actual actuator box) — a channel
-            # fails when more than 5% of samples fall outside [lo, hi].
-            u_lo_arr = np.broadcast_to(np.asarray(u_lo, dtype=np.float64), (u_dim,))
-            u_hi_arr = np.broadcast_to(np.asarray(u_hi, dtype=np.float64), (u_dim,))
-            _violation_rate = np.mean((_u_samples < u_lo_arr) | (_u_samples > u_hi_arr), axis=0)
-            if np.any(_violation_rate > 0.05):
-                return _fail()
-        else:
-            # Scalar (broadcast) or per-channel: the actuator box is axis-aligned,
-            # not a Euclidean ball, and envs like turtlebot have asymmetric bounds
-            # across [w, v]. One scalar vs an aggregate norm would let a slack
-            # channel mask a saturated one.
-            u_bound_arr = np.broadcast_to(np.asarray(u_bound, dtype=np.float64), (u_dim,))
-            # Pairwise: each control channel's own 95th-percentile |u_i| must clear
-            # Its own bound — not one shared vector-norm bound across all channels.
-            _q95_per_dim = np.quantile(np.abs(_u_samples), 0.95, axis=0)
-            if np.any(_q95_per_dim > u_bound_arr):
-                return _fail()
-    if return_wbar:
-        # Normalized W̄ is what a temporal-Ẇ caller would cache as next step's
-        # W_prev_bar (see _add_wdot_term) — return it alongside the deployed metric.
-        return Wv.astype(np.float32), Wbar_v.astype(np.float32)
-    return Wv.astype(np.float32)
-
-
-# Cap on per-state λ-reduction warnings before they are suppressed (see
-# build_cm_dataset). A wrong envelope backs off on every state, and 100k+
-# identical lines bury the aggregate summary that reports the effective λ.
-_MAX_REDUCTION_WARNINGS = 5
-
-
 def _lmi_residual(A_f: np.ndarray, B: np.ndarray, W: np.ndarray, lbd: float, *, r_scaler: float = 1.0) -> float:
     """Max eigenvalue of the contraction LMI at a solved ``W`` — post-hoc numpy
-    re-evaluation of what ``solve_cm_metric`` constrains.
+    re-evaluation of what ``cvstem_joint`` constrains.
 
     Evaluated on the deployed ``W = W̄/ν`` while the SDP constrains the
     normalized ``W̄``, so the bound to clear is ``-eps/ν``, not ``-eps``. Should
@@ -383,72 +228,6 @@ def _lmi_residual(A_f: np.ndarray, B: np.ndarray, W: np.ndarray, lbd: float, *, 
 
 _LAMBDA_BACKOFF_FACTOR = 0.5  # each retry halves λ — not exposed as a config knob, only the retry count is
 
-
-def _solve_cm_metric_with_backoff(
-    A_f: np.ndarray,
-    B: np.ndarray,
-    *,
-    lbd: float,
-    w_lb: float,
-    w_ub: float,
-    eps: float,
-    solver: str,
-    r_scaler: float,
-    max_lambda_reductions: int,
-    chi_weight: float | None = None,
-    nu_weight: float = 1.0,
-    wdot_dt: float = 0.0,
-    W_prev_bar: np.ndarray | None = None,
-    dt: float = 0.0,
-    return_wbar: bool = False,
-    u_bound: float | np.ndarray | None = None,
-    rho: float = 0.0,
-    u_lo: float | np.ndarray | None = None,
-    u_hi: float | np.ndarray | None = None,
-) -> tuple[np.ndarray | None, float, int] | tuple[np.ndarray | None, np.ndarray | None, float, int]:
-    """Solve ``solve_cm_metric`` at ``lbd``; on infeasibility (LMI infeasible or,
-    when ``u_bound`` is set, the implied gain would saturate the actuator — see
-    ``solve_cm_metric``), retry the same state alone with λ halved, up to
-    ``max_lambda_reductions`` times, before giving up.
-
-    Per-state, not global: a "hard" state (e.g. near a kinematic singularity)
-    can be infeasible purely because the requested rate is too aggressive there
-    while a slower-contracting metric still exists. Relaxing λ for that state
-    alone beats both dropping it and coarsening the certificate everywhere.
-
-    Returns ``(W or None, λ actually used, reductions applied)``. Callers should
-    warn when reductions > 0; this doesn't print itself, since offline synthesis
-    and the online per-step reward have very different log-volume tolerances.
-
-    λ-backoff canNOT rescue a structurally infeasible LMI, nor a state whose
-    every feasible metric implies an over-bound gain (measured: 0/300 car states
-    even after 10 halvings at r_scaler=0.01) — the objective (χ/λ + ν) has no
-    relationship to ``‖K‖``. By design: "control out of bound" is meant to
-    surface as a low ``feasibility_rate`` at the requested (λ, r_scaler) so an
-    outer search discards the trial. ``u_bound``/``rho`` are plumbed here for
-    any future caller that wants that gate; no current caller sets them (C2RL's
-    own ``cvstem_u_bound``/``cvstem_rho`` were removed 2026-07-30 — never set
-    by any config, so C2RL's feasibility signal is optimization-feasibility
-    only, via ``min_feasibility_rate``).
-    """
-    cur_lbd = lbd
-    for attempt in range(max_lambda_reductions + 1):
-        res = solve_cm_metric(
-            A_f, B, lbd=cur_lbd, w_lb=w_lb, w_ub=w_ub, eps=eps, solver=solver,
-            r_scaler=r_scaler, chi_weight=chi_weight, nu_weight=nu_weight, wdot_dt=wdot_dt,
-            W_prev_bar=W_prev_bar, dt=dt, return_wbar=return_wbar,
-            u_bound=u_bound, rho=rho, u_lo=u_lo, u_hi=u_hi,
-        )
-        Wv, Wbar_v = res if return_wbar else (res, None)
-        if Wv is not None:
-            return (Wv, Wbar_v, cur_lbd, attempt) if return_wbar else (Wv, cur_lbd, attempt)
-        cur_lbd *= _LAMBDA_BACKOFF_FACTOR
-    return (None, None, cur_lbd, max_lambda_reductions) if return_wbar else (None, cur_lbd, max_lambda_reductions)
-
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# Offline dataset synthesis ("cvstem")
-# ─────────────────────────────────────────────────────────────────────────── #
 
 def _sample_cm_states(
     get_rollout, *, num_samples: int, x_dim: int,
@@ -555,7 +334,6 @@ def build_cm_dataset(
     x_samples: np.ndarray | None = None,
     min_feasibility_rate: float = 0.0,
     r_scaler: float = 1.0,
-    max_lambda_reductions: int = 5,
     chi_weight: float | None = None,
     nu_weight: float = 1.0,
     wdot_dt: float = 0.0,
@@ -693,119 +471,9 @@ def build_cm_dataset(
         "lambda_reduced_rate": 0.0,
     }
 
-    xs, Ws, residuals = [], [], []
-    n_reduced = 0
-    reduced_lbds: list[float] = []
-    prev_Wbar = None  # only advanced when use_temporal — the previous state's W̄
-    pbar = _tqdm.tqdm(range(n), desc=f"{tag} NCM SDP synthesis", file=sys.stdout)
-    for i in pbar:
-        if use_temporal and traj_start[i]:
-            prev_Wbar = None  # new trajectory — no real predecessor yet
-        result = _solve_cm_metric_with_backoff(
-            DfDx[i], B_np[i],
-            lbd=lbd, w_lb=w_lb, w_ub=w_ub, eps=eps, solver=solver,
-            r_scaler=r_scaler, max_lambda_reductions=max_lambda_reductions,
-            chi_weight=chi_weight, nu_weight=nu_weight, wdot_dt=wdot_dt,
-            W_prev_bar=prev_Wbar, dt=temporal_dt, return_wbar=use_temporal,
-            u_bound=u_bound, rho=rho,
-        )
-        if use_temporal:
-            Wv, Wbar_v, lbd_used, reductions = result
-            # Chain forward for the next state in this trajectory. A dropped/
-            # infeasible state (Wv is None) breaks the chain — the next state
-            # is no longer truly consecutive (one dt) with any solved
-            # predecessor, so treat it like a fresh trajectory start rather
-            # than differencing against a stale or wrong-dt W̄.
-            prev_Wbar = Wbar_v if Wv is not None else None
-        else:
-            Wv, lbd_used, reductions = result
-        if reductions > 0 and Wv is not None:
-            n_reduced += 1
-            reduced_lbds.append(lbd_used)
-            # Rate-limited: when the envelope is wrong every state backs off, and
-            # 100k+ identical lines bury the aggregate summary below — which is
-            # the line that actually tells you the effective λ. Print a few, then
-            # count silently.
-            if n_reduced <= _MAX_REDUCTION_WARNINGS:
-                print(f"{tag} WARNING: state {i} infeasible at λ={lbd:.4g} — "
-                      f"reduced to λ={lbd_used:.4g} ({reductions} halving step(s)) to reach feasibility.")
-                if n_reduced == _MAX_REDUCTION_WARNINGS:
-                    print(f"{tag} ... further per-state λ-reduction warnings suppressed; "
-                          f"see the aggregate summary at the end of synthesis.")
-        if Wv is not None:
-            xs.append(x_np[i])
-            Ws.append(Wv)
-            residuals.append(_lmi_residual(DfDx[i], B_np[i], Wv, lbd_used, r_scaler=r_scaler))
-        if (i + 1) % 128 == 0:
-            pbar.set_postfix(feasible=f"{len(xs)}/{i + 1}")
-    pbar.close()
-
-    feas_rate = len(xs) / max(1, n)
-    infeasibility_hint = (
-        "If every state is infeasible, this is a metric-envelope or contraction-rate "
-        "problem, not a control-authority one — this module's LMI has no control-box "
-        "vertices to narrow. Lower w_lb/cvstem_r_scaler before touching λ; see "
-        "ncm_synthesis.py's module docstring."
-    )
-    if not xs:
-        raise RuntimeError(
-            f"{tag} NCM synthesis produced 0 feasible metrics out of {n} states — "
-            f"check lbd={lbd}, eps={eps}, w_lb={w_lb}, w_ub={w_ub}, and the dynamics model. "
-            + infeasibility_hint
-        )
-    if feas_rate < min_feasibility_rate:
-        raise RuntimeError(
-            f"{tag} NCM synthesis only {feas_rate:.1%} of {n} states feasible, below "
-            f"min_feasibility_rate={min_feasibility_rate:.1%} — check lbd={lbd}, eps={eps}, "
-            f"w_lb={w_lb}, w_ub={w_ub}, and the dynamics model, or lower min_feasibility_rate "
-            f"(yaml `cm:` block) if this rate is expected for this env. " + infeasibility_hint
-        )
-    finite_residuals = [r for r in residuals if np.isfinite(r)]
-    residual_mean = float(np.mean(finite_residuals)) if finite_residuals else float("nan")
-    residual_max = float(np.max(finite_residuals)) if finite_residuals else float("nan")
-    lambda_reduced_rate = n_reduced / max(1, n)
-    if n_reduced:
-        print(
-            f"{tag} WARNING: {n_reduced}/{n} states ({lambda_reduced_rate:.1%}) required λ reduction "
-            f"to reach feasibility (mean reduced λ={np.mean(reduced_lbds):.4g}, "
-            f"min={np.min(reduced_lbds):.4g}, requested λ={lbd:.4g}) — those states' CMG targets "
-            f"certify a SLOWER contraction rate than the rest of the dataset."
-        )
-        # A near-total backoff means the envelope is wrong, not that a few
-        # outlying states are hard — and the feasibility rate cannot say so,
-        # because backoff is exactly what drives that rate to 100%. Call it out
-        # explicitly: otherwise a run reports "100% feasible" while every single
-        # metric certifies λ/2, and min_feasibility_rate can never fire.
-        if lambda_reduced_rate >= 0.99:
-            print(
-                f"{tag} WARNING: ESSENTIALLY EVERY state backed off — the metric is certified at "
-                f"λ≈{np.mean(reduced_lbds):.4g}, NOT the requested λ={lbd:.4g}, and "
-                f"feasibility_rate={feas_rate:.1%} cannot reveal this (backoff is what makes it "
-                f"100%). This is an ENVELOPE problem: lower w_lb / cvstem_r_scaler, or request "
-                f"the λ you are actually getting. " + infeasibility_hint
-            )
-    print(
-        f"{tag} NCM synthesis: {len(xs)}/{n} states feasible ({feas_rate:.1%}), "
-        f"LMI residual mean={residual_mean:.3g} max={residual_max:.3g}"
-    )
-    return {
-        "x": np.stack(xs).astype(np.float32),
-        "W": np.stack(Ws).astype(np.float32),
-        "feasibility_rate": feas_rate,
-        "residual_mean": residual_mean,
-        "residual_max": residual_max,
-        "lambda_reduced_count": n_reduced,
-        "lambda_reduced_rate": lambda_reduced_rate,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# Dataset caching
-# ─────────────────────────────────────────────────────────────────────────── #
-
 def _same_weight(cached, requested: float | None) -> bool:
     """Compare a cached ``chi_weight`` against the requested one, treating the
-    ``None`` sentinel (= "use 1/lbd", see ``solve_cm_metric``) as ``nan`` on disk
+    ``None`` sentinel (= "use 1/lbd", see ``cvstem_joint``) as ``nan`` on disk
     — ``nan != nan``, so a plain ``==`` would re-solve every run for the default.
     """
     cached = float(cached)
@@ -882,7 +550,7 @@ def load_cached_cm_dataset(
         and str(npz["solver"]) == solver
         and int(npz["num_samples"]) == num_samples
         and float(npz.get("r_scaler", 1.0)) == r_scaler
-        # chi_weight=None means "1/lbd" (see solve_cm_metric); store it as nan so
+        # chi_weight=None means "1/lbd" (see cvstem_joint); store it as nan so
         # a cached None and an explicit float never compare equal by accident.
         and _same_weight(npz["chi_weight"], chi_weight)
         and float(npz["nu_weight"]) == nu_weight
@@ -895,7 +563,7 @@ def load_cached_cm_dataset(
         # LMI itself (a real Ẇ term) — .get for caches predating this feature.
         and bool(npz.get("wdot_trajectory", False)) == wdot_trajectory
         and float(npz.get("temporal_dt", 0.0)) == temporal_dt
-        # u_bound/rho add the actuator-feasibility check (see solve_cm_metric) —
+        # u_bound/rho add the actuator-feasibility check (removed with the per-state path) —
         # .get for caches predating this feature (None sentinel stored as nan,
         # same trick as chi_weight, since u_bound=None is a real "off" state).
         # u_bound may now be per-channel (pairwise check) — compare as arrays.
@@ -1335,171 +1003,6 @@ def train_cmg_ccm(
 # Online CV-STEM metric (no offline synthesis)
 # ─────────────────────────────────────────────────────────────────────────── #
 
-class OnlineCVSTEMMetric:
-    """Per-step CV-STEM SDP, shaped as a drop-in for a frozen CMG network.
-
-    Same call contract as ``BoundedCCM_Generator``: ``W, _ = metric(x)`` for a
-    batch ``x`` of raw states, plus a ``bounded`` attribute. That is the whole
-    interface the classic envs' ``set_ccm``/``get_rewards`` uses, so swapping
-    this in for the regressed network needs no env change and is identical for
-    the PPO and SAC base algorithms (both read the reward from the env).
-
-    Where the offline pipeline (``build_cm_dataset`` + ``regress_cmg``) solves
-    the SDP once per sampled state and then approximates ``W`` everywhere by a
-    network fit, this solves it at exactly the states the rollout visits:
-
-      1. ``f, B = get_f_and_B(x)`` and the drift Jacobian ``A = ∂f/∂x``
-         (batched, autograd, on device — control enters the LMI only through
-         the Riccati term, so the generalized Jacobian is deliberately not used
-         here; see ``solve_cm_metric``).
-      2. ``A``/``B`` to numpy — cvxpy is CPU-only, so this is a real sync point.
-      3. One ``_solve_cm_metric_with_backoff`` per env, in a Python loop.
-      4. Stack back to a ``(b, x_dim, x_dim)`` tensor on ``x``'s device.
-
-    So every deployed ``M = W⁻¹`` is a verified feasible metric rather than a
-    regression of one — at the cost of ``num_envs`` SDP solves per env-step
-    (~12 ms each with MOSEK on a 4-state system), which is why this is a
-    single-run research configuration and not a sweep one.
-
-    Infeasibility aborts the run (``CVSTEMInfeasibleError``, carrying
-    ``cvstem_lqr.INFEASIBLE_MARKER`` so ``search/sweep_runner.py`` records it as
-    a bad trial rather than a crash). Unlike CV-STEM-LQR there is no "zero
-    feedback" fallback available here — this metric defines a reward, and any
-    substitute ``W`` at that state would silently score an uncertified metric
-    as if it were certified.
-    """
-
-    # W comes back already satisfying w_lb·I ⪯ W ⪯ w_ub·I as an SDP constraint,
-    # so the env's bound_W has nothing left to clamp.
-    bounded = True
-
-    def __init__(
-        self,
-        get_f_and_B: Callable,
-        *,
-        x_dim: int,
-        lbd: float,
-        w_lb: float,
-        w_ub: float,
-        eps: float,
-        solver: str,
-        r_scaler: float,
-        max_lambda_reductions: int,
-        chi_weight: float | None = None,
-        nu_weight: float = 1.0,
-    ) -> None:
-        self._get_f_and_B = get_f_and_B
-        self._x_dim = x_dim
-        self._lbd = lbd
-        self._w_lb = w_lb
-        self._w_ub = w_ub
-        self._eps = eps
-        self._solver = solver
-        self._r_scaler = r_scaler
-        self._max_lambda_reductions = max_lambda_reductions
-        self._chi_weight = chi_weight
-        self._nu_weight = nu_weight
-        # Diagnostics — the offline path reports these once from its dataset;
-        # online they only exist as running counts (read by the trainer).
-        self.num_solves = 0
-        self.num_lambda_reduced = 0
-
-    def to(self, *args, **kwargs):  # noqa: D401 - torch-module-like no-op
-        """No parameters to move: the solve is CPU/cvxpy and the result is
-        returned on the input's device. Present so callers can treat this
-        exactly like the ``nn.Module`` CMG it replaces."""
-        return self
-
-    def eval(self):
-        return self
-
-    def parameters(self):
-        return iter(())
-
-    def __call__(self, x: torch.Tensor):
-        from .cvstem_lqr import INFEASIBLE_MARKER, CVSTEMInfeasibleError
-
-        device = x.device
-        x_req = x[:, : self._x_dim].detach().float().requires_grad_()
-        # get_rewards runs under no_grad; the Jacobian needs grad regardless.
-        with torch.enable_grad():
-            f, B, _ = self._get_f_and_B(x_req)
-            A = jacobian(f, x_req, create_graph=False)
-
-        A_np = A.detach().cpu().numpy()
-        B_np = B.detach().cpu().numpy()
-
-        W_out = np.empty((x_req.shape[0], self._x_dim, self._x_dim), dtype=np.float32)
-        for i in range(x_req.shape[0]):
-            W, _lbd_used, reductions = _solve_cm_metric_with_backoff(
-                A_np[i], B_np[i],
-                lbd=self._lbd, w_lb=self._w_lb, w_ub=self._w_ub, eps=self._eps,
-                solver=self._solver, r_scaler=self._r_scaler,
-                max_lambda_reductions=self._max_lambda_reductions,
-                chi_weight=self._chi_weight, nu_weight=self._nu_weight,
-            )
-            if W is None:
-                msg = (
-                    f"{INFEASIBLE_MARKER}: online C2RL metric has no feasible CV-STEM "
-                    f"solution at env {i}/{x_req.shape[0]}'s state, at lbd={self._lbd}, "
-                    f"cm_eps={self._eps}, w_lb={self._w_lb}, w_ub={self._w_ub}, "
-                    f"cvstem_r_scaler={self._r_scaler} "
-                    f"(max_lambda_reductions={self._max_lambda_reductions}). "
-                    "The Mahalanobis reward has no certified metric to fall back on."
-                )
-                print(msg, flush=True)
-                raise CVSTEMInfeasibleError(msg)
-            W_out[i] = W
-            self.num_solves += 1
-            self.num_lambda_reduced += int(reductions > 0)
-
-        return torch.as_tensor(W_out, device=device), None
-
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# Original CV-STEM (AstroHiro/ncm, ``classncm``) — one joint SDP over uniform
-# samples, then a network regressed onto chol(M)
-# ─────────────────────────────────────────────────────────────────────────── #
-#
-# The reference pipeline, in its own order (``classncm.train`` →
-# ``cvstem`` → ``M2cholM`` → keras ``fit``):
-#
-#   1. draw ``Nx`` states i.i.d. Uniform over the state box (``xlims``);
-#   2. solve one ``cp.Problem`` over all of them, per-state ``W̄_k`` but a
-#      Single shared ``ν`` and ``χ``, minimizing ``J = d₁b̄·χ/α + d₂·ν``;
-#   3. label ``M_k = W_k⁻¹``, take ``chol(M_k)ᵀ`` and vectorize it;
-#   4. MSE-regress a plain MLP ``x ↦ chol(M)`` — that network is the metric;
-#   5. deploy ``K = R⁻¹BᵀM(x)``, ``M = RᵀR`` SPD by construction.
-#
-# Differences from ``solve_cm_metric`` above, which is the same LMI solved
-# Pointwise (each state getting its own ν/χ) and is what C2RL consumes:
-#
-# * ``ν``/``χ`` shared. Pointwise feasibility at every state is a strictly
-#   Weaker claim than one metric family covering them all, and pointwise
-#   ``W_k = W̄_k/ν_k`` are not even on a common scale.
-# * No deployment envelope. ``solve_cm_metric`` adds ``ν ≤ 1/w_lb`` and
-#   ``χ ≤ ν·w_ub`` so the regressed ``W`` stays inside ``bound_W``'s range; the
-#   reference leaves ``ν`` free and merely penalizes it, which is why its
-#   network regresses an unbounded ``chol(M)`` instead of a bounded ``W``.
-# * ``Ẇ`` is always present as ``(W̄ - I)/dt``. It is not a derivative estimate:
-#   ``W̄`` is the decision variable, ``I`` a constant, ``dt`` the env step, and
-#   the samples are unordered so no predecessor exists. Since ``W̄ ⪰ I`` is
-#   enforced the term is PSD, so it only tightens the LMI: feasibility with it
-#   implies feasibility of the static (``Ẇ=0``) LMI, and it certifies the
-#   deployed state-varying metric exactly when ``-Ẇ ⪯ (W̄-I)/dt`` along the real
-#   trajectory — an assumption box sampling cannot check.
-# * No per-state λ-backoff. There is nothing per-state left to back off; the
-#   joint program either certifies λ everywhere or fails.
-#
-# ``r_scaler`` NOTE (only true once ν is free): the LMI sees ν and r solely
-# through the ratio ``ν/r``, and so does the deployed gain
-# ``K = (ν/r)·B̄ᵀW̄⁻¹``. So r cannot make the program feasible or infeasible — it
-# enters only as the weight ``nu_weight·r`` on control authority in ``J``.
-# Raising r therefore shrinks ‖K‖ by making the optimizer buy less authority,
-# which is exactly (up to scale) what raising ``nu_weight`` does. That is why
-# an over-bound control is answered by raising r while an infeasible LMI is
-# answered by lowering λ — the two knobs act on different parts of the program.
-
 def cvstem_joint(
     A: np.ndarray,
     B: np.ndarray,
@@ -1547,7 +1050,7 @@ def cvstem_joint(
         chi_weight/nu_weight: ``J = chi_weight·χ + nu_weight·ν``; ``None`` →
             ``1/lbd`` (the reference's ``d₁b̄·χ/α`` with ``d₁b̄ = 1``).
         w_lb/w_ub: Optional deployment envelope ``w_lb·I ⪯ W ⪯ w_ub·I`` on the
-            deployed ``W = W̄/ν``, the same two scalar caps ``solve_cm_metric``
+            deployed ``W = W̄/ν``, the same two scalar caps the joint program
             applies: ``ν ≤ 1/w_lb`` and ``χ ≤ ν·w_ub``. ``None`` (both, the
             default) leaves ν and χ free, which is Tsukamoto's program exactly —
             pass neither and this function is byte-identical to before.

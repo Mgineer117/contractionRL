@@ -126,9 +126,7 @@ agent:
 cm:
   # Metric source — how the env computes the Mahalanobis reward. "cmg": the
   # frozen Phase-A network below (cmg_method selects how it is trained).
-  # "online" instead solves the CV-STEM SDP per env per step (what c2rl_sac
   # does) — impractical here at this num_envs. See c2rl.py's module docstring.
-  metric_source: cmg
   # Mahalanobis reward
   w_ub: 10.0  # Upper eigenvalue bound for the metric M(x)
   w_lb: 0.1   # Lower eigenvalue bound for the metric M(x)
@@ -142,7 +140,6 @@ cm:
   # cmg_method selects the training pipeline (see c2rl.py module docstring):
   #   "ccm"    — trains the CMG directly via C1/C2 loss minimization
   #             (train_cmg_ccm) — no SDP, so cvstem_r_scaler/
-  #             max_lambda_reductions/cm_data_path below
   #             are unused here.
   #   "cvstem" (default, this config) — Tsukamoto CV-STEM-style: solves one
   #              pointwise SDP per state (ncm_synthesis.solve_cm_metric)
@@ -171,7 +168,6 @@ cm:
   # the dataset — 0 disables this and reverts to dropping immediately. Warns
   # per reduced state + an aggregate summary (build_cm_dataset). "cvstem" only.
   # See ncm_synthesis._solve_cm_metric_with_backoff.
-  max_lambda_reductions: 10
   # Cache the synthesized {x, W} CM dataset here (build_cm_dataset's per-state SDP
   # solve is the expensive part of "cvstem" synthesis — 131072 states can take
   # minutes; unused by "ccm", which has no cache). Reused on a later run as long

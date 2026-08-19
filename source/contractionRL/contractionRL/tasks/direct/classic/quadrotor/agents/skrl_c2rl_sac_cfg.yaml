@@ -75,13 +75,11 @@ agent:
 cm:
   # Metric source — how the env computes the Mahalanobis reward. "online":
   # solve the CV-STEM SDP per env per step at the states the rollout visits
-  # (ncm_synthesis.OnlineCVSTEMMetric), so every M is a verified feasible
   # metric and an infeasible state aborts the run. No Phase A, no CMG
   # regression, no cm_data_path cache — but num_envs SDP solves per step
   # (~12 ms each with MOSEK here), so this is a single-run configuration.
   # "cmg" instead uses the Phase-A network (what c2rl_ppo does). Forced to
   # "cmg" when cmg_method is "ccm" (that pipeline has no per-state SDP).
-  metric_source: cmg
   # Mahalanobis reward
   w_ub: 1000.0
   # lbd/w_lb/cm_eps/cvstem_r_scaler tuned 2026-07-29 via the real wandb sweep
@@ -102,7 +100,6 @@ cm:
   # cmg_method selects the training pipeline (see c2rl.py module docstring):
   #   "ccm"    — trains the CMG directly via C1/C2 loss minimization
   #             (train_cmg_ccm) — no SDP, so cvstem_r_scaler/
-  #             max_lambda_reductions/cm_data_path below
   #             are unused here.
   #   "cvstem" (default, this config) — Tsukamoto CV-STEM-style: solves one
   #              pointwise SDP per state (ncm_synthesis.solve_cm_metric)
@@ -124,7 +121,6 @@ cm:
   # the dataset — 0 disables this and reverts to dropping immediately. Warns
   # per reduced state + an aggregate summary (build_cm_dataset). "cvstem" only.
   # See ncm_synthesis._solve_cm_metric_with_backoff.
-  max_lambda_reductions: 10
   # Cache the synthesized {x, W} CM dataset here (build_cm_dataset's per-state SDP
   # solve is the expensive part of "cvstem" synthesis — 131072 states can take
   # minutes; unused by "ccm", which has no cache). Reused on a later run as long

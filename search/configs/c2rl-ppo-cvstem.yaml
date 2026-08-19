@@ -137,7 +137,5 @@ parameters:
   # whose far-from-reference tail (e.g. cartpole |θ|→π/3) is genuinely
   # infeasible at λ and would otherwise fail an all-or-nothing bar even
   # though the deployed policy rarely operates there.
-  cm.max_lambda_reductions:
-    value: 10   # rescue an infeasible state with up to 10 λ-halvings before dropping it
   cm.cmg_method:
     value: cvstem

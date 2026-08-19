@@ -114,7 +114,6 @@ def main() -> int:
         x_samples=x_samples,
         random_ratio=cache_kwargs["random_ratio"],
         r_scaler=cfg.cvstem_r_scaler,
-        max_lambda_reductions=cfg.max_lambda_reductions,
         chi_weight=cfg.cm_chi_weight,
         nu_weight=cfg.cm_nu_weight, wdot_dt=cfg.cm_wdot_dt,
     )

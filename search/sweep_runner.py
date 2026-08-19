@@ -38,12 +38,9 @@ Crucially, the child's own config decides what counts as a terminal miss — thi
 wrapper only watches for the signals that mean the child actually dropped a
 state or aborted. Strictness is a per-algorithm choice made in the config:
 
-    cm.max_lambda_reductions: 0      # strict offline: a miss can't be rescued,
                                      #   the state drops and the ratio/rate fires
     cm.min_feasibility_rate:  1.0    # offline: child raises if any state is dropped
 
-C2RL offline runs the opposite way on purpose: ``max_lambda_reductions: 10`` lets
-a per-state λ-backoff rescue a miss, and ``min_feasibility_rate: 0.95`` tolerates
 a few genuine drops. A rescued state is feasible, so it never trips a detection
 signal — which is why the ``infeasible at λ=`` rescue WARNING is not a kill
 signal (see ``_HARD_MARKERS``). Only a state the child could not rescue (dropped)
@@ -89,8 +86,8 @@ _TRAIN_PY = _ROOT / "scripts" / "skrl" / "train.py"
 # Substrings that unambiguously mean "the SDP failed" regardless of counts.
 _HARD_MARKERS = (
     # cvstem_lqr.INFEASIBLE_MARKER — the online abort, raised both by CV-STEM-LQR's
-    # control law and by C2RL's metric_source="online" reward metric
-    # (ncm_synthesis.OnlineCVSTEMMetric), which reuses the same marker and error type.
+    # control law. (C2RL's per-step "online" metric used to raise it too; that
+    # path was removed -- a per-state SDP certifies nothing about contraction.)
     "CVSTEM-LQR INFEASIBLE",
     "CVSTEMInfeasibleError",       # same, as it appears in the traceback
     "produced 0 feasible metrics",
@@ -104,14 +101,11 @@ _HARD_MARKERS = (
     # (that code is unreachable); they are kept for the online metric.
     "joint CV-STEM SDP INFEASIBLE",
 )
-# NOTE: "infeasible at λ=" is deliberately not a hard marker. ncm_synthesis only
-# prints that line when `reductions > 0 and Wv is not None` — i.e. on a
-# Successful λ-backoff rescue, not a real miss. With cm.max_lambda_reductions=0
-# a genuine miss can't be rescued, so the state is dropped silently and surfaces
-# through the k<n ratio / min_feasibility_rate paths below. With
-# max_lambda_reductions>0 (c2rl offline) the rescue is the intended, healthy
-# behaviour, so killing on the warning would be a false positive. Strictness is
-# governed by max_lambda_reductions (+ min_feasibility_rate), not by this line.
+# NOTE: the per-state ratio patterns below are legacy. Synthesis now solves ONE
+# joint SDP over every sample, so there is no per-state feasibility rate to fall
+# short of and no per-state λ-backoff to rescue a miss: the program either
+# certifies λ over the whole draw or raises the marker above. The k/n patterns are
+# kept because they still match older logs, not because a current run emits them.
 # tqdm postfix (`pbar.set_postfix(feasible=f"{len(xs)}/{i+1}")`) and the final
 # summary line — both carry a k/n pair that is only healthy when k == n.
 _RATIO_PATTERNS = (
