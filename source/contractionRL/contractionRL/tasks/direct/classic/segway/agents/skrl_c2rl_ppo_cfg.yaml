@@ -163,7 +163,7 @@ cm:
   # cmg_method selects the training pipeline (see c2rl.py module docstring):
   #   "ccm"    — trains the CMG directly via C1/C2 loss minimization
   #             (train_cmg_ccm) — no SDP, so cvstem_r_scaler/
-  #             max_lambda_reductions/min_feasibility_rate/cm_data_path below
+  #             max_lambda_reductions/cm_data_path below
   #             are unused here.
   #   "cvstem" (default, this config) — Tsukamoto CV-STEM-style: solves one
   #              pointwise SDP per state (ncm_synthesis.solve_cm_metric)
@@ -186,7 +186,6 @@ cm:
   # per reduced state + an aggregate summary (build_cm_dataset). "cvstem" only.
   # See ncm_synthesis._solve_cm_metric_with_backoff.
   max_lambda_reductions: 10
-  min_feasibility_rate: 0.95  # raise before CMG regression if fewer than 95% of sampled states are feasible; "cvstem" only
   # Cache the synthesized {x, W} CM dataset here (build_cm_dataset's per-state SDP
   # solve is the expensive part of "cvstem" synthesis — 131072 states can take
   # minutes; unused by "ccm", which has no cache). Reused on a later run as long

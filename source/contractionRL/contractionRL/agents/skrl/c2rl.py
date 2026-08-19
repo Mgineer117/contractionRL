@@ -356,7 +356,6 @@ class C2RLPPOCfg(AgentCfg):
     # likely-biased subset of states — raises before regression if the SDP's
     # feasible fraction falls below this (0.0 = old behavior, only guards
     # against 0% feasible; see ncm_synthesis.build_cm_dataset). "cvstem" method only.
-    min_feasibility_rate: float = 0.0
     # Cache path for the synthesized {x, W} CM dataset (build_cm_dataset's
     # expensive per-state SDP solve) — see synthesize_cmg. Loaded instead of
     # re-solving when it exists and matches lbd/w_lb/w_ub/cm_eps/cm_solver/
@@ -485,7 +484,6 @@ class C2RLSACCfg(AgentCfg):
     cm_wdot_trajectory: bool = False
     cm_temporal_dt: float = 0.05
     max_lambda_reductions: int = 5  # see ncm_synthesis._solve_cm_metric_with_backoff
-    min_feasibility_rate: float = 0.0
     cm_data_path: str = ""
     # ── Offline CMG synthesis (Phase A, always runs before Phase B) ─────────── #
     cmg_memory_size: int = 8192

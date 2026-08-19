@@ -95,6 +95,14 @@ _HARD_MARKERS = (
     "CVSTEMInfeasibleError",       # same, as it appears in the traceback
     "produced 0 feasible metrics",
     "below min_feasibility_rate",
+    # build_cm_dataset now solves ONE joint SDP over all samples, which raises this
+    # instead of reporting a per-state feasibility rate. Without it here an
+    # infeasible offline synthesis is not recognised as a hard failure, so the
+    # trial finishes metric-less -- and a metric-less trial is silently dropped
+    # from the bayes bookkeeping, which is the exact failure this module exists to
+    # prevent. The two markers above can no longer fire from the offline path
+    # (that code is unreachable); they are kept for the online metric.
+    "joint CV-STEM SDP INFEASIBLE",
 )
 # NOTE: "infeasible at λ=" is deliberately not a hard marker. ncm_synthesis only
 # prints that line when `reductions > 0 and Wv is not None` — i.e. on a

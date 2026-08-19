@@ -113,7 +113,6 @@ def main() -> int:
         device="cpu", tag="[build_cm]",
         x_samples=x_samples,
         random_ratio=cache_kwargs["random_ratio"],
-        min_feasibility_rate=cfg.min_feasibility_rate,
         r_scaler=cfg.cvstem_r_scaler,
         max_lambda_reductions=cfg.max_lambda_reductions,
         chi_weight=cfg.cm_chi_weight,
@@ -125,11 +124,10 @@ def main() -> int:
     print(f"[build_cm] solved {len(ds['x'])} states in {el/60:.1f} min — "
           f"feasibility {rate:.1%}, lambda-reduced {ds.get('lambda_reduced_rate', 0.0):.1%}, "
           f"LMI residual mean {ds['residual_mean']:.3e} max {ds['residual_max']:.3e}")
-    if rate < cfg.min_feasibility_rate:
-        print(f"[build_cm] FAILED: feasibility {rate:.1%} < min_feasibility_rate "
-              f"{cfg.min_feasibility_rate:.1%}. Nothing written — lower lbd or widen "
-              f"the envelope rather than lowering the threshold.", file=sys.stderr)
-        return 2
+    # No feasibility THRESHOLD to check: one joint program either certifies lambda
+    # over the whole draw or build_cm_dataset raises, so rate is always 1.0 here
+    # and any `rate < threshold` test is unreachable. Infeasibility arrives as an
+    # exception, not as a low rate.
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     save_cm_dataset(cache_path, ds, **cache_kwargs)

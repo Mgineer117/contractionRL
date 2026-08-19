@@ -75,8 +75,6 @@ parameters:
   # Pinned — see c2rl-ppo-cvstem.yaml for the feasibility-bar rationale.
   cm.max_lambda_reductions:
     value: 10
-  cm.min_feasibility_rate:
-    value: 0.95
   cm.cmg_method:
     value: cvstem
   # Phase-A CMG network, not the per-step SDP. Pinned explicitly rather than
