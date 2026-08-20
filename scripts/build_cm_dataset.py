@@ -14,9 +14,10 @@ The destination path and the cache key both come from ``c2rl.cm_dataset_target``
 — the same function the agent loads through — so a file written here cannot
 key-miss on load. Do not reimplement either here.
 
-Feasibility is a result, not a warning: if fewer than ``min_feasibility_rate``
-of states solve, this exits non-zero rather than writing a dataset the CMG would
-regress onto a biased subset of the state space.
+Feasibility is a result, not a warning. One joint SDP covers every sample, so it
+either certifies the rate over the whole draw or raises -- this exits non-zero and
+writes nothing rather than leaving the CMG to regress onto a metric that
+certifies nothing.
 """
 from __future__ import annotations
 
@@ -64,6 +65,18 @@ def main() -> int:
     p.add_argument("--algorithm", default="c2rl-ppo", choices=["c2rl-ppo", "c2rl-sac"])
     p.add_argument("--check", action="store_true",
                    help="report the target path and whether it already loads, then exit")
+    # Probes for locating the feasibility boundary. A lambda certified at
+    # N=100/eps=0.1 can still be infeasible at the shipped N=10000 (measured on
+    # segway), and each attempt is a multi-hour solve, so the candidates have to
+    # be drivable without rewriting the env yaml between runs. The filename and
+    # cache key both derive from the EFFECTIVE values, so a probe writes its own
+    # file rather than shadowing the config's.
+    p.add_argument("--lbd", type=float, default=None,
+                   help="override the config's contraction rate for this build")
+    p.add_argument("--num-samples", "--num_samples", type=int, default=None,
+                   help="override cmg_memory_size (cost is ~N^1.95, so a smaller "
+                        "N is how you locate the boundary cheaply before "
+                        "committing to the shipped size)")
     p.add_argument("--force", action="store_true",
                    help="re-solve and overwrite even if a matching dataset exists")
     args = p.parse_args()
@@ -76,6 +89,14 @@ def main() -> int:
     )
 
     cfg, cfg_path = _load_cfg(args.task, args.algorithm)
+    if args.lbd is not None:
+        print(f"[build_cm] lbd OVERRIDE {cfg.lbd} -> {args.lbd} (probe; the config "
+              f"still says {cfg.lbd})", flush=True)
+        cfg.lbd = args.lbd
+    if args.num_samples is not None:
+        print(f"[build_cm] N OVERRIDE {cfg.cmg_memory_size} -> {args.num_samples} "
+              f"(probe; the shipped size is {cfg.cmg_memory_size})", flush=True)
+        cfg.cmg_memory_size = args.num_samples
     if cfg.cmg_method != "cvstem":
         raise SystemExit(f"cmg_method is {cfg.cmg_method!r}; only 'cvstem' uses this "
                          f"dataset ('ccm' trains the CMG directly, no SDP).")

@@ -16,7 +16,11 @@ models:
       layers: [256, 256]
       activations: tanh
     output: ACTIONS
-    initial_log_std: 0.0
+    # sigma = exp(-2) = 0.135, not exp(0) = 1.0. On the +-3 applied box that
+    # is 4.5% of the half-range instead of 33%, so the policy starts near its
+    # mean rather than being dominated by its own noise. Inside the
+    # min_log_std/max_log_std clamp above, so it is not truncated at init.
+    initial_log_std: -2.0
   critic:  # PPO value function V(obs)
     class: DeterministicMixin
     network:
