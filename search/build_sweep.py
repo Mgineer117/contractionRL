@@ -44,6 +44,10 @@ DEFAULT_PROJECT = "contractionRL-Search"
 # Isaac Lab task and must not get that flag.
 CLASSIC_ENVS = (
     "classic-car-v0",
+    # The class-III half of the car pair (v in [0.2, 2] makes the Hautus margin
+    # sigma = min(1, v) < 1). Registered here because it was added as an env
+    # without being wired into the sweep tooling, so --env rejected it outright.
+    "classic-car_weak-v0",
     "classic-cartpole-v0",
     "classic-segway-v0",
     "classic-turtlebot-v0",
