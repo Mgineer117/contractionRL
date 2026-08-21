@@ -4,7 +4,7 @@ Two jobs, deliberately separable:
 
   --generate   compute figures/data/minproj_<env>.npz  (the expensive half: one
                λ* bisection per grid cell, each a joint CV-STEM SDP)
-  (default)    read that npz and draw figures/minproj_<env>.png
+  (default)    read that npz and draw figures/minproj_<env>.svg
 
 Keeping them apart is the point. The λ* grid costs thousands of SDP solves and
 never changes for a fixed (env, envelope), so restyling a figure must not re-solve
@@ -208,7 +208,13 @@ def marginal_axis(Z: np.ndarray) -> str:
 
 
 def plot(env_name: str, *, n_traj: int = N_TRAJ_SHOWN,
-         axis: str | None = None) -> pathlib.Path:
+         axis: str | None = None, rate_only: bool = False) -> pathlib.Path:
+    """The min-projected lambda* field for one env.
+
+    ``rate_only`` drops everything that is not the state-dependent rate itself —
+    no rollouts, no x0 marginal, no connectors — and writes ``rate_<env>.svg``
+    instead of ``minproj_<env>.svg``, so the field can be shown on its own.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -223,7 +229,7 @@ def plot(env_name: str, *, n_traj: int = N_TRAJ_SHOWN,
     dx, dy = int(dims[0]), int(dims[1])
     ex, ey = _edges(gx), _edges(gy)
     traj, x0 = z["traj"], z["x0"]
-    k_show = min(int(n_traj), traj.shape[0])
+    k_show = 0 if rate_only else min(int(n_traj), traj.shape[0])
     shown = traj[:k_show]
 
     # Always put the dim lambda* varies along on the X axis, transposing the slice
@@ -244,13 +250,22 @@ def plot(env_name: str, *, n_traj: int = N_TRAJ_SHOWN,
     # steals width from that axes alone, and then a dotted vertical at the same
     # data value lands at a different PIXEL in each panel -- which defeats the
     # entire point of the shared axis.
-    fig = plt.figure(figsize=(10.6, 9.4))
-    gs = fig.add_gridspec(2, 2, height_ratios=[3.1, 1.0], width_ratios=[1.0, 0.035],
-                          hspace=0.06, wspace=0.03)
-    ax = fig.add_subplot(gs[0, 0])
-    axd = fig.add_subplot(gs[1, 0], sharex=ax)
-    cax = fig.add_subplot(gs[0, 1])
-    ax.tick_params(labelbottom=False)
+    if rate_only:
+        # Same panel width and colorbar column as the two-panel figure, so a
+        # rate-only plot can sit beside a full one without rescaling.
+        fig = plt.figure(figsize=(10.6, 7.4))
+        gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 0.035], wspace=0.03)
+        ax = fig.add_subplot(gs[0, 0])
+        axd = None
+        cax = fig.add_subplot(gs[0, 1])
+    else:
+        fig = plt.figure(figsize=(10.6, 9.4))
+        gs = fig.add_gridspec(2, 2, height_ratios=[3.1, 1.0], width_ratios=[1.0, 0.035],
+                              hspace=0.06, wspace=0.03)
+        ax = fig.add_subplot(gs[0, 0])
+        axd = fig.add_subplot(gs[1, 0], sharex=ax)
+        cax = fig.add_subplot(gs[0, 1])
+        ax.tick_params(labelbottom=False)
     which = "x"                               # one code path from here down
 
     # A constant field gets a NEUTRAL flat colour, not a point on viridis. Mapping
@@ -294,10 +309,14 @@ def plot(env_name: str, *, n_traj: int = N_TRAJ_SHOWN,
 
     # Axes cover the union of the field and what is drawn on it: clipping to the
     # box hides every trajectory start outside it (on car, about half of them).
-    lo_y = min(ey[0], float(np.min(shown[:, :, dy])))
-    hi_y = max(ey[-1], float(np.max(shown[:, :, dy])))
-    lo_x = min(ex[0], float(np.min(shown[:, :, dx])))
-    hi_x = max(ex[-1], float(np.max(shown[:, :, dx])))
+    if k_show:
+        lo_y = min(ey[0], float(np.min(shown[:, :, dy])))
+        hi_y = max(ey[-1], float(np.max(shown[:, :, dy])))
+        lo_x = min(ex[0], float(np.min(shown[:, :, dx])))
+        hi_x = max(ex[-1], float(np.max(shown[:, :, dx])))
+    else:
+        # Nothing drawn on top of the field, so the field IS the extent.
+        lo_x, hi_x, lo_y, hi_y = ex[0], ex[-1], ey[0], ey[-1]
     pad_y, pad_x = 0.04 * (hi_y - lo_y), 0.02 * (hi_x - lo_x)
     ax.set_xlim(lo_x - pad_x, hi_x + pad_x)
     ax.set_ylim(lo_y - pad_y, hi_y + pad_y)
@@ -306,14 +325,23 @@ def plot(env_name: str, *, n_traj: int = N_TRAJ_SHOWN,
         ax.axhline(yv, color="white", lw=1.6, ls="--", alpha=0.75, zorder=5)
 
     ax.set_ylabel(names[dy], fontsize=FS_LABEL)
-    if which == "y":
+    if which == "y" or rate_only:
         ax.set_xlabel(names[dx], fontsize=FS_LABEL)
     ax.tick_params(labelsize=FS_TICK)
-    ax.set_title(
-        f"{pretty(env_name)}:  $\\lambda$={float(z['lbd']):g}, r={float(z['r']):g}, "
-        f"$w_{{lb}}$={float(z['w_lb']):g}, $w_{{ub}}$={float(z['w_ub']):g}",
-        fontsize=FS_TITLE, pad=14)
-    ax.legend(fontsize=FS_LEGEND, loc="upper right", framealpha=0.92)
+    # Env name only. The synthesis parameters (lbd, r, w_lb, w_ub) are a property
+    # of the shipped config, not of what the panel shows, and they crowded the
+    # one thing a reader needs to identify the figure by.
+    ax.set_title(pretty(env_name), fontsize=FS_TITLE, pad=14)
+    if k_show:
+        ax.legend(fontsize=FS_LEGEND, loc="upper right", framealpha=0.92)
+
+    if rate_only:
+        out = FIG_DIR / f"rate_{env_name}.svg"
+        fig.savefig(out, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[rate] wrote {out}  ({names[dx]} x {names[dy]}, lambda* spread "
+              f"{float(Z.max() - Z.min()):.3g})")
+        return out
 
     # ── the marginal, over the dim lambda* varies along ─────────────────────
     lim = ax.get_ylim() if which == "y" else ax.get_xlim()
@@ -362,7 +390,7 @@ def plot(env_name: str, *, n_traj: int = N_TRAJ_SHOWN,
                  transform=axd.transAxes, fontsize=FS_LEGEND - 3, color="#7f0f14",
                  ha="right", va="top")
 
-    out = FIG_DIR / f"minproj_{env_name}.png"
+    out = FIG_DIR / f"minproj_{env_name}.svg"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"[minproj] wrote {out}  ({names[dx]} x {names[dy]}, lambda* spread "
@@ -473,6 +501,9 @@ def main() -> int:
                    help="force which axis the x0 marginal is taken over "
                         "(default: whichever one lambda* varies along)")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--rate-only", "--rate_only", action="store_true",
+                   help="also write rate_<env>.svg: the state-dependent "
+                        "contraction rate alone, no rollouts or x0 marginal")
     a = p.parse_args()
 
     envs = [e.strip() for e in a.envs.split(",") if e.strip()]
@@ -483,6 +514,8 @@ def main() -> int:
         elif a.refresh_x0:
             refresh_x0(e, n_x0=a.n_x0, n_traj=a.n_traj, seed=a.seed)
         plot(e, n_traj=a.show_traj, axis=a.marginal_axis)
+        if a.rate_only:
+            plot(e, axis=a.marginal_axis, rate_only=True)
     return 0
 
 

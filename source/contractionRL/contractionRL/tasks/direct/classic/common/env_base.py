@@ -187,6 +187,14 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         self._fixed_uref = torch.zeros_like(self.uref)
         self._fixed_x0 = torch.zeros_like(self.x_t)
 
+        # How many episodes one reference integration serves. See
+        # _pooled_system_reset: system_reset's cost is a loop over the episode's
+        # max_episode_len timesteps that is vectorized over the batch, so drawing
+        # ref_pool_size references costs about what drawing one costs. 1 disables
+        # pooling and restores a fresh integration per reset.
+        self._ref_pool_size = int(env_config.get("ref_pool_size", 64) or 1)
+        self._ref_pool = None
+
         # The privileged critic-only `states` channel is gone: the critic now
         # reads the same {x, xrefs, urefs} observation as the actor and gets its
         # independence from its own architecture (phi/psi/combine — see
@@ -533,6 +541,47 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
             info["maha_tracking_error"] = self.init_maha_error.clone()
         return self.construct_state(self.x_t), info
 
+    def _pooled_system_reset(self, env_ids: torch.Tensor):
+        """``system_reset`` draws that share one reference integration.
+
+        ``system_reset``'s cost is dominated by ``_rollout_reference``, a loop
+        over the episode's ``max_episode_len`` timesteps that is vectorized over
+        the batch — so drawing 64 references costs about what drawing 1 costs.
+        Measured on car: one reset is 100.8 ms against 0.204 ms for a step, i.e.
+        493 steps' worth. That is affordable once per 500-step episode, but
+        ``terminate_out_of_box`` ends episodes long before ``max_episode_len``,
+        so the whole integration was being paid every few steps — training ran
+        53x slower with the box armed (0.27 it/s vs 14.4 it/s on car).
+
+        The draw is unchanged, only batched: ``define_initial_state`` and the
+        reference-weight draw read ``len(env_ids)`` and nothing else, so pooled
+        samples are the same iid samples. No classic env's ``system_reset``
+        indexes by ``env_ids``.
+
+        Two paths do depend on draw position and fall through to a direct call:
+        ``_held_out_weights`` indexes its bank by ``arange(n) % bank_size``, and
+        ``fix_ref_trajectories`` pins one episode per slot on its first reset.
+        """
+        n = len(env_ids)
+        if (self._ref_pool_size <= 1
+                or self.fix_ref_trajectories
+                or getattr(self, "_held_out_weights", None) is not None):
+            return self.system_reset(env_ids)
+
+        pool = self._ref_pool
+        if pool is None or pool["cursor"] + n > pool["x0"].shape[0]:
+            batch = max(self._ref_pool_size, n)
+            # Only the length is read; see the docstring.
+            x0, xref, uref, length = self.system_reset(env_ids.new_zeros(batch))
+            pool = {"x0": x0, "xref": xref, "uref": uref,
+                    "length": length, "cursor": 0}
+            self._ref_pool = pool
+
+        c = pool["cursor"]
+        pool["cursor"] = c + n
+        return (pool["x0"][c:c + n], pool["xref"][c:c + n],
+                pool["uref"][c:c + n], pool["length"])
+
     def reset_idx(self, env_ids: torch.Tensor):
         if len(env_ids) == 0:
             return
@@ -540,7 +589,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         self.time_steps[env_ids] = 0
         self.episode_reward[env_ids] = 0.0
 
-        x_0, xref_arr, uref_arr, _ = self.system_reset(env_ids)
+        x_0, xref_arr, uref_arr, _ = self._pooled_system_reset(env_ids)
         xref_arr = torch.clamp(xref_arr, self.X_MIN, self.X_MAX)
         # x_0 = xref_0 + xe_0 must respect the box too. The reference is clamped on
         # the line above; the initial STATE was not, and xe_0 is drawn from XE_INIT
