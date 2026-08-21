@@ -1,0 +1,6 @@
+{
+  "//": "bgIsolation none: this repo is worked on directly in master by request. A background job would otherwise auto-create a git worktree, and edits made there are invisible in the checkout until the branch is merged -- which already caused a round of confusion (figures/ looked untouched because the deletions were in .claude/worktrees/).",
+  "worktree": {
+    "bgIsolation": "none"
+  }
+}

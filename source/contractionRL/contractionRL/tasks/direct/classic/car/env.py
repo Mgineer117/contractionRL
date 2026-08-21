@@ -55,8 +55,21 @@ X_TERMINATION_MAX = list(X_MAX)
 
 XREF_INIT_MIN = [-POS_SPREAD, -POS_SPREAD, -1.0, 1.5]
 XREF_INIT_MAX = [POS_SPREAD, POS_SPREAD, 1.0, 1.5]
-XE_INIT_MIN = [-1.0, -1.0, -1.0, -1.0]
-XE_INIT_MAX = [1.0, 1.0, 1.0, 1.0]
+# Velocity perturbation is +-0.5, not +-1.0, and the reason is the box.
+#
+# x_0 = xref_0 + xe_0 is clamped to [X_MIN, X_MAX] (env_base.reset), and xref's
+# velocity is PINNED at 1.5 against a [1.0, 2.0] velocity box. At +-1.0 the sum
+# spanned [0.5, 2.5], so the clamp folded a quarter of the mass onto v = 1.0 and
+# another quarter onto v = 2.0: measured 50.6% of episodes started pinned exactly
+# on a box face. That is a worse failure than the out-of-box starts the clamp was
+# added to stop -- half the runs shared two identical initial velocities, and the
+# CMG is least accurate at the box edge where it has data on one side only.
+#
+# +-0.5 makes the sum exactly [1.0, 2.0]: uniform, interior, nothing to clamp.
+# The other three components keep +-1.0 -- position has POS_BOUND ~22 of room and
+# yaw wraps, so neither ever reaches its bound.
+XE_INIT_MIN = [-1.0, -1.0, -1.0, -0.5]
+XE_INIT_MAX = [1.0, 1.0, 1.0, 0.5]
 lim = 1.0
 XE_MIN = [-lim, -lim, -lim, -lim]
 XE_MAX = [lim, lim, lim, lim]

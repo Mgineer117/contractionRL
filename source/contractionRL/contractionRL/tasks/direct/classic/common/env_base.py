@@ -542,6 +542,19 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
 
         x_0, xref_arr, uref_arr, _ = self.system_reset(env_ids)
         xref_arr = torch.clamp(xref_arr, self.X_MIN, self.X_MAX)
+        # x_0 = xref_0 + xe_0 must respect the box too. The reference is clamped on
+        # the line above; the initial STATE was not, and xe_0 is drawn from XE_INIT
+        # independently of where xref sits, so the sum routinely left the box.
+        # Measured on car: xref's velocity is pinned at 1.5 while xe_0 draws
+        # U[-1,1], giving x_0 velocities across [0.5, 2.5] against a [1.0, 2.0]
+        # box — 44% of episodes began outside it.
+        #
+        # Not a cosmetic bound. The CMG is regressed over the box only, so outside
+        # it M(x) is an extrapolation and the Mahalanobis reward is computed from a
+        # metric that certifies nothing there. Every Stability/* metric is also
+        # normalized by the error at x_0, so out-of-box starts move the very
+        # denominator the runs are compared on.
+        x_0 = torch.clamp(x_0, self.X_MIN, self.X_MAX)
         if self.fix_ref_trajectories:
             # First reset of a slot mints its permanent episode — reference and
             # initial state; later resets discard the freshly sampled ones and

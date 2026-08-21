@@ -45,6 +45,7 @@ FS_LEGEND = 15
 FS_CBAR = 16
 
 LINEWIDTH = 3.2          # trajectory stroke
+N_TRAJ_SHOWN = 2         # rollouts drawn; more than this reads as a tangle
 ARROW_FRAC = 0.026       # arrow length as a fraction of the panel
 ARROW_WIDTH = 0.0075     # arrow shaft width (axes fraction)
 
@@ -58,11 +59,8 @@ def pretty(env: str) -> str:
 
 def generate(env_name: str, *, grid: int, n_other: int, n_x0: int,
              n_traj: int, seed: int) -> pathlib.Path:
-    import gymnasium as gym
-    import torch
-
     import contractionRL.tasks.direct.classic  # noqa: F401
-    from contractionRL.agents.skrl.ncm_synthesis import sample_state_box
+    import gymnasium as gym
     from lambda_subsets import active_dims_auto, jacobians, max_lambda  # noqa: E402
 
     env = gym.make(f"classic-{env_name}-v0", num_envs=n_traj, device="cpu").unwrapped
@@ -100,7 +98,13 @@ def generate(env_name: str, *, grid: int, n_other: int, n_x0: int,
             Z[j, i] = float(np.min(lams))
         print(f"[minproj]   column {i + 1}/{grid} done", flush=True)
 
-    x0 = sample_state_box(env.X_MIN, env.X_MAX, n=n_x0, seed=seed).astype(np.float64)
+    # x0 from the env's OWN reset, not a uniform box draw. reset() takes
+    # x_0 = clamp(xref_0, box) + xe_0, and for car_weak xref's velocity is drawn
+    # from [0.3, 1.5] specifically so the plant sits in the weak-authority region
+    # (sigma = min(1, v) = v < 1). Sampling uniformly over the box would erase the
+    # very concentration this figure is supposed to show, and would also not match
+    # the envs whose cached x0 was reset-drawn.
+    x0 = _reset_x0(env, n_x0, seed=seed)
 
     # Trajectories: the env's own reference rollout, which is what the panel is
     # about — where the closed loop actually goes, not where the box allows.
@@ -116,6 +120,52 @@ def generate(env_name: str, *, grid: int, n_other: int, n_x0: int,
              x_min=x_min, x_max=x_max)
     print(f"[minproj] wrote {out}")
     return out
+
+
+def refresh_x0(env_name: str, *, n_x0: int, n_traj: int, seed: int) -> pathlib.Path:
+    """Rewrite x0/traj in the cached npz from the CURRENT env; keep Z.
+
+    lambda* depends on the plant and the envelope, so a change to how episodes
+    start cannot move it. Recomputing the grid to pick up a new x0 draw would burn
+    thousands of SDP solves for an identical result.
+    """
+    import contractionRL.tasks.direct.classic  # noqa: F401
+    import gymnasium as gym
+
+    src = DATA_DIR / f"minproj_{env_name}.npz"
+    if not src.exists():
+        raise SystemExit(f"nothing cached at {src} — use --generate")
+    old = dict(np.load(src, allow_pickle=True))
+
+    env = gym.make(f"classic-{env_name}-v0", num_envs=n_traj, device="cpu").unwrapped
+    lo = env.X_MIN.detach().cpu().numpy().astype(np.float64)
+    hi = env.X_MAX.detach().cpu().numpy().astype(np.float64)
+    x0 = _reset_x0(env, n_x0, seed=seed)
+    out_frac = float(((x0 < lo - 1e-6) | (x0 > hi + 1e-6)).any(axis=1).mean())
+
+    old["x0"] = x0
+    old["traj"] = _rollout(env, n_traj)
+    old["x_min"], old["x_max"] = lo, hi
+    np.savez(src, **old)
+    print(f"[minproj] refreshed x0/traj in {src}  "
+          f"({out_frac:.2%} of x0 outside the box)")
+    return src
+
+
+def _reset_x0(env, n: int, *, seed: int = 0) -> np.ndarray:
+    """``n`` initial states as the env actually produces them, via repeated reset.
+
+    Batched: one reset yields ``num_envs`` states, so this loops until it has n.
+    """
+    out = []
+    k = 0
+    while sum(len(o) for o in out) < n:
+        env.reset(seed=seed + k)
+        out.append(env.x_t.detach().cpu().numpy().copy())
+        k += 1
+        if k > 4000:                     # a stuck env must not spin forever
+            break
+    return np.concatenate(out, axis=0)[:n].astype(np.float64)
 
 
 def _cm_cfg(env_name: str) -> dict:
@@ -145,7 +195,20 @@ def _rollout(env, n_traj: int) -> np.ndarray:
 
 # ─────────────────────────────── plot ────────────────────────────────────── #
 
-def plot(env_name: str) -> pathlib.Path:
+def marginal_axis(Z: np.ndarray) -> str:
+    """"x" or "y": the axis lambda* actually varies along.
+
+    Z is indexed [y, x]. Comparing the peak-to-peak of the per-axis means, rather
+    than the raw spread, keeps a single noisy cell from deciding the layout.
+    A flat field falls through to "x", where the panel is wider and easier to read.
+    """
+    var_x = float(np.ptp(Z.mean(axis=0)))
+    var_y = float(np.ptp(Z.mean(axis=1)))
+    return "y" if var_y > var_x else "x"
+
+
+def plot(env_name: str, *, n_traj: int = N_TRAJ_SHOWN,
+         axis: str | None = None) -> pathlib.Path:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -158,101 +221,178 @@ def plot(env_name: str) -> pathlib.Path:
     dims = z["dims"]
     names = [str(s) for s in z["state_names"]]
     dx, dy = int(dims[0]), int(dims[1])
+    ex, ey = _edges(gx), _edges(gy)
+    traj, x0 = z["traj"], z["x0"]
+    k_show = min(int(n_traj), traj.shape[0])
+    shown = traj[:k_show]
 
-    fig, ax = plt.subplots(figsize=(9.5, 7.6))
+    # Always put the dim lambda* varies along on the X axis, transposing the slice
+    # when it is the second one. That keeps ONE layout for every env -- field on
+    # top, marginal below over x, vertical connectors -- while still giving each
+    # env the marginal that carries information. car_weak is why: its lambda* is
+    # flat in yaw and swings 2.78 across vel, so vel becomes its x-axis.
+    which = axis or marginal_axis(Z)
+    if which == "y":
+        Z = Z.T
+        dx, dy = dy, dx
+        gx, gy = gy, gx
+        ex, ey = _edges(gx), _edges(gy)
+    md = dx                                   # the marginal is always over x now
 
-    # λ*(x) background. pcolormesh over the cell EDGES, not centres, so a cell's
-    # colour covers the region it was computed for.
-    ex = _edges(gx)
-    ey = _edges(gy)
-    mesh = ax.pcolormesh(ex, ey, Z, cmap="viridis", shading="flat")
-    cb = fig.colorbar(mesh, ax=ax, pad=0.02)
-    # A constant field is stated on the colorbar, not the title: it is a fact
-    # about lambda*, and the old figures wasted title width on it while
-    # matplotlib's offset text ("1e-14+4.88") overlapped the title anyway.
-    lab = r"$\lambda^*(x)$"
+    # The colorbar gets its OWN column spanning only the top row, so both panels
+    # keep an identical width. Attaching it to the top axes instead (colorbar(ax=ax))
+    # steals width from that axes alone, and then a dotted vertical at the same
+    # data value lands at a different PIXEL in each panel -- which defeats the
+    # entire point of the shared axis.
+    fig = plt.figure(figsize=(10.6, 9.4))
+    gs = fig.add_gridspec(2, 2, height_ratios=[3.1, 1.0], width_ratios=[1.0, 0.035],
+                          hspace=0.06, wspace=0.03)
+    ax = fig.add_subplot(gs[0, 0])
+    axd = fig.add_subplot(gs[1, 0], sharex=ax)
+    cax = fig.add_subplot(gs[0, 1])
+    ax.tick_params(labelbottom=False)
+    which = "x"                               # one code path from here down
+
+    # A constant field gets a NEUTRAL flat colour, not a point on viridis. Mapping
+    # a single value through the colormap put car and quadrotor at the very bottom
+    # of the scale, so their panels rendered dark purple -- which reads as "low
+    # lambda*" beside the varying-field panels where purple genuinely is low.
     if float(Z.max() - Z.min()) < 1e-6:
-        lab += f"  (constant {float(Z.mean()):.4g})"
-    cb.set_label(lab, fontsize=FS_CBAR)
-    cb.ax.tick_params(labelsize=FS_TICK)
-    # A near-constant field makes matplotlib print an offset like "1e-14+4.88",
-    # which collided with the title in the old figures and told the reader
-    # nothing. Say "constant" once instead.
-    cb.formatter.set_useOffset(False)
-    cb.update_ticks()
+        mesh = ax.pcolormesh(ex, ey, np.zeros_like(Z), cmap="Greys",
+                             vmin=0.0, vmax=1.0, shading="flat")
+    else:
+        mesh = ax.pcolormesh(ex, ey, Z, cmap="viridis", shading="flat")
+    # A constant field gets NO colorbar. Normalizing a colormap around a single
+    # value invents a range (car showed 4.4-5.3 for a field that is 4.884
+    # everywhere) and invites reading a gradient that does not exist. The value is
+    # stated on the panel instead. The colorbar COLUMN is still reserved and just
+    # switched off, so all five figures keep identical panel geometry and can be
+    # laid side by side.
+    is_const = float(Z.max() - Z.min()) < 1e-6
+    if is_const:
+        cax.axis("off")
+        ax.text(0.5, 0.045,
+                rf"$\lambda^*(x) = {float(Z.mean()):.4g}$  everywhere",
+                transform=ax.transAxes, ha="center", va="bottom",
+                fontsize=FS_LABEL, color="0.10",
+                bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="0.55",
+                          alpha=0.92), zorder=8)
+    else:
+        cb = fig.colorbar(mesh, cax=cax)
+        cb.set_label(r"$\lambda^*(x)$", fontsize=FS_CBAR)
+        cb.ax.tick_params(labelsize=FS_TICK)
+        cb.formatter.set_useOffset(False)
+        cb.update_ticks()
 
-    # x0 as a DENSITY, not 2000 markers.
-    x0 = z["x0"]
-    _density(ax, x0[:, dx], x0[:, dy], gx, gy)
-
-    # Trajectories, thicker, with direction arrows.
-    traj = z["traj"]
-    for k in range(traj.shape[0]):
+    for k in range(k_show):
         tx, ty = traj[k, :, dx], traj[k, :, dy]
-        ax.plot(tx, ty, "-", color="#d62728", lw=LINEWIDTH, alpha=0.9,
+        ax.plot(tx, ty, "-", color="#d62728", lw=LINEWIDTH, alpha=0.92,
                 zorder=4, label=r"$x(t)$" if k == 0 else None)
         _arrows(ax, tx, ty)
+        ax.plot(tx[0], ty[0], "o", ms=11, mfc="white", mec="#7f0f14", mew=2.4,
+                zorder=7, label=r"$x_0$ of shown runs" if k == 0 else None)
 
-    ax.set_xlabel(names[dx], fontsize=FS_LABEL)
+    # Axes cover the union of the field and what is drawn on it: clipping to the
+    # box hides every trajectory start outside it (on car, about half of them).
+    lo_y = min(ey[0], float(np.min(shown[:, :, dy])))
+    hi_y = max(ey[-1], float(np.max(shown[:, :, dy])))
+    lo_x = min(ex[0], float(np.min(shown[:, :, dx])))
+    hi_x = max(ex[-1], float(np.max(shown[:, :, dx])))
+    pad_y, pad_x = 0.04 * (hi_y - lo_y), 0.02 * (hi_x - lo_x)
+    ax.set_xlim(lo_x - pad_x, hi_x + pad_x)
+    ax.set_ylim(lo_y - pad_y, hi_y + pad_y)
+    # Mark the certified box, so the blank margin is not mistaken for field.
+    for yv in (ey[0], ey[-1]):
+        ax.axhline(yv, color="white", lw=1.6, ls="--", alpha=0.75, zorder=5)
+
     ax.set_ylabel(names[dy], fontsize=FS_LABEL)
+    if which == "y":
+        ax.set_xlabel(names[dx], fontsize=FS_LABEL)
     ax.tick_params(labelsize=FS_TICK)
-    ax.set_xlim(ex[0], ex[-1])
-    ax.set_ylim(ey[0], ey[-1])
-
-    spread = float(Z.max() - Z.min())
     ax.set_title(
         f"{pretty(env_name)}:  $\\lambda$={float(z['lbd']):g}, r={float(z['r']):g}, "
         f"$w_{{lb}}$={float(z['w_lb']):g}, $w_{{ub}}$={float(z['w_ub']):g}",
         fontsize=FS_TITLE, pad=14)
-    ax.legend(fontsize=FS_LEGEND, loc="upper right", framealpha=0.9)
+    ax.legend(fontsize=FS_LEGEND, loc="upper right", framealpha=0.92)
+
+    # ── the marginal, over the dim lambda* varies along ─────────────────────
+    lim = ax.get_ylim() if which == "y" else ax.get_xlim()
+    m = x0[:, md]
+    keep = (m >= lim[0]) & (m <= lim[1])
+    dens, centres = _marginal(m[keep], *lim)
+    if which == "y":
+        axd.fill_betweenx(centres, 0.0, dens, color="0.45", alpha=0.55, zorder=2)
+        axd.plot(dens, centres, color="0.15", lw=2.0, zorder=3)
+        axd.set_xlabel(rf"$x_0$ density ({names[md]})", fontsize=FS_LABEL - 2)
+        axd.set_xlim(left=0.0)
+        axd.set_ylim(*lim)
+    else:
+        axd.fill_between(centres, 0.0, dens, color="0.45", alpha=0.55, zorder=2)
+        axd.plot(centres, dens, color="0.15", lw=2.0, zorder=3)
+        axd.set_xlabel(names[md], fontsize=FS_LABEL)
+        axd.set_ylabel(r"$x_0$ density", fontsize=FS_LABEL)
+        axd.set_ylim(bottom=0.0)
+        axd.set_xlim(*lim)
+    axd.tick_params(labelsize=FS_TICK)
+
+    # Connectors, oriented to match: a line from each shown rollout's start to
+    # its place in the distribution.
+    for k in range(k_show):
+        start_val = traj[k, 0, md]
+        if which == "y":
+            for a in (ax, axd):
+                a.axhline(start_val, ls=":", lw=1.9, color="#7f0f14", alpha=0.85,
+                          zorder=6)
+            axd.plot(0.0, start_val, "o", ms=9, mfc="white", mec="#7f0f14",
+                     mew=2.2, zorder=7, clip_on=False)
+        else:
+            for a in (ax, axd):
+                a.axvline(start_val, ls=":", lw=1.9, color="#7f0f14", alpha=0.85,
+                          zorder=6)
+            axd.plot(start_val, 0.0, "o", ms=9, mfc="white", mec="#7f0f14",
+                     mew=2.2, zorder=7, clip_on=False)
+
+    out_box = ((x0[:, dx] < ex[0]) | (x0[:, dx] > ex[-1])
+               | (x0[:, dy] < ey[0]) | (x0[:, dy] > ey[-1]))
+    frac = float(out_box.mean())
+    if frac > 0:
+        # Upper RIGHT: the marginal's left shoulder is where the interesting mass
+        # sits on the weak-authority envs, and the note was landing on top of it.
+        axd.text(0.985, 0.86, f"{frac:.0%} of $x_0$ outside the certified box",
+                 transform=axd.transAxes, fontsize=FS_LEGEND - 3, color="#7f0f14",
+                 ha="right", va="top")
 
     out = FIG_DIR / f"minproj_{env_name}.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"[minproj] wrote {out}  ({names[dx]} x {names[dy]}, "
-          f"lambda* spread {spread:.3g})")
+    print(f"[minproj] wrote {out}  ({names[dx]} x {names[dy]}, lambda* spread "
+          f"{float(Z.max() - Z.min()):.3g}, marginal over {names[md]} "
+          f"({which}-axis), {k_show} trajectories, {frac:.0%} of x0 outside box)")
     return out
+
+
+def _marginal(u: np.ndarray, lo: float, hi: float, bins: int = 42):
+    """Smoothed 1D histogram of x0 along the shared axis.
+
+    A histogram rather than a KDE: no bandwidth to defend, and the reset draw is
+    a uniform box perturbation, so the honest shape is flat-topped with real
+    edges — a KDE would round exactly the corners that matter.
+    """
+    H, edges = np.histogram(u, bins=bins, range=(lo, hi), density=True)
+    centres = 0.5 * (edges[:-1] + edges[1:])
+    k = np.array([1.0, 2.0, 3.0, 2.0, 1.0])
+    k /= k.sum()
+    num = np.convolve(H, k, mode="same")
+    # Same edge correction as the 2D case: convolve zero-pads, which would sag
+    # the two ends and invent a taper the samples do not have.
+    den = np.convolve(np.ones_like(H), k, mode="same")
+    return num / np.where(den > 0, den, 1.0), centres
 
 
 def _edges(c: np.ndarray) -> np.ndarray:
     """Cell centres -> edges, so pcolormesh colours the region each cell covers."""
     step = (c[-1] - c[0]) / max(len(c) - 1, 1)
     return np.concatenate([c - step / 2.0, [c[-1] + step / 2.0]])
-
-
-def _density(ax, u, v, gx, gy) -> None:
-    """Filled-contour density of x0 with a light outline, plus one legend proxy."""
-    import matplotlib.pyplot as plt  # noqa: F401
-    from matplotlib.lines import Line2D
-    lo_u, hi_u = _edges(gx)[[0, -1]]
-    lo_v, hi_v = _edges(gy)[[0, -1]]
-    inside = (u >= lo_u) & (u <= hi_u) & (v >= lo_v) & (v <= hi_v)
-    u, v = u[inside], v[inside]
-    if u.size < 8:
-        ax.scatter(u, v, s=26, c="white", edgecolors="k", zorder=5,
-                   label=r"$x_0$")
-        return
-    # 2D histogram, smoothed by the contour interpolation itself. A histogram
-    # rather than a KDE: no bandwidth to justify, and the reset draw is uniform
-    # over a box, so the honest picture is "flat inside, zero outside" and a KDE
-    # would round the corners it is meant to show.
-    # 12 bins, not 18: at n=2000 an 18x18 grid holds ~6 counts per bin, so the
-    # contours trace Poisson noise and invent structure. Coarser bins plus one
-    # smoothing pass, and the levels start at 0 so a uniform box draw -- which is
-    # exactly what reset() produces -- actually looks uniform instead of mottled.
-    H, ue, ve = np.histogram2d(u, v, bins=(12, 12),
-                               range=[[lo_u, hi_u], [lo_v, hi_v]])
-    uc = 0.5 * (ue[:-1] + ue[1:])
-    vc = 0.5 * (ve[:-1] + ve[1:])
-    dens = _smooth(H.T / max(H.sum(), 1.0))
-    if dens.max() <= 0:
-        return
-    levels = np.linspace(0.0, dens.max(), 7)
-    ax.contourf(uc, vc, dens, levels=levels, cmap="Greys", alpha=0.4, zorder=2)
-    ax.contour(uc, vc, dens, levels=levels[1:], colors="white",
-               linewidths=1.0, alpha=0.6, zorder=3)
-    ax.plot([], [], marker="s", ls="none", ms=12, color="0.35",
-            label=r"$x_0$ density")
 
 
 def _smooth(a: np.ndarray) -> np.ndarray:
@@ -316,12 +456,22 @@ def main() -> int:
                    help="comma-separated short env names")
     p.add_argument("--generate", action="store_true",
                    help="recompute the lambda* grid (expensive) before plotting")
+    p.add_argument("--refresh-x0", "--refresh_x0", action="store_true",
+                   help="redraw x0/traj from the current env, keeping the cached "
+                        "lambda* grid — the cheap fix when reset() changed but the "
+                        "plant and envelope did not")
     p.add_argument("--grid", type=int, default=15)
     p.add_argument("--n-other", "--n_other", type=int, default=8,
                    help="samples of the projected-out dims per cell (the min is "
                         "taken over these)")
     p.add_argument("--n-x0", "--n_x0", type=int, default=2000)
     p.add_argument("--n-traj", "--n_traj", type=int, default=10)
+    p.add_argument("--show-traj", "--show_traj", type=int, default=N_TRAJ_SHOWN,
+                   help="rollouts to draw (the npz may hold more)")
+    p.add_argument("--marginal-axis", "--marginal_axis", choices=["x", "y"],
+                   default=None,
+                   help="force which axis the x0 marginal is taken over "
+                        "(default: whichever one lambda* varies along)")
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args()
 
@@ -330,7 +480,9 @@ def main() -> int:
         if a.generate or not (DATA_DIR / f"minproj_{e}.npz").exists():
             generate(e, grid=a.grid, n_other=a.n_other, n_x0=a.n_x0,
                      n_traj=a.n_traj, seed=a.seed)
-        plot(e)
+        elif a.refresh_x0:
+            refresh_x0(e, n_x0=a.n_x0, n_traj=a.n_traj, seed=a.seed)
+        plot(e, n_traj=a.show_traj, axis=a.marginal_axis)
     return 0
 
 
