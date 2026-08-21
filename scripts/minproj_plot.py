@@ -195,12 +195,21 @@ def _rollout(env, n_traj: int) -> np.ndarray:
 
 # ─────────────────────────────── plot ────────────────────────────────────── #
 
+# Envs whose layout is pinned by hand rather than inferred. Only needed where
+# lambda* is CONSTANT: with a flat field there is no "axis lambda* varies along"
+# to detect, so marginal_axis' tie-break decides the layout arbitrarily. car is
+# pinned to put vel on x, matching car_weak -- the two are the same plant and
+# read as a pair, so they must not come out transposed relative to each other.
+AXIS_OVERRIDE = {"car": "y"}
+
+
 def marginal_axis(Z: np.ndarray) -> str:
     """"x" or "y": the axis lambda* actually varies along.
 
     Z is indexed [y, x]. Comparing the peak-to-peak of the per-axis means, rather
     than the raw spread, keeps a single noisy cell from deciding the layout.
-    A flat field falls through to "x", where the panel is wider and easier to read.
+    A flat field falls through to "x", where the panel is wider and easier to read
+    — see AXIS_OVERRIDE for the envs where that tie-break is not the wanted one.
     """
     var_x = float(np.ptp(Z.mean(axis=0)))
     var_y = float(np.ptp(Z.mean(axis=1)))
@@ -237,7 +246,7 @@ def plot(env_name: str, *, n_traj: int = N_TRAJ_SHOWN,
     # top, marginal below over x, vertical connectors -- while still giving each
     # env the marginal that carries information. car_weak is why: its lambda* is
     # flat in yaw and swings 2.78 across vel, so vel becomes its x-axis.
-    which = axis or marginal_axis(Z)
+    which = axis or AXIS_OVERRIDE.get(env_name) or marginal_axis(Z)
     if which == "y":
         Z = Z.T
         dx, dy = dy, dx
