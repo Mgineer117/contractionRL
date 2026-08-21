@@ -401,7 +401,7 @@ def build_cm_dataset(
     # The pointwise program below solves an independent SDP per state with its own
     # ν/χ and no Ẇ term, so its "feasibility" is a per-state statement, not a
     # contraction certificate: it can report 100% at a λ the joint program cannot
-    # certify at all (measured on car_weak). C2RL then regressed its frozen CMG
+    # certify at all (measured on car_v1). C2RL then regressed its frozen CMG
     # onto that, and every downstream rate claim inherited the weaker program.
     # This is the same cvstem_joint that find_uniform_lambda searches with, so the
     # (lbd, r) it certifies is the one actually solved here.

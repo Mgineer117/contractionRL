@@ -126,6 +126,12 @@ METRIC_KINDS = ("ccm", "cvstem_pretrained", "cvstem_online", "random")
 # Environment / scenario
 # ─────────────────────────────────────────────────────────────────────────── #
 
+
+def _env_id(name: str) -> str:
+    """Short name -> gym id, via the one map the classic package owns."""
+    from contractionRL.tasks.direct.classic import env_id
+    return env_id(name)
+
 def make_env(env_name: str, seed: int, time_bound: float | None = None):
     """Instantiate a classic env (num_envs=1, cpu) with a seeded reset.
 
@@ -138,7 +144,7 @@ def make_env(env_name: str, seed: int, time_bound: float | None = None):
     torch.manual_seed(seed)
     np.random.seed(seed)
     env = gym.make(
-        f"classic-{env_name}-v0",
+        _env_id(env_name),
         num_envs=1,
         device="cpu",
         disable_env_checker=True,

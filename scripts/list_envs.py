@@ -36,6 +36,12 @@ DIRECT_DIR = ROOT / "source/contractionRL/contractionRL/tasks/direct"
 N_PROBE = 300
 
 
+
+def _env_id(name: str) -> str:
+    """Short name -> gym id, via the one map the classic package owns."""
+    from contractionRL.tasks.direct.classic import env_id
+    return env_id(name)
+
 def classic_names() -> list[str]:
     return sorted(p.name for p in CLASSIC_DIR.iterdir()
                   if p.is_dir() and (p / "env.py").exists())
@@ -52,7 +58,7 @@ def probe(task: str) -> dict:
     import gymnasium as gym
     import torch
 
-    env = gym.make(f"classic-{task}-v0", num_envs=1, device="cpu").unwrapped
+    env = gym.make(_env_id(task), num_envs=1, device="cpu").unwrapped
     n, m = int(env.num_dim_x), int(env.num_dim_control)
     lo, hi = env.X_MIN.numpy().astype(float), env.X_MAX.numpy().astype(float)
     xs = np.random.default_rng(0).uniform(lo, hi, size=(N_PROBE, n))

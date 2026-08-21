@@ -137,7 +137,7 @@ else
 fi
 
 # ── Env ─────────────────────────────────────────────────────────────────── #
-CLASSIC_ENVS=("classic-car-v0" "classic-car_weak-v0" "classic-cartpole-v0" "classic-segway-v0" "classic-turtlebot-v0" "classic-quadrotor-v0")
+CLASSIC_ENVS=("classic-car-v0" "classic-car-v1" "classic-cartpole-v0" "classic-segway-v0" "classic-turtlebot-v0" "classic-quadrotor-v0")
 ISAAC_ENVS=("Humanoid-PathTracking-v0" "Humanoid-VelTracking-v0" "Manipulator-PathTracking-v0" "Manipulator-VelTracking-v0" "Quadruped-PathTracking-v0" "Quadruped-VelTracking-v0")
 
 if [[ -z "$ENV_ARG" ]]; then
@@ -150,7 +150,7 @@ if [[ "$ENV_ARG" == "all" ]]; then
 else
     case "$ENV_ARG" in
         car|classic-car-v0)             ENVS=("classic-car-v0") ;;
-        car_weak|classic-car_weak-v0)   ENVS=("classic-car_weak-v0") ;;
+        car_v1|classic-car-v1)   ENVS=("classic-car-v1") ;;
         cartpole|classic-cartpole-v0)   ENVS=("classic-cartpole-v0") ;;
         segway|classic-segway-v0)       ENVS=("classic-segway-v0") ;;
         turtlebot|classic-turtlebot-v0) ENVS=("classic-turtlebot-v0") ;;

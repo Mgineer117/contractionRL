@@ -50,8 +50,22 @@ ARROW_FRAC = 0.026       # arrow length as a fraction of the panel
 ARROW_WIDTH = 0.0075     # arrow shaft width (axes fraction)
 
 
+# Title text, where capitalizing the short name is not what should be shown.
+# The car pair is titled v0/v1 on BOTH sides: "Car" against "Car v1" would read
+# as a base case beside a variant, when they are two settings of one plant.
+DISPLAY_NAME = {"car": "Car v0", "car_v1": "Car v1"}
+
+
+def env_id(env: str) -> str:
+    """Short name -> gym id, via the one map the classic package owns."""
+    from contractionRL.tasks.direct.classic import env_id as _resolve
+    return _resolve(env)
+
+
 def pretty(env: str) -> str:
-    """car_weak -> Car_weak? No: Car Weak. Underscores are word breaks here."""
+    """Short name -> title text. two_link_arm -> Two Link Arm; car_v1 -> Car v1."""
+    if env in DISPLAY_NAME:
+        return DISPLAY_NAME[env]
     return " ".join(w.capitalize() for w in env.split("_"))
 
 
@@ -63,7 +77,7 @@ def generate(env_name: str, *, grid: int, n_other: int, n_x0: int,
     import gymnasium as gym
     from lambda_subsets import active_dims_auto, jacobians, max_lambda  # noqa: E402
 
-    env = gym.make(f"classic-{env_name}-v0", num_envs=n_traj, device="cpu").unwrapped
+    env = gym.make(env_id(env_name), num_envs=n_traj, device="cpu").unwrapped
     x_min = env.X_MIN.detach().cpu().numpy().astype(np.float64)
     x_max = env.X_MAX.detach().cpu().numpy().astype(np.float64)
 
@@ -99,7 +113,7 @@ def generate(env_name: str, *, grid: int, n_other: int, n_x0: int,
         print(f"[minproj]   column {i + 1}/{grid} done", flush=True)
 
     # x0 from the env's OWN reset, not a uniform box draw. reset() takes
-    # x_0 = clamp(xref_0, box) + xe_0, and for car_weak xref's velocity is drawn
+    # x_0 = clamp(xref_0, box) + xe_0, and for car_v1 xref's velocity is drawn
     # from [0.3, 1.5] specifically so the plant sits in the weak-authority region
     # (sigma = min(1, v) = v < 1). Sampling uniformly over the box would erase the
     # very concentration this figure is supposed to show, and would also not match
@@ -137,7 +151,7 @@ def refresh_x0(env_name: str, *, n_x0: int, n_traj: int, seed: int) -> pathlib.P
         raise SystemExit(f"nothing cached at {src} — use --generate")
     old = dict(np.load(src, allow_pickle=True))
 
-    env = gym.make(f"classic-{env_name}-v0", num_envs=n_traj, device="cpu").unwrapped
+    env = gym.make(env_id(env_name), num_envs=n_traj, device="cpu").unwrapped
     lo = env.X_MIN.detach().cpu().numpy().astype(np.float64)
     hi = env.X_MAX.detach().cpu().numpy().astype(np.float64)
     x0 = _reset_x0(env, n_x0, seed=seed)
@@ -198,7 +212,7 @@ def _rollout(env, n_traj: int) -> np.ndarray:
 # Envs whose layout is pinned by hand rather than inferred. Only needed where
 # lambda* is CONSTANT: with a flat field there is no "axis lambda* varies along"
 # to detect, so marginal_axis' tie-break decides the layout arbitrarily. car is
-# pinned to put vel on x, matching car_weak -- the two are the same plant and
+# pinned to put vel on x, matching car_v1 -- the two are the same plant and
 # read as a pair, so they must not come out transposed relative to each other.
 AXIS_OVERRIDE = {"car": "y"}
 
@@ -244,7 +258,7 @@ def plot(env_name: str, *, n_traj: int = N_TRAJ_SHOWN,
     # Always put the dim lambda* varies along on the X axis, transposing the slice
     # when it is the second one. That keeps ONE layout for every env -- field on
     # top, marginal below over x, vertical connectors -- while still giving each
-    # env the marginal that carries information. car_weak is why: its lambda* is
+    # env the marginal that carries information. car_v1 is why: its lambda* is
     # flat in yaw and swings 2.78 across vel, so vel becomes its x-axis.
     which = axis or AXIS_OVERRIDE.get(env_name) or marginal_axis(Z)
     if which == "y":
@@ -489,7 +503,7 @@ def _arrows(ax, tx, ty, every: int = 45) -> None:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--envs", default="car,car_weak,segway,cartpole,quadrotor",
+    p.add_argument("--envs", default="car,car_v1,segway,cartpole,quadrotor",
                    help="comma-separated short env names")
     p.add_argument("--generate", action="store_true",
                    help="recompute the lambda* grid (expensive) before plotting")

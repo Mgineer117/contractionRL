@@ -128,7 +128,7 @@ ccc0378, against 84.8 s locally). Quote the cluster column when sizing a wall:
 
 | plant | x_dim | exponent | N=10000 local | N=10000 **on cluster** |
 |---|---|---|---|---|
-| car (and car_weak, cartpole, segway) | 4 | 1.91 | ~11 h | **~30 h** |
+| car (and car_v1, cartpole, segway) | 4 | 1.91 | ~11 h | **~30 h** |
 | quadrotor | 10 | 1.97 | ~74 h | **~197 h (8.2 d)** |
 
 Getting this wrong is expensive and it already happened: three 4-dim builds were

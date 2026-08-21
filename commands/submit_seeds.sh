@@ -9,17 +9,17 @@
 # --parallel 5, and the two envs train for different lengths (their yamls say
 # 100k and 300k), so:
 #   car       100k -> 6.5 h/run  x 2 waves of 5 = ~13 h  -> 24 h is fine
-#   car_weak  300k -> 19.4 h/run x 2 waves of 5 = ~39 h  -> 24 h TIMES OUT
-# car_weak therefore gets 2 days, which every partition here allows (csl 7 d,
+#   car_v1  300k -> 19.4 h/run x 2 waves of 5 = ~39 h  -> 24 h TIMES OUT
+# car_v1 therefore gets 2 days, which every partition here allows (csl 7 d,
 # IllinoisComputes-GPU 3 d, eng-research-gpu exactly 2 d). run_seeds.sh has no
 # resume, so a wall kill loses the unfinished seeds outright.
 set -uo pipefail
 cd "$HOME/contractionRL" || exit 1
 
-ONLY="${1:-}"          # optional substring filter, e.g. car_weak
+ONLY="${1:-}"          # optional substring filter, e.g. car_v1
 
 i=0
-for ENVNAME in classic-car-v0 classic-car_weak-v0; do
+for ENVNAME in classic-car-v0 classic-car-v1; do
     for GAMMA in 0.01 0.99 0.999; do
         case $((i % 3)) in
             0) P=csl;                  A=csl ;;
@@ -28,7 +28,7 @@ for ENVNAME in classic-car-v0 classic-car_weak-v0; do
         esac
         i=$((i + 1))
         case "$ENVNAME" in
-            *car_weak*) T=2-00:00:00 ;;
+            *car_v1*) T=2-00:00:00 ;;
             *)          T=1-00:00:00 ;;
         esac
         short=${ENVNAME#classic-}; short=${short%-v0}

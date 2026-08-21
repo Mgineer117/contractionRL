@@ -1,20 +1,29 @@
-"""Car with a weak-Authority velocity box — the class-III half of the car pair.
+"""The car at low speed — v1 of the car, where the contraction rate stops being
+constant.
 
-Identical plant to ``classic/car``: same ``f``, same ``B``, same reward, same
-reference generator. The only difference is the box.
+``classic-car-v0`` and ``classic-car-v1`` are the SAME vehicle: same ``f``, same
+``B``, same reward, same reference generator. They are two versions of one env
+rather than two envs because the only thing that differs is the velocity box —
+and that one change is enough to move the certified contraction rate from a
+constant to a function of the state.
 
-Why this exists. ``docs/dynamics_taxonomy.md`` §2.2 shows the car's Hautus margin
-at ``s = 0`` is ``sigma = min(1, v)``, so the velocity box alone decides the
-contraction class, with every line of the dynamics held fixed:
+``docs/dynamics_taxonomy.md`` §2.2 gives the car's Hautus margin at ``s = 0`` as
+``sigma = min(1, v)``, so the box alone decides the contraction class:
 
-    classic-car-v0        v in [1.0, 2.0]   sigma == 1        -> class II
-    classic-car_weak-v0   v in [0.2, 2.0]   sigma == v < 1    -> class III
+    classic-car-v0   v in [1.0, 2.0]   sigma == 1       -> class II,  lambda*(x) constant
+    classic-car-v1   v in [0.2, 2.0]   sigma == v < 1   -> class III, lambda*(x) state-dependent
+
+Measured on the shipped envelope (see figures/rate_car.svg, figures/rate_car_v1.svg):
+
+    v0   lambda* = 4.884 everywhere
+    v1   lambda* sweeps 1.15 -> 3.92 with v, saturating at 3.920 once v >= 1.10
+         (past v = 1 the min in sigma stops biting and v1 IS v0)
 
 Measured at lbd=0.3, N=200 (``scripts/feasibility_certificate.py --verify``):
 
     env         class  hautus     nu      rho spread  lam_C spread  ||K||max
     car          II    1.000e+00    9.536     1.0000       1.0000      2.862
-    car_weak     III   2.049e-01  147.5      15.4690       7.4668      8.775
+    car_v1     III   2.049e-01  147.5      15.4690       7.4668      8.775
 
 That pair is the one within-plant control available for "does the contraction
 class change how RL behaves": any comparison across two different plants
@@ -40,14 +49,14 @@ VREF_WEAK_LO = 0.3
 # Upper end of the INITIAL velocity draw, and the velocity slice of XE_INIT.
 #
 # Measured lambda*(v) for this env (min-projected joint CV-STEM SDP, 15 cells
-# across the box, see figures/minproj_car_weak.png):
+# across the box, see figures/minproj_car_v1.png):
 #
 #     v    0.20  0.33  0.46  0.59  0.71  0.84  0.97  1.10 ... 2.00
 #     l*   1.145 1.709 2.207 2.654 3.071 3.466 3.833 3.920 ... 3.920
 #
 # It rises monotonically and then SATURATES at 3.920 from v = 1.10 on, because
 # the Hautus margin is sigma = min(1, v) and the min stops biting once v >= 1 --
-# past that point car_weak is just the car. So the low-rate region this env
+# past that point car_v1 is just the car. So the low-rate region this env
 # exists to study is v well under 1.
 #
 # With xref's velocity drawn from [0.3, 0.6] and xe's from +-0.1, x_0's velocity
@@ -58,7 +67,7 @@ VREF_WEAK_LO = 0.3
 #
 # Inherited instead, xref's velocity ran to 1.5 and xe's to +-1, so x_0 covered
 # the entire [0.2, 2.0] box and most episodes began in the saturated region --
-# which is the one place car_weak carries no more information than car.
+# which is the one place car_v1 carries no more information than car.
 VREF_WEAK_HI = 0.6
 XE_INIT_V = 0.1
 
@@ -87,10 +96,10 @@ BOX_OVERRIDES = {
 ENV_CONFIG = {**CAR_ENV_CONFIG, **BOX_OVERRIDES}
 
 
-class CarWeakEnv(CarEnv):
+class CarV1Env(CarEnv):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **{**BOX_OVERRIDES, **kwargs})
         # After super().__init__, which sets self.task = "car". Anything keyed on
         # the task name -- notably the offline CM dataset directory -- must not
         # collide with the class-II variant's.
-        self.task = "car_weak"
+        self.task = "car_v1"

@@ -190,7 +190,7 @@ cm:
   # ν=140 and >99% of controls out of box at every λ, i.e. this env looks
   # infeasible when it is not. Always pass --cm_dt 1.0.
   #
-  # Why this is 5x slower than car's 0.3902 on an identical plant: car_weak is
+  # Why this is 5x slower than car's 0.3902 on an identical plant: car_v1 is
   # the class-III half of the pair (v ∈ [0.2, 2] makes the Hautus margin
   # σ = min(1, v) = v < 1, see the env docstring), so the same box needs a lower
   # certified rate and more control-effort weight to keep ‖K‖ inside the same
@@ -220,7 +220,7 @@ cm:
   #              action range — see ncm_synthesis.py module docstring.
   cmg_method: cvstem
   # 3.2, not car's 1.6 — measured together with lbd: 0.0771 above, not tuned
-  # separately. r is live only where the ν term in J competes; at car_weak's rate
+  # separately. r is live only where the ν term in J competes; at car_v1's rate
   # it took the box violations from ~7% at r=0.1 down to 4.82% at r=3.2.
   cvstem_r_scaler: 3.2
   # On SDP infeasibility at a given state, retry that state alone with λ
@@ -235,12 +235,12 @@ cm:
   # still match too; re-solved and overwritten otherwise. "cvstem" only.
   # Must differ from classic-car-v0's path. The dataset is {x -> W*(x)} sampled
   # over the env's state box, and the box is not part of the cache key
-  # (cm_dataset_target keys on lbd/w_lb/w_ub/r/eps/solver/N only). classic-car_weak-v0
+  # (cm_dataset_target keys on lbd/w_lb/w_ub/r/eps/solver/N only). classic-car-v1
   # widens the velocity box down to v = 0.2, a region classic-car-v0 never samples
   # -- so sharing a path would silently hand the weak variant a metric that was
   # never solved anywhere near the weak-authority states the whole experiment is
   # about, and no key check would catch it.
-  cm_data_path: "data/classic/car_weak/cm_data.npz"
+  cm_data_path: "data/classic/car_v1/cm_data.npz"
 
 # ── Offline CMG synthesis (Phase A, always runs before Phase B) ───────────── #
 # Sample cmg_memory_size states (uniformly from the classic env's analytic

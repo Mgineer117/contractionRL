@@ -29,7 +29,7 @@ extra_flags:
   - "--ref_offset"
   - "1"
   # No --num_timesteps here on purpose: the horizon belongs to the env yaml
-  # (car 100k, car_weak 300k), and only the swept axes are passed on the CLI.
+  # (car 100k, car_v1 300k), and only the swept axes are passed on the CLI.
   # The two envs therefore train for different lengths, which is fine for the
   # WITHIN-env gamma comparison this grid is for, and not comparable ACROSS envs.
 
