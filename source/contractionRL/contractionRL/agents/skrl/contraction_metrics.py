@@ -324,6 +324,72 @@ class StatManagerEnvWrapper:
                 continue
         return default
 
+    def set_discount_factor(self, gamma: float) -> None:
+        """Tell the wrapper which gamma to discount with (see
+        :meth:`_track_discounted_return`). Called by the runner once the agent
+        config is final, so a swept discount_factor is the one used."""
+        self._gamma = float(gamma)
+
+    def _track_discounted_return(self, reward, terminated, truncated) -> None:
+        """Accumulate the episodic DISCOUNTED return G = sum_t gamma^t r_t.
+
+        This is the objective the agent is actually given, and the only quantity
+        whose maximizer is pi*_gamma. The undiscounted `total_reward_*` already
+        logged is a different functional, and tuning against it would select the
+        policy that happens to track well rather than the best approximation of
+        pi*_gamma -- which is what the theory is about.
+
+        gamma^t is carried as a running factor and BOTH accumulators reset on
+        episode end, so the exponent is the step index WITHIN the episode. A
+        global step counter would make gamma^t underflow to 0 within a few
+        hundred steps at gamma=0.99 and silently report G == 0 forever after.
+        """
+        if getattr(self, "_gamma", None) is None:
+            return
+        r = torch.as_tensor(reward, device=self._device()).reshape(-1).float()
+        n = r.numel()
+        if getattr(self, "_disc_return", None) is None or self._disc_return.numel() != n:
+            self._disc_return = torch.zeros(n, device=r.device)
+            self._disc_w = torch.ones(n, device=r.device)
+            self._disc_done: list[float] = []
+        self._disc_return += self._disc_w * r
+        self._disc_w *= self._gamma
+
+        def _flat(x):
+            if x is None:
+                return torch.zeros(n, dtype=torch.bool, device=r.device)
+            t = torch.as_tensor(x, device=r.device).reshape(-1).bool()
+            return t if t.numel() == n else torch.zeros(n, dtype=torch.bool, device=r.device)
+
+        done = _flat(terminated) | _flat(truncated)
+        if done.any():
+            self._disc_done.extend(self._disc_return[done].detach().cpu().tolist())
+            del self._disc_done[:-4096]      # bound the buffer
+            self._disc_return[done] = 0.0
+            self._disc_w[done] = 1.0
+
+    def discounted_return_summary(self) -> dict[str, float]:
+        """``discounted_return_{mean,ci95,median,min,max}`` over completed episodes.
+
+        Empty until at least one episode has finished, so the key is ABSENT
+        rather than a misleading 0.0 -- the same rule the stability metrics use,
+        and it matters here because this is the sweep's objective: a 0.0 written
+        before any episode ended would look like a real (very bad) score.
+        """
+        v = np.asarray(getattr(self, "_disc_done", []), dtype=float)
+        if v.size == 0:
+            return {}
+        m, ci = mean_confidence_interval(v)
+        return {
+            "discounted_return_mean": float(m),
+            "discounted_return_ci95": float(ci),
+            "discounted_return_median": float(np.median(v)),
+            "discounted_return_min": float(v.min()),
+            "discounted_return_max": float(v.max()),
+            "discounted_return_n": float(v.size),
+        }
+
+
     def _device(self):
         return getattr(self.env, "device", "cpu")
 
@@ -953,6 +1019,7 @@ class StatManagerEnvWrapper:
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
+        self._track_discounted_return(reward, terminated, truncated)
         self._track_action_volatility(action, terminated, truncated)
         o = self._obs_tensor(obs)
         if o is not None:
@@ -1008,6 +1075,18 @@ class StatManagerEnvWrapper:
                 if volatility:
                     info["log"].update(
                         stability_log_dict(volatility, self._device(), tab="Episode"))
+
+        # Discounted return G = sum_t gamma^t r_t. Emitted only when it CHANGED
+        # -- it moves only as episodes complete, so logging it every step wrote
+        # ~500 identical copies per episode into wandb's transaction log.
+        _n_done = len(getattr(self, "_disc_done", ()))
+        if isinstance(info, dict) and _n_done != getattr(self, "_last_logged_disc_n", None):
+            disc = self.discounted_return_summary()
+            if disc:
+                self._last_logged_disc_n = _n_done
+                if "log" not in info or not isinstance(info["log"], dict):
+                    info["log"] = {}
+                info["log"].update(stability_log_dict(disc, self._device(), tab="Reward"))
 
         return obs, reward, terminated, truncated, info
 
