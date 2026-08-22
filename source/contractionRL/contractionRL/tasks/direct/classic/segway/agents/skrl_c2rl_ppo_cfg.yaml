@@ -156,7 +156,21 @@ cm:
   #
   # segway sits ON the envelope: nu pins at exactly 1/w_lb = 1000 at every rung
   # that solves, so there is no slack to trade and nothing looser is available.
-  lbd: 0.0152
+  # 0.0152 was measured at the search stage (N=100, cm_eps 0.1) and is NOT a
+  # property of segway's box -- it is a property of 100 lucky samples. The states
+  # that refute it occupy ~1% of the box, so a 100-point draw misses them 26% of
+  # the time, and that is the draw the search got. At N=1000 the answer already
+  # collapses onto the true cap and never moves again; the joint program at
+  # N=10000 duly reported INFEASIBLE after 38 h. cm_eps is NOT the culprit and
+  # cannot be: the LMI is sym(S) <= -eps*I, so the search's 0.1 was STRICTER than
+  # the ship stage's 0.01 and still passed.
+  #
+  # 0.03 is set against the cap of the REDEFINED box (env.py PITCH_LIM = 0.90),
+  # where lambda* bottoms out at 0.0407 -- deliberately 26% under it, because the
+  # cached grid is 15x15 with 8 projected samples per cell and a denser draw can
+  # only find worse. Treat it as a candidate until a build at N=10000 / eps 0.01
+  # returns feasible; that program is the only authority here.
+  lbd: 0.03
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled)
   # SDP contraction metric (cm_eps used by both cmg_method paths; cm_solver "cvstem" only)

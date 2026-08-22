@@ -15,8 +15,31 @@ STATE_NAMES = ("pos_x", "pitch", "vel_x_b", "pitch_rate")
 # which dims wrap, which translate, and which co-rotate under a yaw rotation.
 
 # X bounds
-X_MIN = [-5.0, -math.pi / 3, -1.0, -math.pi]
-X_MAX = [5.0, math.pi / 3, 1.0, math.pi]
+#
+# PITCH_LIM is 0.90 rad (51.6 deg), not the pi/3 (60 deg) it was, and that is a
+# statement about what is CERTIFIABLE, not about the plant.
+#
+# lambda*(x) over the old box is a smooth 0.19-0.34 across ~93% of it and
+# collapses in exactly two opposite corners: maximum tilt combined with fast
+# rotation THE OTHER WAY (pitch -1.047 with pitch_rate +2.69 gives 0.00367, and
+# the mirror +1.047 / -2.69 gives 0.00939). A uniform rate must hold everywhere,
+# so those two corners set it for the whole box -- a 93x collapse driven by ~1%
+# of the volume. At lambda = 0.00367 over a 15 s episode the certified bound is
+# C*exp(-lambda*T) = 1.15 * 0.946 = 1.088 > 1: it does not even promise the error
+# ends below where it started. The certificate was vacuous.
+#
+# Trimming pitch by one grid column removes both corners and lifts the cap 11x,
+# to 0.0407, where the bound is 0.625 -- a real 37% guaranteed decay -- while
+# keeping 87% of the (pitch, pitch_rate) area. Trimming pitch_rate instead is a
+# worse trade: 6x for 27% of the area. See scripts/minproj_plot.py's cached grid
+# and the table in the 2026-08-22 session.
+#
+# This does NOT touch the initial distribution: XE_INIT draws pitch from +-0.15,
+# far inside either bound. What it changes is the set the CM dataset certifies
+# over, and the tilt at which an episode terminates (60 deg -> 51.6 deg).
+PITCH_LIM = 0.90
+X_MIN = [-5.0, -PITCH_LIM, -1.0, -math.pi]
+X_MAX = [5.0, PITCH_LIM, 1.0, math.pi]
 
 # Episode ends the first step x leaves this box (opt-in: --terminate_out_of_box).
 # Defaults to the state box itself, i.e. it fires exactly where env_base.step's
@@ -60,8 +83,14 @@ UREF_MAX = [6.0]
 # lbd*(x0) median 0.2207 -> 0.0987. The sign dims are
 # mirrored by one shared sign, because the slow set is two lobes on a
 # diagonal that no single box can cover.
+# The pitch ceiling is PITCH_LIM, not a literal: it used to be 1.0467, the old
+# pi/3 box bound, and when the box moved to 0.90 the 37.9% of this range above
+# 0.90 was clamped straight onto the box face. That is not a cosmetic artifact --
+# x_0 pinned to a boundary is not the draw this box describes, and every
+# Stability/* metric is normalised by the error at x_0. Derive it so the two
+# cannot drift apart again (scripts/check_boxes.py fails loudly if they do).
 X_INIT_MIN = [-5.0, 0.6596, 0.0098, -3.1244]
-X_INIT_MAX = [5.0, 1.0467, 0.994, -0.6786]
+X_INIT_MAX = [5.0, PITCH_LIM, 0.994, -0.6786]
 X_INIT_SIGN_DIMS = [1, 2, 3]
 
 ENV_CONFIG = {
