@@ -35,6 +35,13 @@ echo "[$(date)] host=$(hostname) env=$ENVNAME gamma=$GAMMA seeds=10"
 # and returns immediately, so the batch job "completes" in ~15 s and SLURM tears
 # down the cgroup, killing the training it just launched. With it, the seed loop
 # runs in the FOREGROUND and the job lives as long as the work does.
+# --discount_factor, NOT --agent.discount_factor=. The dotted form only works
+# where scripts/skrl/train_utils.py has apply_cli_dotted_overrides; the cluster's
+# checkout does not, and there the arg lands in argparse's leftovers and is
+# DROPPED WITHOUT A WORD. That is not hypothetical: the 2026-08-21 batch ran all
+# six cells at the yaml's pinned discount_factor: 0.01 and produced byte-identical
+# per-seed AUCs for gamma 0.01 and gamma 0.999. The explicit flag exists in both
+# checkouts, so it is the portable one.
 ./run_seeds.sh --detached \
     --algorithms c2rl-ppo \
     --env "$ENVNAME" \
@@ -42,7 +49,7 @@ echo "[$(date)] host=$(hostname) env=$ENVNAME gamma=$GAMMA seeds=10"
     --gpu 0 \
     --parallel 5 \
     --tag "gamma${GAMMA}_${ENVNAME}" \
-    --extra "--agent.discount_factor=$GAMMA" \
+    --extra "--discount_factor $GAMMA" \
     -y
 rc=$?
 echo "[$(date)] done rc=$rc env=$ENVNAME gamma=$GAMMA"
