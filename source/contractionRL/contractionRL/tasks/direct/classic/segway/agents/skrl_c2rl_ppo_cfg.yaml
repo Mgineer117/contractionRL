@@ -165,12 +165,21 @@ cm:
   # cannot be: the LMI is sym(S) <= -eps*I, so the search's 0.1 was STRICTER than
   # the ship stage's 0.01 and still passed.
   #
-  # 0.03 is set against the cap of the REDEFINED box (env.py PITCH_LIM = 0.90),
-  # where lambda* bottoms out at 0.0407 -- deliberately 26% under it, because the
-  # cached grid is 15x15 with 8 projected samples per cell and a denser draw can
-  # only find worse. Treat it as a candidate until a build at N=10000 / eps 0.01
-  # returns feasible; that program is the only authority here.
-  lbd: 0.03
+  # 0.0514 is CERTIFIED on the redefined box (env.py PITCH_LIM = 0.90) by the
+  # shipping program -- joint CV-STEM over N=10000 at eps 0.01, feasible with
+  # nu=1000, chi=1393, J=2.81e+04 and LMI residual max -0.01 (strictly negative),
+  # 2026-08-24 job 10071517. 14x the 0.0152 that the old box could not sustain.
+  #
+  # It came from the N=100 search and I wrongly predicted it would fail, on the
+  # grounds that it exceeded a 0.0407 cap read off the cached lambda* grid. That
+  # cap was computed on the OLD box, so it was never the right bound to test
+  # against. Two lower candidates (0.0407, 0.03) were queued as fallbacks and
+  # cancelled once this one cleared.
+  #
+  # Caveat worth keeping: N=10000 over a 4-dim box is ~10 samples per dimension,
+  # so this certifies the sampled set, not the continuum. It is the repo's
+  # shipping standard, not a proof.
+  lbd: 0.0514
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled)
   # SDP contraction metric (cm_eps used by both cmg_method paths; cm_solver "cvstem" only)

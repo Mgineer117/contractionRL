@@ -4,53 +4,71 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
-#SBATCH --time=1-00:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=2-00:00:00
 #
-# TEN SEEDS at ONE discount factor for ONE env. Not a sweep: commands/run_seeds.sh
-# trains a FIXED config across seeds and aggregates the Stability CSVs, which is
-# what a per-gamma seed distribution needs. (search_cluster.sh would instead put
-# W&B agents on a search space; its own header says it searches, this does not.)
+# One (env, gamma, seed-subset) cell. Driven by ENVNAME, GAMMA and SEEDS.
 #
-# One job per (env, gamma) cell so a single cell can be resubmitted without
-# touching the other five, and so the three partitions can be used at once.
+# --parallel 1, NOT 5. Five seeds sharing one GPU was measured at 0.41 it/s per
+# seed against 14.0 it/s on a dedicated GPU -- a 34x penalty, not the ~5x that
+# fair sharing would cost. The window-500 encoder at num_envs=1 is latency-bound
+# (a GRU walking 500/stride-3 = 167 sequentially dependent points on a batch of
+# one), so concurrent processes thrash rather than interleave. That single
+# setting is what timed out five of nine cells on 2026-08-22.
 #
-# --extra carries the only axis that is not already in the env yaml. Everything
-# else -- timesteps, num_envs, the pinned PPO hyperparameters -- stays in the
-# config, so the CLI names only what actually varies.
+# SEED_OFFSET / SEED_COUNT are exported as plain integers and the comma list is
+# built HERE, because sbatch --export is itself comma-delimited: passing
+# SEEDS="6,7" through it keeps only "6", and run_seeds.sh then reads a bare
+# integer as a COUNT (its line 173) and silently runs seeds 0-5 instead of 6-7.
+# That is exactly what happened on the first attempt -- every job ran overlapping
+# low seeds, none ever reached seeds 5-9, and the banner read "seeds=6".
 #
-# python -u equivalent: run_seeds.sh writes its own per-run logs, and this
-# wrapper's stdout is small, but keep the flush habit (see docs/cluster.md 1b).
+# run_seeds.sh takes a LIST when the value contains a separator (line 176), so
+# seq -s, produces precisely the subset this job owns.
+#
+# Sizing, against the PESSIMISTIC 5 it/s (the probe ran on an H200; A10 nodes are
+# slower) so every job fits 48 h on the worst hardware it might land on:
+#   car / cartpole  100k steps  5.6 h/seed  -> 5 seeds =  28 h
+#   car_weak        300k steps 16.7 h/seed  -> 2 seeds =  33 h
+# At the measured 14 it/s these are 10 h and 12 h. See docs/cluster.md.
+#
+# python -u equivalent: run_seeds.sh writes its own per-run logs, but keep the
+# flush habit (docs/cluster.md 1b) -- a wall-limit SIGTERM does not flush.
 set -uo pipefail
 source /sw/apps/anaconda3/2024.10/etc/profile.d/conda.sh
 conda activate env_isaaclab
 cd "$HOME/contractionRL"
-echo "[$(date)] host=$(hostname) env=$ENVNAME gamma=$GAMMA seeds=10"
+SEEDS=$(seq -s, "$SEED_OFFSET" $((SEED_OFFSET + SEED_COUNT - 1)))
+echo "[$(date)] host=$(hostname) env=$ENVNAME gamma=$GAMMA seeds=$SEEDS"
+# Guard: a mangled export must fail loudly, not silently retrain seed 0.
+case "$SEEDS" in
+    *,*) : ;;
+    *) echo "FATAL: SEEDS='$SEEDS' has no comma; run_seeds.sh would read it as a COUNT"; exit 2 ;;
+esac
 
-# Cluster checkout still has run_seeds.sh at the repo ROOT (no commands/ dir there
-# yet -- that move is local-only), so call it by the path that exists on the host.
-# --detached is the internal flag run_seeds.sh sets on its own nohup re-exec. It
-# is exactly what an sbatch needs: WITHOUT it the script forks itself under nohup
-# and returns immediately, so the batch job "completes" in ~15 s and SLURM tears
-# down the cgroup, killing the training it just launched. With it, the seed loop
-# runs in the FOREGROUND and the job lives as long as the work does.
-# --discount_factor, NOT --agent.discount_factor=. The dotted form only works
-# where scripts/skrl/train_utils.py has apply_cli_dotted_overrides; the cluster's
-# checkout does not, and there the arg lands in argparse's leftovers and is
-# DROPPED WITHOUT A WORD. That is not hypothetical: the 2026-08-21 batch ran all
-# six cells at the yaml's pinned discount_factor: 0.01 and produced byte-identical
-# per-seed AUCs for gamma 0.01 and gamma 0.999. The explicit flag exists in both
-# checkouts, so it is the portable one.
+# --ref_length 500 pins the window to the FULL episode (max_episode_len is 500 for
+# every classic env here: dt 0.03, time_bound 15), the same at every gamma, with
+# the tail repeating the last reference point. Left unset, train.py's AUTO sizes it
+# from 1/(1-gamma) -- 2 points at gamma=0.01, 101 at 0.99, 500 at 0.999 -- so the
+# sweep would vary gamma AND the observation width together and could not tell a
+# gamma effect from an architecture effect.
+#
+# --discount_factor, NOT --agent.discount_factor=. The dotted form is resolved by
+# train_utils.apply_cli_dotted_overrides, which this checkout does not have, so it
+# lands in argparse's leftovers and is DROPPED WITHOUT A WORD. That is not
+# hypothetical: the 2026-08-21 batch ran all six cells at the yaml's pinned
+# discount_factor: 0.01 and returned byte-identical per-seed AUCs for gamma 0.01
+# and gamma 0.999. Both flags below exist in both checkouts.
 ./run_seeds.sh --detached \
     --algorithms c2rl-ppo \
     --env "$ENVNAME" \
-    --seeds 10 \
+    --seeds "$SEEDS" \
     --gpu 0 \
-    --parallel 5 \
+    --parallel 1 \
     --tag "gamma${GAMMA}_${ENVNAME}" \
-    --extra "--discount_factor $GAMMA" \
+    --extra "--discount_factor $GAMMA --ref_length 500" \
     -y
 rc=$?
-echo "[$(date)] done rc=$rc env=$ENVNAME gamma=$GAMMA"
+echo "[$(date)] done rc=$rc env=$ENVNAME gamma=$GAMMA seeds=$SEEDS"
 exit 0

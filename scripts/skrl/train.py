@@ -734,16 +734,28 @@ if _is_classic:
         from contractionRL.agents.skrl.ref_window import RefWindow as _RW
         _len = args_cli.ref_length
         if _len is None:
-            # AUTO: size the window to this run's gamma. Done here, after every
-            # gamma override (CLI + wandb sweep) has landed, so a swept
-            # discount_factor resizes the observation to match instead of
-            # being evaluated against a stale hand-picked length.
-            _len = _RW.length_for_horizon(
-                _gamma, int(raw_env.unwrapped.max_episode_len), args_cli.ref_offset)
-            print(f"[train] ref_length AUTO -> {_len} "
-                  f"(gamma={_gamma}, effective horizon "
-                  f"{_RW.effective_horizon(_gamma, int(raw_env.unwrapped.max_episode_len))} steps, "
-                  f"offset={args_cli.ref_offset})")
+            # Default is the FULL episode, the same length at every gamma, with
+            # the tail repeating the last reference point (RefWindow clamps
+            # indices past the episode end).
+            #
+            # Sizing it from gamma instead -- which is what this did -- makes the
+            # observation a function of gamma: 2 points at gamma=0.01, 101 at
+            # 0.99, 500 at 0.999. A gamma sweep run that way varies gamma AND the
+            # observation width together, so any effect it measures is
+            # gamma-and-architecture with no way to separate them afterwards. It
+            # also made the cells wildly unequal in cost (6.87 it/s at gamma=0.01
+            # against 0.41 it/s at 0.999, a 16.5x spread) so the high-gamma cells
+            # could not finish inside a wall the low-gamma ones cleared easily.
+            #
+            # A full window is never too short for the discount, so check_markov
+            # cannot fire; at low gamma it is larger than the horizon needs,
+            # which costs compute but confounds nothing.
+            _len = int(raw_env.unwrapped.max_episode_len) // max(args_cli.ref_offset, 1)
+            print(f"[train] ref_length FULL -> {_len} "
+                  f"(episode {int(raw_env.unwrapped.max_episode_len)} steps, "
+                  f"offset={args_cli.ref_offset}; gamma={_gamma} does NOT change it. "
+                  f"Effective horizon at this gamma is "
+                  f"{_RW.effective_horizon(_gamma, int(raw_env.unwrapped.max_episode_len))} steps)")
         raw_env.unwrapped.configure_ref_window(
             length=_len, offset=args_cli.ref_offset, gamma=_gamma)
         # The window reaches wandb as CONFIG. Without it the gamma/window pairing
@@ -756,7 +768,7 @@ if _is_classic:
         _win_cfg = {
             "ref_length": int(_len),
             "ref_offset": int(args_cli.ref_offset),
-            "ref_length_mode": "pinned" if args_cli.ref_length is not None else "auto",
+            "ref_length_mode": "pinned" if args_cli.ref_length is not None else "full",
             "ref_window_span": int(_len) * int(args_cli.ref_offset),
             "effective_horizon": int(_RW.effective_horizon(_gamma, _mel)),
             "max_episode_len": _mel,
