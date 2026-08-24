@@ -62,9 +62,10 @@ YAML policy config:
           activations: relu
       output: ACTIONS
 
-When backbone is ``contraction``, ``layers`` is extracted from the first
-network entry and passed as ``hidden_dim`` to CLActorModel.  All other
-MLP-specific keys (``output``, ``initial_log_std``) are dropped.
+When backbone is ``contraction``/``control``, ``layers`` is extracted from the
+first network entry and passed as ``hidden_dim`` to CLActorModel. ``output`` is
+dropped. ``initial_log_std`` is NOT dropped -- CLActorModel honours it, and this
+docstring previously said otherwise while the code agreed with the docstring.
 """
 from __future__ import annotations
 
@@ -167,7 +168,19 @@ def _gaussian_factory(observation_space, state_space, action_space, device,
             return SquashedCLActorModel(
                 observation_space=observation_space, action_space=action_space,
                 device=device, hidden_dim=hidden_dim, x_dim=x_dim, **kwargs)
-        kwargs.pop("initial_log_std", None)
+        # initial_log_std is FORWARDED, not dropped. It used to be popped here,
+        # which silently pinned every backbone: control run to log_std 0.0, i.e.
+        # sigma = 1.0, whatever the yaml asked for. CLActorModel declares the
+        # argument and applies it (`if initial_log_std != 0.0: fill_`), so the pop
+        # was discarding a value the model was ready to honour -- and discarding
+        # it invisibly, since a Gaussian policy with sigma = 1.0 looks healthy.
+        #
+        # The consequence was not subtle: at sigma = 1.0 instead of the configured
+        # exp(-2) = 0.135, the sampled action carried ~7.4x the intended noise,
+        # the state left the termination box in ~4 of 500 steps, and because EVERY
+        # episode ended early stability_summary() published only early_end_frac --
+        # so AUC, contraction rate, overshoot, score and the whole
+        # Stability_maha/* family were missing from every run.
         return CLActorModel(
             observation_space=observation_space, action_space=action_space,
             device=device, hidden_dim=hidden_dim, x_dim=x_dim, **kwargs)
