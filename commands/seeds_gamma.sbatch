@@ -27,11 +27,17 @@
 # run_seeds.sh takes a LIST when the value contains a separator (line 176), so
 # seq -s, produces precisely the subset this job owns.
 #
-# Sizing, against the PESSIMISTIC 5 it/s (the probe ran on an H200; A10 nodes are
-# slower) so every job fits 48 h on the worst hardware it might land on:
-#   car / cartpole  100k steps  5.6 h/seed  -> 5 seeds =  28 h
-#   car_weak        300k steps 16.7 h/seed  -> 2 seeds =  33 h
-# At the measured 14 it/s these are 10 h and 12 h. See docs/cluster.md.
+# Sizing: ONE SEED PER JOB. The binding rate is not the 5-14 it/s measured at
+# gamma=0.01 but the 1.38-1.72 it/s measured at gamma>=0.99, where PPO's
+# kl_threshold early-stop never fires so all learning_epochs x mini_batches = 20
+# gradient steps run every update. At 1.38 it/s, 100k steps is 20.1 h.
+#   gamma 0.01        100k  ~5.6 h/seed
+#   gamma 0.99/0.999  100k  ~20.1 h/seed
+# Two seeds of a high-gamma cell is 40 h against a 48 h wall -- inside it only if
+# the node matches the machine that rate was measured on. One seed per job is 20 h,
+# a 2.4x margin that holds even on a much slower A10, and it makes each job
+# independently complete: a lost job costs one seed, not a whole cell.
+# See docs/cluster.md.
 #
 # python -u equivalent: run_seeds.sh writes its own per-run logs, but keep the
 # flush habit (docs/cluster.md 1b) -- a wall-limit SIGTERM does not flush.
@@ -39,7 +45,12 @@ set -uo pipefail
 source /sw/apps/anaconda3/2024.10/etc/profile.d/conda.sh
 conda activate env_isaaclab
 cd "$HOME/contractionRL"
-SEEDS=$(seq -s, "$SEED_OFFSET" $((SEED_OFFSET + SEED_COUNT - 1)))
+# Trailing comma, always. run_seeds.sh reads a value matching ^[0-9]+$ as a
+# COUNT and anything else as a LIST (its lines 175-179), so a single-seed job
+# passing "7" would silently train seeds 0-6. The comma forces the LIST branch
+# for every SEED_COUNT, and `IFS=", " read -a` drops the trailing empty field,
+# so "7," -> (7) and "7,8," -> (7 8).
+SEEDS="$(seq -s, "$SEED_OFFSET" $((SEED_OFFSET + SEED_COUNT - 1))),"
 echo "[$(date)] host=$(hostname) env=$ENVNAME gamma=$GAMMA seeds=$SEEDS"
 # Guard: a mangled export must fail loudly, not silently retrain seed 0.
 case "$SEEDS" in

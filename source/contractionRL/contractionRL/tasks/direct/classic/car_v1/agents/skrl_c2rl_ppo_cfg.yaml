@@ -296,7 +296,15 @@ empirical_dynamics:
 
 trainer:
   class: C2RLSkrlTrainer
-  # 300k, matching classic-car-v0 exactly. The two differ only in the state box
-  # and cm_data_path; an unequal training budget would confound the class
-  # comparison the pair exists for. Single source of truth -- do not override.
-  timesteps: 300000  # Total number of environment steps to train for
+  # Matches classic-car-v0 exactly. The two differ only in the state box and
+  # cm_data_path; an unequal training budget would confound the class comparison
+  # the pair exists for. Single source of truth -- do not override.
+  #
+  # 100000, matching cartpole, segway and car-v0, so all four envs of the gamma
+  # batch share ONE sample budget and the sweep varies only gamma. It was 300000,
+  # which at the measured high-gamma rate (1.38-1.72 it/s: at gamma>=0.99 PPO's
+  # kl_threshold early-stop never fires, so all learning_epochs x mini_batches =
+  # 20 gradient steps run per update) needs 48-60 h for a SINGLE seed --
+  # unschedulable against a 48 h wall by any split. At 100000 it is ~20 h/seed,
+  # which is the one-seed-per-job sizing the whole batch now uses.
+  timesteps: 100000  # Total number of environment steps to train for

@@ -654,7 +654,16 @@ if _is_classic:
             pass
         # Consistent run name: CLI override > YAML-provided name > deterministic
         # default that matches the local log directory (logs/classic/<algo>/<ts>).
-        _wkw["name"] = args_cli.wandb_run_name or _wkw.get("name") or f"classic_{algorithm}_{_run_ts}"
+        # env + algorithm + seed + date. The old default was
+        # f"classic_{algorithm}_{_run_ts}", which named every env identically and
+        # omitted the seed, so a 10-seed x 3-gamma x 4-env batch arrived in W&B as
+        # 120 same-titled runs distinguishable only by opening each one's config.
+        # args_cli.task keeps its version suffix ("classic-car-v0" -> "car-v0",
+        # "classic-car-v1" -> "car-v1"): stripping "-v0" would collapse the two car
+        # variants this batch exists to contrast.
+        _env_tag = (args_cli.task or "env").removeprefix("classic-")
+        _wkw["name"] = (args_cli.wandb_run_name or _wkw.get("name")
+                        or f"{_env_tag}_{algorithm}_seed{seed}_{_run_ts}")
         # wandb.run.name is not a config key, so it can't be filtered/grouped on
         # in the runs table — mirror it into the config, alongside a batch label
         # that defaults to the run date so a relaunch is separable from the

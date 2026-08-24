@@ -6,6 +6,14 @@ models:
   policy:
     class: GaussianMixin # DeterministicMixin
     backbone: control  # PPO is unbounded; uref+feedback can exceed the declared action space
+    # gru / stride 3, matching car-v0 and car-v1. Absent, these default to
+    # encoder "mlp" (models.py), which with the gamma batch's pinned
+    # --ref_length 500 flattens a 500-point reference window straight into the
+    # first linear layer -- a different architecture from the other two envs in
+    # the same sweep, so a gamma curve here would not be comparable to theirs.
+    # Stride 3 is fixed for this project: it walks 500/3 = 167 window points.
+    encoder: gru
+    encoder_stride: 3
     clip_actions: false
     clip_log_std: true
     min_log_std: -20.0

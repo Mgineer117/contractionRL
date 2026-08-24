@@ -6,6 +6,14 @@ models:
   policy:
     class: GaussianMixin # DeterministicMixin
     backbone: control  # PPO is unbounded; uref+feedback can exceed the declared action space
+    # gru / stride 3, matching car-v0 and car-v1. Absent, these default to
+    # encoder "mlp" (models.py), which with the gamma batch's pinned
+    # --ref_length 500 flattens a 500-point reference window straight into the
+    # first linear layer -- a different architecture from the other two envs in
+    # the same sweep, so a gamma curve here would not be comparable to theirs.
+    # Stride 3 is fixed for this project: it walks 500/3 = 167 window points.
+    encoder: gru
+    encoder_stride: 3
     clip_actions: false
     clip_log_std: true
     min_log_std: -20.0
@@ -254,4 +262,11 @@ empirical_dynamics:
 
 trainer:
   class: C2RLSkrlTrainer
-  timesteps: 20000   # Total number of environment steps to train for
+  # 100000, matching cartpole, car-v0 and car-v1, so all four envs of the gamma
+  # batch share ONE sample budget and the sweep varies only gamma. It was 20000:
+  # five times shorter than its siblings, which would have made segway's gamma
+  # curve a budget effect as much as a discount effect and left it uncomparable to
+  # the rest of the table. At the binding high-gamma rate (1.38 it/s, where PPO's
+  # kl_threshold early-stop never fires) this is ~20 h/seed, which is one seed per
+  # job against the 48 h wall -- the same sizing every other env in the batch uses.
+  timesteps: 100000  # Total number of environment steps to train for
