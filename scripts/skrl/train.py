@@ -140,9 +140,6 @@ _ov.add_argument("--entropy_loss_scale", "--entropy-loss-scale",
 _ov.add_argument("--kl_threshold", "--kl-threshold", "--ppo_kl_threshold", "--ppo-kl-threshold",
                  type=float, default=None)
 _ov.add_argument("--value_loss_scale", "--value-loss-scale", type=float, default=None)
-# C2RL only: after the trained eval, also evaluate with the residual bypassed
-# (= pure CV-STEM-LQR base) on the identical frozen CMG — a controlled base-vs-
-# residual comparison free of CMG-regression nondeterminism. See models.CLActorModel.
 # AUC-aligned Euclidean-decrement reward (see c2rl.C2RLPPOCfg.reward_euclidean).
 # Works for standalone PPO/SAC too (applied straight to the env — see the
 # `not _is_contraction` block right after raw_env is built) as well as C2RL.
@@ -164,7 +161,7 @@ parser.add_argument("--no_terminate_out_of_box", "--no-terminate-out-of-box",
 # BaseEnv.set_terminate_out_of_box.__doc__ before using it.
 parser.add_argument("--terminate_as_terminal", "--terminate-as-terminal",
                     dest="terminate_as_terminal", action="store_true", default=False)
-# C2RL only: warm-start the residual to the online per-state CV-STEM-LQR controller.
+# C2RL only: penalise ||u - uref||^2 in the reward (residual trust anchor).
 _ov.add_argument("--residual_anchor_scale", "--residual-anchor-scale",
                  dest="residual_anchor_scale", type=float, default=None)
 _ov.add_argument("--pretrain_critic_steps", "--pretrain-critic-steps",
