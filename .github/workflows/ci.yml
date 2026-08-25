@@ -66,8 +66,14 @@ jobs:
           pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install "skrl>=2.0.0" "gymnasium>=0.29" pyyaml scipy "cvxpy<1.7" tqdm
+      # --ref_length 5, not the AUTO full-episode window: AUTO gives obs_dim 3004,
+      # and skrl's RandomMemory allocates (memory_size, num_envs, obs_dim) PER
+      # ENVIRONMENT, so SAC's replay buffer alone is 9.6 GB and peak RSS ~19.6 GB
+      # (measured). A GitHub runner has 7 GB, so sac/c2rl-sac were OOM-killed --
+      # SIGTERM, exit 143, which Actions reports as a runner shutdown. This job
+      # checks that the config plumbing is wired up, not that anything learns.
       - name: Train ${{ matrix.algorithm }} on classic-car-v0
         run: |
           python scripts/skrl/train.py --classic --task classic-car-v0 \
             --algorithm ${{ matrix.algorithm }} --num_timesteps 200 \
-            --num_envs 8 --device cpu --no_wandb --skip_final_eval
+            --ref_length 5 --num_envs 8 --device cpu --no_wandb --skip_final_eval
