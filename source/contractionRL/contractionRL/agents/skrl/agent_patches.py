@@ -610,3 +610,69 @@ def patch_prune_checkpoints(agent) -> None:
             stale.unlink(missing_ok=True)
 
     agent.write_checkpoint = _pruning_write
+
+
+def patch_ppo_kl_terminates_update(agent) -> None:
+    """Make ``kl_threshold`` end the whole update, not just the current epoch.
+
+    skrl's PPO checks the threshold inside the mini-batch loop and ``break``s
+    only that loop (ppo.py: ``if self.cfg.kl_threshold and kl_divergence >
+    self.cfg.kl_threshold: break``). The epoch loop above it then starts the next
+    epoch and gradient steps resume, so with ``learning_epochs: 10`` a single
+    trip costs the remainder of one epoch and nothing more -- the policy can
+    still move ten times as far as the threshold was meant to allow. Reference
+    PPO implementations stop the entire update instead, which is what
+    ``kl_threshold`` reads as and what this restores.
+
+    Rather than transcribe skrl's ``_update`` here (which would silently freeze a
+    copy of its GAE, clipping and logging behaviour at whatever version it was
+    copied from), this rewrites the two lines in question in the *installed*
+    source and rebinds the result. If skrl changes those lines the anchor no
+    longer matches and this raises, which is the intended outcome: the patch
+    fails loudly instead of quietly reverting to per-epoch behaviour.
+    """
+    import inspect
+    import textwrap
+    import types
+
+    if not hasattr(agent, "policy") or not hasattr(agent.cfg, "kl_threshold"):
+        return
+    if not agent.cfg.kl_threshold:
+        return  # threshold disabled; nothing to enforce
+    if getattr(agent, "_kl_terminates_update", False):
+        return
+
+    src = textwrap.dedent(inspect.getsource(type(agent).update))
+    anchor = ("                    if self.cfg.kl_threshold and kl_divergence > self.cfg.kl_threshold:\n"
+              "                        break\n")
+    anchor = textwrap.dedent(anchor)
+    # Locate it tolerant of indentation, but require exactly one occurrence.
+    needle = "if self.cfg.kl_threshold and kl_divergence > self.cfg.kl_threshold:"
+    if src.count(needle) != 1:
+        raise RuntimeError(
+            "[patch_ppo_kl_terminates_update] expected exactly one kl_threshold "
+            f"early-stop in {type(agent).__name__}.update, found {src.count(needle)}. "
+            "skrl's update loop changed -- re-derive this patch rather than skip it.")
+    lines = src.split("\n")
+    i = next(k for k, l in enumerate(lines) if needle in l)
+    indent = " " * (len(lines[i]) - len(lines[i].lstrip()))
+    if lines[i + 1].strip() != "break":
+        raise RuntimeError("[patch_ppo_kl_terminates_update] the line after the "
+                           "kl_threshold check is not a bare break; re-derive.")
+    lines[i + 1] = f"{indent}    _kl_stop[0] = True\n{indent}    break"
+    # Break the epoch loop too, immediately after the mini-batch loop ends.
+    j = next(k for k, l in enumerate(lines)
+             if l.strip().startswith("for epoch in range(self.cfg.learning_epochs)"))
+    epoch_indent = " " * (len(lines[j]) - len(lines[j].lstrip()))
+    lines.insert(j, f"{epoch_indent}_kl_stop = [False]")
+    # after insert, the epoch-loop body is shifted by one
+    k = next(idx for idx, l in enumerate(lines)
+             if l.strip().startswith("if self.scheduler:"))
+    lines.insert(k, f"{epoch_indent}    if _kl_stop[0]:\n{epoch_indent}        break")
+
+    ns = dict(inspect.getmodule(type(agent)).__dict__)
+    exec(compile("\n".join(lines), "<kl_terminating_update>", "exec"), ns)  # noqa: S102
+    agent.update = types.MethodType(ns["update"], agent)
+    agent._kl_terminates_update = True
+    print(f"[patch] kl_threshold={agent.cfg.kl_threshold} now terminates the whole "
+          f"update (was: the current epoch only).", flush=True)

@@ -612,6 +612,7 @@ class C2RLAgent(Agent):
             patch_caps_regularizer,
             patch_kl_logging,
             patch_ppo_diagnostics,
+            patch_ppo_kl_terminates_update,
             patch_ppo_std_annealing,
             patch_sac_entropy_clamp,
         )
@@ -621,6 +622,11 @@ class C2RLAgent(Agent):
             disable_advantage_norm=bool(getattr(parsed_cfg, "disable_advantage_norm", False)),
         )
         patch_sac_entropy_clamp(self._rl_agent)
+        # kl_threshold must end the UPDATE, not just the current epoch. skrl
+        # breaks only the mini-batch loop, so with learning_epochs > 1 the next
+        # epoch resumes stepping and the threshold bounds one epoch's movement
+        # instead of the update's. No-op when kl_threshold is 0/unset.
+        patch_ppo_kl_terminates_update(self._rl_agent)
         # Applied to the inner PPO/SAC sub-agent: C2RL's outer agent has no
         # .policy/.scaler of its own for the patch to hook.
         patch_caps_regularizer(
