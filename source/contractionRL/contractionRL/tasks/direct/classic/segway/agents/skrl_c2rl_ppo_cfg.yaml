@@ -262,11 +262,12 @@ empirical_dynamics:
 
 trainer:
   class: C2RLSkrlTrainer
-  # 100000, matching cartpole, car-v0 and car-v1, so all four envs of the gamma
-  # batch share ONE sample budget and the sweep varies only gamma. It was 20000:
-  # five times shorter than its siblings, which would have made segway's gamma
-  # curve a budget effect as much as a discount effect and left it uncomparable to
-  # the rest of the table. At the binding high-gamma rate (1.38 it/s, where PPO's
-  # kl_threshold early-stop never fires) this is ~20 h/seed, which is one seed per
-  # job against the 48 h wall -- the same sizing every other env in the batch uses.
-  timesteps: 100000  # Total number of environment steps to train for
+  # 500000, matching cartpole. Sized against measurement: a 100000-step segway
+  # seed completed in 1h09-1h27, so 500000 is ~5.8-7.3 h, inside the 48 h wall
+  # with room to spare.
+  #
+  # NOTE cartpole and segway are now on 500000 while car-v0 and car-v1 remain on
+  # 100000. Within-env gamma comparisons are unaffected; comparing absolute
+  # numbers across the two groups compares different budgets as well as different
+  # plants.
+  timesteps: 500000  # Total number of environment steps to train for
