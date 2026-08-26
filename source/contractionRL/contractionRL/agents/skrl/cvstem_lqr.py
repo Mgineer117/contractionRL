@@ -40,6 +40,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 from skrl.agents.torch.base import Agent, AgentCfg
@@ -205,6 +206,46 @@ class CVSTEMLQRAgent(Agent):
 
     # ── Phase A: his train(), once at construction ─────────────────────────── #
 
+    def _load_shared_c2rl_dataset(self, *, tag: str) -> dict | None:
+        """Load the C2RL ``cm_data_*`` cache for this env, or None.
+
+        Same joint CV-STEM SDP, same state box, same (lbd, w_lb, w_ub, r_scaler,
+        eps, solver, N) key -- so when C2RL has already solved it, re-solving here
+        would burn hours to land on the same metric, and any drift between the two
+        would leave both configs claiming a rate only one of them was certified
+        for.
+
+        ``cm_data_*`` stores ``x`` and ``W``; this fills in the ``cholM`` labels
+        ``regress_cholm`` wants via ``M_to_cholvec`` (M = W^-1, R = chol(M)^T),
+        which is exactly how the joint path built them. ``nu``/``chi``/``J`` are
+        solver diagnostics that nothing downstream of the fit reads.
+        """
+        import numpy as np
+
+        from .ncm_synthesis import M_to_cholvec, cm_dataset_filename, load_cached_cm_dataset
+
+        cfg = self._cfg
+        if not cfg.cm_data_path:
+            return None
+        base = Path(cfg.cm_data_path)
+        path = base.with_name(cm_dataset_filename(
+            cfg.lbd, cfg.cm_w_lb, cfg.cm_w_ub, cfg.r_scaler, stem="cm_data"))
+        ds = load_cached_cm_dataset(
+            path, lbd=cfg.lbd, w_lb=cfg.cm_w_lb, w_ub=cfg.cm_w_ub, eps=cfg.cm_eps,
+            solver=cfg.cm_solver, num_samples=cfg.cm_samples, tag=tag,
+            r_scaler=cfg.r_scaler, chi_weight=cfg.chi_weight,
+            nu_weight=cfg.nu_weight,
+        )
+        if ds is None:
+            return None
+        if "cholM" not in ds:
+            ds = dict(ds)
+            ds["cholM"] = M_to_cholvec(np.asarray(ds["W"]))
+        print(f"{tag} using the shared C2RL metric dataset {path} "
+              f"({np.asarray(ds['W']).shape[0]} states) -- no separate joint solve.",
+              flush=True)
+        return ds
+
     def _synthesize(self) -> None:
         """Uniform samples → one joint SDP → MSE-fit ``CholMetric``, then freeze."""
         from .ncm_synthesis import (
@@ -233,7 +274,15 @@ class CVSTEMLQRAgent(Agent):
             w_ub=cfg.cm_w_ub, eps=cfg.cm_eps, dt=self._dt, n_samples=cfg.cm_samples,
         ) if cfg.cm_data_path else None
 
-        dataset = load_cvstem_dataset(cache, tag=tag, **cache_cfg) if cache else None
+        # Prefer the SHARED C2RL cache. Both algorithms synthesize their metric
+        # with the same joint CV-STEM program over the same state box, so a
+        # separate cvstem_joint_* file was two solves of one problem and, worse,
+        # two metrics that could silently drift apart while both configs claimed
+        # the same lambda. cm_data_* stores x and W; cholM is chol(W^-1), which
+        # M_to_cholvec derives, so nothing is lost by reading the C2RL file.
+        dataset = self._load_shared_c2rl_dataset(tag=tag)
+        if dataset is None:
+            dataset = load_cvstem_dataset(cache, tag=tag, **cache_cfg) if cache else None
         if dataset is None:
             dataset = cvstem_metric_dataset(
                 self._get_f_and_B, self._x_lo, self._x_hi,
