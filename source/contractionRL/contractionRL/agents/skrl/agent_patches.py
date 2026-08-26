@@ -459,20 +459,38 @@ def patch_kl_logging_post_update(agent) -> None:
             old_log_prob = memory.get_tensor_by_name("log_prob")
         except (KeyError, AttributeError):
             return  # memory not laid out as PPO's; nothing to compare against
+        # CHUNKED, not one forward over the whole rollout. The window encoder
+        # runs a GRU over ref_length/stride points per sample, so a single call
+        # on rollouts x num_envs (24 x 1024 = 24576 here) asked cuDNN for
+        # 17.93 GiB and OOM-killed every run on a 22 GiB A10. The metric is a
+        # mean over transitions, so summing over chunks is exactly equal to the
+        # whole-batch value -- there is nothing to trade off.
+        obs_f = obs.view(-1, obs.shape[-1])
+        act_f = actions.view(-1, actions.shape[-1])
+        old_f = old_log_prob.view(-1)
+        try:
+            states_f = memory.get_tensor_by_name("states")
+            states_f = states_f.view(-1, states_f.shape[-1])
+        except (KeyError, AttributeError):
+            states_f = None
+        total, count = 0.0, 0
+        chunk = 1024
         with torch.no_grad():
-            flat = {
-                "observations": agent._observation_preprocessor(obs.view(-1, obs.shape[-1])),
-                "taken_actions": actions.view(-1, actions.shape[-1]),
-            }
-            if hasattr(agent, "_state_preprocessor"):
-                try:
-                    states = memory.get_tensor_by_name("states")
-                    flat["states"] = agent._state_preprocessor(states.view(-1, states.shape[-1]))
-                except (KeyError, AttributeError):
-                    pass
-            _, outputs = policy.act(flat, role="policy")
-            r = outputs["log_prob"].view(-1) - old_log_prob.view(-1)
-            kl = ((torch.exp(r) - 1) - r).mean().item()
+            for i in range(0, obs_f.shape[0], chunk):
+                sl = slice(i, i + chunk)
+                flat = {
+                    "observations": agent._observation_preprocessor(obs_f[sl]),
+                    "taken_actions": act_f[sl],
+                }
+                if states_f is not None and hasattr(agent, "_state_preprocessor"):
+                    flat["states"] = agent._state_preprocessor(states_f[sl])
+                _, outputs = policy.act(flat, role="policy")
+                r = outputs["log_prob"].view(-1) - old_f[sl]
+                total += float(((torch.exp(r) - 1) - r).sum())
+                count += r.numel()
+        if not count:
+            return
+        kl = total / count
         agent.track_data("Policy / KL divergence (post-update)", kl)
 
     agent.update = _update_then_log_kl

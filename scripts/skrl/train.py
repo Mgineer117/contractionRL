@@ -586,9 +586,17 @@ if _is_classic:
         # in the runs table — mirror it into the config, alongside a batch label
         # that defaults to the run date so a relaunch is separable from the
         # previous day's runs without passing anything.
+        # env_name/algorithm/task alongside run_name for the same reason run_name
+        # is here: wandb.run.name is not a config key, so the runs table cannot
+        # filter or group on it. Without these, "all the segway runs" is only
+        # expressible as a name regex, and env_name reads as null in the UI.
         _wkw.setdefault("config", {}).update({
             "run_name": _wkw["name"],
             "run_batch": args_cli.wandb_batch or _run_ts.split("_")[0],
+            "env_name": _env_tag,
+            "task": args_cli.task,
+            "algorithm": algorithm,
+            "seed": seed,
         })
 
         # A sweep must init early: its sampled hyperparameters only exist on
