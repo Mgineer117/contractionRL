@@ -946,10 +946,10 @@ class StatManagerEnvWrapper:
         """Accumulate per-step ``||u_t - u_{t-1}||_2`` into per-episode means.
 
         A measurement of the deployed action sequence, not a penalty: the
-        executed action, exploration noise included, whereas CAPS' temporal term
+        executed action, exploration noise included, whereas an action-smoothness term
         regularizes the policy mean. Deliberately different quantities — this is
         what the actuator actually sees, so it stays meaningful for algorithms
-        with no CAPS term and is what to read for physical deployability.
+        with no smoothness term and is what to read for physical deployability.
 
         Autoreset: both families reset done envs inside ``step()`` and return the
         new episode's first obs, so the action after a done comes from an
