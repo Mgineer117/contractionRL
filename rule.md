@@ -9,6 +9,23 @@ Read this before changing `terminate_out_of_box`, `x_termination_*`, `dt`,
 
 ---
 
+## 0. This file is permissioned
+
+**Adding to, editing, or removing anything in `rule.md` requires the repo owner's
+explicit permission, per rule.** Do not write to this file as a side effect of
+other work, do not "tidy" it, and do not delete a rule because it is
+inconvenient for a change in flight.
+
+**Every change made to this repository must conform to the rules below.** If a
+change cannot be made without violating a rule, that is a signal to stop and
+raise it — not to amend the rule. A rule here exists because breaking it already
+cost a real, measured failure; the rule is the cheaper half of that lesson.
+
+To propose a change: state which rule, what the new text would be, and the
+measurement that justifies it, then wait for approval.
+
+---
+
 ## 1. What happens when the state leaves the box
 
 ### The five layers, in the order `step()` applies them
