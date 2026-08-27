@@ -406,10 +406,12 @@ def build_cm_dataset(
     # This is the same cvstem_joint that find_uniform_lambda searches with, so the
     # (lbd, r) it certifies is the one actually solved here.
     #
-    # dt: cm_wdot_dt defaults to 0.0, so this falls through to 1.0 — which is the
-    # certified value (see commit 8a64182's table). find_uniform_lambda instead
-    # defaults --cm-dt to the env's dt (0.03), and passing that here would make
-    # the (W̄-I)/dt term 33x larger and force ν from ~4 to ~140.
+    # dt: fixed at 1.0 everywhere, and no longer configurable on either side. It
+    # was, and find_uniform_lambda defaulted it to the env's dt (0.03) while
+    # generation defaulted to 1.0 -- a (W̄-I)/dt term 33x larger in the SEARCH than
+    # in the program the search was picking a lambda for, forcing ν from ~4 to
+    # ~140. The two must solve the same program; the only way to guarantee that
+    # is for neither to have a knob.
     A_j = DfDx.astype(np.float64)
     B_j = B_np.astype(np.float64)
     joint_dt = float(wdot_dt or temporal_dt or 1.0)
@@ -432,7 +434,7 @@ def build_cm_dataset(
             f"w=[{w_lb:g},{w_ub:g}], r={r_scaler:g} over {n} samples. This is a real "
             "result, not a transient failure: no single metric family certifies that "
             "rate over this state box. Re-run scripts/find_uniform_lambda.py for this "
-            "env (with --cm_dt 1.0) and use what it certifies.")
+            "env and use what it certifies.")
     # The LMI residual, measured rather than reported by the solver. cvstem_joint
     # returns only {W, nu, chi, J}, so a `sol.get("residual")` here is silently
     # NaN — and residual_mean/residual_max are exactly the evidence that the

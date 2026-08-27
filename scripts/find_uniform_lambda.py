@@ -405,13 +405,25 @@ def main() -> int:
           f"w_lb = {w_lb:g}, w_ub = {w_ub:g}")
     print(f"  nu = {sol['nu']:.4g} (max eig of M), chi = {sol['chi']:.4g} "
           f"(condition number), J = {sol['J']:.4g}")
-    print(f"\n  Set in the env's skrl_cvstem_lqr_cfg.yaml:\n"
+    print(f"\n  This rate belongs in EVERY yaml for this env, and the two algorithms\n"
+          f"  spell the same quantities differently — writing only one is how segway\n"
+          f"  ended up at lbd=0.0514 under c2rl and 0.0152 under cvstem-lqr:\n"
+          f"\n    skrl_cvstem_lqr_cfg.yaml\n"
           f"      agent: r_scaler: {r:g}\n"
-          f"      cm:    lbd: {lbd:.3f}\n"
-          f"             cm_eps: {eps_search:g}  (search; the config synthesizes at {eps_eval:g})\n"
-          f"             cm_dt: {lmi_dt:g}\n"
+          f"      cm:    lbd: {lbd:.4f}\n"
+          f"             cm_eps: {eps_eval:g}   (the search ran at {eps_search:g})\n"
           f"             cm_w_lb: {w_lb:g}\n"
-          f"             cm_w_ub: {w_ub:g}")
+          f"             cm_w_ub: {w_ub:g}\n"
+          f"\n    skrl_c2rl_ppo_cfg.yaml / skrl_c2rl_sac_cfg.yaml / skrl_c3m_cfg.yaml\n"
+          f"      cm:    lbd: {lbd:.4f}\n"
+          f"             cvstem_r_scaler: {r:g}\n"
+          f"             cm_eps: {eps_eval:g}\n"
+          f"             w_lb: {w_lb:g}\n"
+          f"             w_ub: {w_ub:g}\n"
+          f"\n  Then REGENERATE the CM dataset (lbd is in the cache key, so the old npz\n"
+          f"  key-misses rather than being wrong-but-used), and verify it:\n"
+          f"      python scripts/build_cm_dataset.py --task {args.task} --algorithm c2rl-ppo\n"
+          f"      python scripts/verify_cm_dataset.py --task {args.task}")
     if args.no_eval:
         return 0
 
@@ -422,7 +434,9 @@ def main() -> int:
               f"against the {args.num_samples} the search certified — strictly harder, "
               f"so it can come back infeasible even though the search cleared.")
     agent = CVSTEMLQRAgent(
-        cfg={"lbd": lbd, "r_scaler": r, "cm_eps": eps_eval, "cm_dt": lmi_dt,
+        # No cm_dt: it is not a CVSTEMLQRCfg field any more (the SDP is pinned at
+        # 1.0), so passing it only earns an "ignoring config key" warning.
+        cfg={"lbd": lbd, "r_scaler": r, "cm_eps": eps_eval,
              "cm_w_lb": w_lb, "cm_w_ub": w_ub,
              "cm_solver": args.solver, "cm_samples": args.eval_samples,
              "cm_seed": args.seed, "cmg_hidden_dims": [100, 100, 100],
