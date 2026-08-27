@@ -267,6 +267,20 @@ def main() -> int:
     p.add_argument("--solver", default="MOSEK")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--eval-envs", "--eval_envs", type=int, default=16)
+    # rule.md Step 1: X is the LARGEST box over which one lambda certifies. When
+    # nothing certifies, the box is the thing that is wrong, so it has to be
+    # searchable from here rather than by editing env.py between attempts.
+    p.add_argument("--x-scale", "--x_scale", type=float, default=1.0,
+                   help="Scale every state box (X, X_INIT, XE, XE_INIT, XREF_INIT) "
+                        "about the ORIGIN by this factor before searching. <1 "
+                        "shrinks the certified region, which shrinks e(0) with it. "
+                        "The only lever for an LMI-INFEASIBLE env: the LMI contains "
+                        "no uref, so control bounds cannot move it.")
+    p.add_argument("--uref-scale", "--uref_scale", type=float, default=1.0,
+                   help="Scale the control box (UREF, and the applied U box with "
+                        "it) by this factor. Moves the ACTUATOR gate only -- use it "
+                        "when the log says '%% of controls out of box', never when "
+                        "it says LMI INFEASIBLE.")
     p.add_argument("--no-eval", "--no_eval", action="store_true",
                    help="Stop after the search; skip the episode. Use this when "
                         "sweeping several envs: the eval rebuilds the agent at "
@@ -283,6 +297,29 @@ def main() -> int:
 
     def _np(t):
         return t.detach().cpu().numpy().astype(np.float64)
+
+    # Scaled about the ORIGIN, not about each box's own centre. The reference an
+    # episode tracks starts at XREF_INIT (zero for segway), so e(0) = x_0 - xref_0
+    # scales with the DISTANCE FROM ZERO, not with the box width -- halving an
+    # asymmetric box about its own centre would leave that distance untouched.
+    # Every box has to move together or an init box ends up outside X.
+    if args.x_scale != 1.0:
+        for _name in ("X_MIN", "X_MAX", "XE_MIN", "XE_MAX", "XE_INIT_MIN",
+                      "XE_INIT_MAX", "X_INIT_MIN", "X_INIT_MAX",
+                      "XREF_INIT_MIN", "XREF_INIT_MAX"):
+            _b = getattr(env, _name, None)
+            if _b is not None:
+                setattr(env, _name, _b * args.x_scale)
+        print(f"[uniform-lambda] X-SCALE {args.x_scale:g}: state boxes shrunk about "
+              f"the origin. X = [{_np(env.X_MIN).round(4)}, {_np(env.X_MAX).round(4)}]")
+    if args.uref_scale != 1.0:
+        for _name in ("UREF_MIN", "UREF_MAX", "U_MIN", "U_MAX"):
+            _b = getattr(env, _name, None)
+            if _b is not None:
+                setattr(env, _name, _b * args.uref_scale)
+        print(f"[uniform-lambda] UREF-SCALE {args.uref_scale:g}: control box now "
+              f"[{_np(env.UREF_MIN).round(4)}, {_np(env.UREF_MAX).round(4)}]. This "
+              f"moves the actuator gate only -- the LMI has no uref in it.")
 
     # The CV-STEM SDP always runs at dt = 1.0. Not a knob: generation resolves
     # joint_dt = float(wdot_dt or temporal_dt or 1.0) in ncm_synthesis.cvstem_joint
