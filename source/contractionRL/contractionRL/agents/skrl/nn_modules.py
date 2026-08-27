@@ -25,8 +25,8 @@ def _sym_from_names(names):
     return StateSymmetry.from_names(names)
 
 
-from .angle_utils import embed_angles, embedded_dim, wrap_diff
-from .math_utils import bound_W, rescale_residual, spd_inverse
+from .angle_utils import embed_angles, embedded_dim
+from .math_utils import rescale_residual
 from .ref_window import Feats, RefWindow
 
 _MIN_LOG_STD = math.log(0.001)  # ≈ -6.908; annealing floor
@@ -876,59 +876,3 @@ class BoundedCCM_Generator(nn.Module):
 # Measured worse than the post-hoc actuator filter once deployed through regressed
 # networks: 98.4% held-out violation vs 24.6%. See ncm_synthesis.py's matching note.
 # Recover with `git log -S CVSTEMBoundedLQRBase`.
-
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# CVSTEMLQRBase — the analytic CV-STEM-LQR law, used ONLY to generate regression
-# targets for pretraining pi. It is never attached as a deployed base: the
-# control law stays u = urefs[0] + pi(s). See C2RLAgent._pretrain_residual_cvstemlqr.
-# ─────────────────────────────────────────────────────────────────────────── #
-class CVSTEMLQRBase:
-    """The certified CV-STEM-LQR control law, evaluated to produce regression
-    targets for pretraining pi.
-
-        u_base = uref - K(x)·e,   K(x) = (1/r)·B(x)ᵀ·M(x),   M(x) = W(x)⁻¹,
-        e = wrap_diff(x - xref)
-
-    Byte-for-byte ``CVSTEMLQRAgent._compute_action_pretrained``: same Phase-A
-    frozen CMG, same analytic ``B(x)``, same ``R = r_scaler·I``, so the targets
-    are the same law that agent deploys.
-
-    This is a target generator, NOT a deployed base. It is never assigned to the
-    policy, and the control law stays ``u = urefs[0] + pi(s)`` throughout: PPO
-    starts from a pi that imitates the analytic gain instead of from noise, and
-    is then free to move away from it.
-
-    Deliberately not an ``nn.Module``: it references the frozen CMG but must not
-    register it as a policy submodule, which would double-count the CMG in the
-    policy's parameters/checkpoint and in the optimizer. Its output is fully
-    detached — nothing here is ever differentiated through.
-    """
-
-    def __init__(self, ccm_gen, get_f_and_B, *, r_scaler, w_lb, window: RefWindow,
-                 angle_idx=()):
-        self.ccm_gen = ccm_gen
-        self.get_f_and_B = get_f_and_B
-        self.r = float(r_scaler) + 1e-5           # strictly positive (mirrors cvstem_lqr.py)
-        self.w_lb = float(w_lb)
-        self.window = window
-        self.x_dim = window.x_dim
-        self.u_dim = window.u_dim
-        self.angle_idx = list(angle_idx or [])
-
-    def __call__(self, state: torch.Tensor) -> torch.Tensor:
-        # Analytic feedback is myopic: it needs only the current reference, so
-        # it reads xrefs[0]/urefs[0] and ignores the rest of the window.
-        x, xrefs, urefs = self.window.split(state)
-        xref, uref = xrefs[:, 0], urefs[:, 0]
-        with torch.no_grad():
-            _f, B, _ = self.get_f_and_B(x)
-            B = B.to(torch.float32)
-            raw_W, _ = self.ccm_gen(x)
-            W = bound_W(raw_W, self.w_lb, self.x_dim,
-                        getattr(self.ccm_gen, "bounded", False))
-            M = spd_inverse(W)                                   # (b, x, x)
-            K = (1.0 / self.r) * torch.bmm(B.transpose(1, 2), M)  # (b, u, x)
-            e = wrap_diff(x - xref, self.angle_idx).unsqueeze(-1)  # (b, x, 1)
-            u = uref - torch.bmm(K, e).squeeze(-1)               # (b, u)
-        return u.detach()

@@ -220,20 +220,6 @@ cm:
   # Caveat worth keeping: N=10000 over a 4-dim box is ~10 samples per dimension,
   # so this certifies the sampled set, not the continuum. It is the repo's
   # shipping standard, not a proof.
-  # Regress pi onto the analytic CV-STEM-LQR law before PPO starts. Segway needs
-  # it: AUC/T (mean normalized error) measured 1.20 at a 15 s horizon and 1.20 at
-  # 60 s, i.e. the error never decays -- while the certified lambda = 0.0514
-  # permits 0.31 at 60 s. The gap is the policy, not the envelope: from-scratch PPO
-  # never finds a stabilizing feedback on a plant that diverges without one.
-  #
-  # The analytic law is used ONLY as a regression target. It is never attached to
-  # the policy, so the deployed control stays u = urefs[0] + pi(s).
-  residual_cvstemlqr_pretrain: true
-  residual_pretrain_epochs: 200
-  residual_pretrain_lr: 1.0e-3
-  residual_pretrain_batch: 1024
-  residual_pretrain_samples: 65536
-  residual_pretrain_clamp_target: true
   lbd: 0.0514
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled)
