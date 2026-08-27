@@ -884,24 +884,25 @@ class BoundedCCM_Generator(nn.Module):
 # control law stays u = urefs[0] + pi(s). See C2RLAgent._pretrain_residual_cvstemlqr.
 # ─────────────────────────────────────────────────────────────────────────── #
 class CVSTEMLQRBase:
-    """The certified CV-STEM-LQR control law, packaged as a fixed baseline the
-    C2RL actor learns a residual on top of.
+    """The certified CV-STEM-LQR control law, evaluated to produce regression
+    targets for pretraining pi.
 
         u_base = uref - K(x)·e,   K(x) = (1/r)·B(x)ᵀ·M(x),   M(x) = W(x)⁻¹,
         e = wrap_diff(x - xref)
 
     Byte-for-byte ``CVSTEMLQRAgent._compute_action_pretrained``: same Phase-A
-    frozen CMG, same analytic ``B(x)``, same ``R = r_scaler·I``. That controller
-    already scores near the analytic tracking floor (~0.9 AUC on car), yet C2RL
-    normally ignores it and learns feedback from scratch. As the baseline, the
-    policy starts there and PPO can only improve it (clamped reward, actuator
-    limits, preview, discrete-dt and nonlinear corrections the linear gain misses).
+    frozen CMG, same analytic ``B(x)``, same ``R = r_scaler·I``, so the targets
+    are the same law that agent deploys.
+
+    This is a target generator, NOT a deployed base. It is never assigned to the
+    policy, and the control law stays ``u = urefs[0] + pi(s)`` throughout: PPO
+    starts from a pi that imitates the analytic gain instead of from noise, and
+    is then free to move away from it.
 
     Deliberately not an ``nn.Module``: it references the frozen CMG but must not
     register it as a policy submodule, which would double-count the CMG in the
-    policy's parameters/checkpoint and in the optimizer. No learnable parameters
-    — ``u_base`` is a fixed detached offset like ``uref``, so gradients flow only
-    through the residual.
+    policy's parameters/checkpoint and in the optimizer. Its output is fully
+    detached — nothing here is ever differentiated through.
     """
 
     def __init__(self, ccm_gen, get_f_and_B, *, r_scaler, w_lb, window: RefWindow,

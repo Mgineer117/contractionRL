@@ -214,7 +214,6 @@ class C2RLPPOCfg(AgentCfg):
     # With reward_euclidean: Level form r=-‖e‖ (tightest AUC alignment) vs the
     # default decrement form. See env_base.get_rewards.
     reward_level: bool = False
-    residual_distill_epochs: int = 300
     # Removed 2026-07-30: hard_control_bound* / gain_net_* knobs, for the
     # hard-control-bound base (free SDP gain Y + Boyd bounded-peak-input LMI).
     # Measured worse than the post-hoc actuator filter (cvstem_u_bound/rho,
@@ -368,7 +367,6 @@ class C2RLSACCfg(AgentCfg):
     cvstem_r_scaler: float = 1.0
     reward_euclidean: bool = False       # AUC-aligned Euclidean-decrement reward (see C2RLPPOCfg)
     reward_level: bool = False           # Level (r=-‖e‖) vs decrement euclidean reward (see C2RLPPOCfg)
-    residual_distill_epochs: int = 300
     # Weights of the CV-STEM objective J (always minimized) — see
     # C2RLPPOCfg.cm_chi_weight above and ncm_synthesis.cvstem_joint.
     cm_chi_weight: float | None = None
@@ -896,18 +894,17 @@ class C2RLAgent(Agent):
                 torch.as_tensor(roll["uref"], dtype=torch.float32, device=dev))
 
     def _pretrain_residual_cvstemlqr(self) -> None:
-        """Pretrain π so u = uref + π(s) matches the analytic CV-STEM-LQR control
-        law u_cvstemlqr(x,xref,uref) = uref - K(x)·e, K = R⁻¹BᵀW⁻¹, computed from
-        the same frozen Phase-A metric M(x) as _pretrain_residual_contraction's
-        certificate. Plain supervised MSE regression — no SDP, no jacobians, no
-        C3M loss — so it is well-posed and actually converges near 0, unlike the
-        Cu≺0 violation loss (observed to plateau ~2.6-3.3 regardless of epochs;
-        that residual violation correlates with per-seed overshoot/AUC variance,
-        see project memory). Reuses the CVSTEMLQRBase class the analytic baseline
-        eval uses, but only to generate targets here — it is never attached to
-        policy.base_controller, so the deployed law stays u = uref + π exactly as
-        in "contraction" mode. Same rollout/preview-pool sampling as
-        _pretrain_residual_contraction, for a fair like-for-like comparison."""
+        """Pretrain π so u = uref + π(s) matches the analytic CV-STEM-LQR law
+        u = uref - K(x)·e, K = R⁻¹BᵀW⁻¹, computed from the frozen Phase-A metric.
+
+        Plain supervised MSE regression — no SDP, no jacobians, no C3M loss — so
+        it is well-posed and converges near 0 (measured 9.2e-3 -> 6.7e-6 over 200
+        epochs on segway).
+
+        CVSTEMLQRBase is used here ONLY to generate targets; it is never attached
+        to the policy, so the deployed law stays u = uref + π. The effect is on
+        PPO's starting point: it fine-tunes a stabilizing controller instead of
+        searching for one."""
         from .nn_modules import CVSTEMLQRBase
         cfg = self._cfg
         policy = self._policy_model
