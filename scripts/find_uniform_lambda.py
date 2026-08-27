@@ -176,20 +176,39 @@ def evaluate(env, agent, n_envs):
     e0 = env.wrap_angles(env.x_t - env.xref[:, 0]).norm(dim=-1)
     e_last, e_max, err_sum = e0.clone(), e0.clone(), e0.clone()
     umax = 0.0
+    # `active` freezes an env's accumulators once its episode ends. BaseEnv.step
+    # calls reset_idx(done) INTERNALLY, so on the step where an env finishes,
+    # env.x_t is already the NEXT episode's fresh draw and env.xref has been
+    # re-rolled. Reading e after that samples an unrelated random state: measured
+    # on car e[T-1] = 17.66 against a true final 10.41, and on segway it reported
+    # contraction_rate 0.0056 for an open loop whose true rate is 0. Since
+    # truncation fires at t = T-1 for EVERY env, that junk sample landed in
+    # e_last, e_max and err_sum on every run -- i.e. in all four Stability/*
+    # numbers this script prints as its verdict.
+    active = torch.ones_like(e0, dtype=torch.bool)
+    steps = torch.zeros_like(e0)
     for t in range(T):
         flat = torch.cat([torch.as_tensor(obs[k], dtype=torch.float32).reshape(n_envs, -1)
                           for k in sorted(obs)], dim=-1)
         with torch.no_grad():
             u, _ = agent.act(flat, None, timestep=t, timesteps=T)
         umax = max(umax, float(u.abs().max()))
-        obs, _, _, _, _ = env.step(u.numpy())
+        obs, _, term, trunc, _ = env.step(u.numpy())
         e = env.wrap_angles(env.x_t - env.xref[:, min(t + 1, T - 1)]).norm(dim=-1)
         e = torch.nan_to_num(e, nan=1e6, posinf=1e6)
-        e_max = torch.maximum(e_max, e)
-        err_sum += e
-        e_last = e
+        done = (torch.as_tensor(term).reshape(-1).bool()
+                | torch.as_tensor(trunc).reshape(-1).bool())
+        # This step's e is valid only for envs that did NOT just reset.
+        upd = active & ~done
+        e_max = torch.where(upd, torch.maximum(e_max, e), e_max)
+        err_sum = torch.where(upd, err_sum + e, err_sum)
+        e_last = torch.where(upd, e, e_last)
+        steps = torch.where(upd, steps + 1, steps)
+        active = active & ~done
+        if not active.any():
+            break
     m = per_env_metrics(e0=e0, e_last=e_last, e_max=e_max, err_sum=err_sum,
-                        steps=torch.full_like(e0, T + 1), dt=float(env.dt))
+                        steps=steps + 1, dt=float(env.dt))
     return {k: float(v.mean()) for k, v in m.items()}, umax
 
 
