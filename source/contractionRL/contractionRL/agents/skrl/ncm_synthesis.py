@@ -421,10 +421,13 @@ def build_cm_dataset(
     # indistinguishable from a hang for its entire life — and Python block-buffers
     # stdout to a file, so a wall-limit SIGTERM would discard even this. Run these
     # under `python -u`.
+    # ~15 h AND ~17 GB resident at n=10000 (measured on cartpole, 2026-08-27). The
+    # memory is why these have to run one at a time: two concurrent builds do not
+    # fit in 30 GB, and the OOM killer takes whichever is further along.
     print(f"{tag} joint CV-STEM SDP: one program over {n} samples "
           f"(lbd={lbd:g}, eps={eps:g}, w=[{w_lb:g},{w_ub:g}], r={r_scaler:g}, "
           f"dt={joint_dt:g}, solver={solver}) — no per-sample progress to report, "
-          f"expect ~15 h at n=10000 ...", flush=True)
+          f"expect ~15 h and ~17 GB at n=10000; run these SERIALLY ...", flush=True)
     sol = cvstem_joint(A_j, B_j, lbd=lbd, eps=eps, dt=joint_dt,
                        solver=solver, r_scaler=r_scaler, chi_weight=chi_weight,
                        nu_weight=nu_weight, w_lb=w_lb, w_ub=w_ub)

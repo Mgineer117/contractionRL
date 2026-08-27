@@ -32,6 +32,18 @@ cm:
   # (the λ-selection step; the reference's own linesearch is not run here).
   # From scripts/find_uniform_lambda.py's uniform state-box search — measured
   # jointly with the r/w_lb/w_ub here, one solution of one program.
+  # WARNING (2026-08-27): this lbd is NOT certified and no contraction method
+  # currently works on this env. The joint CV-STEM SDP is infeasible at every
+  # lambda down to 0.01 over every box searched (x_scale 0.75..0.1), and that is
+  # not a synthesiser problem: (A,B) has controllability rank 4/6 at EVERY sampled
+  # state, so two of six modes are unreachable. A plain LQR confirms it -- the
+  # Riccati equation has no solution at 161 of 400 steps and the error GROWS,
+  # 0.506 -> 2.681 over 8 s (decay -0.2845/s).
+  #
+  # cmg_method: ccm would not rescue it either; an existence certificate still
+  # needs the directions to be reachable. Fix the dynamics or the actuation in
+  # env.py before running any contraction algorithm here. build_cm_dataset will
+  # raise rather than write a dataset, which is the correct behaviour.
   lbd: 0.3902
   cm_eps: 0.01
   # Deployment envelope w_lb·I ⪯ W ⪯ w_ub·I, as the caps nu <= 1/w_lb and
