@@ -18,7 +18,7 @@
 #
 # Flags (all optional; anything omitted is prompted for):
 #   --algorithm NAME     a stem in search/configs/ (e.g. ppo, c3m, cvstem-lqr)
-#   --env NAME           car|cartpole|segway|turtlebot|quadrotor, an Isaac Lab
+#   --env NAME           car|cartpole|segway|quadrotor, an Isaac Lab
 #                        task id, or 'all' for every classic env
 #   --num-agents N       parallel wandb agents per env (default 3)
 #   --gpu N              pin every agent to this GPU (default: round-robin)
@@ -117,12 +117,12 @@ fi
 [[ "$DETACHED" -ne 1 ]] && _success "Algorithm: ${C_BOLD}$ALGORITHM${C_RESET}"
 
 # ── Env ─────────────────────────────────────────────────────────────────── #
-CLASSIC_ENVS=("classic-car-v0" "classic-cartpole-v0" "classic-segway-v0" "classic-turtlebot-v0" "classic-quadrotor-v0")
+CLASSIC_ENVS=("classic-car-v0" "classic-cartpole-v0" "classic-segway-v0" "classic-quadrotor-v0")
 ISAAC_ENVS=("Humanoid-PathTracking-v0" "Humanoid-VelTracking-v0" "Manipulator-PathTracking-v0" "Manipulator-VelTracking-v0" "Quadruped-PathTracking-v0" "Quadruped-VelTracking-v0")
 
 if [[ -z "$ENV_ARG" ]]; then
     ENV_ARG=$(prompt_choice "Select env to sweep (or 'all' for every classic env):" \
-        car cartpole segway turtlebot quadrotor "${ISAAC_ENVS[@]}" all)
+        car cartpole segway quadrotor "${ISAAC_ENVS[@]}" all)
 fi
 
 if [[ "$ENV_ARG" == "all" ]]; then
@@ -132,14 +132,13 @@ else
         car|classic-car-v0)             ENVS=("classic-car-v0") ;;
         cartpole|classic-cartpole-v0)   ENVS=("classic-cartpole-v0") ;;
         segway|classic-segway-v0)       ENVS=("classic-segway-v0") ;;
-        turtlebot|classic-turtlebot-v0) ENVS=("classic-turtlebot-v0") ;;
         quadrotor|classic-quadrotor-v0) ENVS=("classic-quadrotor-v0") ;;
         *)
             # Isaac Lab task id — accept only ids that actually exist.
             _found=0
             for e in "${ISAAC_ENVS[@]}"; do [[ "$e" == "$ENV_ARG" ]] && _found=1; done
             if [[ "$_found" -ne 1 ]]; then
-                echo "Unknown env '$ENV_ARG'. Classic: car/cartpole/segway/turtlebot/quadrotor (or 'all'). Isaac Lab: ${ISAAC_ENVS[*]}" >&2
+                echo "Unknown env '$ENV_ARG'. Classic: car/cartpole/segway/quadrotor (or 'all'). Isaac Lab: ${ISAAC_ENVS[*]}" >&2
                 exit 1
             fi
             ENVS=("$ENV_ARG")

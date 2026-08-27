@@ -25,7 +25,7 @@ If you touched anything an algorithm reads, also smoke-run the matrix — a conf
 key that stops being applied does **not** raise:
 
 ```bash
-for e in car cartpole turtlebot segway quadrotor; do
+for e in car cartpole segway quadrotor; do
   for a in ppo sac c3m lqr sdlqr cvstem-lqr c2rl-ppo c2rl-sac; do
     python scripts/skrl/train.py --classic --task classic-$e-v0 --algorithm $a \
         --num_timesteps 300 --num_envs 16 --no_wandb --skip_final_eval || echo "FAIL $e/$a"

@@ -11,7 +11,6 @@ new env) had no way to know which dims must co-rotate.
 Instead each env now declares ``state_names``: one name per state dim, e.g.
 
     car        = ("pos_x", "pos_y", "yaw", "vel")
-    turtlebot  = ("pos_x", "pos_y", "yaw")
     segway     = ("pos_x", "pitch", "vel_x_b", "pitch_rate")
     quadrotor  = ("pos_x", "pos_y", "pos_z", "vel_x_w", "vel_y_w", "vel_z_w",
                   "thrust", "roll", "pitch", "yaw")

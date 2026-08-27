@@ -136,8 +136,12 @@ def main() -> int:
                                  seed=getattr(cfg, "cm_seed", 0))
 
     t0 = time.time()
+    # env.get_rollout, not None: with cmg_random_ratio in (0,1) the mixer asks the
+    # rollout for the reference-structured share and a None here is a TypeError
+    # mid-solve. At the shipped ratio of 0.0 the offline pool is used wholesale
+    # and this is never called.
     ds = build_cm_dataset(
-        None, env.get_f_and_B,
+        env.get_rollout, env.get_f_and_B,
         x_dim=int(env.num_dim_x),
         lbd=cfg.lbd, w_lb=cfg.w_lb, w_ub=cfg.w_ub, eps=cfg.cm_eps,
         num_samples=cfg.cmg_memory_size, solver=cfg.cm_solver,

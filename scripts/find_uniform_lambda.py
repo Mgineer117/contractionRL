@@ -53,8 +53,8 @@ honest form of this check is a budget on how often that happens.
 
 ``expand_box`` is sign-aware: a bound widens by multiplying when it already points
 outward (negative ``lo``, positive ``hi``) and by dividing when it points inward,
-since ``2 x positive_lo`` would narrow the box. Zero is a fixed point, which is
-what turtlebot's ``v ∈ [0, 0.44]`` needs.
+since ``2 x positive_lo`` would narrow the box. Zero is a fixed point, so a
+one-sided box like ``v ∈ [0, 0.44]`` widens outward only.
 
 When ``r`` bites, and when it does not
 ---------------------------------------
@@ -74,13 +74,14 @@ sits on plateaus that later break through (on the car at lbd=0.39 it stalls at
 0.66 from r=3.2 to 6.4, and at lbd=0.26 the same plateau drops to 0.086 by
 r=25.6).
 
-Note the ``cm_dt`` dependence: at ``cm_dt = env.dt`` the ``(W̄-I)/dt`` term is 33x
-harsher on the classic envs and pins the solution at the corner, which is the
-regime where ``r`` looks inert. It is not inert at ``cm_dt = 1``.
+The SDP runs at ``dt = 1.0``, fixed. It was a flag, and defaulting it to
+``env.dt`` made the (W̄-I)/dt term 33x harsher than the program the configs
+actually generate at -- so the search certified a rate the generator never had to
+meet. That is also the regime where ``r`` looks inert; it is not inert at 1.0.
 
 Example::
 
-    python scripts/find_uniform_lambda.py --task classic-car-v0 --cm-dt 1.0
+    python scripts/find_uniform_lambda.py --task classic-car-v0
 """
 from __future__ import annotations
 
@@ -134,8 +135,8 @@ def expand_box(lo, hi, factor=2.0):
     A bound widens by multiplying when it already points outward (negative
     ``lo``, positive ``hi``) and by dividing when it points inward (positive
     ``lo``, negative ``hi``) — ``2 × positive_lo`` would narrow the box, not
-    widen it. Zero is a fixed point either way, which is what turtlebot's
-    ``v ∈ [0, 0.44]`` needs (its lower bound must stay at 0).
+    widen it. Zero is a fixed point either way, which is what a one-sided box
+    like ``v ∈ [0, 0.44]`` needs (its lower bound must stay at 0).
     """
     lo, hi = np.asarray(lo, dtype=np.float64), np.asarray(hi, dtype=np.float64)
     return (np.where(lo < 0, lo * factor, lo / factor),

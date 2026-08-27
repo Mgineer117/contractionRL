@@ -38,9 +38,6 @@ Crucially, the child's own config decides what counts as a terminal miss — thi
 wrapper only watches for the signals that mean the child actually dropped a
 state or aborted. Strictness is a per-algorithm choice made in the config:
 
-                                     #   the state drops and the ratio/rate fires
-    cm.min_feasibility_rate:  1.0    # offline: child raises if any state is dropped
-
 a few genuine drops. A rescued state is feasible, so it never trips a detection
 signal — which is why the ``infeasible at λ=`` rescue WARNING is not a kill
 signal (see ``_HARD_MARKERS``). Only a state the child could not rescue (dropped)

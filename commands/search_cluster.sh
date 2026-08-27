@@ -40,7 +40,7 @@
 #
 # Flags (all optional; anything omitted is prompted for):
 #   --algorithm NAME     a stem in search/configs/ (e.g. ppo, c2rl-sac-cvstem)
-#   --env NAME           car|cartpole|segway|turtlebot|quadrotor, an Isaac Lab
+#   --env NAME           car|cartpole|segway|quadrotor, an Isaac Lab
 #                        task id, or 'all' for every classic env
 #   --method M           bayes (default) | grid | random
 #   --project NAME       W&B project for the sweep (default: build_sweep.py's
@@ -213,11 +213,11 @@ _header "contractionRL cluster sweep launcher"
 _success "Algorithm: ${C_BOLD}$ALGORITHM${C_RESET}"
 
 # ── Env ───────────────────────────────────────────────────────────────────── #
-CLASSIC_ENVS=("classic-car-v0" "classic-car-v1" "classic-cartpole-v0" "classic-segway-v0" "classic-turtlebot-v0" "classic-quadrotor-v0")
+CLASSIC_ENVS=("classic-car-v0" "classic-car-v1" "classic-cartpole-v0" "classic-segway-v0" "classic-quadrotor-v0")
 ISAAC_ENVS=("Humanoid-PathTracking-v0" "Humanoid-VelTracking-v0" "Manipulator-PathTracking-v0" "Manipulator-VelTracking-v0" "Quadruped-PathTracking-v0" "Quadruped-VelTracking-v0")
 if [[ -z "$ENV_ARG" ]]; then
     ENV_ARG=$(prompt_choice "Select env to sweep (or 'all' for every classic env):" \
-        car cartpole segway turtlebot quadrotor "${ISAAC_ENVS[@]}" all)
+        car cartpole segway quadrotor "${ISAAC_ENVS[@]}" all)
 fi
 if [[ "$ENV_ARG" == "all" ]]; then
     ENVS=("${CLASSIC_ENVS[@]}")
@@ -227,7 +227,6 @@ else
         car_v1|classic-car-v1)   ENVS=("classic-car-v1") ;;
         cartpole|classic-cartpole-v0)   ENVS=("classic-cartpole-v0") ;;
         segway|classic-segway-v0)       ENVS=("classic-segway-v0") ;;
-        turtlebot|classic-turtlebot-v0) ENVS=("classic-turtlebot-v0") ;;
         quadrotor|classic-quadrotor-v0) ENVS=("classic-quadrotor-v0") ;;
         *)
             _found=0; for e in "${ISAAC_ENVS[@]}"; do [[ "$e" == "$ENV_ARG" ]] && _found=1; done

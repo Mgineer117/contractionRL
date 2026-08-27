@@ -34,9 +34,10 @@ STATE_NAMES = ("pos_x", "pitch", "vel_x_b", "pitch_rate")
 # worse trade: 6x for 27% of the area. See scripts/minproj_plot.py's cached grid
 # and the table in the 2026-08-22 session.
 #
-# This does NOT touch the initial distribution: XE_INIT draws pitch from +-0.15,
-# far inside either bound. What it changes is the set the CM dataset certifies
-# over, and the tilt at which an episode terminates (60 deg -> 51.6 deg).
+# This does NOT touch the initial distribution: segway sets X_INIT, so reset()
+# draws x_0 from that box directly and never reads XE_INIT at all. What it
+# changes is the set the CM dataset certifies over, and the tilt at which an
+# episode terminates (60 deg -> 51.6 deg).
 PITCH_LIM = 0.90
 X_MIN = [-5.0, -PITCH_LIM, -1.0, -math.pi]
 X_MAX = [5.0, PITCH_LIM, 1.0, math.pi]

@@ -933,7 +933,11 @@ class ContractionRunner:
                                      critic_encoder_stride=int(models_cfg.get("critic", {}).get("encoder_stride", 1)),
                                      critic_analytic_potential=bool(
                                          models_cfg.get("critic", {}).get("analytic_potential", False)),
-                                     w_lb=float(agent_cfg.get("cm", {}).get("w_lb", 0.01))))
+                                     # The local w_lb, NOT agent_cfg["cm"]["w_lb"]: agent_cfg was
+                                     # FLATTENED above ({**cm_cfg, **cmg_cfg, ...}), so there is no
+                                     # nested "cm" block and that read returned the 0.01 default for
+                                     # every config -- 10x the 0.001 the envs actually ship.
+                                     w_lb=float(w_lb)))
 
         # Pass the raw agent_cfg dict (not a pre-parsed C2RLPPOCfg/C2RLSACCfg) —
         # C2RLAgent keeps the full dict in self._raw_cfg, which make_base_rl_cfg()
