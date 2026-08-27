@@ -7,7 +7,7 @@ evaluates on any environment and the reported stability metrics are directly com
 
 - **Classic envs** — pure NumPy/gymnasium, no simulator. Analytically synthesize a fresh reference
   trajectory every `reset()`. Twelve are registered (`car-v0`, `car-v1`, `cartpole`, `segway`,
-  `turtlebot`, `quadrotor`, `aircraft`, `auv`, `ball_and_beam`, `pvtol`, `tora`, `two_link_arm`).
+  `quadrotor`, `aircraft`, `auv`, `ball_and_beam`, `pvtol`, `tora`, `two_link_arm`).
 - **Isaac envs** — quadruped / humanoid / manipulator velocity- and path-tracking. Need Isaac Lab.
 
 ## Install
@@ -85,7 +85,7 @@ One policy, two phases.
 
 1. **Synthesize the metric, then freeze it.** `cmg_method: cvstem` solves one SDP per sampled
    state and regresses the metric network onto `{x -> W*}`; `ccm` instead trains it directly on
-   Manchester's C1/C2 losses (no SDP — required for a driftless plant such as `turtlebot`, which is
+   Manchester's C1/C2 losses (no SDP — required for a driftless plant, which is
    CV-STEM-infeasible at every `lambda`). The `cvstem` solve is expensive, so its result is cached
    under `data/` and the agent **refuses to run** rather than silently re-solve when no cached
    dataset matches the config.

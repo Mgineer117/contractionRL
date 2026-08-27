@@ -25,11 +25,13 @@ same draw ``cvstem_lqr`` synthesizes over.
 
 The control check — A 5% budget, not a veto
 --------------------------------------------
-Uniform state samples carry no reference, so the error is drawn from the env's own
-reset perturbation box ``[XE_INIT_MIN, XE_INIT_MAX]`` and the feedforward from
-``[UREF_MIN, UREF_MAX]``. (Not ``XE_MIN``/``XE_MAX`` -- that is C3M's flat +-1
-training-perturbation box, not the tracking error an episode presents; see the
-comment at the ``e_lo, e_hi`` assignment.) At every sampled state, ``--n-draws`` of each are pushed through the
+Uniform state samples carry no reference, so the error is resampled from the env's
+own ``define_initial_state`` -- the actual e(0) an episode presents -- and the
+feedforward from ``[UREF_MIN, UREF_MAX]``. Deliberately NOT read off any named box:
+whether reset perturbs by ``XE_INIT`` or draws ``x_0`` directly from ``X_INIT``
+depends on the env, and reading the wrong one silently gated cartpole and segway on
+errors 5.7x-11x too small (see the comment at the e-draw assignment).
+At every sampled state, ``--n-draws`` of each are pushed through the
 control the agent would really apply, ``u = uref - K(x)·e`` with ``K = (1/r)BᵀM``,
 and the check fails only when more than ``--viol-frac`` (5%) of that population
 lands outside the control box.
@@ -228,19 +230,20 @@ def main() -> int:
     p.add_argument("--u-expansion", "--u_expansion", type=float, default=2.0,
                    help="Control box = uref box widened by this, sign-aware "
                         "(see expand_box). 2.0 is what every env here uses.")
-    p.add_argument("--w-lb", "--w_lb", type=float, default=0.01,
+    # 0.001/1000.0 -- what every shipped yaml uses. These used to default to
+    # 0.01/100, capping the searched gain 10x tighter than deployment
+    # (||K|| <= ||B||/(r*w_lb)), so the 5% actuator budget was measured on an
+    # envelope no config runs.
+    p.add_argument("--w-lb", "--w_lb", type=float, default=0.001,
                    help="Deployment envelope lower bound, FIXED — the search never "
                         "moves it. If nothing certifies inside it, that is the answer.")
-    p.add_argument("--w-ub", "--w_ub", type=float, default=100.0,
+    p.add_argument("--w-ub", "--w_ub", type=float, default=1000.0,
                    help="Deployment envelope upper bound, FIXED.")
     p.add_argument("--cm-eps", "--cm_eps", type=float, default=None,
                    help="ε, the strict-definiteness margin (Tsukamoto's epsilon, which "
                         "is 0 — see eps_for_n). Default AUTO: scheduled from the sample "
                         "count, 0.1 at N<=100, 0.05 at N<=1000, 0.01 beyond. Pass a "
                         "float to pin BOTH phases to it.")
-    p.add_argument("--cm-dt", "--cm_dt", type=float, default=None,
-                   help="The LMI's dt = the agent's cm_dt (his CV-STEM sampling "
-                        "period, NOT the integrator step). Default: the env's dt.")
     p.add_argument("--solver", default="MOSEK")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--eval-envs", "--eval_envs", type=int, default=16)
@@ -256,24 +259,43 @@ def main() -> int:
     def _np(t):
         return t.detach().cpu().numpy().astype(np.float64)
 
-    lmi_dt = float(env.dt) if args.cm_dt is None else float(args.cm_dt)
+    # The CV-STEM SDP always runs at dt = 1.0. Not a knob: generation resolves
+    # joint_dt = float(wdot_dt or temporal_dt or 1.0) in ncm_synthesis.cvstem_joint
+    # and C2RL leaves those at 0, so 1.0 is the only value the dataset is ever
+    # built at. This used to default to env.dt, which made the SEARCH's (W-I)/dt
+    # term 33x harsher than the program actually GENERATED -- so the certified
+    # lambda answered a question nobody asked.
+    LMI_DT = 1.0
+    lmi_dt = LMI_DT
     uref_lo, uref_hi = _np(env.UREF_MIN), _np(env.UREF_MAX)
-    # XE_INIT, not XE_MIN/XE_MAX. The check asks "of the controls this metric
-    # generates, what fraction is unrealizable?", so the error draws have to be
-    # the errors an episode actually presents -- XE_INIT is exactly what reset()
-    # perturbs by, and it is sized per env (quadrotor's is per-dimension, from
-    # measured budget consumption along the CV-STEM tube).
+    # The error draws come from the env's OWN define_initial_state, not from any
+    # named box. The check asks "of the controls this metric generates, what
+    # fraction is unrealizable?", so the errors have to be the ones an episode
+    # actually presents -- and only the env knows which box that is.
     #
-    # XE_MIN/XE_MAX is C3M's training-perturbation box: a flat +-1 on every dim,
-    # identical across all four envs, sampled by get_rollout(., "c3m") for the
-    # contraction loss. It was never sized to represent tracking error, and on
-    # segway it is 6.7x wider in pitch than reset ever produces -- a 1 rad (57
-    # deg) tilt error, which the env's own comment calls "mid-fall, not a
-    # tracking error". Measured at a fixed metric (lbd=0.0101, r=6.4), swapping
-    # only this box moves the violation rate 35.20% -> 0.61%, i.e. it alone was
-    # the difference between segway certifying and returning INFEASIBLE at every
-    # (lbd, r, envelope) tried. Cartpole is insensitive: 3.01% -> 0.00%.
-    e_lo, e_hi = _np(env.XE_INIT_MIN), _np(env.XE_INIT_MAX)
+    # This used to read XE_INIT_MIN/MAX directly, on the stated assumption that
+    # "XE_INIT is exactly what reset() perturbs by". That is false for any env
+    # setting x_init_min: env_base.define_initial_state then takes the direct-box
+    # branch, draws x_0 ~ U[X_INIT], back-solves e(0) = x_0 - xref_0, and never
+    # reads XE_INIT at all. Four envs do this -- segway, cartpole, ball_and_beam,
+    # tora -- and for them the sampled error was 5.7x-11x too small in ||e||,
+    # besides being centred and independent per dim where the real draw is a
+    # sign-correlated shell (X_INIT_SIGN_DIMS, and segway's pitch cannot be zero).
+    #
+    # Measured on the SHIPPED cached metrics, swapping only this draw:
+    #     car       2.57% -> 2.32%   PASS -> PASS   (unaffected, no x_init_min)
+    #     cartpole  2.36% -> 70.04%  PASS -> FAIL
+    #     segway    0.73% -> 45.49%  PASS -> FAIL
+    # i.e. every lambda certified for cartpole and segway was gated on errors the
+    # plant never presents. Calling the env is what keeps this from drifting again
+    # the next time an init box is added -- there is no box name to get wrong.
+    with torch.no_grad():
+        _, _xe_0, _ = env.define_initial_state(torch.arange(
+            max(args.num_samples * args.n_draws, 4096), device=env.device))
+    e_pool = _np(_xe_0)
+    print(f"[uniform-lambda] error draws from define_initial_state: "
+          f"||e||2 mean {np.linalg.norm(e_pool, axis=-1).mean():.4f}, "
+          f"per-dim max |e| {np.abs(e_pool).max(axis=0).round(3)}")
     # The control box is the uref box widened by --u-expansion, which is how every
     # env defines it (env_base.py: "the applied box is 2x this"). Derived rather
     # than read off U_MIN/U_MAX so the check states the relationship it relies on.
@@ -305,7 +327,8 @@ def main() -> int:
               f"{args.num_samples}, eval {eps_eval:g} at N={args.eval_samples} "
               f"(eps is a covering radius — denser draw, less margin needed).")
     print(f"[uniform-lambda] control check: {args.n_draws} draws per state of "
-          f"u = uref - K*e, e ~ U[{e_lo.round(3)}, {e_hi.round(3)}], uref ~ "
+          f"u = uref - K*e, e resampled from define_initial_state "
+          f"(per-dim max |e| {np.abs(e_pool).max(axis=0).round(3)}), uref ~ "
           f"U[{uref_lo.round(3)}, {uref_hi.round(3)}]; FAILS when more than "
           f"{args.viol_frac:.1%} land outside [{u_lo.round(3)}, {u_hi.round(3)}]")
     w_lb, w_ub = args.w_lb, args.w_ub
@@ -320,7 +343,11 @@ def main() -> int:
     # Drawn once and reused at every (lbd, r) — see control_violation_rate.
     rng = np.random.default_rng(args.seed)
     shape = (args.num_samples, args.n_draws)
-    e_draws = rng.uniform(e_lo, e_hi, size=(*shape, e_lo.size))
+    # Resampled from the real e(0) pool rather than a box, so the joint structure
+    # survives: the shared-sign correlation across dims and the shell shape (an
+    # env whose X_INIT excludes zero never presents a small error). A per-dim
+    # uniform would destroy both even with the right bounds.
+    e_draws = e_pool[rng.integers(0, e_pool.shape[0], size=shape)]
     uref_draws = rng.uniform(uref_lo, uref_hi, size=(*shape, uref_lo.size))
 
     lbd, r, sol = args.lbd0, args.r0, None

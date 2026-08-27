@@ -9,7 +9,7 @@ CV-STEM-LQR, C2RL-PPO, C2RL-SAC) run through one unified **skrl** backend, acros
 families that share the same interface:
 
 - **Isaac envs** (`tasks/direct/{quadruped,humanoid,manipulator}_{vel,path}_tracking`, `cartpole`) — need Isaac Sim.
-- **Classic envs** (`tasks/direct/classic/{car,cartpole,segway,turtlebot}`) — pure NumPy/gymnasium,
+- **Classic envs** (`tasks/direct/classic/{car,cartpole,segway,quadrotor}`) — pure NumPy/gymnasium,
   no Isaac Sim, analytically synthesize their own reference trajectory every `reset()`.
 
 Every path-tracking env (Isaac and classic) shares the reference-window observation
@@ -73,7 +73,7 @@ is in README.md — read it before guessing at a flag.
   stays a dependency bump.
 
 **Envs** (`source/contractionRL/contractionRL/tasks/direct/`):
-- `classic/common/env_base.py` — `BaseEnv` shared by car/cartpole/segway/turtlebot. Analytical
+- `classic/common/env_base.py` — `BaseEnv` shared by every classic env. Analytical
   `get_f_and_B(x)`, generates its own reference trajectory each episode.
 - `common/path_tracking_base.py` — the Isaac-side equivalent interface (`{x, xrefs, urefs}` layout,
   `Stability`/`Episode` W&B logging, `set_ccm` for the Mahalanobis reward).
@@ -142,7 +142,7 @@ comparable across algorithms and env families.
 - **Do not modify vendored skrl code** — patch via `agent_patches.py` or project-side subclasses.
 - **SDP infeasibility is a signal, not a nuisance.** If CV-STEM reports 0% feasible, fix the
   envelope (`w_lb`, `cvstem_r_scaler`), don't lower `min_feasibility_rate`. A driftless plant
-  (e.g. turtlebot, `f≡0`) is infeasible for CV-STEM at every λ by construction — use
+  (`f≡0`) is infeasible for CV-STEM at every λ by construction — use
   `cmg_method: ccm` there instead.
 - **Actions must not be clipped for contraction controllers.** `torch.clamp` has zero gradient at
   saturation and silently collapses the certified feedback Jacobian. Use the tanh-squashed

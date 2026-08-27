@@ -28,7 +28,6 @@ warnings.filterwarnings(
 from . import car  # noqa: E402,F401  registers classic-car-v0
 from . import car_v1  # noqa: F401  registers classic-car-v1 (same plant, weak-authority velocity box)
 from . import cartpole  # noqa: F401 registers classic-cartpole-v0
-from . import turtlebot  # noqa: F401 registers classic-turtlebot-v0
 from . import segway  # noqa: F401 registers classic-segway-v0
 from . import quadrotor  # noqa: F401 registers classic-quadrotor-v0
 from . import ball_and_beam  # noqa: F401  registers classic-ball_and_beam-v0
@@ -38,7 +37,7 @@ from . import auv  # noqa: F401  registers classic-auv-v0
 from . import pvtol  # noqa: F401  registers classic-pvtol-v0
 from . import tora  # noqa: F401  registers classic-tora-v0
 
-__all__ = ["car", "car_v1", "cartpole", "turtlebot", "segway", "quadrotor", "ball_and_beam", "two_link_arm", "aircraft", "auv", "pvtol", "tora"]
+__all__ = ["car", "car_v1", "cartpole", "segway", "quadrotor", "ball_and_beam", "two_link_arm", "aircraft", "auv", "pvtol", "tora"]
 
 # Short name -> gym id, for the envs whose id is not ``classic-<name>-v0``.
 # car_v1 is the same plant as car with a wider velocity box, so it registers as a

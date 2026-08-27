@@ -200,32 +200,7 @@ class C2RLPPOCfg(AgentCfg):
     # the metric's condition number and scale, and they are decision variables:
     # W̄ ⪰ I, W̄ ⪯ χI, deployed W = W̄/ν. "cvstem" method only.
     cm_chi_weight: float | None = None  # None → 1/lbd, mirroring Tsukamoto's chi/alp
-    cm_nu_weight: float = 1.0           # his d2_over
-    # If > 0, include Tsukamoto's Ẇ ≈ (W̄ - I)/dt proxy for the material derivative
-    # (classncm.cvstem0 puts the integration step here). 0 = omit it, which is what
-    # the pointwise-per-state design otherwise forces (no neighbouring sample to
-    # difference against — see ncm_synthesis.py's module docstring). "cvstem" method
-    # only; superseded by cm_wdot_trajectory when that's on.
-    cm_wdot_dt: float = 0.0
-    # Real Ẇ from offline reference trajectories ("cvstem" method only): instead of
-    # dropping Ẇ or using the static cm_wdot_dt proxy above, sample states as
-    # trajectory-ordered chunks from dynamics_pretrain_data_path (which must be
-    # set — raises otherwise) and difference each state's solved normalized W̄
-    # against the actual previous state's along that same reference trajectory —
-    # Ẇ ≈ (W̄_t − W̄_{t−1})/cm_temporal_dt, the real material derivative rather
-    # than an approximation (see ncm_synthesis.build_cm_dataset's
-    # traj_x/traj_lengths/temporal_dt and dynamics_pretrain.load_offline_trajectories).
-    # Incompatible with cmg_random_ratio>0 (mixing in i.i.d. random states would
-    # break trajectory continuity — ignored when this is on) and with
-    # cmg_method="ccm" (train_cmg_ccm has no per-state SDP to add Ẇ to; raises).
-    cm_wdot_trajectory: bool = False
-    # Integration step between consecutive states in the offline trajectory data —
-    # Not auto-derived from the env (dynamics_data.npz doesn't record it); set it
-    # to the same dt used to generate that file (scripts/skrl/train.py's
-    # _generate_ref_trajs: env_cfg.sim.dt * env_cfg.decimation). Only read when
-    # cm_wdot_trajectory=True.
-    cm_temporal_dt: float = 0.05
-    # On SDP infeasibility at a state, retry that state alone with λ halved,
+    cm_nu_weight: float = 1.0    # On SDP infeasibility at a state, retry that state alone with λ halved,
     # up to this many times, before giving up on it (0 = old behavior, drop
     # Guards build_cm_dataset against silently regressing the CMG onto a small,
     # likely-biased subset of states — raises before regression if the SDP's
@@ -345,11 +320,6 @@ class C2RLSACCfg(AgentCfg):
     # C2RLPPOCfg.cm_chi_weight above and ncm_synthesis.cvstem_joint.
     cm_chi_weight: float | None = None
     cm_nu_weight: float = 1.0
-    cm_wdot_dt: float = 0.0  # superseded by cm_wdot_trajectory when that's on
-    # Real Ẇ from offline reference trajectories — see C2RLPPOCfg.cm_wdot_trajectory
-    # / cm_temporal_dt above.
-    cm_wdot_trajectory: bool = False
-    cm_temporal_dt: float = 0.05
     cm_data_path: str = ""
     # ── Offline CMG synthesis (Phase A, always runs before Phase B) ─────────── #
     cmg_memory_size: int = 8192
@@ -399,12 +369,11 @@ def cm_dataset_target(cfg) -> tuple[Path | None, dict]:
 
     data_path = getattr(cfg, "dynamics_pretrain_data_path", "") or None
     explicit_cache_path = getattr(cfg, "cm_data_path", "") or None
-    # cm_wdot_trajectory (see C2RLPPOCfg's docstring): real Ẇ from offline
-    # Reference trajectories instead of dropping it or Tsukamoto's static
-    # cm_wdot_dt proxy. random_ratio is meaningless there (the whole point is
-    # Not mixing in i.i.d. states) so it is forced to 0 in the cache key too.
-    wdot_trajectory = bool(getattr(cfg, "cm_wdot_trajectory", False))
-    temporal_dt = cfg.cm_temporal_dt if wdot_trajectory else 0.0
+    # The SDP always runs at dt = 1.0 and never differences a trajectory, so both
+    # of these are fixed. They were config knobs (cm_wdot_trajectory /
+    # cm_temporal_dt / cm_wdot_dt); keeping them configurable is what let the
+    # search and the generation solve different programs.
+    wdot_trajectory, temporal_dt = False, 0.0
     random_ratio = 0.0 if wdot_trajectory else getattr(cfg, "cmg_random_ratio", 0.0)
 
     if explicit_cache_path:
@@ -426,7 +395,7 @@ def cm_dataset_target(cfg) -> tuple[Path | None, dict]:
         solver=cfg.cm_solver, num_samples=cfg.cmg_memory_size, tag="[C2RL]",
         r_scaler=cfg.cvstem_r_scaler,
         chi_weight=cfg.cm_chi_weight,
-        nu_weight=cfg.cm_nu_weight, wdot_dt=cfg.cm_wdot_dt,
+        nu_weight=cfg.cm_nu_weight, wdot_dt=0.0,
         random_ratio=random_ratio,
         wdot_trajectory=wdot_trajectory, temporal_dt=temporal_dt,
     )
@@ -533,19 +502,6 @@ class C2RLAgent(Agent):
                 "models.cmg.network.constrain_eigenvalues: true in the yaml, or "
                 "let ContractionRunner build it (it forces this)."
             )
-        if bool(getattr(parsed_cfg, "cm_wdot_trajectory", False)):
-            if parsed_cfg.cmg_method != "cvstem":
-                raise ValueError(
-                    "[C2RL] cm_wdot_trajectory=True needs cmg_method='cvstem' — "
-                    "'ccm' (train_cmg_ccm) has no per-state SDP to add a Ẇ term to."
-                )
-            if not getattr(parsed_cfg, "dynamics_pretrain_data_path", ""):
-                raise ValueError(
-                    "[C2RL] cm_wdot_trajectory=True needs dynamics_pretrain_data_path "
-                    "set to a trajectory-structured dynamics_data.npz (see "
-                    "dynamics_pretrain.load_offline_trajectories) — there is no other "
-                    "source of REAL trajectory order to difference Ẇ against."
-                )
 
         # ── Phase B: a real skrl PPO/SAC agent for the deployed policy ───── #
         # PPO's memory holds exactly one on-policy rollout chunk. SAC's is a

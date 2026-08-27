@@ -35,11 +35,6 @@ cm:
   # jointly with the r/w_lb/w_ub here, one solution of one program.
   lbd: 1.3169
   cm_eps: 0.01
-  # Tsukamoto's CV-STEM sampling period, which is a synthesis hyperparameter and
-  # Not the integrator step: his cart-pole notebook uses dt=1 while the sim runs
-  # at 0.1 and RK4-substeps at 0.01. Unset, this falls back to the env integrator
-  # step, a much harsher (W-I)/dt bound that inflates nu by the same factor.
-  cm_dt: 1.0
   # Deployment envelope w_lb·I ⪯ W ⪯ w_ub·I, as the caps nu <= 1/w_lb and
   # chi <= nu*w_ub on the joint program's shared nu/chi. Absent, this is the
   # reference program (no envelope) — but lbd above was certified with them.

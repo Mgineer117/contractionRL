@@ -164,11 +164,82 @@ has not been revalidated at 2000 steps.
 
 ---
 
-## 2. How long the episode has to be
+## 2. Order of operations for defining an environment
+
+Every box depends on the one before it. Defining them out of order is how a
+"certified" number ends up describing a plant nobody runs — the 2026-08-27
+segway/cartpole failure was exactly this (see Rule 1's measured section).
+
+**The order is fixed:**
+
+### Step 1 — X bounds (the certified region)
+
+Find `X_MIN/X_MAX` control-theoretically, by **existence of a uniform contraction
+rate**: the box is the largest region over which one lambda certifies via the
+CV-STEM SDP. This box is the *validity domain* — outside it the metric is an
+extrapolation and no certificate applies. Nothing else may be chosen first,
+because everything below is expressed relative to it.
+
+### Step 2 — XE bounds (the certified perturbation)
+
+Established the same way, on the same SDP: the tracking-error set the uniform
+lambda covers.
+
+### Step 3 — X_INIT and XREF_INIT (where episodes spawn)
+
+Only now, and **only after lambda is known**:
+
+- If the plant has a **state-dependent contraction rate**, set `X_INIT` to the
+  **low-rate region** — the hardest corner — so the reported number is not
+  flattered by easy starts. `XREF_INIT` is established the same way, so the
+  reference also starts in the low-rate region.
+- If the rate is **not state-dependent**, `X_INIT`/`XREF_INIT` are arbitrary
+  within the X box.
+
+`X_INIT` is *redetermined after* the lambda search, so treat the current
+`X_INIT` as the search's input and do not iterate the circular dependency.
+
+**Any consumer of the initial-error distribution must ask the env, never a box
+name.** `env_base.define_initial_state` returns `e(0)` from `X_INIT` when that is
+set and from `XE_INIT` otherwise; reading `XE_INIT` directly is what silently
+gated cartpole and segway on errors 5.7x-11x too small, because the `X_INIT`
+boxes were added ten days after the gate was written and the gate's comment kept
+asserting the old invariant. Call `define_initial_state`; there is then no box
+name to get wrong.
+
+### Step 4 — reference synthesis must stay inside the X bounds
+
+The synthesized reference trajectory must remain within `X_MIN/X_MAX` for the
+whole episode. A reference that leaves the box is clamped, and the stored
+`(xref, uref)` then stops being a trajectory of the plant — every
+`u = uref + feedback` controller is chasing an unreachable reference. Gravity-loaded
+plants need a state-dependent trim in `uref` for this to hold.
+
+### Step 5 — the horizon must permit 95% error reduction
+
+Given the uniform lambda from Step 1, the episode must be long enough to
+contract 95% of the initial error: `T95 = ln(20*C)/lambda` (Rule 3). Size the
+horizon to that, from a **measured** rate.
+
+### Why this order
+
+Each step's validity is conditional on the previous one:
+
+| if you set | before | the failure |
+|---|---|---|
+| `X_INIT` | lambda | you cannot know which region is low-rate |
+| the lambda gate's error draw | `X_INIT` | the gate tests errors the plant never presents |
+| the horizon | lambda | `T95` is unknown, so the horizon is a guess |
+| the reference | X bounds | the reference is clamped and unreachable |
+
+---
+
+## 3. How long the episode has to be
 
 ### The requirement
 
 The horizon must give the controller time to reach 5% of the initial error.
+This is Step 5 of Rule 2.
 For an error decaying as `||e(t)|| = C * ||e0|| * exp(-lambda*t)`:
 
 ```

@@ -25,7 +25,7 @@
 # Flags (all optional; anything omitted is prompted for):
 #   --algorithms list    comma/space separated: ppo, sac, c3m, lqr, sdlqr,
 #                        cvstem-lqr, c2rl-ppo, c2rl-sac
-#   --env NAME           car|cartpole|segway|turtlebot|quadrotor, an Isaac Lab
+#   --env NAME           car|cartpole|segway|quadrotor, an Isaac Lab
 #                        task id, or 'all' for every classic env
 #   --seeds SPEC         a count (e.g. 5 → seeds 0..4) or an explicit list
 #   --gpu SPEC           GPU index, a comma/space list of indices to round-robin
@@ -137,12 +137,12 @@ else
 fi
 
 # ── Env ─────────────────────────────────────────────────────────────────── #
-CLASSIC_ENVS=("classic-car-v0" "classic-car-v1" "classic-cartpole-v0" "classic-segway-v0" "classic-turtlebot-v0" "classic-quadrotor-v0")
+CLASSIC_ENVS=("classic-car-v0" "classic-car-v1" "classic-cartpole-v0" "classic-segway-v0" "classic-quadrotor-v0")
 ISAAC_ENVS=("Humanoid-PathTracking-v0" "Humanoid-VelTracking-v0" "Manipulator-PathTracking-v0" "Manipulator-VelTracking-v0" "Quadruped-PathTracking-v0" "Quadruped-VelTracking-v0")
 
 if [[ -z "$ENV_ARG" ]]; then
     ENV_ARG=$(prompt_choice "Select env (or 'all' for every classic env):" \
-        car cartpole segway turtlebot quadrotor "${ISAAC_ENVS[@]}" all)
+        car cartpole segway quadrotor "${ISAAC_ENVS[@]}" all)
 fi
 
 if [[ "$ENV_ARG" == "all" ]]; then
@@ -153,13 +153,12 @@ else
         car_v1|classic-car-v1)   ENVS=("classic-car-v1") ;;
         cartpole|classic-cartpole-v0)   ENVS=("classic-cartpole-v0") ;;
         segway|classic-segway-v0)       ENVS=("classic-segway-v0") ;;
-        turtlebot|classic-turtlebot-v0) ENVS=("classic-turtlebot-v0") ;;
         quadrotor|classic-quadrotor-v0) ENVS=("classic-quadrotor-v0") ;;
         *)
             _found=0
             for e in "${ISAAC_ENVS[@]}"; do [[ "$e" == "$ENV_ARG" ]] && _found=1; done
             if [[ "$_found" -ne 1 ]]; then
-                _error "Unknown env '$ENV_ARG'. Classic: car/cartpole/segway/turtlebot/quadrotor (or 'all'). Isaac Lab: ${ISAAC_ENVS[*]}"
+                _error "Unknown env '$ENV_ARG'. Classic: car/cartpole/segway/quadrotor (or 'all'). Isaac Lab: ${ISAAC_ENVS[*]}"
                 exit 1
             fi
             ENVS=("$ENV_ARG")

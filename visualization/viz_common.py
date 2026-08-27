@@ -27,7 +27,7 @@ Policy          a deterministic callable obs(1, 2*x_dim+u_dim) -> u(1, u_dim).
 Normalized error (the quantity every plot shows):
     r(t) = sqrt( e_tᵀ M(x_t) e_t / e_0ᵀ M(x_0) e_0 ),   e_t = wrap(x_t - xref_t)
 
-Scope — u_dim <= 2 only (car/turtlebot 2, cartpole/segway 1). A deliberate
+Scope — u_dim <= 2 only (car 2, cartpole/segway 1). A deliberate
 restriction, not a limitation to work around: at one or two inputs the full
 control space is plottable, so the landscape is complete, with no projection and
 no information loss (u_dim 1 -> a t x u surface; u_dim 2 -> a u0 x u1 surface
@@ -72,8 +72,8 @@ from contractionRL.agents.skrl.nn_modules import BoundedCCM_Generator, CCM_Gener
 
 # Only envs with u_dim <= 2 — the full control space is plottable without any
 # projection (see the module docstring). quadrotor (u_dim=4) is deliberately out.
-CLASSIC_ENVS = ("car", "cartpole", "turtlebot", "segway")
-U_DIM = {"cartpole": 1, "segway": 1, "car": 2, "turtlebot": 2}
+CLASSIC_ENVS = ("car", "cartpole", "segway")
+U_DIM = {"cartpole": 1, "segway": 1, "car": 2}
 POLICIES_DIR = os.path.join(_VIZ_DIR, "policies")
 OUTPUT_DIR = os.path.join(_VIZ_DIR, "output")
 

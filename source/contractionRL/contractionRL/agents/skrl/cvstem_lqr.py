@@ -30,7 +30,8 @@ runs this same program at a smaller sample count to pick ``lbd``.
 
 The one thing his code leaves implicit is that ``dt`` is the CV-STEM sampling
 period, not the integrator step — his cart-pole notebook synthesizes at ``dt=1``
-while the simulation runs at ``0.1``. ``cm_dt`` is that knob here.
+while the simulation runs at ``0.1``. Fixed at ``1.0`` here -- not a knob,
+so the searched and generated programs cannot diverge.
 
 An infeasible joint SDP aborts the run — there is no per-state λ-backoff and no
 partial-feasibility rate, because one program covers every sample.
@@ -73,21 +74,14 @@ class CVSTEMLQRCfg(AgentCfg):
     # R = r_scaler·I, in both the SDP's Riccati term and the deployed gain.
     # Inert: ν is a free variable and the LMI sees only ν/r, so the solved ν
     # absorbs r and K is unchanged (measured on the car: ν/r, χ and ‖K‖₂ all
-    # identical for r from 1e-2 to 1e4). λ, ε and cm_dt are the only knobs that
+    # identical for r from 1e-2 to 1e4). λ and ε are the only knobs that
     # move the gain — nu_weight/chi_weight are inert too (ν and χ come out
     # jointly minimal, so the objective weights never activate a trade-off).
     r_scaler: float = 1.0
 
     # ── The joint CV-STEM SDP (yaml `cm:` block) ───────────────────────────── #
     lbd: float = 0.5              # contraction rate λ (his alpha)
-    cm_eps: float = 0.01          # strict-definiteness margin (his epsilon)
-    # The dt of his ``(W̄-I)/dt`` term — the CV-STEM sampling period, which is a
-    # free hyperparameter of the synthesis and not the integrator step. His
-    # cart-pole notebook sets it to 1 while the simulation integrates at 0.1 and
-    # RK4-substeps at 0.01. ``None`` falls back to the env's dt, which is a 33x
-    # harsher Ẇ bound on the classic envs and inflates ν by the same factor.
-    cm_dt: float | None = None
-    # Optional deployment envelope w_lb·I ⪯ W ⪯ w_ub·I on the deployed w = W̄/ν,
+    cm_eps: float = 0.01    # Optional deployment envelope w_lb·I ⪯ W ⪯ w_ub·I on the deployed w = W̄/ν,
     # the two scalar caps solve_cm_metric applies: ν ≤ 1/w_lb, χ ≤ ν·w_ub. Both
     # None (the default) is Tsukamoto's program exactly — ν and χ free, no
     # envelope. w_lb is the direct gain cap, ‖K‖₂ ≤ ‖B‖₂/(r·w_lb), and is the
@@ -143,8 +137,8 @@ class CVSTEMLQRAgent(Agent):
       ``get_f_and_B``: ``(x) -> (f, B, Bbot)`` (analytical env dynamics or a
         loaded NeuralDynamics).
       ``x_lo``/``x_hi``: the env's own state box — his ``xlims``. Required.
-      ``dt``: fallback for the SDP's ``Ẇ`` term when ``cfg.cm_dt`` is unset.
-        Required only in that case — see ``CVSTEMLQRCfg.cm_dt``, which is his
+      ``dt``: accepted for signature compatibility; the SDP's ``Ẇ`` term is
+        always taken at ``dt = 1.0``, which is his
         CV-STEM sampling period and takes precedence.
     """
 
@@ -186,13 +180,16 @@ class CVSTEMLQRAgent(Agent):
         self._angle_idx = angle_idx or []
         self._cfg = cfg
         self._get_f_and_B = get_f_and_B
-        # cfg.cm_dt wins over the env's dt: his dt is the CV-STEM sampling period,
-        # a synthesis hyperparameter, not the integrator step (see CVSTEMLQRCfg).
-        # The env's dt is only the fallback for configs that don't state one.
-        dt = cfg.cm_dt if cfg.cm_dt is not None else dt
+        # The SDP always runs at dt = 1.0, never the env's dt. This is Tsukamoto's
+        # CV-STEM sampling period -- a synthesis hyperparameter, not an integrator
+        # step: at the envs' small dt the (W-I)/dt term is ~33x harsher and pins
+        # the solution at the envelope corner. Fixed rather than configurable so
+        # the searched and generated programs cannot diverge -- which they did
+        # while this was a knob (the search defaulted to env.dt, generation to 1.0).
+        dt = 1.0
         # The box is a property of the env and has no sane default — a guessed
         # box certifies the wrong region — and a missing dt silently rescales Ẇ.
-        if x_lo is None or x_hi is None or dt is None:
+        if x_lo is None or x_hi is None:
             raise ValueError(
                 "CVSTEMLQRAgent needs the env's state box (x_lo/x_hi) and a dt: the "
                 "joint CV-STEM SDP samples uniformly over that box and its (W̄-I)/dt "

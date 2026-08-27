@@ -31,11 +31,6 @@ cm:
   # Shared with c2rl_ppo per 8a64182.
   lbd: 0.0152
   cm_eps: 0.01
-  # Tsukamoto's CV-STEM sampling period, which is a synthesis hyperparameter and
-  # Not the integrator step: his cart-pole notebook uses dt=1 while the sim runs
-  # at 0.1 and RK4-substeps at 0.01. Unset, this falls back to the env integrator
-  # step, a much harsher (W-I)/dt bound that inflates nu by the same factor.
-  cm_dt: 1.0
   # Deployment envelope. Segway shipped without one (the reference
   # program); added so nu is bounded and the gain cap
   # ||K|| <= ||B||/(r*w_lb) exists. Same envelope as the other envs.

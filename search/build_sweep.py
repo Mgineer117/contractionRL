@@ -50,7 +50,6 @@ CLASSIC_ENVS = (
     "classic-car-v1",
     "classic-cartpole-v0",
     "classic-segway-v0",
-    "classic-turtlebot-v0",
     "classic-quadrotor-v0",
 )
 ISAACLAB_ENVS = (

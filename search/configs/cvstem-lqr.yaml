@@ -19,7 +19,7 @@ runner:
   wrapper: true
   # Exactly one episode, then stop. The episode length is read from the env's
   # own ENV_CONFIG (time_bound / dt) at launch, so it never drifts from the
-  # env definition: car/cartpole/segway 500, turtlebot 600, quadrotor 400.
+  # env definition: car/cartpole/segway 500, quadrotor 400.
   one_episode: true
   # An infeasible SDP at any state, in any of the 64 envs, aborts the trial
   # immediately and records this AUC. The metric is minimized, so the poison

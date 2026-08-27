@@ -54,7 +54,6 @@ _VIZ_DIR = os.path.dirname(os.path.abspath(__file__))
 # Falls back to generic x0..xN-1 labels for envs not listed here.
 STATE_LABELS = {
     "car": ["x", "y", "theta", "v"],
-    "turtlebot": ["x", "y", "theta"],
     "cartpole": ["x", "theta", "xdot", "thetadot"],
     "segway": ["x", "theta", "xdot", "thetadot"],
 }
