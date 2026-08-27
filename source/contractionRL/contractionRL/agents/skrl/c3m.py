@@ -667,6 +667,17 @@ class C3MSkrlTrainer(Trainer):
                 ev = self.eval(timestep=t)
                 track_stability_summary(agent, ev["stability"])
                 track_reward_summary(agent, ev["reward"])
+                # C3M's trainer never forwards info["log"] (its eval loop discards
+                # info), so the generic Clamp/* passthrough that PPO/SAC/C2RL get
+                # from their trainers does not reach here. Emit it explicitly on
+                # the agent-side route instead of letting the metric go silently
+                # missing for exactly the algorithm whose whole claim is a
+                # contraction certificate.
+                _clamp = getattr(self.env, "clamp_summary", None)
+                if callable(_clamp):
+                    _cs = _clamp()
+                    if _cs:
+                        track_stability_summary(agent, _cs, tab="Clamp")
 
                 # Read the losses captured on the agent by update(); tracking_data
                 # may already be cleared by post_interaction → write_tracking_data,

@@ -148,6 +148,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         self._clamp_any = 0.0
         self._clamp_usat = 0.0
         self._clamp_n = 0
+        self._clamp_nonfinite = 0.0
         self._CLAMP_LOG_EVERY_STEPS = 100
 
         self.time_bound = env_config["time_bound"]
@@ -587,10 +588,12 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         out = {f"frac_{nm}": float(self._clamp_hits[i]) / n for i, nm in enumerate(names)}
         out["frac_any"] = self._clamp_any / n
         out["frac_u_saturated"] = self._clamp_usat / n
+        out["frac_nonfinite"] = self._clamp_nonfinite / n
         if reset:
             self._clamp_hits.zero_()
             self._clamp_any = 0.0
             self._clamp_usat = 0.0
+            self._clamp_nonfinite = 0.0
             self._clamp_n = 0
         return out
 
@@ -707,6 +710,11 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         x_dot = f_x + torch.bmm(B_x, u.unsqueeze(-1)).squeeze(-1)
         next_x = self.x_t + self.dt * x_dot
 
+        # Counted BEFORE carry_forward_nonfinite: it replaces NaN/Inf with the
+        # previous state, after which a diverged step compares as in-box (NaN
+        # comparisons are False) and would be invisible in frac_any. Same class of
+        # silent failure the clamp accounting exists to expose.
+        self._clamp_nonfinite += float((~torch.isfinite(next_x)).any(-1).float().sum())
         next_x = carry_forward_nonfinite(next_x, self.x_t)
 
         # Measured on the raw integrated state, before the position freeze and
