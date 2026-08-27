@@ -381,6 +381,19 @@ def main() -> int:
             print(f"\n[uniform-lambda] RESULT: INFEASIBLE — nothing certifies with the "
                   f"control in box down to lbd={args.lbd_min:g} inside the fixed "
                   f"envelope w_lb={w_lb:g}, w_ub={w_ub:g}.")
+            print("\n  Lowering lbd further will not help — it was already driven to "
+                  "the floor.\n  Read the last few lines above to tell the two causes "
+                  "apart:\n"
+                  "\n    mostly 'LMI INFEASIBLE'  -> the ENVELOPE binds. The metric that\n"
+                  "        contracts this plant needs a larger nu than 1/w_lb permits.\n"
+                  "        Lower --w-lb (raise the gain ceiling) before touching lbd.\n"
+                  "\n    mostly '% of controls out of box' with nu pinned at 1/w_lb\n"
+                  "        -> the ACTUATOR binds: the LMI wants a gain the control box\n"
+                  "        cannot deliver over errors this large. That is a rule.md\n"
+                  "        Step 1 result, not a tuning failure -- the X box is wider\n"
+                  "        than this plant's authority certifies. Shrink X (and then\n"
+                  "        redetermine X_INIT, Step 3), or raise UREF if the hardware\n"
+                  "        actually has that authority.")
             return 2
         sol = cvstem_joint(A, B, lbd=lbd, eps=eps_search, dt=lmi_dt,
                            solver=args.solver, r_scaler=r, w_lb=w_lb, w_ub=w_ub)
