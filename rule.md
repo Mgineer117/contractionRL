@@ -82,6 +82,12 @@ it silently *becomes* the dynamics, and then:
 **Always measure the clamp rate before trusting a contraction number.** If it is
 not small, the certificate is void regardless of how the SDP was solved.
 
+This is now logged: `Clamp/frac_any`, `Clamp/frac_<state_name>` per dimension,
+plus `Clamp/frac_u_saturated` and `Clamp/frac_nonfinite`. Deliberately NOT gated
+behind the stability buffer, so it still reports when no episode completes and no
+AUC is published. `frac_u_saturated` separates "out of authority" (saturating)
+from "failing inside its authority" (not saturating).
+
 ### Measured: segway, 2026-08-27
 
 105,888 env-steps under the analytic CV-STEM-LQR law. Fraction of `(env, step)`
