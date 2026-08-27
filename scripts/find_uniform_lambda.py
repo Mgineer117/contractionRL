@@ -268,7 +268,12 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--eval-envs", "--eval_envs", type=int, default=16)
     p.add_argument("--no-eval", "--no_eval", action="store_true",
-                   help="Stop after the search; skip the episode.")
+                   help="Stop after the search; skip the episode. Use this when "
+                        "sweeping several envs: the eval rebuilds the agent at "
+                        "--eval-samples (10000), which is the SAME joint SDP "
+                        "build_cm_dataset solves (~15 h), so a 5-env batch spends "
+                        "75 h re-deriving what regeneration has to compute anyway. "
+                        "The search itself is ~6 min/env at the default N=100.")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
