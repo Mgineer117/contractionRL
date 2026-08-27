@@ -85,7 +85,7 @@ cm:
   w_lb: 0.001
   # From scripts/find_uniform_lambda.py's uniform state-box search — measured
   # jointly with the r/w_lb/w_ub here, one solution of one program.
-  lbd: 0.3902
+  lbd: 0.2000
               # "cvstem", CMG Cu/C1 loss for "ccm")
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled)
@@ -109,7 +109,22 @@ cm:
   #              W = M⁻¹ congruence — it is what makes K above the certified gain.)
   #              Control is penalized via this Riccati term, not bounded over an
   #              action range — see ncm_synthesis.py module docstring.
-  cmg_method: cvstem
+  # ccm, not cvstem. The joint CV-STEM SDP certifies NOTHING for this plant at any
+  # lambda down to 0.01, over every box searched on 2026-08-27: x_scale 0.75..0.1,
+  # uref_scale 2..256, cm_eps 0.1 and 0.01. It only becomes feasible at uref x256
+  # (lbd 0.0771), i.e. a +-256 control box on a plant whose reference box is +-1.
+  #
+  # That is the SDP, not the plant. A plain LQR (Q=R=I) tracks this env from its own
+  # initial conditions with |u| max 0.203 against that +-1 box -- 5x headroom -- and
+  # decays the mean error at ~0.2455/s (0.193 -> 0.046 over 8 s). CV-STEM demands
+  # |K| ~ 1e3 because B is weak (|B|=0.40) and m=2 < n=3, so one direction gets no
+  # control and the program pays for it by driving nu to its 1/w_lb cap.
+  #
+  # ccm trains the CMG on the C1/C2 losses with no SDP, which is the documented
+  # route for a plant CV-STEM cannot certify. NOTE the lambda below is a TRAINING
+  # TARGET for that loss, not a certified rate -- it is the measured LQR rate,
+  # rounded down. Nothing here proves it is achievable.
+  cmg_method: ccm
   cvstem_r_scaler: 3.2
   # On SDP infeasibility at a given state, retry that state alone with λ
   # halved, up to this many times, before giving up on it and dropping it from
