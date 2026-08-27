@@ -89,6 +89,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         # reads it per step — set the default now so the mixin never sees a
         # missing attribute if that ordering ever changes.
         self.angle_idx = getattr(self, "angle_idx", [])
+
         self._init_termination_box(
             env_config.get("x_termination_min"),
             env_config.get("x_termination_max"),
@@ -129,6 +130,25 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         else:
             self.pos_dimension = env_config["pos_dimension"]
             self.angle_idx = env_config.get("angle_idx", [])
+
+        # ── Clamp-rate accounting (Clamp/* in wandb) ──────────────────────── #
+        # The out-of-box clamp is a NUMERICAL BACKSTOP, not a model: wherever it
+        # fires, the realized transition is not xdot = f(x) + B(x)u, so no
+        # CV-STEM/C3M certificate applies to that step. Measured on segway it
+        # fired on 95% of steps, which silently made the clamp the dynamics and
+        # invalidated every Stability/* number reported alongside it. It has to be
+        # observable, so accumulate here and publish next to those metrics.
+        #
+        # Counted on the RAW integrated state, before the freeze/clamp erase the
+        # excursion — the same reason _left_termination_box is measured there.
+        #
+        # Placed after num_dim_x and state_names are resolved: both are read here
+        # and neither exists at the top of __init__.
+        self._clamp_hits = torch.zeros(self.num_dim_x, device=self.device, dtype=torch.float32)
+        self._clamp_any = 0.0
+        self._clamp_usat = 0.0
+        self._clamp_n = 0
+        self._CLAMP_LOG_EVERY_STEPS = 100
 
         self.time_bound = env_config["time_bound"]
         self.dt = env_config["dt"]
@@ -538,6 +558,42 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
             info["maha_tracking_error"] = self.init_maha_error.clone()
         return self.construct_state(self.x_t), info
 
+    def clamp_summary(self, *, reset: bool = True) -> dict[str, float]:
+        """Per-dimension fraction of steps whose RAW integrated state left the
+        state box, i.e. how often the numerical backstop stood in for the plant.
+
+        Published as ``Clamp/*``. Read this before trusting any ``Stability/*``
+        number: where the clamp fires the realized transition is not
+        ``xdot = f(x) + B(x)u``, so the contraction certificate does not describe
+        it. Segway measured 95% here while reporting a plausible-looking AUC.
+
+        ``frac_any`` is the headline. ``frac_u_saturated`` is included because it
+        separates "the controller is out of authority" (saturating) from "the
+        controller is failing inside its authority" (not saturating) — on segway
+        it was 0.00%, which ruled out the actuator box as the cause.
+
+        Fractions are over the steps since the last read, so the value tracks the
+        current policy rather than diluting into a since-process-start average.
+        """
+        # Volume gate: hold until a full window of env-steps has accumulated, so
+        # this publishes at roughly the stability cadence instead of every step.
+        # Per-step logging of a value that changes every step is what grew a
+        # single run's wandb transaction log to 3.4 GB (see contraction_metrics'
+        # note at the stability emit site).
+        if self._clamp_n < self.num_envs * self._CLAMP_LOG_EVERY_STEPS:
+            return {}
+        n = float(self._clamp_n)
+        names = self.state_names or tuple(f"x{i}" for i in range(self.num_dim_x))
+        out = {f"frac_{nm}": float(self._clamp_hits[i]) / n for i, nm in enumerate(names)}
+        out["frac_any"] = self._clamp_any / n
+        out["frac_u_saturated"] = self._clamp_usat / n
+        if reset:
+            self._clamp_hits.zero_()
+            self._clamp_any = 0.0
+            self._clamp_usat = 0.0
+            self._clamp_n = 0
+        return out
+
     def _pooled_system_reset(self, env_ids: torch.Tensor):
         """``system_reset`` draws that share one reference integration.
 
@@ -643,6 +699,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         if not isinstance(u, torch.Tensor):
             u = torch.tensor(u, device=self.device, dtype=torch.float32)
         u = torch.nan_to_num(u)
+        _u_unclamped = u
         u = torch.clamp(u, self.U_MIN, self.U_MAX)
         self.time_steps += 1
 
@@ -656,6 +713,13 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         # the X-box clamp below — both erase the excursion, so a check placed
         # after them could never fire. None when the feature is off.
         left_box = self._left_termination_box(next_x)
+
+        # Clamp accounting — same raw state, same reason (see _clamp_hits).
+        _hit = ((next_x < self.X_MIN) | (next_x > self.X_MAX)).float()
+        self._clamp_hits += _hit.sum(0)
+        self._clamp_any += float((_hit.sum(-1) > 0).float().sum())
+        self._clamp_usat += float((_u_unclamped != u).any(-1).float().sum())
+        self._clamp_n += _hit.shape[0]
 
         pos_min = self.X_MIN[:self.pos_dimension]
         pos_max = self.X_MAX[:self.pos_dimension]

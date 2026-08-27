@@ -1055,6 +1055,33 @@ class StatManagerEnvWrapper:
             # run-*.wandb reached 3.4 GB, 15 concurrent workers put the home
             # filesystem at 94 GB of a 103 GB quota, and the previous quota
             # exhaustion killed the whole search.
+            # Clamp/* — how often the out-of-box backstop stood in for the plant.
+            #
+            # Published on its OWN cadence, deliberately NOT behind the _fresh
+            # gate below. That gate needs a completed full-length episode, and
+            # this metric matters most exactly when no episode completes: a run
+            # whose every episode ends early publishes no AUC at all, and the
+            # clamp rate is then the only number explaining why. Gating it with
+            # the stability buffer would have hidden it in the one case it is
+            # for.
+            #
+            # Volume is bounded env-side instead (clamp_summary returns {} until
+            # a full window has accumulated), which keeps it in the same order as
+            # the stability cadence — see the wandb transaction-log note below.
+            if isinstance(info, dict):
+                _clamp = None
+                for _t in (self.env, getattr(self.env, "unwrapped", None)):
+                    _c = getattr(_t, "clamp_summary", None) if _t is not None else None
+                    if callable(_c):
+                        _clamp = _c
+                        break
+                if _clamp is not None:
+                    _cs = _clamp()
+                    if _cs:
+                        if "log" not in info or not isinstance(info["log"], dict):
+                            info["log"] = {}
+                        info["log"].update(stability_log_dict(_cs, self._device(), tab="Clamp"))
+
             _fresh = self._initialized and self._compute_count > 0 and (
                 self._compute_count != getattr(self, "_last_logged_compute_count", None))
             if _fresh and isinstance(info, dict):
