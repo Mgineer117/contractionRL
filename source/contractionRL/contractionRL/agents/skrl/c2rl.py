@@ -149,6 +149,32 @@ class C2RLPPOCfg(AgentCfg):
     w_lb: float = 0.1
     tracking_scaler: float = 1.0
     control_scaler: float = 0.0
+    # Regress pi onto the analytic CV-STEM-LQR law before PPO starts.
+    #
+    # u_cvstemlqr = uref - K(x)e with K = R^-1 B' M(x), M from the SAME frozen
+    # Phase-A metric, so the target is the certified gain rather than a tuned one.
+    # Plain supervised MSE: well-posed and converges near 0, unlike the C3M Cu<0
+    # violation loss (which plateaued ~2.6-3.3 regardless of epochs).
+    #
+    # CVSTEMLQRBase generates targets ONLY. It is never attached to the policy, so
+    # the deployed law stays u = urefs[0] + pi(s) -- no analytic controller in the
+    # loop, which is the constraint this pretrain has to respect.
+    #
+    # Motivation, measured on segway: AUC/T (the mean normalized error) sat at 1.20
+    # at a 15 s horizon and 1.20 at 60 s -- the error never decays, it just holds
+    # above its initial value. The certificate permits 0.31 at 60 s, so the gap is
+    # the policy, not the envelope: from-scratch PPO never finds a stabilizing
+    # feedback on a plant that diverges without one.
+    residual_cvstemlqr_pretrain: bool = False
+    residual_pretrain_epochs: int = 200
+    residual_pretrain_lr: float = 1.0e-3
+    residual_pretrain_batch: int = 1024
+    residual_pretrain_samples: int = 65536
+    # Clamp the regression target to the box env_base.step actually applies
+    # (2 x UREF bounds). At small r_scaler the certified gain puts most target
+    # components outside it, and regressing onto unrealizable values leaves pi
+    # deep in saturation where d(applied u)/d(pi) = 0 and PPO's gradient vanishes.
+    residual_pretrain_clamp_target: bool = True
     lbd: float = 1e-2  # contraction rate λ — used by both cmg_method's synthesis loss
     # ── SDP contraction metric ("cvstem" cmg_method only) — see ncm_synthesis.py ── #
     cm_eps: float = 1e-2   # strict-definiteness margin on the contraction LMI (both methods)
@@ -850,9 +876,103 @@ class C2RLAgent(Agent):
         else:
             info = self._synthesize_cmg_cvstem(timesteps=timesteps)
         self._attach_critic_potential()
+        # Pretrain pi AFTER the CMG is frozen (the regression target K = R^-1 B' M
+        # is computed from it) and BEFORE Phase B, so PPO fine-tunes a stabilizing
+        # controller instead of searching for one. Opt-in, off by default.
+        if getattr(self._cfg, "residual_cvstemlqr_pretrain", False):
+            self._pretrain_residual_cvstemlqr()
         return info
 
 
+
+    def _window_pool(self, n: int, dev) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pools of plausible (xref, uref) rows to fill the future window slots
+        during pretraining — see the call sites. Empty when length == 1 (the
+        window is then just the current reference and there is nothing to fill)."""
+        if self._window.length <= 1:
+            return None, None
+        roll = self._get_rollout(n, "c3m")
+        return (torch.as_tensor(roll["xref"], dtype=torch.float32, device=dev),
+                torch.as_tensor(roll["uref"], dtype=torch.float32, device=dev))
+
+    def _pretrain_residual_cvstemlqr(self) -> None:
+        """Pretrain π so u = uref + π(s) matches the analytic CV-STEM-LQR control
+        law u_cvstemlqr(x,xref,uref) = uref - K(x)·e, K = R⁻¹BᵀW⁻¹, computed from
+        the same frozen Phase-A metric M(x) as _pretrain_residual_contraction's
+        certificate. Plain supervised MSE regression — no SDP, no jacobians, no
+        C3M loss — so it is well-posed and actually converges near 0, unlike the
+        Cu≺0 violation loss (observed to plateau ~2.6-3.3 regardless of epochs;
+        that residual violation correlates with per-seed overshoot/AUC variance,
+        see project memory). Reuses the CVSTEMLQRBase class the analytic baseline
+        eval uses, but only to generate targets here — it is never attached to
+        policy.base_controller, so the deployed law stays u = uref + π exactly as
+        in "contraction" mode. Same rollout/preview-pool sampling as
+        _pretrain_residual_contraction, for a fair like-for-like comparison."""
+        from .nn_modules import CVSTEMLQRBase
+        cfg = self._cfg
+        policy = self._policy_model
+        policy.train()  # cuDNN RNN backward needs train mode — see the sibling
+                         # method's comment; identical values, just unlocks backward.
+        dev = self.device
+        params = [p for n, p in policy.named_parameters()
+                  if p.requires_grad and "log_std" not in n]
+        if not params:
+            print("[C2RL] cvstem-lqr regression pretrain: no trainable π params — skipping.",
+                  flush=True)
+            return
+        base = CVSTEMLQRBase(
+            self._ccm_gen, self._get_f_and_B, r_scaler=cfg.cvstem_r_scaler,
+            w_lb=cfg.w_lb, window=self._window, angle_idx=self._angle_idx,
+        )
+        lr = float(getattr(cfg, "residual_pretrain_lr", 1e-3))
+        epochs = int(getattr(cfg, "residual_pretrain_epochs", 200))
+        batch = int(getattr(cfg, "residual_pretrain_batch", 1024))
+        N = int(getattr(cfg, "residual_pretrain_samples", 65536))
+        opt = torch.optim.Adam(params, lr=lr)
+        data = self._get_rollout(N, "c3m")                       # {x, xref, uref}
+        X = torch.as_tensor(data["x"], dtype=torch.float32, device=dev)
+        XR = torch.as_tensor(data["xref"], dtype=torch.float32, device=dev)
+        UR = torch.as_tensor(data["uref"], dtype=torch.float32, device=dev)
+        pool_xr, pool_ur = self._window_pool(max(N, 8192), dev)
+        # Actuator box the env actually applies. env_base.step clamps to
+        # U_MIN/U_MAX = 2 * UREF_MIN/max, while self.action_space is declared at
+        # the uref bounds — hence the factor 2 here, which mirrors that step()
+        # rather than the declared space. See residual_pretrain_clamp_target.
+        clamp_target = bool(getattr(cfg, "residual_pretrain_clamp_target", False))
+        u_lo = u_hi = None
+        if clamp_target:
+            u_hi = 2.0 * torch.as_tensor(self.action_space.high, dtype=torch.float32, device=dev)
+            u_lo = 2.0 * torch.as_tensor(self.action_space.low, dtype=torch.float32, device=dev)
+
+        self._ccm_gen.eval()
+        _clamp_desc = (f", target CLAMPED to the applied actuator box "
+                       f"[{u_lo.min().item():g}, {u_hi.max().item():g}]" if clamp_target else "")
+        print(f"[C2RL] cvstem-lqr regression-pretraining π vs analytic base: {epochs} "
+              f"epochs × {N} states (MSE, window length={self._window.length} with RANDOM "
+              f"future reference points{_clamp_desc})…", flush=True)
+        for ep in range(epochs):
+            perm = torch.randperm(N, device=dev)
+            tot, nb = 0.0, 0
+            for s in range(0, N, batch):
+                idx = perm[s:s + batch]
+                x, xref, uref = X[idx], XR[idx], UR[idx]
+                state = self._window.synth_obs(x, xref, uref, pool_xr, pool_ur)
+                u = policy.compute({"observations": state}, role="policy")[0]
+                target = base(state)
+                if clamp_target:
+                    target = torch.clamp(target, u_lo, u_hi)
+                loss = torch.mean((u - target) ** 2)
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                if all(p.grad is None or torch.isfinite(p.grad).all() for p in params):
+                    opt.step()
+                tot += float(loss.item()); nb += 1
+            if ep % max(1, epochs // 10) == 0 or ep == epochs - 1:
+                print(f"[C2RL] cvstem-lqr regression pretrain epoch {ep + 1}/{epochs} "
+                      f"mse={tot / max(1, nb):.4e}", flush=True)
+        print("[C2RL] π REGRESSION-PRETRAINED to match CV-STEM-LQR (u = uref + π, base "
+              "NOT attached) — PPO now fine-tunes it on the Mahalanobis reward.", flush=True)
 
     def _attach_critic_potential(self) -> None:
         """O6: hand the (now frozen) Phase-A CMG to the critic so it can evaluate
