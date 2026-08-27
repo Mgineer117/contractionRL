@@ -58,12 +58,15 @@ case "$SEEDS" in
     *) echo "FATAL: SEEDS='$SEEDS' has no comma; run_seeds.sh would read it as a COUNT"; exit 2 ;;
 esac
 
-# --ref_length 500 pins the window to the FULL episode (max_episode_len is 500 for
-# every classic env here: dt 0.03, time_bound 15), the same at every gamma, with
-# the tail repeating the last reference point. Left unset, train.py's AUTO sizes it
-# from 1/(1-gamma) -- 2 points at gamma=0.01, 101 at 0.99, 500 at 0.999 -- so the
-# sweep would vary gamma AND the observation width together and could not tell a
-# gamma effect from an architecture effect.
+# --ref_length is NOT pinned: train.py's AUTO already sets it to the env's own
+# max_episode_len (see its "ref_length FULL" line), which is the full episode for
+# every env and is what the Markov requirement needs -- the episodic return from t
+# touches xref[t .. T-1], so the window has to reach the episode end. Pinning 500
+# was correct while every env ran 500 steps; segway now runs 2000, and the pin
+# would have handed it a window covering a quarter of its own episode.
+#
+# Crucially AUTO does not vary with gamma, so the sweep still changes only gamma
+# and never the observation width -- which is what the pin was there to guarantee.
 #
 # --discount_factor, NOT --agent.discount_factor=. The dotted form is resolved by
 # train_utils.apply_cli_dotted_overrides, which this checkout does not have, so it
@@ -78,7 +81,7 @@ esac
     --gpu 0 \
     --parallel 1 \
     --tag "gamma${GAMMA}_${ENVNAME}" \
-    --extra "--discount_factor $GAMMA --ref_length 500" \
+    --extra "--discount_factor $GAMMA" \
     -y
 rc=$?
 echo "[$(date)] done rc=$rc env=$ENVNAME gamma=$GAMMA seeds=$SEEDS"
