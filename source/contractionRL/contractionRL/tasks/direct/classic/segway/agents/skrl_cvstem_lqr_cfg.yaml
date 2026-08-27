@@ -29,7 +29,7 @@ cm:
   # The stage-1 search (N=100, cm_eps=0.1) returns 0.0228, but that rung is
   # LMI-INFEASIBLE at N=1000/0.01 and so could never build at N=10000.
   # Shared with c2rl_ppo per 8a64182.
-  lbd: 0.0152
+  lbd: 0.0514
   cm_eps: 0.01
   # Deployment envelope. Segway shipped without one (the reference
   # program); added so nu is bounded and the gain cap

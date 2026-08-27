@@ -81,8 +81,19 @@ XE_MAX = [lim, lim, lim, lim]
 # controls outside the box, at +-10 it is 0.7%. These are Bupp et al.'s
 # Normalised units -- mass, spring and inertia all scaled to 1 -- so there is no
 # hardware torque limit being violated here.
-UREF_MIN = [-10.0]
-UREF_MAX = [10.0]
+# +-80, not +-10. Nothing certifies at +-10 (infeasible at every lambda down to
+# 0.01, 2026-08-27), so the shipped lbd -- 0.3902 under c2rl, 0.1171 under
+# cvstem-lqr -- described no program that has a solution.
+#
+# 8x rather than 4x, and no X shrink, from the 2D probe:
+#     x 1.00  u 4x  -> lbd 0.0228      x 1.00  u 8/16/32x -> lbd 0.1156
+#     x 0.35  u 1x  -> lbd 0.1156      x 0.75  u 8x       -> lbd 0.1734
+# Control alone SATURATES at 0.1156 -- 16x and 32x buy nothing over 8x -- and
+# 8x matches what shrinking X to 0.35 achieves while leaving the certified
+# region whole, which is the region the certificate is a statement about.
+# 0.1734 is available but only by giving up a quarter of the state box.
+UREF_MIN = [-80.0]
+UREF_MAX = [80.0]
 
 # Initial state drawn directly from this box (see env_base.X_INIT_MIN),
 # placing every episode start in the plant's low-lambda region:

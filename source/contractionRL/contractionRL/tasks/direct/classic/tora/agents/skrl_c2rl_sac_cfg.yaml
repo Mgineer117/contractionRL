@@ -85,7 +85,7 @@ cm:
   w_lb: 0.001
   # From scripts/find_uniform_lambda.py's uniform state-box search — measured
   # jointly with the r/w_lb/w_ub here, one solution of one program.
-  lbd: 0.3902
+  lbd: 0.1156
               # "cvstem", CMG Cu/C1 loss for "ccm")
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled)
@@ -110,7 +110,7 @@ cm:
   #              Control is penalized via this Riccati term, not bounded over an
   #              action range — see ncm_synthesis.py module docstring.
   cmg_method: cvstem
-  cvstem_r_scaler: 3.2
+  cvstem_r_scaler: 0.1
   # On SDP infeasibility at a given state, retry that state alone with λ
   # halved, up to this many times, before giving up on it and dropping it from
   # the dataset — 0 disables this and reverts to dropping immediately. Warns

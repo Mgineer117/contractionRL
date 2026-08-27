@@ -102,6 +102,16 @@ def main() -> int:
     cache_path, cache_kwargs = cm_dataset_target(cfg)
     if cache_path is None:
         raise SystemExit(f"{cfg_path}: no cm_data_path — nowhere to write the dataset.")
+    # A --num-samples probe gets its OWN filename. cm_dataset_filename encodes only
+    # (lbd, w_lb, w_ub, r_scaler), so without this a probe resolves to the SHIPPED
+    # path and writes a 100-state file where the agent expects 10000 -- which then
+    # key-misses at load and sends training back into a 15 h SDP. --lbd probes are
+    # already distinct because lbd IS in the name; N is not. The agent never
+    # constructs this name, so a probe can never be picked up by mistake.
+    if args.num_samples is not None:
+        cache_path = cache_path.with_name(
+            f"{cache_path.stem}_N{cfg.cmg_memory_size}{cache_path.suffix}")
+        print(f"[build_cm] probe path (N override): {cache_path}")
 
     print(f"[build_cm] config    {cfg_path}")
     print(f"[build_cm] target    {cache_path}")

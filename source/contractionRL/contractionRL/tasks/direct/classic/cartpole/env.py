@@ -52,8 +52,12 @@ XE_MAX = [lim, lim, lim, lim]
 # place the pole past what any gain could recover, making the actuator check
 # infeasible by arithmetic, not by the SDP. +-12 N applied holds 0.55 rad and
 # matches real hardware (Gym cartpole uses 10 N, Quanser's linear pendulum ~15).
-UREF_MIN = [-6.0]
-UREF_MAX = [6.0]
+# +-12, not +-6. Nothing certifies at +-6 (infeasible at every lambda down to
+# 0.01, 2026-08-27); at +-12 the joint SDP gives lbd=0.0771. Shrinking X to 0.75x
+# reaches the SAME lambda, so the two are equivalent here and doubling the force
+# is the smaller change to what the benchmark means.
+UREF_MIN = [-12.0]
+UREF_MAX = [12.0]
 
 # Initial state drawn directly from this box (see env_base.X_INIT_MIN),
 # placing every episode start in the plant's low-lambda region:

@@ -76,8 +76,16 @@ XE_MAX = [lim, lim, lim, lim]
 # capped it at 3.2 m/s^2. For scale, statically holding the XE_INIT pitch of
 # 0.15 rad needs only |u| = 0.65 and a 60-degree tilt needs 4.17; the box has to
 # cover the pitch_rate term too, which is what actually saturated it.
-UREF_MIN = [-6.0]
-UREF_MAX = [6.0]
+# +-24, not +-6. find_uniform_lambda certifies lbd=0.0514 here and NOTHING at
+# +-6 (infeasible at every lambda down to 0.01, 2026-08-27). The shipped 0.0514
+# was therefore right about the rate and wrong about the actuator, which is what
+# the 95%-of-steps clamp rate and 'zero gain beats every nonzero gain' were both
+# reporting: the controller was certified for an actuator it did not have.
+# Shrinking X instead does not work -- infeasible at 0.75x and 0.5x -- because
+# the difficulty is unstable tilt (max Re eig A = +2.76, |A| = 15.3), which wants
+# gain rather than a smaller region. p99|u| was already ~10 against the old +-6.
+UREF_MIN = [-24.0]
+UREF_MAX = [24.0]
 
 # Initial state drawn directly from this box (see env_base.X_INIT_MIN),
 # placing every episode start in the plant's low-lambda region:
