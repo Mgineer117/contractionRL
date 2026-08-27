@@ -321,9 +321,9 @@ class CVSTEMMetric:
         self.solver = solver or cm.get("cm_solver", "SCS")
         self.r_scaler = float(cfg.get("agent", {}).get("r_scaler",
                               cm.get("cvstem_r_scaler", 1.0)))
-        # 1.0, matching build_cm_dataset's dt=(cm_wdot_dt or temporal_dt or 1.0).
-        # The env dt would inflate the (W-I)/dt term ~33x — see docs/cluster.md.
-        self.cm_dt = float(cm.get("cm_dt", 1.0) or 1.0)
+        # Every CV-STEM SDP in the repo solves at dt=1.0; not configurable, so the
+        # viz cannot draw a metric from a different program than the one that ships.
+        self.cm_dt = 1.0
         self.infeasible = 0
         self.solves = 0
         self.name = f"cvstem (joint SDP, {self.solver})"
@@ -396,9 +396,9 @@ class CVSTEMPretrainedMetric:
         self.eps = float(cm.get("cm_eps", 0.01))
         self.solver = solver or cm.get("cm_solver", "SCS")
         self.r_scaler = float(agent.get("r_scaler", cm.get("cvstem_r_scaler", 1.0)))
-        # 1.0, matching build_cm_dataset's dt=(cm_wdot_dt or temporal_dt or 1.0).
-        # The env dt would inflate the (W-I)/dt term ~33x — see docs/cluster.md.
-        self.cm_dt = float(cm.get("cm_dt", 1.0) or 1.0)
+        # Every CV-STEM SDP in the repo solves at dt=1.0; not configurable, so the
+        # viz cannot draw a metric from a different program than the one that ships.
+        self.cm_dt = 1.0
         tag = "[viz-cvstem-pretrain]"
 
         # Cache identity must mirror save/load exactly, or a config change would

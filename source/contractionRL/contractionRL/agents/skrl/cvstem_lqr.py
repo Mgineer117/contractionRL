@@ -188,13 +188,12 @@ class CVSTEMLQRAgent(Agent):
         # while this was a knob (the search defaulted to env.dt, generation to 1.0).
         dt = 1.0
         # The box is a property of the env and has no sane default — a guessed
-        # box certifies the wrong region — and a missing dt silently rescales Ẇ.
+        # box certifies the wrong region.
         if x_lo is None or x_hi is None:
             raise ValueError(
-                "CVSTEMLQRAgent needs the env's state box (x_lo/x_hi) and a dt: the "
-                "joint CV-STEM SDP samples uniformly over that box and its (W̄-I)/dt "
-                "term is scaled by that dt. Set `cm_dt` in the yaml's cm: block, or "
-                "pass dt= to fall back to the env step."
+                "CVSTEMLQRAgent needs the env's state box (x_lo/x_hi): the joint "
+                "CV-STEM SDP samples uniformly over that box, so without it there "
+                "is no region to certify."
             )
         self._x_lo, self._x_hi, self._dt = x_lo, x_hi, float(dt)
 

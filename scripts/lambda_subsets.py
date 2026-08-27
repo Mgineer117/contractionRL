@@ -535,14 +535,11 @@ def main(argv=None):
               if args.active_dims else active_dims_auto(env, seed=args.seed))
 
     # An absent cm_w_lb/cm_w_ub is not an error: it means the reference program
-    # with no envelope, which is what segway ships. cm_dt absent would silently
-    # fall back to the env integrator step and solve a 30x harsher LMI, so that
-    # one is called out rather than defaulted quietly.
-    if "cm_dt" not in cm:
-        print(f"[subsets] WARNING: {cfg_path} has no cm_dt; using env dt={env.dt:g}. "
-              f"That is a much harsher (W-I)/dt than the configs' 1.0.")
+    # with no envelope, which is what segway ships. dt is NOT read from the yaml:
+    # every CV-STEM SDP in the repo solves at 1.0, so reading it would only create
+    # a way for this probe to solve a different program than the one that ships.
     kw = dict(eps=args.cm_eps if args.cm_eps is not None else cm["cm_eps"],
-              dt=cm.get("cm_dt", float(env.dt)), solver=cm.get("cm_solver", "MOSEK"),
+              dt=1.0, solver=cm.get("cm_solver", "MOSEK"),
               r_scaler=cfg["agent"]["r_scaler"],
               w_lb=None if args.free_envelope else (args.w_lb if args.w_lb is not None
                                                    else cm.get("cm_w_lb")),

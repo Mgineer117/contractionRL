@@ -118,6 +118,17 @@ def main() -> int:
     if args.check:
         print("[build_cm] NOT present (or key mismatch) — run without --check to build.")
         return 1
+    # A key MISS on an existing file is a clobber, not a rebuild. The filename
+    # carries only (lbd, w_lb, w_ub, r_scaler) while the key also carries
+    # num_samples/eps/solver/chi/nu — so a --num-samples probe resolves to the
+    # SHIPPED path and overwrites a 10000-state dataset with 20 states. Measured:
+    # a probe run destroyed data/classic/car/...npz (recovered from git).
+    if existing is None and cache_path.exists() and not args.force:
+        print(f"[build_cm] {cache_path} EXISTS but does not match this key "
+              f"(N={cfg.cmg_memory_size} eps={cfg.cm_eps} solver={cfg.cm_solver}). "
+              f"Writing would overwrite it. Pass --force if that is intended.",
+              file=sys.stderr)
+        return 2
 
     task = args.task if args.task.startswith("classic-") else f"classic-{args.task}-v0"
     env = gym.make(task, num_envs=1, device="cpu").unwrapped
@@ -135,7 +146,7 @@ def main() -> int:
         random_ratio=cache_kwargs["random_ratio"],
         r_scaler=cfg.cvstem_r_scaler,
         chi_weight=cfg.cm_chi_weight,
-        nu_weight=cfg.cm_nu_weight, wdot_dt=cfg.cm_wdot_dt,
+        nu_weight=cfg.cm_nu_weight, wdot_dt=0.0,
     )
     el = time.time() - t0
 
