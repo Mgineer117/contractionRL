@@ -150,6 +150,9 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         self._clamp_n = 0
         self._clamp_nonfinite = 0.0
         self._CLAMP_LOG_EVERY_STEPS = 100
+        self._ref_clamp_hits = torch.zeros(
+            self.num_dim_x, device=self.device, dtype=torch.float32)
+        self._ref_clamp_n = 0
 
         self.time_bound = env_config["time_bound"]
         self.dt = env_config["dt"]
@@ -331,6 +334,20 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
     def sample_reference_controls(self, freqs, weights, _t, infos, add_noise=False):
         ...
 
+    def ref_clamp_summary(self) -> dict[str, float]:
+        """Fraction of synthesized reference steps the X-box clamp modified, per
+        dim. Anything above ~0 means the stored (xref, uref) is not a trajectory
+        of the plant, so every u = uref + feedback controller is chasing a point
+        the plant cannot hold (rule.md Step 4)."""
+        if not self._ref_clamp_n:
+            return {}
+        n = float(self._ref_clamp_n)
+        names = list(self.state_names) or [f"x{i}" for i in range(self.num_dim_x)]
+        out = {f"ref_frac_{names[i]}": float(self._ref_clamp_hits[i]) / n
+               for i in range(self.num_dim_x)}
+        out["ref_frac_any"] = max(out.values()) if out else 0.0
+        return out
+
     def _rollout_reference(self, xref_0: torch.Tensor, freqs, weights) -> tuple[torch.Tensor, torch.Tensor, int]:
         xref_list = [xref_0]
         xref_wrapped_list = [xref_0]
@@ -353,7 +370,16 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
             next_x = xref_prev + self.dt * x_dot
 
             next_x_wrapped = self.wrap_angles(next_x)
+            _pre = next_x_wrapped
             next_x_wrapped = torch.clamp(next_x_wrapped, self.X_MIN, self.X_MAX)
+            # How often the clamp actually BITES. Checking "is xref inside X"
+            # afterwards can never fail -- the line above put it there -- so a
+            # reference that free-falls and is pinned to the wall reads as a
+            # perfect 0% out-of-box while no longer being a trajectory of the
+            # plant. Measured on segway: a reference started at any nonzero tilt
+            # scores 0.0% out-of-box and still makes the tracking error GROW 5x.
+            self._ref_clamp_hits += (_pre != next_x_wrapped).float().sum(0)
+            self._ref_clamp_n += next_x_wrapped.shape[0]
 
             xref_list.append(next_x_wrapped)
             xref_wrapped_list.append(next_x_wrapped)

@@ -98,8 +98,47 @@ UREF_MAX = [24.0]
 # x_0 pinned to a boundary is not the draw this box describes, and every
 # Stability/* metric is normalised by the error at x_0. Derive it so the two
 # cannot drift apart again (scripts/check_boxes.py fails loudly if they do).
-X_INIT_MIN = [-5.0, 0.6596, 0.0098, -3.1244]
-X_INIT_MAX = [5.0, PITCH_LIM, 0.994, -0.6786]
+# rule.md Step 3, redone 2026-08-27 AFTER the uniform lambda was known -- which is
+# the whole point of the ordering, and was not done for the previous box.
+#
+# The previous X_INIT had X_INIT_MAX[pitch] == X_MAX[pitch] EXACTLY (0.8999997 both).
+# Episodes therefore spawned on the wall and pitch clamped on 100% of steps, so the
+# simulated plant was not f+Bu and AUC had nothing to converge to: measured flat at
+# 79-92 over 33k steps with contraction rate 0.025 against the certified 0.0514.
+#
+# Where the hard region actually is, from the certified metric (lam(x) = largest
+# rate satisfying A_cl'M + M A_cl + 2 lam M <= 0, A_cl = A - B(1/r)B'M):
+#     lam over X: min 0.0686  median 0.2732  max 0.4319   -> 6.3x spread,
+#     so the rate IS state-dependent and Step 3's low-rate rule applies.
+#     corr(lam, |pitch|) = -0.226  <- the only dim that drives it
+#     corr(lam, |pos_x|) = +0.002, |vel_x_b| = -0.014, |pitch_rate| = +0.148
+#     hardest 5% of states sit at mean |pitch| 0.797 (vs 0.444 over all of X).
+# min lam 0.0686 >= the certified uniform 0.0514, an independent check that the
+# certificate is sound.
+#
+# So spawn at high tilt -- |pitch| in [0.65, 0.78] is inside that hardest band --
+# but stop short of the 0.90 wall, and start the body slow so the recovery
+# transient has somewhere to go. Measured with the certified controller over 400
+# steps x 128 envs: pitch clamps 0.000 of steps, clamp_any 0.027 (all of it
+# vel_x_b transient), and the error contracts to 0.64% of e(0), well past Step 5's
+# 95%. Raising the tilt further only trades error reduction for clamping.
+# pitch_rate is NEGATIVE against a positive pitch on purpose: X_INIT_SIGN_DIMS
+# mirrors dims 1-3 together, so the draw is (+pitch, -rate) or (-pitch, +rate) and
+# never the same-sign quadrant. That diagonal is where the plant is actually slow,
+# and the certified metric says so plainly -- restricted to the |pitch| > 0.6 band
+# used here, mean lam is 0.168 on the opposite-sign diagonal against 0.331 on the
+# same-sign one, and the global minimum 0.0686 lives on it. A symmetric pitch_rate
+# range would send half of every batch to the easy quadrant.
+#
+# Chosen among four diagonal candidates by measurement; this one is simultaneously
+# the hardest and the cleanest, so there is no trade to argue about:
+#     pitch_rate band     mean lam in box   clamp_any   e(T)/e(0)
+#     [-0.15, -0.05]           0.2383         0.029       0.0064
+#     [-0.60, -0.20]           0.2218         0.020       0.0053
+#     [-1.50, -0.60]           0.1938         0.016       0.0034   <- this one
+#     wider tilt               0.2148         0.026       0.0048
+X_INIT_MIN = [-2.0, 0.65, 0.0, -1.50]
+X_INIT_MAX = [2.0, 0.78, 0.05, -0.60]
 X_INIT_SIGN_DIMS = [1, 2, 3]
 
 ENV_CONFIG = {
