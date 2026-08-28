@@ -71,12 +71,32 @@ parameters:
   # key, which models.policy.* and models.critic.* don't.
   xref_encoder:
     value: gru
-  # Trimmed to the window AUTO actually builds at gamma=0.9 (11 points): stride
-  # 1/2/3/5 keep 11/6/4/3 points. The old ladder went to 20, which on an
-  # 11-point window keeps one point — a degenerate "sequence" that makes the
-  # gru/attn arms identical to a 1-point mlp and wastes trials.
+  # The full ladder, INCLUDING stride 1. Stride is a modelling choice -- how
+  # finely the window resolves the horizon -- and it must be decided by the
+  # sweep, not silently removed by whichever card the job landed on.
+  #
+  # It is not free, though, and the cost is the reason jobs OOM'd here first.
+  # AUTO sizes the window to the env's FULL EPISODE, not to gamma (train.py
+  # prints "ref_length FULL -> 2000 ... gamma=0.999 does NOT change it"), so
+  # retained points = episode/stride and that differs 4x across the envs one
+  # config serves. At num_envs 1024 the measured cost is ~11.8 MiB per retained
+  # point (attn, stride 1, 500-point window peaked at 5.9 GiB):
+  #     episode  500 (car, car_v1, cartpole)  stride 1 ->  500 pts,  5.9 GiB
+  #     episode  400 (quadrotor)              stride 1 ->  400 pts,  4.7 GiB
+  #     episode 2000 (segway)                 stride 1 -> 2000 pts, 23.6 GiB
+  # segway at stride 1 therefore does not fit a 22.06 GiB A10 even alone -- a
+  # trial tried to allocate 26.80 GiB and died. It is placed on a 48 GB L40S
+  # instead; see commands/launch_cvstem_search.sh for the per-env placement.
+  #
+  # NOTE what stride costs statistically. It preserves the SPAN of the horizon
+  # but subsamples within it, and RefWindow.check_markov is explicit that the
+  # skipped reference points "are never observed, so the window is a subsampling
+  # of the horizon, exact only to the extent the reference is smooth". So a
+  # strided window is only APPROXIMATELY a sufficient statistic for V -- fine for
+  # these smooth sinusoidal references, but it is a real approximation and
+  # precisely why stride belongs in the search rather than being assumed away.
   xref_encoder_stride:
-    values: [1, 2, 3, 5, 10]
+    values: [1, 2, 3, 5, 10, 20]
   # ── PPO / GAE knobs (re-opened) ──────────────────────────────────────── #
   # GAE bias/variance trade-off. Same ladder as the standalone ppo.yaml, plus
   # 0.99 (the current per-env pin) so bayes can confirm or move off it.
