@@ -48,7 +48,7 @@ parameters:
   # The window is sized per-trial from this value (RefWindow.length_for_horizon),
   # so changing gamma here resizes the observation to match automatically.
   agent.discount_factor:
-    value: 0.9
+    value: 0.999
   # ── Reference-window encoding (actor W2 + critic psi) ────────────────────── #
   # "mlp" flattens the (strided) points; "gru"/"attn" consume them as a
   # sequence — see nn_modules.PreviewSequenceEncoder. The stride applies
@@ -61,13 +61,13 @@ parameters:
   # per-path nested-dict join only works when the two targets share a parent
   # key, which models.policy.* and models.critic.* don't.
   xref_encoder:
-    values: [mlp, gru, attn]
+    value: gru
   # Trimmed to the window AUTO actually builds at gamma=0.9 (11 points): stride
   # 1/2/3/5 keep 11/6/4/3 points. The old ladder went to 20, which on an
   # 11-point window keeps one point — a degenerate "sequence" that makes the
   # gru/attn arms identical to a 1-point mlp and wastes trials.
   xref_encoder_stride:
-    values: [1, 2, 3, 5]
+    values: [1, 2, 3, 5, 10]
   # ── PPO / GAE knobs (re-opened) ──────────────────────────────────────── #
   # GAE bias/variance trade-off. Same ladder as the standalone ppo.yaml, plus
   # 0.99 (the current per-env pin) so bayes can confirm or move off it.
@@ -85,9 +85,74 @@ parameters:
   # Mahalanobis reward's scale swings with w_lb/w_ub across the state box, and
   # PPO's advantage normalization only partly absorbs that — see rl_glue.
   agent.use_reward_norm:
-    values: [true, false]
+    value: false
+  # Pinned at 0.0 -- pure tracking reward, no control-effort term. Not a swept
+  # axis. This line previously read `value:` with an EMPTY right-hand side, which
+  # YAML parses as None, so every trial had been running control_scaler=None
+  # instead of a number.
   cm.control_scaler:
-    values: [0.0, 0.01, 0.1, 1.0]
+    value: 0.0
+
+  # ── KL-adaptive LR: five coherent (KL budget, LR band) configurations ──── #
+  # Re-opened deliberately. These were pinned across all envs after a spread of
+  # 0.004/0.016/0.032 was left behind with no per-plant rationale; the pin is
+  # lifted here because the learning rate, learning_epochs and initial_log_std
+  # have all moved since, so the old point is no longer the tuned one.
+  #
+  # Sampled as ONE nested parameter under `agent` rather than as separate flat
+  # keys, because these five numbers are not independent. skrl steps the
+  # scheduler once per epoch on that epoch's mean KL:
+  #     kl > kl_threshold * kl_factor  ->  lr /= lr_factor  (floor min_lr)
+  #     kl < kl_threshold / kl_factor  ->  lr *= lr_factor  (ceil  max_lr)
+  # so the DECREASE branch can only ever fire if
+  #     sched_kl_threshold * kl_factor  <=  agent.kl_threshold (the PPO early stop)
+  # Otherwise PPO stops the epoch before KL is ever observed that high and the
+  # controller can only ratchet the LR upward -- which is precisely the failure
+  # recorded in the env yamls. Every row below satisfies it with equality at
+  # kl_factor 4, and each row also sets learning_rate == min_lr so the run starts
+  # at the slowest rate it is allowed and has to earn its way up.
+  #
+  # The whole dict REPLACES agent.learning_rate_scheduler_kwargs (the merge is
+  # shallow), so every key it needs is written out in full here -- an inherited
+  # kl_factor or lr_factor would be silently dropped.
+  agent:
+    values:
+      # 1. the shipped pin, as the control arm
+      - {kl_threshold: 0.016, learning_rate: 1.0e-6,
+         learning_rate_scheduler_kwargs: {kl_threshold: 0.004, kl_factor: 4,
+                                          lr_factor: 1.2, min_lr: 1.0e-6, max_lr: 1.0e-4}}
+      # 2. tighter trust region, slower band
+      - {kl_threshold: 0.008, learning_rate: 1.0e-7,
+         learning_rate_scheduler_kwargs: {kl_threshold: 0.002, kl_factor: 4,
+                                          lr_factor: 1.2, min_lr: 1.0e-7, max_lr: 3.0e-5}}
+      # 3. looser trust region, faster band
+      - {kl_threshold: 0.032, learning_rate: 1.0e-6,
+         learning_rate_scheduler_kwargs: {kl_threshold: 0.008, kl_factor: 4,
+                                          lr_factor: 1.2, min_lr: 1.0e-6, max_lr: 3.0e-4}}
+      # 4. loosest, for plants that need to move quickly early
+      - {kl_threshold: 0.064, learning_rate: 1.0e-5,
+         learning_rate_scheduler_kwargs: {kl_threshold: 0.016, kl_factor: 4,
+                                          lr_factor: 1.2, min_lr: 1.0e-5, max_lr: 1.0e-3}}
+      # 5. shipped KL budget, but a much wider LR band to let the controller work
+      - {kl_threshold: 0.016, learning_rate: 1.0e-7,
+         learning_rate_scheduler_kwargs: {kl_threshold: 0.004, kl_factor: 4,
+                                          lr_factor: 1.2, min_lr: 1.0e-7, max_lr: 1.0e-3}}
+
+  # ── Initial exploration sigma = exp(initial_log_std) ─────────────────────── #
+  # sigma is plant-relative, not a universal constant: measured against the
+  # feedback the certified controller must produce, the -0.5 every env shipped is
+  # right for car (sigma/p95 0.83) and 11x too small for segway (0.087). Fixing
+  # segway took its AUC from 167 to 1.8 with nothing else changed.
+  #
+  # One sweep config serves every env, so the ladder has to span the whole range
+  # the plants ask for: sigma 0.61 (car) to 7.4 (segway). scripts/
+  # check_exploration_scale.py predicts the right rung per env from that env's own
+  # p95 -- for segway it said 1.94 and the sweep optimum landed there -- so a trial
+  # far from that prediction is expected to lose, and this axis is partly a test of
+  # that rule on the envs where it has not yet been checked.
+  models.policy.initial_log_std:
+    values: [-0.5, 0.0, 0.7, 1.4, 2.0]
+
   # Pinned. C2RL consumes the metric only as a reward (not a deployed
   # certificate), so a little per-state λ-backoff and a <100% bar are
   # acceptable: the offline synthesis samples the full uniform state box,
@@ -97,11 +162,9 @@ parameters:
   cm.cmg_method:
     value: cvstem
 
-# kl_threshold and std_dev_annealing are NOT searched. Both are now fixed
-# across every env and PPO-family algorithm: the KLAdaptiveLR deadband
-# (kl_threshold 0.004, kl_factor 4 -> decrease above 0.016, increase below 0.001,
-# lr in [1e-6, 1e-4] starting at the floor) and the PPO early stop at 0.016.
-# Re-opening either as a per-env axis is what produced the 0.004/0.016/0.032
-# spread that had no per-plant rationale and went stale the moment the learning
-# rate, learning_epochs and initial_log_std changed. std_dev_annealing is off --
-# PPO learns log_std through the policy loss.
+# std_dev_annealing stays OFF and unsearched: PPO learns log_std through the
+# policy loss, so annealing it on a schedule fights the gradient. initial_log_std
+# above sets only the STARTING point, which is a different question.
+#
+# kl_threshold IS searched again, as part of the joint `agent` group above --
+# see the reasoning there for why it cannot be a flat independent axis.
