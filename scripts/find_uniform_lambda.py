@@ -281,6 +281,12 @@ def main() -> int:
                         "it) by this factor. Moves the ACTUATOR gate only -- use it "
                         "when the log says '%% of controls out of box', never when "
                         "it says LMI INFEASIBLE.")
+    p.add_argument("--verify-n", "--verify_n", type=int, default=1000,
+                   help="re-solve the accepted (lbd, r) at this many samples before "
+                        "reporting success; 0 disables. The search draw is sparse by "
+                        "design (it explores many points), and a rate that clears it "
+                        "can be infeasible on a denser one -- which the 15 h shipped "
+                        "build would otherwise be the thing to discover.")
     p.add_argument("--no-eval", "--no_eval", action="store_true",
                    help="Stop after the search; skip the episode. Use this when "
                         "sweeping several envs: the eval rebuilds the agent at "
@@ -446,6 +452,45 @@ def main() -> int:
             print(f"[uniform-lambda]   {state} -> FEASIBLE, {frac:.2%} of controls out "
                   f"of box (<= {args.viol_frac:.1%}) "
                   f"(nu={sol['nu']:.4g}, chi={sol['chi']:.4g}, J={sol['J']:.4g})")
+            # Confirm at a DENSER draw before accepting. A lambda that clears the
+            # search draw can be flatly infeasible on a bigger one -- the sampled
+            # LMI only constrains the states it saw, and the gaps between them are
+            # where an over-optimistic rate hides. Measured 2026-08-27: cartpole,
+            # tora and ball_and_beam all certified at N=100 and were INFEASIBLE at
+            # N=600, which the shipped N=10000 build would have reported after
+            # ~15 h of solving. Catching it here costs one extra solve.
+            if args.verify_n and args.verify_n > args.num_samples:
+                xv = sample_state_box(env.X_MIN, env.X_MAX, n=args.verify_n,
+                                      seed=args.seed + 1)
+                Av, Bv = drift_jacobians(env.get_f_and_B, xv)
+                vsol = cvstem_joint(Av, Bv, lbd=lbd, eps=eps_for_n(args.verify_n),
+                                    dt=lmi_dt, solver=args.solver, r_scaler=r,
+                                    w_lb=w_lb, w_ub=w_ub)
+                if vsol is None:
+                    print(f"[uniform-lambda]   VERIFY at N={args.verify_n} INFEASIBLE "
+                          f"— the rate does not survive a denser draw, lowering lbd")
+                    r = args.r0
+                    lbd /= args.lbd_factor
+                    continue
+                vfrac = control_violation_rate(
+                    vsol["W"], Bv, r_scaler=r,
+                    e_draws=e_pool[rng.integers(0, e_pool.shape[0],
+                                                size=(args.verify_n, args.n_draws))],
+                    uref_draws=rng.uniform(uref_lo, uref_hi,
+                                           size=(args.verify_n, args.n_draws,
+                                                 uref_lo.size)),
+                    u_lo=u_lo, u_hi=u_hi)
+                print(f"[uniform-lambda]   VERIFY at N={args.verify_n}: feasible, "
+                      f"{vfrac:.2%} of controls out of box (nu={vsol['nu']:.4g})")
+                if vfrac > args.viol_frac:
+                    print("[uniform-lambda]   ...but over the box budget at the denser "
+                          "draw — raising r")
+                    r *= args.r_factor
+                    if r > args.r_max:
+                        r = args.r0
+                        lbd /= args.lbd_factor
+                    continue
+                sol = vsol
             break
         print(f"[uniform-lambda]   {state} -> {frac:.2%} of controls out of box "
               f"— raising r (nu={sol['nu']:.4g}, chi={sol['chi']:.4g})")
