@@ -117,6 +117,12 @@ def main() -> int:
     p.add_argument("--steps", type=int, default=400)
     p.add_argument("--synth-n", "--synth_n", type=int, default=600,
                    help="when no dataset exists, solve the metric at this N")
+    p.add_argument("--no-move-xref", "--no_move_xref", dest="move_xref",
+                   action="store_false", default=True,
+                   help="keep XREF_INIT where it is instead of co-locating it with "
+                        "X_INIT. Only correct for an env whose reference is pinned "
+                        "(segway holds XREF_INIT at zero: a tilted reference is not "
+                        "sustainable for an inverted pendulum).")
     p.add_argument("--apply", action="store_true")
     args = p.parse_args()
 
@@ -226,8 +232,20 @@ def main() -> int:
             else:
                 lo[i], hi[i] = -half * shrink, half * shrink
         lo, hi = np.maximum(lo, X_LO), np.minimum(hi, X_HI)
-        cs, ratio, ei, ef = rollout_clamp(env, lo, hi, env.XREF_INIT_MIN.numpy(),
-                                          env.XREF_INIT_MAX.numpy(), W, x_np, r,
+        # XREF_INIT moves WITH X_INIT, which is what rule.md Step 3 says ("XREF_INIT
+        # is established the same way, so the reference also starts in the low-rate
+        # region") and is not optional. Moving X_INIT alone does not make the
+        # operating point harder, it makes e(0) = x_0 - xref_0 enormous: on car and
+        # car_v1 that produced e(0) of 20-35 against the ~1.0 their XE_INIT gives,
+        # a different problem rather than a harder one, and nothing contracted.
+        # Co-locating them keeps e(0) at roughly the box width while still putting
+        # both endpoints in the slow region.
+        if args.move_xref:
+            ref_lo, ref_hi = lo, hi
+        else:
+            ref_lo = env.XREF_INIT_MIN.numpy()
+            ref_hi = env.XREF_INIT_MAX.numpy()
+        cs, ratio, ei, ef = rollout_clamp(env, lo, hi, ref_lo, ref_hi, W, x_np, r,
                                           steps=args.steps)
         fa = cs.get("frac_any", float("nan"))
         worst = max(((k, v) for k, v in cs.items() if k.startswith("frac_")
@@ -249,6 +267,9 @@ def main() -> int:
           f"clamp {fa:.3f}, e(T)/e(0) {ratio:.3f}")
     print(f"  X_INIT_MIN = [{', '.join(f'{v:.4f}' for v in lo)}]")
     print(f"  X_INIT_MAX = [{', '.join(f'{v:.4f}' for v in hi)}]")
+    if args.move_xref:
+        print(f"  XREF_INIT_MIN = [{', '.join(f'{v:.4f}' for v in lo)}]   (co-located, Step 3)")
+        print(f"  XREF_INIT_MAX = [{', '.join(f'{v:.4f}' for v in hi)}]")
     if args.apply:
         print("\n--apply is not wired: X_INIT lives in env.py next to prose that "
               "explains it, so paste the two lines above with a note on why.")
