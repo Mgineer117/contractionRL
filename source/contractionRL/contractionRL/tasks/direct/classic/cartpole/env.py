@@ -64,8 +64,36 @@ UREF_MAX = [12.0]
 # lbd*(x0) median 1.3194 -> 0.5625. The sign dims are
 # mirrored by one shared sign, because the slow set is two lobes on a
 # diagonal that no single box can cover.
-X_INIT_MIN = [-5.0, 0.8286, -1.0, 0.0168]
-X_INIT_MAX = [5.0, 1.0467, 1.0, 0.9676]
+# rule.md Step 3, redone 2026-08-28 AFTER the lambda was verified at N=1000
+# (0.0514, r 12.8). The previous box had TWO of the defects segway had:
+#   * X_INIT_MAX[pitch] == X_MAX[pitch] EXACTLY (1.0467 both), so episodes spawned
+#     on the wall and pitch clamped from step 0;
+#   * vel_x_b spanned the FULL +-1.0 X range, leaving the recovery transient no
+#     room in a dim that does not even drive the difficulty.
+#
+# The rate is state-dependent (lam(x) spread 9.58x over X) and driven by |pitch|
+# alone: corr(lam,|pitch|) = -0.767, against |pos_x| -0.016, |vel_x_b| +0.022,
+# |pitch_rate| -0.041. So tilt is what makes this plant hard, and the spawn wants
+# to be as tilted as the transient allows. Measured with the certified controller
+# over 400 steps x 128 envs, pitch clamp is 0.000 at every rung -- the binding
+# constraint is pitch_rate, whose +-1.0 box is tight against the recovery from a
+# large tilt:
+#     pitch band     clamp_any   pitch_rate   e(T)/e(0)
+#     0.75 - 0.91      0.058       0.056        0.0041
+#     0.60 - 0.80      0.048       0.046        0.0030
+#     0.45 - 0.60      0.034       0.032        0.0016
+#     0.35 - 0.50      0.026       0.023        0.0019
+#     0.25 - 0.40      0.017       0.014        0.0026   <- highest tilt under 2%
+# Taking the hardest band that still leaves the transient room, which is the same
+# trade segway made. Going higher buys tilt by reintroducing clamping, and a
+# clamped state means the plant is not f+Bu and the certificate describes nothing.
+#
+# pitch_rate is NEGATIVE against a positive pitch: X_INIT_SIGN_DIMS mirrors dims
+# 1 and 3 together, so the draw is (+pitch, -rate) or (-pitch, +rate) -- falling
+# back toward upright rather than away from it, which is what leaves the transient
+# inside the box.
+X_INIT_MIN = [-2.0, 0.25, -0.02, -0.15]
+X_INIT_MAX = [2.0, 0.40, 0.02, -0.02]
 X_INIT_SIGN_DIMS = [1, 3]
 
 ENV_CONFIG = {
