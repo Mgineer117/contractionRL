@@ -43,6 +43,9 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "source", "contractionRL"))
 
 import contractionRL.tasks.direct.classic  # noqa: E402,F401
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import gymnasium as gym  # noqa: E402
 import yaml  # noqa: E402
 from contractionRL.agents.skrl.math_utils import jacobian  # noqa: E402
@@ -148,8 +151,17 @@ def main() -> int:
               f"rate STRUCTURE only (absolute rates indicative, box is rollout-verified)")
         x_np = sample_state_box(env.X_MIN, env.X_MAX, n=n, seed=0).astype(np.float64)
         A0, B0 = drift_jacobians(env.get_f_and_B, x_np, device="cpu")
+        # eps is a covering radius scheduled by sample count -- hardcoding 0.1 at
+        # N=600 solves a STRICTER program than the one that certified the lambda
+        # (the search uses 0.05 there), and reports a false infeasible. tora did
+        # exactly that before this line read eps_for_n.
+        # The SHIPPED cm_eps, not the search schedule. Step 3 analyses the metric
+        # the env actually deploys, and eps_for_n(600)=0.05 is five times stricter
+        # than the 0.01 the configs generate at -- strict enough to report tora
+        # infeasible at a lambda its own dataset builds fine at.
+        _eps = float(cm.get("cm_eps", 0.01))
         sol = cvstem_joint(np.asarray(A0, np.float64), np.asarray(B0, np.float64),
-                           lbd=float(cm["lbd"]), eps=0.1, dt=1.0, solver=cm.get("cm_solver", "MOSEK"),
+                           lbd=float(cm["lbd"]), eps=_eps, dt=1.0, solver=cm.get("cm_solver", "MOSEK"),
                            r_scaler=float(cm["cvstem_r_scaler"]),
                            w_lb=float(cm["w_lb"]), w_ub=float(cm["w_ub"]))
         if sol is None:

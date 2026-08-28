@@ -143,6 +143,11 @@ class QuadrotorEnv(BaseEnv):
 # stored (xref, uref) stopped being a trajectory of the plant.
         # excitation sized against the box: at 0.1 the reference clamped 47% of steps on
         # vel_x_w/vel_y_w, so (xref, uref) stopped being a trajectory.
-        weights = 0.01 * weights / torch.sqrt((weights ** 2).sum(dim=1, keepdim=True))
+        # 0.005, not 0.01: at 0.01 the excitation itself drives the reference into
+        # the X box on 3.2% of steps (worst dim vel_x_w), and a clamped reference is
+        # no longer a trajectory of the plant (rule.md Step 4). Halving it drops that
+        # to 1.7% and nothing below 0.005 improves further -- the remainder is drift,
+        # not excitation. Measured 2026-08-27 via ref_clamp_summary().
+        weights = 0.005 * weights / torch.sqrt((weights ** 2).sum(dim=1, keepdim=True))
         xref_arr, uref_arr, length = self._rollout_reference(xref_0, freqs, weights)
         return x_0, xref_arr, uref_arr, length

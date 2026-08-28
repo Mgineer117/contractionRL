@@ -154,6 +154,13 @@ class PVTOLEnv(BaseEnv):
     def sample_reference_controls(self, freqs, weights, _t, infos, add_noise=False):
         n = weights.shape[0]
         uref = torch.zeros(n, self.num_dim_control, device=self.device)
+        # Trim first: the aircraft falls without hover thrust, so a reference built from sinusoids
+        # around zero control is a falling one. It clamps into the X box and the
+        # stored (xref, uref) then stops being a trajectory of the plant, which
+        # every u = uref + feedback controller is left chasing (rule.md Step 4).
+        xr = infos.get("xref_t")
+        if xr is not None:
+            uref = uref + self.drift_trim_uref(xr)
         # Trim: thrust must cancel gravity along the body axis, so it grows as
         # 1/cos(phi) when tilted. A constant G only hovers at phi = 0; tilted, it
         # under-lifts and the reference falls out of the box (measured 36-53%

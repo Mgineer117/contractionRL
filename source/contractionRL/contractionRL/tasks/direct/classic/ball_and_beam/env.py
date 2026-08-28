@@ -154,6 +154,13 @@ class BallAndBeamEnv(BaseEnv):
     def sample_reference_controls(self, freqs, weights, _t, infos, add_noise=False):
         n = weights.shape[0]
         uref = torch.zeros(n, self.num_dim_control, device=self.device)
+        # Trim first: the beam falls under gravity, so a reference built from sinusoids
+        # around zero control is a falling one. It clamps into the X box and the
+        # stored (xref, uref) then stops being a trajectory of the plant, which
+        # every u = uref + feedback controller is left chasing (rule.md Step 4).
+        xr = infos.get("xref_t")
+        if xr is not None:
+            uref = uref + self.drift_trim_uref(xr)
         # Trim: the torque that cancels the ball's gravity moment at the current
         # reference state, so the unforced reference holds its tilt instead of
         # collapsing into the box. Without it the reference clamps 64% of the
