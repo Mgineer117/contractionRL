@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import contractionRL.tasks.direct.classic  # noqa: E402,F401
 import gymnasium as gym  # noqa: E402
+from contractionRL.agents.skrl.math_utils import jacobian  # noqa: E402
 
 
 def metric_for(env, cm, short, synth_n):
@@ -60,27 +61,45 @@ def metric_for(env, cm, short, synth_n):
     return x, np.asarray(sol["W"], np.float64), f"synth N={synth_n}"
 
 
-def measure(env, x_np, W, r, steps):
-    """Mean-error trace under the certified controller."""
+def measure(env, steps):
+    """Mean-error trace under a per-state LQR (Q = R = I).
+
+    NOT a nearest-neighbour lookup of the certified W. That was the first
+    version and it is unusable above a few dimensions: 10000 samples in
+    quadrotor's 10-D box leaves the nearest stored metric far from the visited
+    state, and the resulting gain reported a NEGATIVE decay rate -- an
+    interpolation artifact, not a property of the plant.
+
+    Solving the Riccati equation at each visited state is exact there, needs no
+    dataset at all (so Step 5 can be checked before Step 1 finishes), and answers
+    the question Step 5 actually asks: is the horizon long enough for a good
+    controller to remove 95% of the initial error. Where the ARE has no solution
+    the state is not stabilisable, and zero gain is the honest thing to apply --
+    that is a real property of the plant and shows up as a growing error.
+    """
+    import scipy.linalg as sla
+
     env.reset()
-    tree = torch.as_tensor(x_np, dtype=torch.float32)
-    errs = []
+    n, m = int(env.num_dim_x), int(env.num_dim_control)
+    Q, R = np.eye(n), np.eye(m)
+    errs, fails = [], 0
     for t in range(steps):
-        xt = env.x_t
-        idx = torch.cdist(xt, tree).argmin(dim=-1).numpy()
+        x = env.x_t.detach().clone().requires_grad_()
+        with torch.enable_grad():
+            f, B, _ = env.get_f_and_B(x)
+        A = jacobian(f, x, create_graph=False).detach().numpy()[0].astype(np.float64)
+        Bk = B.detach().numpy()[0].astype(np.float64)
         xr = env.xref[:, min(t, env.xref.shape[1] - 1)]
         ur = env.uref[:, min(t, env.uref.shape[1] - 1)].numpy()
-        e = env.wrap_angles(xt - xr).numpy().astype(np.float64)
-        with torch.no_grad():
-            _, B, _ = env.get_f_and_B(xt)
-        Bn = B.numpy().astype(np.float64)
-        u = np.empty_like(ur)
-        for i in range(len(e)):
-            M = np.linalg.inv(W[idx[i]])
-            u[i] = ur[i] - ((1.0 / r) * Bn[i].T @ M) @ e[i]
+        e = env.wrap_angles(env.x_t - xr).numpy().astype(np.float64)
+        try:
+            K = Bk.T @ sla.solve_continuous_are(A, Bk, Q, R)
+        except Exception:  # noqa: BLE001 — unstabilisable here; zero gain is honest
+            fails += 1
+            K = np.zeros((m, n))
         errs.append(np.linalg.norm(e, axis=-1))
-        env.step(u.astype(np.float32))
-    return np.array(errs).mean(axis=1)
+        env.step((ur - e @ K.T).astype(np.float32))
+    return np.array(errs).mean(axis=1), fails
 
 
 def main() -> int:
@@ -94,7 +113,7 @@ def main() -> int:
 
     tasks = [args.task] if args.task else [k for k in gym.registry
                                            if k.startswith("classic-")]
-    print(f"{'env':<15} {'metric':<13} {'horizon':>8} {'lam_cert':>9} {'lam_meas':>9} "
+    print(f"{'env':<15} {'ctrl':<15} {'horizon':>8} {'lam_cert':>9} {'lam_meas':>9} "
           f"{'C':>5} {'T95_meas':>9} {'e(T)/e(0)':>10}  verdict")
     bad = []
     for t in tasks:
@@ -107,13 +126,8 @@ def main() -> int:
             cm = yaml.safe_load(fh)["cm"]
         env = gym.make(t, num_envs=args.envs, device="cpu").unwrapped
         H = float(env.dt) * int(env.episode_len)
-        x_np, W, tag = metric_for(env, cm, short, args.synth_n)
-        if W is None:
-            print(f"{short:<15} {tag:<13} {H:>8.1f}       --        --     --        --"
-                  f"          --  (no metric)")
-            continue
-        r = float(cm["cvstem_r_scaler"]) + 1e-5
-        e = measure(env, x_np, W, r, int(env.episode_len))
+        e, fails = measure(env, int(env.episode_len))
+        tag = "LQR" if not fails else f"LQR({fails} unstab)"
         e0 = max(e[0], 1e-12)
         C = float(e.max() / e0)                      # overshoot, off the same trace
         k = max(5, len(e) // 2)
@@ -126,7 +140,7 @@ def main() -> int:
              "OK (reaches 95%)" if ratio <= 0.05 else "*** TOO SHORT ***")
         if ratio > 0.05:
             bad.append(short)
-        print(f"{short:<15} {tag:<13} {H:>8.1f} {float(cm['lbd']):>9.4f} {lam_m:>9.4f} "
+        print(f"{short:<15} {tag:<15} {H:>8.1f} {float(cm['lbd']):>9.4f} {lam_m:>9.4f} "
               f"{C:>5.2f} {t95:>9.1f} {ratio:>10.4f}  {ok}")
     if bad:
         print(f"\nhorizon does not reach 95% reduction: {', '.join(bad)}")

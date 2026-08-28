@@ -36,7 +36,19 @@ models:
     # is 4.5% of the half-range instead of 33%, so the policy starts near its
     # mean rather than being dominated by its own noise. Inside the
     # min_log_std/max_log_std clamp above, so it is not truncated at init.
-    initial_log_std: -0.5
+    # Set from the plant, not copied. sigma = exp(initial_log_std) is only meaningful
+    # against the feedback this env actually needs: the certified controller's own
+    # -K(x)e has |pi| p95 = 6.95 here, so the shipped -0.5 (sigma 0.607) asked the
+    # policy to find a 7-unit stabilising action by sampling 0.6-unit ones. From a
+    # spawn that clamps on step 1 the reward is then nearly flat and nothing moves:
+    # Clamp/frac_pitch sat at 1.000 for a whole run while frac_u_saturated stayed 0,
+    # authority unused because exploration never reached it. Swept at 20k steps:
+    #     sigma 0.61 -> AUC 167.16, rate 0.0071      sigma 4.06 -> AUC   2.90, rate 0.2331
+    #     sigma 2.01 -> AUC  77.58, rate 0.0074      sigma 7.39 -> AUC   1.83, rate 0.2291
+    # ln(6.95) = 1.94, and the sweep optimum landed there independently, so the
+    # rule "sigma ~ p95 of the certified feedback" is what is encoded -- see
+    # scripts/check_exploration_scale.py, which measures it for every env.
+    initial_log_std: 1.94
   critic:  # PPO value function V(obs)
     class: DeterministicMixin
     network:

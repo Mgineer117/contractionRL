@@ -20,7 +20,12 @@ models:
     # is 4.5% of the half-range instead of 33%, so the policy starts near its
     # mean rather than being dominated by its own noise. Inside the
     # min_log_std/max_log_std clamp above, so it is not truncated at init.
-    initial_log_std: -0.5
+    # Set from the plant: the certified controller's feedback has |pi| p95 =
+    # 5.24 here, so the shipped -0.5 (sigma 0.607) was ~9x too small to explore
+    # into the useful range. ln(5.24) = 1.66. Same defect segway had, where a
+    # sweep confirmed the p95 rule empirically (AUC 167 -> 1.8). Not swept here
+    # yet, so this is the measured proportion rather than a tuned optimum.
+    initial_log_std: 1.66
   critic:  # PPO value function V(obs)
     class: DeterministicMixin
     network:
@@ -29,7 +34,7 @@ models:
       layers: [128, 128]
       activations: tanh
     output: ONE
-  # NeuralDynamics (ẋ = f(x) + B(x)·u) — feeds the online contraction-metric SDP
+    # NeuralDynamics (ẋ = f(x) + B(x)·u) — feeds the online contraction-metric SDP
   # when learning dynamics. Built only when use_empirical_dynamics=true (pass
   # --use_empirical_dynamics); classic envs default to analytical get_f_and_B.
   dynamics:
