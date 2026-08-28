@@ -42,6 +42,15 @@ runner:
 extra_flags:
   - "--ref_offset"
   - "1"
+  # 50k, not the yaml's 500k. A search trial has to RANK configurations, not
+  # produce a shipped model, and at the measured 2.5-3.3 steps/s on a shared A10 a
+  # 500k trial is 42-55 h -- past the 48 h wall, so NOT ONE trial would have
+  # finished and the sweep would have returned nothing at all. Measured locally on
+  # segway, the ranking is already legible far earlier: AUC 2.43 at 44k against
+  # 2.10 at 500k, while the arms this sweep separates differ by 100x (167 vs 1.8).
+  # 50k is ~5.5 h/trial, so an agent completes ~8 in the window instead of 0.
+  - "--num_timesteps"
+  - "50000"
 
 parameters:
   # gamma=0.9 -> effective horizon 10 steps -> AUTO ref_length 11 (offset 1).
