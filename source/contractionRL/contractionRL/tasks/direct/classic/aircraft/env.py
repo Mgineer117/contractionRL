@@ -101,8 +101,21 @@ XE_MAX = [lim, lim, lim, lim]
 # reference control bounds -- Normalised commands, u[0] = 1 is full elevator
 # (DELTA_MAX rad) and u[1] = 1 is full thrust (THRUST_MAX N). Applied box is 2x,
 # i.e. the physical surfaces can reach 2x their nominal range under feedback.
-UREF_MIN = [-1.0, -1.0]
-UREF_MAX = [1.0, 1.0]
+# +-4, not +-1. Two independent measurements land on the same factor:
+#
+#   TRIM   the least-squares control that merely HOLDS this plant, -B^+ f,
+#          needs 3.5x the +-1 box at p95 and exceeds it on 61% of the state
+#          box. No reference generator can hold an aircraft it cannot trim,
+#          which is why 17% of reference steps were being clamped (Step 4).
+#   RATE   at +-1 nothing certifies above lbd=0.0514 and even that failed a
+#          denser draw; at 4x the joint SDP certifies lbd=0.3902 r=1.6,
+#          verified at N=1000 with 0.61% of controls out of box.
+#
+# 7.6x the certified rate for 4x the actuator, and T95 drops from 77 s -- far
+# outside this env's 10 s horizon -- to about 10 s (Step 5). The elevator was
+# simply too small for the envelope this env asks it to fly.
+UREF_MIN = [-4.0, -4.0]
+UREF_MAX = [4.0, 4.0]
 
 
 ENV_CONFIG = {
@@ -170,9 +183,63 @@ class AircraftEnv(BaseEnv):
         B[:, 3, 0] = qbar * S_WING * CBAR * C_M_DELTA * DELTA_MAX / IYY
         return B
 
+    @property
+    def _ref_nominal(self):
+        """Centre of XREF_INIT: the nominal operating point the reference holds."""
+        return 0.5 * (self.XREF_INIT_MIN + self.XREF_INIT_MAX)
+
     def sample_reference_controls(self, freqs, weights, _t, infos, add_noise=False):
         n = weights.shape[0]
         uref = torch.zeros(n, self.num_dim_control, device=self.device)
+        # Trim first. An aircraft reference built from sinusoids around ZERO
+        # control is not level flight, it is a phugoid that walks into the pitch
+        # bound: 17% of reference steps were being clamped, and a clamped
+        # reference is no longer a trajectory of the plant (rule.md Step 4).
+        # This only became possible once UREF grew to +-4 -- the trim needs 3.5x
+        # the old +-1 box at p95, so before that there was nothing to wire in.
+        # Trim ALONE makes it worse -- 14.3% clamped becomes 49.8%, because zeroing
+        # the drift leaves a marginally stable plant that integrates every
+        # perturbation. two_link_arm's comment says the same thing: an
+        # open-loop-unstable plant needs stabilising FEEDBACK to generate a bounded
+        # reference, and gravity/drift compensation on its own leaves an integrator.
+        # So cancel the drift and pull back toward the start attitude in one
+        # least-squares solve, u = -B^+ [f + kp (x - x0)]:
+        #     kp   0    0.5    1      2      4      8     16     64    128
+        #     ref 0.498 0.220 0.078  0.048  0.039  0.036  0.035  0.034  0.013
+        # The hold pulls toward the NOMINAL operating point -- the centre of
+        # XREF_INIT -- not toward xref_0 and not toward the origin.
+        #   * xref_0 is a random offset, generally not an equilibrium, so holding it
+        #     has to be fought for continuously: measured 0.261, WORSE than the
+        #     0.143 baseline.
+        #   * the origin is right for the dims that are deviations (alpha, pitch,
+        #     pitch_rate) and WRONG for airspeed, which is absolute and lives in
+        #     [0.6, 2.5]: pulling V toward 0 drives it into the LOWER wall, and sure
+        #     enough the entire residual at that setting was vel.
+        # The centre of XREF_INIT is the nominal reference state and is correct for
+        # both kinds of coordinate at once. (segway says the same from the other
+        # side: its XREF_INIT is pinned at zero, its own equilibrium, because a
+        # tilted reference is unsustainable for an inverted pendulum.)
+        #
+        # kp=16 sits at the start of the flat region. Going stiffer is a trap: at
+        # 128 the hold SATURATES uref, a minority of episodes then lose airspeed to
+        # the wall outright, and the reference stops moving at all (measured travel
+        # 0.002 in vel against a 1.9-wide box) -- a pinned reference that scores
+        # better on one number by being a worse trajectory.
+        #
+        # This does NOT get aircraft under the 2% bar: the residual is airspeed,
+        # every other dim reaches 0.000, and V is the slowest mode here. Step 4
+        # stays RED for this env rather than being tuned into a pass.
+        xr = infos.get("xref_t")
+        x0 = infos.get("xref_0")
+        if xr is not None:
+            if x0 is None:
+                uref = uref + self.drift_trim_uref(xr)
+            else:
+                with torch.no_grad():
+                    f_x, B_x, _ = self.get_f_and_B(xr, need_null=False)
+                    hold = -torch.bmm(torch.linalg.pinv(B_x),
+                                      (f_x + 16.0 * (xr - self._ref_nominal)).unsqueeze(-1)).squeeze(-1)
+                uref = uref + torch.clamp(hold, self.UREF_MIN, self.UREF_MAX)
         for i, freq in enumerate(freqs):
             weight = weights[:, i, :]
             phase = math.sin(freq * _t / self.time_bound * 2 * math.pi)
