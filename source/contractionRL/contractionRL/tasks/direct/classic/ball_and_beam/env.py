@@ -75,8 +75,19 @@ XE_MAX = [lim, lim, lim, lim]
 # at the beam tip alone needs m*g*r = 0.49 N m, leaving nothing for feedback,
 # and the certificate had to weight the control r=102.4 to stay inside it.
 # At +-2.0 the same search returns lbd 0.0780 -> 0.8889 with r 102.4 -> 25.6.
-UREF_MIN = [-2.0]
-UREF_MAX = [2.0]
+# +-4, not +-2. At +-2 nothing certifies that survives a denser draw: five
+# candidates were accepted at N=100 and all five failed the N=1000 re-solve,
+# with the ladder running to the lambda floor -- and notably it never hit an
+# LMI wall, so the coarse draw is simply optimistic for this plant. Verified
+# at N=1000 across the ladder (2026-08-28):
+#     uref x2 -> lbd 0.3902 r 25.6 (1.70% out of box)   <- this one, minimal
+#     uref x4 -> lbd 0.8779 r  6.4 (1.71%)
+#     uref x8 -> lbd 1.3169 r  3.2 (2.96%)
+# Taking the smallest enlargement that certifies, same rule used for segway,
+# cartpole, tora and aircraft. More actuator buys more rate here if that is
+# ever wanted -- the trade is explicit above rather than hidden in a tuning.
+UREF_MIN = [-4.0]
+UREF_MAX = [4.0]
 
 # Initial state drawn directly from this box (see env_base.X_INIT_MIN),
 # placing every episode start in the plant's low-lambda region:

@@ -15,7 +15,7 @@ agent:
   class: CVSTEM-LQR
   # R = r_scaler·I, used in both the metric SDP's Riccati term and the deployed
   # gain K = R⁻¹BᵀM — a single knob so K stays the certified CV-STEM gain.
-  r_scaler: 102.4
+  r_scaler: 25.6
   experiment:
     directory: "ball_and_beam_cvstem_lqr"
     experiment_name: ""
@@ -32,7 +32,7 @@ cm:
   # (the λ-selection step; the reference's own linesearch is not run here).
   # From scripts/find_uniform_lambda.py's uniform state-box search — measured
   # jointly with the r/w_lb/w_ub here, one solution of one program.
-  lbd: 0.5853
+  lbd: 0.3902
   cm_eps: 0.01
   # Deployment envelope w_lb·I ⪯ W ⪯ w_ub·I, as the caps nu <= 1/w_lb and
   # chi <= nu*w_ub on the joint program's shared nu/chi. Absent, this is the
