@@ -1,24 +1,26 @@
-"""Pick a GPU big enough to hold an env's densest reference window.
+"""Pick a GPU big enough for the worst trial the sweep can sample.
 
-The sweep's memory footprint is not a property of the algorithm, it is a
-property of the ENV crossed with the stride the trial happened to sample, and
-those differ by 5x across the envs one search config serves. Placing jobs by
-hand gets this wrong in exactly one direction -- segway's 2000-step episode at
-stride 1 needs 23.6 GiB and was scheduled onto a 22.06 GiB A10, where a trial
-tried to allocate 26.80 GiB and died.
+The footprint is driven by the GRU/attn encoder over the reference window, and it
+is set by two things the sweep samples INDEPENDENTLY:
 
-    retained points = ceil(episode_len / min(stride))
-    VRAM           ~ points * MIB_PER_POINT_1024 * (num_envs / 1024)
+    seq = ceil(episode_len / stride)                  the window it unrolls
+    B   = rollouts * num_envs / mini_batches          the PPO mini-batch it sees
 
-MIB_PER_POINT_1024 is measured, not derived: attn at stride 1 on a 500-point
-window peaked at 5.9 GiB with num_envs=1024, i.e. ~11.8 MiB per retained point.
-It is a sizing heuristic and deliberately paired with HEADROOM below rather than
-trusted exactly -- the observed peak on segway (26.8 GiB attempted) ran above the
-23.6 GiB this predicts, because a single allocation lands on top of whatever the
-run already holds.
+and the cost is ~linear in their PRODUCT. An earlier version of this file priced
+memory per retained point and ignored B entirely; it predicted 28.8 GiB for
+segway at stride 1 and the real allocation was 53.58 GiB, so segway OOM'd again
+on a 44 GiB L40S. B is not a detail, it is half the product.
 
-    python scripts/gpu_for_env.py --env classic-segway-v0
+GIB_PER_BSEQ is calibrated from that failure -- 53.58 GiB at B=6144, seq=2000 --
+rather than derived from tensor shapes, so it already contains the gate count,
+the cuDNN workspace and the autograd tape.
+
+The WORST case is what has to fit, not the average: bayes will eventually sample
+the densest stride together with the smallest mini_batches, and that trial has to
+run rather than take its GPU-mates down with it.
+
     python scripts/gpu_for_env.py --all
+    python scripts/gpu_for_env.py --env classic-segway-v0 --shell
 """
 from __future__ import annotations
 
@@ -35,26 +37,28 @@ sys.path.insert(0, os.path.join(_ROOT, "source", "contractionRL"))
 import contractionRL.tasks.direct.classic  # noqa: E402,F401
 import gymnasium as gym  # noqa: E402
 
-MIB_PER_POINT_1024 = 11.8
-HEADROOM = 1.25          # the prediction ran ~13% under the observed peak; round up
+# Calibrated: a GRU trial at B=6144, seq=2000 tried to allocate 53.58 GiB.
+GIB_PER_BSEQ = 53.58 / (6144 * 2000)
+HEADROOM = 1.15          # the allocation lands on top of whatever the run holds
 
 # Partitions this account can reach, with USABLE GiB per card (nominal minus the
-# ~2 GiB the driver and context hold) and the account each one bills to. Ordered
-# smallest-first so a job takes the cheapest card that fits rather than the
-# biggest one available.
+# ~2 GiB driver/context) and the account each bills to. Smallest first, so a job
+# takes the cheapest card that fits rather than the biggest one free.
 FLEET = [
     ("eng-research-gpu", "huytran1-ae-eng", "A10",  22.0),
-    ("csl",              "csl",             "L40S", 45.0),
     ("IllinoisComputes-GPU", "huytran1-ic",  "A100", 38.0),
+    ("csl",              "csl",             "L40S", 44.0),
 ]
 
 
-def need_gib(task: str, min_stride: int, num_envs: int) -> tuple[float, int, int]:
+def need_gib(task: str, min_stride: int, num_envs: int, rollouts: int,
+             min_mini_batches: int) -> tuple[float, int, int, int]:
+    """Worst-case GiB for one trial: densest stride x smallest mini_batches."""
     env = gym.make(task, num_envs=1, device="cpu").unwrapped
     ep = int(env.episode_len)
-    pts = math.ceil(ep / max(1, min_stride))
-    gib = pts * MIB_PER_POINT_1024 * (num_envs / 1024.0) / 1024.0 * HEADROOM
-    return gib, ep, pts
+    seq = math.ceil(ep / max(1, min_stride))
+    B = max(1, int(rollouts * num_envs / max(1, min_mini_batches)))
+    return B * seq * GIB_PER_BSEQ * HEADROOM, ep, seq, B
 
 
 def place(gib: float, agents: int):
@@ -71,6 +75,8 @@ def main() -> int:
     p.add_argument("--env", default=None)
     p.add_argument("--all", action="store_true")
     p.add_argument("--algorithm", default="c2rl-ppo-cvstem")
+    p.add_argument("--rollouts", type=int, default=24,
+                   help="agent.rollouts from the env yaml; sets the PPO batch")
     p.add_argument("--agents", type=int, default=2, help="concurrent trials per GPU")
     p.add_argument("--shell", action="store_true",
                    help="emit `PARTITION ACCOUNT AGENTS` for a launcher to read")
@@ -81,40 +87,46 @@ def main() -> int:
     strides = cfg["parameters"]["xref_encoder_stride"].get(
         "values", [cfg["parameters"]["xref_encoder_stride"].get("value", 1)])
     min_stride = min(strides)
+    mbs = cfg["parameters"].get("agent.mini_batches", {})
+    min_mb = min(mbs.get("values", [mbs.get("value", 4)]))
     num_envs = int(cfg.get("num_envs", 1024))
 
     tasks = ([args.env] if args.env else
              [k for k in gym.registry if k.startswith("classic-")])
     if not args.shell:
-        print(f"densest stride {min_stride}, num_envs {num_envs}, "
-              f"{args.agents} agents/GPU, {HEADROOM:g}x headroom")
-        print(f"{'env':<24} {'episode':>8} {'points':>7} {'GiB/trial':>10} "
-              f"{'GiB/GPU':>8}  placement")
+        print(f"worst case = densest stride {min_stride} x smallest mini_batches "
+              f"{min_mb}, num_envs {num_envs}, rollouts {args.rollouts}, "
+              f"{HEADROOM:g}x headroom")
+        print(f"{'env':<24} {'episode':>8} {'seq':>6} {'B':>7} {'GiB/trial':>10}  placement")
     rc = 0
     for t in tasks:
-        gib, ep, pts = need_gib(t, min_stride, num_envs)
+        gib, ep, seq, B = need_gib(t, min_stride, num_envs, args.rollouts, min_mb)
         hit = place(gib, args.agents)
         if args.shell:
-            if args.env and hit:
-                print(f"{hit[0]} {hit[1]} {args.agents}")
-            elif args.env:
-                # Nothing fits at this packing; one agent is the last resort.
-                solo = place(gib, 1)
-                if solo:
-                    print(f"{solo[0]} {solo[1]} 1")
-                else:
-                    print("NONE NONE 0")
-                    rc = 1
+            if not args.env:
+                continue
+            solo = hit or place(gib, 1)
+            if solo:
+                print(f"{solo[0]} {solo[1]} {args.agents if hit else 1}")
+            else:
+                print("NONE NONE 0")
+                rc = 1
             continue
         if hit:
-            print(f"{t:<24} {ep:>8} {pts:>7} {gib:>10.1f} {gib*args.agents:>8.1f}"
-                  f"  {hit[0]} ({hit[2]}, {hit[3]:g} GiB)")
+            print(f"{t:<24} {ep:>8} {seq:>6} {B:>7} {gib:>10.1f}  "
+                  f"{hit[0]} ({hit[2]}, {hit[3]:g} GiB) x{args.agents}")
         else:
             solo = place(gib, 1)
-            alt = (f"  -> only fits 1 agent on {solo[0]} ({solo[2]})" if solo
-                   else "  -> DOES NOT FIT ANY CARD; raise the min stride or cut num_envs")
-            print(f"{t:<24} {ep:>8} {pts:>7} {gib:>10.1f} {gib*args.agents:>8.1f}{alt}")
-            rc = 1
+            if solo:
+                print(f"{t:<24} {ep:>8} {seq:>6} {B:>7} {gib:>10.1f}  "
+                      f"{solo[0]} ({solo[2]}) x1 only")
+            else:
+                biggest = FLEET[-1]
+                need_ne = int(num_envs * biggest[3] / gib)
+                print(f"{t:<24} {ep:>8} {seq:>6} {B:>7} {gib:>10.1f}  "
+                      f"NO CARD FITS (max {biggest[2]} {biggest[3]:g}) -> "
+                      f"num_envs <= {need_ne}")
+                rc = 1
     return rc
 
 

@@ -108,8 +108,16 @@ parameters:
   # Gradient passes over each rollout batch, and how finely it is split.
   agent.learning_epochs:
     values: [2, 5, 10]
+  # 4 is REMOVED, and unlike the stride ladder this one really is infeasible
+  # rather than merely expensive. The encoder unrolls the window over the PPO
+  # mini-batch, B = rollouts * num_envs / mini_batches, and the cost goes as
+  # B * seq. At mini_batches 4 that is B = 6144, so segway's stride-1 window
+  # (seq 2000) needs ~61.6 GiB -- more than the largest card reachable here
+  # (L40S, 44 GiB). Keeping it would mean bayes eventually samples a trial that
+  # cannot run on any GPU and takes its neighbours down with it.
+  # At 8 the same trial is ~30.8 GiB and fits an L40S on its own.
   agent.mini_batches:
-    values: [4, 8, 16]
+    values: [8, 16]
   # Non-biasing running-std reward normalizer (r/std, no centering). The
   # Mahalanobis reward's scale swings with w_lb/w_ub across the state box, and
   # PPO's advantage normalization only partly absorbs that — see rl_glue.
