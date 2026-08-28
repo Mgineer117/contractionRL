@@ -32,7 +32,7 @@ cm:
   # (the λ-selection step; the reference's own linesearch is not run here).
   # From scripts/find_uniform_lambda.py's uniform state-box search — measured
   # jointly with the r/w_lb/w_ub here, one solution of one program.
-  lbd: 0.0771
+  lbd: 0.0514
   cm_eps: 0.01
   # Deployment envelope w_lb·I ⪯ W ⪯ w_ub·I, as the caps nu <= 1/w_lb and
   # chi <= nu*w_ub on the joint program's shared nu/chi. Absent, this is the

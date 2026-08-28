@@ -158,7 +158,7 @@ cm:
   # when >5% of generated u = uref - (1/r)B^T M e leave the 2x-expanded uref
   # box). Measured together with w_lb/w_ub above and cvstem_r_scaler below —
   # one solution of one program, not independent knobs. Pointwise feasibility measured 100%% at N=200.
-  lbd: 0.0771
+  lbd: 0.0514
               # "cvstem", CMG Cu/C1 loss for "ccm")
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled)
