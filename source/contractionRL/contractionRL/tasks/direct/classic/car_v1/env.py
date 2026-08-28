@@ -45,6 +45,15 @@ from ..car.env import ENV_CONFIG as CAR_ENV_CONFIG
 from ..car.env import STATE_NAMES, CarEnv  # noqa: F401  re-exported for parity
 
 V_WEAK_LO = 0.2
+# rule.md Step 3, checked 2026-08-27 against the certified metric: unlike car,
+# this plant IS state-dependent -- the local closed-loop rate lam(x) spans
+# 0.0821 to 0.4610 over X, a 5.61x spread, driven almost entirely by speed
+# (corr(lam, |vel|) = +0.804). The SIGN is the part worth reading twice: lam
+# RISES with speed, so the SLOW end is the hard one. The [0.3, 0.6] band below
+# already sits at the bottom of the X box's [0.2, 2.0], so the reference
+# already starts in the low-rate region and Step 3 is satisfied here without
+# an X_INIT box -- e(0) keeps coming from XE_INIT, which is what holds it near
+# 1.0 instead of the box width.
 VREF_WEAK_LO = 0.3
 # Upper end of the INITIAL velocity draw, and the velocity slice of XE_INIT.
 #

@@ -38,6 +38,9 @@ X_MAX = [30.0, 30.0, 30.0, _X4_LIM, _X5_LIM, _X6_LIM, _X7_HIGH, _X8_LIM, _X9_LIM
 X_TERMINATION_MIN = list(X_MIN)
 X_TERMINATION_MAX = list(X_MAX)
 
+# rule.md Step 3, checked 2026-08-27: lam(x) is 1.3219 at min, median and max
+# over X -- 1.00x spread, |corr| <= 0.013 on every dim. Not state-dependent, so
+# the init boxes are arbitrary within X and XE_INIT stands.
 XREF_INIT_MIN = [-5.0, -5.0, -5.0, -1.0, -1.0, -1.0, G, 0.0, 0.0, 0.0]
 XREF_INIT_MAX = [5.0, 5.0, 5.0, 1.0, 1.0, 1.0, G, 0.0, 0.0, 0.0]
 

@@ -53,6 +53,12 @@ X_MAX = [POS_BOUND, POS_BOUND, math.pi, v_h]
 X_TERMINATION_MIN = list(X_MIN)
 X_TERMINATION_MAX = list(X_MAX)
 
+# rule.md Step 3, checked 2026-08-27 against the certified metric: the local
+# closed-loop rate lam(x) is 0.4420 at min, median AND max over the whole X box
+# -- a 1.00x spread, with |corr| <= 0.021 against every state dim. The rate is
+# NOT state-dependent here, so Step 3's low-rate rule does not apply and the
+# init boxes are arbitrary within X. No X_INIT: reset perturbs by XE_INIT, which
+# is what keeps e(0) at ~1.0 instead of the box width.
 XREF_INIT_MIN = [-POS_SPREAD, -POS_SPREAD, -1.0, 1.5]
 XREF_INIT_MAX = [POS_SPREAD, POS_SPREAD, 1.0, 1.5]
 # Velocity perturbation is +-0.5, not +-1.0, and the reason is the box.
