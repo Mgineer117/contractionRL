@@ -356,7 +356,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
             u = -torch.bmm(torch.linalg.pinv(B), f.unsqueeze(-1)).squeeze(-1)
         return torch.clamp(u, self.UREF_MIN, self.UREF_MAX)
 
-    def ref_clamp_summary(self) -> dict[str, float]:
+    def ref_clamp_summary(self, *, reset: bool = False) -> dict[str, float]:
         """Fraction of synthesized reference steps the X-box clamp modified, per
         dim. Anything above ~0 means the stored (xref, uref) is not a trajectory
         of the plant, so every u = uref + feedback controller is chasing a point
@@ -368,6 +368,15 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         out = {f"ref_frac_{names[i]}": float(self._ref_clamp_hits[i]) / n
                for i in range(self.num_dim_x)}
         out["ref_frac_any"] = max(out.values()) if out else 0.0
+        # reset=True is what you want when comparing reference generators: the
+        # accumulator starts filling during __init__ (BaseEnv.__init__ calls
+        # reset()), so without it every measurement is averaged with the
+        # constructor's synthesis and comes out insensitive to the change under
+        # test -- which is exactly how a tuning sweep can return the identical
+        # number for every gain and look like a plateau.
+        if reset:
+            self._ref_clamp_hits.zero_()
+            self._ref_clamp_n = 0
         return out
 
     def _rollout_reference(self, xref_0: torch.Tensor, freqs, weights) -> tuple[torch.Tensor, torch.Tensor, int]:

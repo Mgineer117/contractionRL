@@ -154,13 +154,6 @@ class BallAndBeamEnv(BaseEnv):
     def sample_reference_controls(self, freqs, weights, _t, infos, add_noise=False):
         n = weights.shape[0]
         uref = torch.zeros(n, self.num_dim_control, device=self.device)
-        # Trim first: the beam falls under gravity, so a reference built from sinusoids
-        # around zero control is a falling one. It clamps into the X box and the
-        # stored (xref, uref) then stops being a trajectory of the plant, which
-        # every u = uref + feedback controller is left chasing (rule.md Step 4).
-        xr = infos.get("xref_t")
-        if xr is not None:
-            uref = uref + self.drift_trim_uref(xr)
         # Trim: the torque that cancels the ball's gravity moment at the current
         # reference state, so the unforced reference holds its tilt instead of
         # collapsing into the box. Without it the reference clamps 64% of the
@@ -196,7 +189,17 @@ class BallAndBeamEnv(BaseEnv):
         freqs = list(range(1, 6))
         n = len(env_ids)
         weights = torch.randn(n, len(freqs), len(UREF_MIN), device=self.device)
-        # excitation sized against the box: halving it takes reference clamping 6.6% -> 0.9%.
-        weights = 0.075 * weights / torch.sqrt((weights ** 2).sum(dim=1, keepdim=True))
+        # 0.02, not 0.075. Re-measured 2026-08-27 with ref_clamp_summary(reset=True),
+        # which discards the synthesis BaseEnv.__init__ already did -- without that
+        # reset every number here is averaged with the constructor's reference and
+        # comes out insensitive to the setting under test, which is how this stayed
+        # at 0.075 under a comment saying halving it helped:
+        #     0.075 -> 3.9% of reference steps clamped
+        #     0.0375 -> 1.6%      0.02 -> 0.35%      0.01 -> 0.0%
+        # 0.02 is the largest amplitude that is effectively zero, so the reference
+        # stays as rich as it can while remaining a trajectory of the plant
+        # (rule.md Step 4). The cascade above is what makes any of this possible;
+        # excitation is what was overdriving it.
+        weights = 0.02 * weights / torch.sqrt((weights ** 2).sum(dim=1, keepdim=True))
         xref_arr, uref_arr, length = self._rollout_reference(xref_0, freqs, weights)
         return x_0, xref_arr, uref_arr, length
