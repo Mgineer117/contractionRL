@@ -46,7 +46,7 @@ FS_LEGEND = 15
 FS_CBAR = 16
 
 LINEWIDTH = 3.2          # trajectory stroke
-N_TRAJ_SHOWN = 2         # rollouts drawn; more than this reads as a tangle
+N_TRAJ_SHOWN = 1         # ONE x(t) and its xref(t); more reads as a tangle
 ARROW_FRAC = 0.026       # arrow length as a fraction of the panel
 ARROW_WIDTH = 0.0075     # arrow shaft width (axes fraction)
 
@@ -72,15 +72,41 @@ def pretty(env: str) -> str:
 
 # ────────────────────────────── generate ─────────────────────────────────── #
 
-def generate(env_name: str, *, grid: int, n_other: int, n_x0: int,
-             n_traj: int, seed: int) -> pathlib.Path:
-    import contractionRL.tasks.direct.classic  # noqa: F401
+def _make_env(env_name: str, n_traj: int, ref_mode: str, migrate_gain: float):
+    """gym.make + the reference mode.
+
+    Set post-construction because ``reference_mode`` is read by
+    ``_rollout_reference`` at reset() time, not baked in at __init__. Matters for
+    car/car_v1: their ``sample_reference_controls`` only drives the STEERING
+    channel, so in "arbitrary" mode the reference velocity is frozen at its draw
+    for the whole episode and the reference can never leave the low-rate region.
+    The migration term is the only thing that moves it."""
     import gymnasium as gym
+    env = gym.make(env_id(env_name), num_envs=n_traj, device="cpu").unwrapped
+    env.reference_mode = ref_mode
+    env.migrate_gain = migrate_gain
+    # The constructor already built a 64-reference pool (_pooled_system_reset
+    # amortizes _rollout_reference over a batch), so without this the mode set
+    # above is silently ignored: reset() serves cached arbitrary-mode references
+    # and _migrate_uref is never called. Measured: 0 calls, reference velocity
+    # frozen at its draw. Clearing forces the pool to be rebuilt under the mode.
+    env._ref_pool = None
+    if ref_mode == "contractive" and env.XREF_INIT_FAST_MIN is None:
+        raise SystemExit(
+            f"{env_name}: reference_mode=contractive needs xref_init_fast_min/max "
+            f"in its ENV_CONFIG (rule.md Step 3) -- none defined.")
+    return env
+
+
+def generate(env_name: str, *, grid: int, n_other: int, n_x0: int,
+             n_traj: int, seed: int, ref_mode: str = "arbitrary",
+             migrate_gain: float = 1.0) -> pathlib.Path:
+    import contractionRL.tasks.direct.classic  # noqa: F401
     import torch
     from find_uniform_lambda import control_violation_rate, expand_box  # noqa: E402
     from lambda_subsets import active_dims_auto, jacobians, max_lambda  # noqa: E402
 
-    env = gym.make(env_id(env_name), num_envs=n_traj, device="cpu").unwrapped
+    env = _make_env(env_name, n_traj, ref_mode, migrate_gain)
     x_min = env.X_MIN.detach().cpu().numpy().astype(np.float64)
     x_max = env.X_MAX.detach().cpu().numpy().astype(np.float64)
 
@@ -152,22 +178,25 @@ def generate(env_name: str, *, grid: int, n_other: int, n_x0: int,
 
     # Trajectories: the env's own reference rollout, which is what the panel is
     # about — where the closed loop actually goes, not where the box allows.
-    traj = _rollout(env, n_traj)
+    traj, traj_ref = _rollout(env, n_traj)
 
     out = DATA_DIR / f"minproj_{env_name}.npz"
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez(out, Z=Z, dims=np.asarray(dims), grid_x=gx, grid_y=gy,
              exact=np.asarray(True), lbd=np.asarray(cfg["lbd"]),
              r=np.asarray(cfg["r"]), w_lb=np.asarray(cfg["w_lb"]),
-             w_ub=np.asarray(cfg["w_ub"]), traj=traj, x0=x0,
+             w_ub=np.asarray(cfg["w_ub"]), traj=traj, traj_ref=traj_ref, x0=x0,
              state_names=np.asarray(list(env.state_names)),
              x_min=x_min, x_max=x_max,
-             actuator_gated=np.asarray(True), viol_frac=np.asarray(VIOL_FRAC))
+             actuator_gated=np.asarray(True), viol_frac=np.asarray(VIOL_FRAC),
+             reference_mode=np.asarray(ref_mode))
     print(f"[minproj] wrote {out}")
     return out
 
 
-def refresh_x0(env_name: str, *, n_x0: int, n_traj: int, seed: int) -> pathlib.Path:
+def refresh_x0(env_name: str, *, n_x0: int, n_traj: int, seed: int,
+               ref_mode: str = "arbitrary",
+               migrate_gain: float = 1.0) -> pathlib.Path:
     """Rewrite x0/traj in the cached npz from the CURRENT env; keep Z.
 
     lambda* depends on the plant and the envelope, so a change to how episodes
@@ -175,22 +204,22 @@ def refresh_x0(env_name: str, *, n_x0: int, n_traj: int, seed: int) -> pathlib.P
     thousands of SDP solves for an identical result.
     """
     import contractionRL.tasks.direct.classic  # noqa: F401
-    import gymnasium as gym
 
     src = DATA_DIR / f"minproj_{env_name}.npz"
     if not src.exists():
         raise SystemExit(f"nothing cached at {src} — use --generate")
     old = dict(np.load(src, allow_pickle=True))
 
-    env = gym.make(env_id(env_name), num_envs=n_traj, device="cpu").unwrapped
+    env = _make_env(env_name, n_traj, ref_mode, migrate_gain)
     lo = env.X_MIN.detach().cpu().numpy().astype(np.float64)
     hi = env.X_MAX.detach().cpu().numpy().astype(np.float64)
     x0 = _reset_x0(env, n_x0, seed=seed)
     out_frac = float(((x0 < lo - 1e-6) | (x0 > hi + 1e-6)).any(axis=1).mean())
 
     old["x0"] = x0
-    old["traj"] = _rollout(env, n_traj)
+    old["traj"], old["traj_ref"] = _rollout(env, n_traj)
     old["x_min"], old["x_max"] = lo, hi
+    old["reference_mode"] = np.asarray(ref_mode)
     np.savez(src, **old)
     print(f"[minproj] refreshed x0/traj in {src}  "
           f"({out_frac:.2%} of x0 outside the box)")
@@ -224,8 +253,14 @@ def _cm_cfg(env_name: str) -> dict:
             "cm_eps": float(cm["cm_eps"])}
 
 
-def _rollout(env, n_traj: int) -> np.ndarray:
-    """Open-loop-along-reference rollout: x(t) under the env's own uref."""
+def _rollout(env, n_traj: int):
+    """Open-loop-along-reference rollout. Returns ``(x(t), xref(t))``.
+
+    Both, because the figure is about the pair: xref is where the task ASKS the
+    plant to be, x is where it goes. With reference_mode="contractive" the two
+    are visibly different objects -- the reference migrates from the low-rate
+    region toward the high-rate one and x follows it -- and drawing only x hides
+    what is being asked."""
     import torch
     obs, _ = env.reset(seed=0)
     T = int(env.max_episode_len)
@@ -235,7 +270,8 @@ def _rollout(env, n_traj: int) -> np.ndarray:
         obs, *_ = env.step(u.detach().cpu().numpy()
                            if isinstance(u, torch.Tensor) else u)
         xs.append(env.x_t.detach().cpu().numpy().copy())
-    return np.transpose(np.asarray(xs, dtype=np.float64), (1, 0, 2))
+    xr = env.xref[:, :T + 1].detach().cpu().numpy().astype(np.float64)
+    return (np.transpose(np.asarray(xs, dtype=np.float64), (1, 0, 2)), xr)
 
 
 # ─────────────────────────────── plot ────────────────────────────────────── #
@@ -283,6 +319,7 @@ def plot(env_name: str, *, n_traj: int = N_TRAJ_SHOWN,
     dx, dy = int(dims[0]), int(dims[1])
     ex, ey = _edges(gx), _edges(gy)
     traj, x0 = z["traj"], z["x0"]
+    traj_ref = z["traj_ref"] if "traj_ref" in z.files else None
     k_show = 0 if rate_only else min(int(n_traj), traj.shape[0])
     shown = traj[:k_show]
 
@@ -354,20 +391,34 @@ def plot(env_name: str, *, n_traj: int = N_TRAJ_SHOWN,
         cb.update_ticks()
 
     for k in range(k_show):
+        # The REFERENCE first, under the state: xref is what the task asks for and
+        # x is what the plant does, so the pair is the object of interest. Under
+        # reference_mode="contractive" they are visibly different -- the reference
+        # migrates out of the low-rate region and x follows it.
+        if traj_ref is not None:
+            rx, ry = traj_ref[k, :, dx], traj_ref[k, :, dy]
+            ax.plot(rx, ry, "--", color="#1f77b4", lw=LINEWIDTH * 0.8, alpha=0.95,
+                    zorder=3, label=r"$x_{ref}(t)$" if k == 0 else None)
+            ax.plot(rx[0], ry[0], "s", ms=9, mfc="white", mec="#12496f", mew=2.2,
+                    zorder=7, label=r"$x_{ref}(0)$" if k == 0 else None)
+            ax.plot(rx[-1], ry[-1], "*", ms=17, mfc="#1f77b4", mec="#12496f",
+                    mew=1.0, zorder=8,
+                    label=r"$x_{ref}(T)$" if k == 0 else None)
         tx, ty = traj[k, :, dx], traj[k, :, dy]
         ax.plot(tx, ty, "-", color="#d62728", lw=LINEWIDTH, alpha=0.92,
                 zorder=4, label=r"$x(t)$" if k == 0 else None)
         _arrows(ax, tx, ty)
         ax.plot(tx[0], ty[0], "o", ms=11, mfc="white", mec="#7f0f14", mew=2.4,
-                zorder=7, label=r"$x_0$ of shown runs" if k == 0 else None)
+                zorder=7, label=r"$x_0$" if k == 0 else None)
 
     # Axes cover the union of the field and what is drawn on it: clipping to the
     # box hides every trajectory start outside it (on car, about half of them).
     if k_show:
-        lo_y = min(ey[0], float(np.min(shown[:, :, dy])))
-        hi_y = max(ey[-1], float(np.max(shown[:, :, dy])))
-        lo_x = min(ex[0], float(np.min(shown[:, :, dx])))
-        hi_x = max(ex[-1], float(np.max(shown[:, :, dx])))
+        _all = ([shown] if traj_ref is None else [shown, traj_ref[:k_show]])
+        lo_y = min([ey[0]] + [float(np.min(a[:, :, dy])) for a in _all])
+        hi_y = max([ey[-1]] + [float(np.max(a[:, :, dy])) for a in _all])
+        lo_x = min([ex[0]] + [float(np.min(a[:, :, dx])) for a in _all])
+        hi_x = max([ex[-1]] + [float(np.max(a[:, :, dx])) for a in _all])
     else:
         # Nothing drawn on top of the field, so the field IS the extent.
         lo_x, hi_x, lo_y, hi_y = ex[0], ex[-1], ey[0], ey[-1]
@@ -555,6 +606,11 @@ def main() -> int:
                    help="force which axis the x0 marginal is taken over "
                         "(default: whichever one lambda* varies along)")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--reference-mode", "--reference_mode",
+                   choices=["arbitrary", "contractive"], default="arbitrary",
+                   help="contractive: the reference starts in the low-rate "
+                        "region and migrates toward XREF_INIT_FAST")
+    p.add_argument("--migrate-gain", "--migrate_gain", type=float, default=1.0)
     p.add_argument("--rate-only", "--rate_only", action="store_true",
                    help="also write rate_<env>.svg: the state-dependent "
                         "contraction rate alone, no rollouts or x0 marginal")
@@ -564,9 +620,11 @@ def main() -> int:
     for e in envs:
         if a.generate or not (DATA_DIR / f"minproj_{e}.npz").exists():
             generate(e, grid=a.grid, n_other=a.n_other, n_x0=a.n_x0,
-                     n_traj=a.n_traj, seed=a.seed)
+                     n_traj=a.n_traj, seed=a.seed,
+                     ref_mode=a.reference_mode, migrate_gain=a.migrate_gain)
         elif a.refresh_x0:
-            refresh_x0(e, n_x0=a.n_x0, n_traj=a.n_traj, seed=a.seed)
+            refresh_x0(e, n_x0=a.n_x0, n_traj=a.n_traj, seed=a.seed,
+                       ref_mode=a.reference_mode, migrate_gain=a.migrate_gain)
         plot(e, n_traj=a.show_traj, axis=a.marginal_axis)
         if a.rate_only:
             plot(e, axis=a.marginal_axis, rate_only=True)

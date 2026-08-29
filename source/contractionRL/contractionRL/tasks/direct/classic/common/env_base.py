@@ -76,8 +76,11 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         #                 state-dependent rate this is deliberately the LOW-rate
         #                 region (rule.md Step 3), so the number reported is the
         #                 hard case.
-        #   "contractive" the XREF_INIT_FAST band instead: the same plant asked to
-        #                 operate where its contraction rate is HIGH.
+        #   "contractive" starts in the SAME low-rate region and then migrates the
+        #                 reference toward XREF_INIT_FAST -- the high-rate band --
+        #                 over the episode. The hard initial condition is kept;
+        #                 what changes is whether the task lets the plant move to
+        #                 where it is controllable.
         #
         # The distinction exists because contraction is a property of the
         # operating point while the operating point is dictated by the task, and
@@ -100,6 +103,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         self.XREF_INIT_FAST_MAX = (None if _xf_hi is None else torch.tensor(
             _xf_hi, device=self.device, dtype=torch.float32).flatten())
         self.reference_mode = str(env_config.get("reference_mode", "arbitrary"))
+        self.migrate_gain = float(env_config.get("migrate_gain", 1.0))
         if self.reference_mode not in ("arbitrary", "contractive"):
             raise ValueError(
                 f"reference_mode must be 'arbitrary' or 'contractive', got "
@@ -355,10 +359,11 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
     def define_initial_state(self, env_ids: torch.Tensor):
         n = len(env_ids)
         rand_xref = torch.rand(n, self.num_dim_x, device=self.device, dtype=torch.float32)
-        ref_lo, ref_hi = self.XREF_INIT_MIN, self.XREF_INIT_MAX
-        if self.reference_mode == "contractive":
-            ref_lo, ref_hi = self.XREF_INIT_FAST_MIN, self.XREF_INIT_FAST_MAX
-        xref_0 = ref_lo + rand_xref * (ref_hi - ref_lo)
+        # The START is the same in both modes -- the low-rate region, per Step 3.
+        # "contractive" changes where the reference GOES, not where it begins,
+        # which is the point: the episode still has to survive the hard corner and
+        # the migration into the easy one is what is being asked about.
+        xref_0 = self.XREF_INIT_MIN + rand_xref * (self.XREF_INIT_MAX - self.XREF_INIT_MIN)
         xref_0 = self._apply_shared_sign(xref_0, self.XREF_INIT_SIGN_DIMS)
 
         if self.X_INIT_MIN is not None:
@@ -400,6 +405,34 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
             u = -torch.bmm(torch.linalg.pinv(B), f.unsqueeze(-1)).squeeze(-1)
         return torch.clamp(u, self.UREF_MIN, self.UREF_MAX)
 
+    def _migrate_uref(self, xref_t: torch.Tensor) -> torch.Tensor:
+        """Control that walks the reference from the slow region to the fast one.
+
+        Least squares through the actuated directions, exactly like
+        ``drift_trim_uref``: ``u = B(x)^+ k (x_target - x)`` with the target the
+        centre of ``XREF_INIT_FAST``. Only the dims where the fast band actually
+        differs from the start band contribute -- on car_v1 that is velocity
+        alone, so this reads as "accelerate toward v ~ 1.2" and touches nothing
+        else.
+
+        Applied INSIDE ``_rollout_reference``, so the migrated ``xref`` is
+        integrated under the migrated ``uref`` and the stored pair stays an exact
+        trajectory of the plant (rule.md Step 4). Clamped to the uref box, and the
+        gain is deliberately gentle: the reference has to arrive smoothly enough
+        that the tracking controller can follow it, and a step change would ask
+        the plant to jump rather than to travel.
+        """
+        target = 0.5 * (self.XREF_INIT_FAST_MIN + self.XREF_INIT_FAST_MAX)
+        start_c = 0.5 * (self.XREF_INIT_MIN + self.XREF_INIT_MAX)
+        # only the dims the fast band actually moves
+        active = (target - start_c).abs() > 1e-9
+        err = torch.where(active, target - xref_t, torch.zeros_like(xref_t))
+        with torch.no_grad():
+            _, B, _ = self.get_f_and_B(xref_t, need_null=False)
+            u = torch.bmm(torch.linalg.pinv(B),
+                          (self.migrate_gain * err).unsqueeze(-1)).squeeze(-1)
+        return torch.clamp(u, self.UREF_MIN, self.UREF_MAX)
+
     def ref_clamp_summary(self, *, reset: bool = False) -> dict[str, float]:
         """Fraction of synthesized reference steps the X-box clamp modified, per
         dim. Anything above ~0 means the stored (xref, uref) is not a trajectory
@@ -439,6 +472,8 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
             # and settled at a fixed error no matter how small e(0) was.
             uref_t = self.sample_reference_controls(
                 freqs, weights, _t, {"xref_0": xref_0, "xref_t": xref_list[-1]})
+            if self.reference_mode == "contractive":
+                uref_t = uref_t + self._migrate_uref(xref_list[-1])
             xref_prev = xref_list[-1]
             f_x, B_x, _ = self.get_f_and_B(xref_prev, need_null=False)
             x_dot = f_x + torch.bmm(B_x, uref_t.unsqueeze(-1)).squeeze(-1)
