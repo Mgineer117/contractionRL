@@ -107,6 +107,12 @@ def rollout_clamp(env, box_lo, box_hi, ref_lo, ref_hi, W, x_np, r, steps=400, n=
     return cs, float(np.mean(ratio)), float(errs[0].mean()), float(errs[-1].mean())
 
 
+# Fraction of |X| the spawn box must leave free on every side. Mirrors
+# MIN_HEADROOM_FRAC in tests/test_rule_step3_spawn_box.py -- kept a touch
+# above it so a box this tool emits is not marginal against the test.
+MIN_HEADROOM_FRAC = 0.06
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -232,6 +238,18 @@ def main() -> int:
             else:
                 lo[i], hi[i] = -half * shrink, half * shrink
         lo, hi = np.maximum(lo, X_LO), np.minimum(hi, X_HI)
+        # Never emit a box that spawns ON the wall. The ladder's top rung is
+        # shrink=1.0, which sets hi = half exactly -- 0% headroom -- and the
+        # np.minimum above re-pins any asymmetric dim back to X_HI, so both paths
+        # can hand back a spawn flush against the box. That is the segway bug
+        # (X_INIT[pitch] == X_MAX[pitch]): a state clamped from step 0 makes the
+        # plant something other than f+Bu and no certificate describes it.
+        # Capped against exactly what tests/test_rule_step3_spawn_box.py measures,
+        # reach = max(|lo|,|hi|) against half, so the tool cannot emit a box its
+        # own rule rejects.
+        cap = np.array([max(abs(X_LO[i]), abs(X_HI[i])) * (1.0 - MIN_HEADROOM_FRAC)
+                        for i in range(len(names))])
+        lo, hi = np.clip(lo, -cap, cap), np.clip(hi, -cap, cap)
         # XREF_INIT moves WITH X_INIT, which is what rule.md Step 3 says ("XREF_INIT
         # is established the same way, so the reference also starts in the low-rate
         # region") and is not optional. Moving X_INIT alone does not make the

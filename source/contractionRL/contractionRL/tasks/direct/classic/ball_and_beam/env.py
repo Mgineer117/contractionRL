@@ -86,8 +86,8 @@ XE_MAX = [lim, lim, lim, lim]
 # Taking the smallest enlargement that certifies, same rule used for segway,
 # cartpole, tora and aircraft. More actuator buys more rate here if that is
 # ever wanted -- the trade is explicit above rather than hidden in a tuning.
-UREF_MIN = [-4.0]
-UREF_MAX = [4.0]
+UREF_MIN = [-8.0]
+UREF_MAX = [8.0]
 
 # Initial state drawn directly from this box (see env_base.X_INIT_MIN),
 # placing every episode start in the plant's low-lambda region:
