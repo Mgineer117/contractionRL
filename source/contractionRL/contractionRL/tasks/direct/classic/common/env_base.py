@@ -69,6 +69,47 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
                 "one without the other silently falls back to xref_0 + xe_0."
             )
         self.X_INIT_SIGN_DIMS = list(env_config.get("x_init_sign_dims", []) or [])
+
+        # reference_mode: WHERE the reference is asked to operate.
+        #
+        #   "arbitrary"   (default) the shipped XREF_INIT band. For a plant with a
+        #                 state-dependent rate this is deliberately the LOW-rate
+        #                 region (rule.md Step 3), so the number reported is the
+        #                 hard case.
+        #   "contractive" the XREF_INIT_FAST band instead: the same plant asked to
+        #                 operate where its contraction rate is HIGH.
+        #
+        # The distinction exists because contraction is a property of the
+        # operating point while the operating point is dictated by the task, and
+        # nothing in the current setup lets those be varied separately. Measured
+        # on car_v1, whose rate rises with speed (corr(lam,|vel|) = +0.804), the
+        # SAME certified controller gives
+        #     xref v in [0.3, 0.6]  (shipped, slow)  achieved rate 0.281
+        #     xref v in [1.0, 1.4]  (fast)           achieved rate 0.463
+        # against a local lam_max of 0.461 -- i.e. it reaches the local rate when
+        # the task lets it. Both are honest numbers about different questions, and
+        # neither is reachable from the other without this switch.
+        #
+        # An env with no XREF_INIT_FAST declares that it has no meaningfully
+        # faster region, and asking for "contractive" there is an error rather
+        # than a silent fallback to the same band.
+        _xf_lo = env_config.get("xref_init_fast_min")
+        _xf_hi = env_config.get("xref_init_fast_max")
+        self.XREF_INIT_FAST_MIN = (None if _xf_lo is None else torch.tensor(
+            _xf_lo, device=self.device, dtype=torch.float32).flatten())
+        self.XREF_INIT_FAST_MAX = (None if _xf_hi is None else torch.tensor(
+            _xf_hi, device=self.device, dtype=torch.float32).flatten())
+        self.reference_mode = str(env_config.get("reference_mode", "arbitrary"))
+        if self.reference_mode not in ("arbitrary", "contractive"):
+            raise ValueError(
+                f"reference_mode must be 'arbitrary' or 'contractive', got "
+                f"{self.reference_mode!r}")
+        if self.reference_mode == "contractive" and self.XREF_INIT_FAST_MIN is None:
+            raise ValueError(
+                "reference_mode='contractive' needs xref_init_fast_min/max on this "
+                "env. Absent means the rate is not state-dependent here (or the "
+                "fast band has not been measured), and silently reusing the normal "
+                "band would report a 'contractive' number that is the arbitrary one.")
         # ── Early-termination box (on by default) ────────────────────────── #
         # The episode ends the first step x leaves [X_TERMINATION_MIN,
         # X_TERMINATION_MAX]. Without it a diverged env is silently pinned at the
@@ -314,7 +355,10 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
     def define_initial_state(self, env_ids: torch.Tensor):
         n = len(env_ids)
         rand_xref = torch.rand(n, self.num_dim_x, device=self.device, dtype=torch.float32)
-        xref_0 = self.XREF_INIT_MIN + rand_xref * (self.XREF_INIT_MAX - self.XREF_INIT_MIN)
+        ref_lo, ref_hi = self.XREF_INIT_MIN, self.XREF_INIT_MAX
+        if self.reference_mode == "contractive":
+            ref_lo, ref_hi = self.XREF_INIT_FAST_MIN, self.XREF_INIT_FAST_MAX
+        xref_0 = ref_lo + rand_xref * (ref_hi - ref_lo)
         xref_0 = self._apply_shared_sign(xref_0, self.XREF_INIT_SIGN_DIMS)
 
         if self.X_INIT_MIN is not None:

@@ -87,6 +87,23 @@ BOX_OVERRIDES = {
     "x_min": [*CAR_ENV_CONFIG["x_min"][:3], V_WEAK_LO],
     "xref_init_min": [*CAR_ENV_CONFIG["xref_init_min"][:3], VREF_WEAK_LO],
     "xref_init_max": [*CAR_ENV_CONFIG["xref_init_max"][:3], VREF_WEAK_HI],
+    # The FAST band, used only under reference_mode="contractive". This plant's
+    # rate rises with speed -- corr(lam, |vel|) = +0.804 -- so [0.3, 0.6] above is
+    # the HARD region and this is the easy one. Both are real questions about the
+    # same certified controller, and the answers differ by 1.6x:
+    #     v in [0.3, 0.6] (shipped)   achieved rate 0.281   AUC 3.90
+    #     v in [1.0, 1.4] (this)      achieved rate 0.463   AUC 2.59
+    # 0.463 against a local lam_max of 0.461: asked to operate where the plant is
+    # easy, the controller reaches the local rate almost exactly.
+    #
+    # [1.0, 1.4] and not the top of the box: v in [1.6, 2.0] DIVERGES with the
+    # same controller (rate -0.125, error x4.86) even though lam(x) is high there
+    # and the reference does not clamp. Not yet diagnosed -- the working guess is
+    # that u = uref - K e is the straight-line approximation to a geodesic
+    # feedback and the finite-error error grows too fast at high speed -- so the
+    # band stops short of it rather than shipping a number I cannot explain.
+    "xref_init_fast_min": [*CAR_ENV_CONFIG["xref_init_min"][:3], 1.0],
+    "xref_init_fast_max": [*CAR_ENV_CONFIG["xref_init_max"][:3], 1.4],
     # Velocity slice only: the position/yaw perturbations stay the car's, since
     # lambda* is flat in those (measured ptp 0.0000 across yaw).
     "xe_init_min": [*CAR_ENV_CONFIG["xe_init_min"][:3], -XE_INIT_V],

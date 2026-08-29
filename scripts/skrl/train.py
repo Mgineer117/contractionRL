@@ -32,6 +32,13 @@ if not _is_classic:
 
 # ─── Full argument parser ─────────────────────────────────────────────────── #
 parser = argparse.ArgumentParser(description="Train an RL agent with skrl.")
+parser.add_argument("--reference_mode", choices=["arbitrary", "contractive"], default=None,
+                    help="WHERE the reference is asked to operate. 'arbitrary' (default) is "
+                         "the shipped XREF_INIT, which for a state-dependent plant is the "
+                         "LOW-rate region by design (rule.md Step 3). 'contractive' uses the "
+                         "env's measured high-rate band instead, so the same certified "
+                         "controller is asked an easier question -- car_v1 goes 0.281 -> 0.463 "
+                         "achieved rate. Only envs declaring xref_init_fast_* accept it.")
 parser.add_argument("--classic", action="store_true", default=False,
                     help="Use classic gymnasium environment (no Isaac Sim).")
 parser.add_argument("--headon", action="store_true", default=False,
@@ -629,7 +636,9 @@ if _is_classic:
     if not device:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-    raw_env = gym.make(args_cli.task, num_envs=num_envs, device=device)
+    _ref_kw = ({"reference_mode": args_cli.reference_mode}
+               if getattr(args_cli, "reference_mode", None) else {})
+    raw_env = gym.make(args_cli.task, num_envs=num_envs, device=device, **_ref_kw)
     # Standalone PPO/SAC path: apply the euclidean/level reward switch straight
     # to the env — C2RL applies the equivalent through its own set_ccm() call
     # inside ContractionRunner (see c2rl.py), and normalize_agent_cfg pops these
