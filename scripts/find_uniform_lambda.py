@@ -281,6 +281,10 @@ def main() -> int:
                         "it) by this factor. Moves the ACTUATOR gate only -- use it "
                         "when the log says '%% of controls out of box', never when "
                         "it says LMI INFEASIBLE.")
+    p.add_argument("--verify-seeds", "--verify_seeds", type=int, default=3,
+                   help="independent denser draws that must ALL be feasible "
+                        "before a lambda is accepted; 1 restores the old "
+                        "single-draw behaviour that certified tora wrongly")
     p.add_argument("--verify-n", "--verify_n", type=int, default=1000,
                    help="re-solve the accepted (lbd, r) at this many samples before "
                         "reporting success; 0 disables. The search draw is sparse by "
@@ -460,28 +464,47 @@ def main() -> int:
             # N=600, which the shipped N=10000 build would have reported after
             # ~15 h of solving. Catching it here costs one extra solve.
             if args.verify_n and args.verify_n > args.num_samples:
-                xv = sample_state_box(env.X_MIN, env.X_MAX, n=args.verify_n,
-                                      seed=args.seed + 1)
-                Av, Bv = drift_jacobians(env.get_f_and_B, xv)
-                vsol = cvstem_joint(Av, Bv, lbd=lbd, eps=eps_for_n(args.verify_n),
-                                    dt=lmi_dt, solver=args.solver, r_scaler=r,
-                                    w_lb=w_lb, w_ub=w_ub)
-                if vsol is None:
+                # EVERY seed must clear it, not one. A single denser draw is a
+                # coin flip near the feasibility boundary: tora's lbd=0.1156
+                # r=0.1 is INFEASIBLE at N=600 (eps 0.01 and 0.05) and at
+                # N=1000 (eps 0.01 and 0.05) on seed 0, yet shipped as certified
+                # because the one verify draw at seed 1 happened to solve.
+                # Feasible at N=100, infeasible at N=600, feasible at N=1000 is
+                # not monotone in sample count, so the draw was deciding it -- and
+                # a rate that flips with the seed is not certified.
+                vsol, vfrac, vbad = None, 0.0, None
+                for _k in range(max(1, args.verify_seeds)):
+                    xv = sample_state_box(env.X_MIN, env.X_MAX, n=args.verify_n,
+                                          seed=args.seed + 1 + _k)
+                    Av, Bv = drift_jacobians(env.get_f_and_B, xv)
+                    _sol = cvstem_joint(Av, Bv, lbd=lbd, eps=eps_for_n(args.verify_n),
+                                        dt=lmi_dt, solver=args.solver, r_scaler=r,
+                                        w_lb=w_lb, w_ub=w_ub)
+                    if _sol is None:
+                        vbad = args.seed + 1 + _k
+                        break
+                    # Worst violation over the seeds decides, same as the LMI:
+                    # the reported number must be the one a bad draw would give.
+                    _f = control_violation_rate(
+                        _sol["W"], Bv, r_scaler=r,
+                        e_draws=e_pool[rng.integers(0, e_pool.shape[0],
+                                                    size=(args.verify_n, args.n_draws))],
+                        uref_draws=rng.uniform(uref_lo, uref_hi,
+                                               size=(args.verify_n, args.n_draws,
+                                                     uref_lo.size)),
+                        u_lo=u_lo, u_hi=u_hi)
+                    if _sol is not None and (vsol is None or _f > vfrac):
+                        vsol, vfrac = _sol, _f
+                if vbad is not None:
                     print(f"[uniform-lambda]   VERIFY at N={args.verify_n} INFEASIBLE "
-                          f"— the rate does not survive a denser draw, lowering lbd")
+                          f"on seed {vbad} of {args.verify_seeds} — the rate does not "
+                          f"survive a denser draw, lowering lbd")
                     r = args.r0
                     lbd /= args.lbd_factor
                     continue
-                vfrac = control_violation_rate(
-                    vsol["W"], Bv, r_scaler=r,
-                    e_draws=e_pool[rng.integers(0, e_pool.shape[0],
-                                                size=(args.verify_n, args.n_draws))],
-                    uref_draws=rng.uniform(uref_lo, uref_hi,
-                                           size=(args.verify_n, args.n_draws,
-                                                 uref_lo.size)),
-                    u_lo=u_lo, u_hi=u_hi)
-                print(f"[uniform-lambda]   VERIFY at N={args.verify_n}: feasible, "
-                      f"{vfrac:.2%} of controls out of box (nu={vsol['nu']:.4g})")
+                print(f"[uniform-lambda]   VERIFY at N={args.verify_n}: feasible on all "
+                      f"{args.verify_seeds} seeds, worst {vfrac:.2%} of controls out of "
+                      f"box (nu={vsol['nu']:.4g})")
                 if vfrac > args.viol_frac:
                     print("[uniform-lambda]   ...but over the box budget at the denser "
                           "draw — raising r")
