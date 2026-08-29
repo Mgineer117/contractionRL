@@ -148,17 +148,58 @@ def solve_at(A, B, lbd, kw):
     return cvstem_joint(A, B, lbd=lbd, **kw)
 
 
-def max_lambda(A, B, kw, *, lo=0.01, hi=60.0, tol=0.005):
-    """Largest λ this sample set certifies. Returns ``(λ, solution, n_solves)``."""
-    base = solve_at(A, B, lo, kw)
+def max_lambda(A, B, kw, *, lo=0.01, hi=60.0, tol=0.005, gate=None):
+    """Largest λ this sample set certifies. Returns ``(λ, solution, n_solves)``.
+
+    ``gate(W, B, r_scaler) -> bool`` optionally adds a SECOND condition the rate
+    must satisfy, and passing one changes what the answer means. Without it this
+    is pure LMI feasibility: the fastest rate at which *some* metric satisfies the
+    inequality, with no question of whether the implied controller can be built.
+    That ceiling can be far above anything attainable -- on the car it returns
+    4.88 against a shipped 0.3902, and reaching 4.88 needs ‖K‖₂ ≈ 60 against a
+    ±1.5 actuator, i.e. 99.8% of the commanded controls outside the box.
+
+    With the actuator gate supplied, the bisection returns the fastest REALIZABLE
+    rate instead, which is the quantity a trajectory can actually exhibit.
+    """
+    def ok(lam):
+        sol = solve_at(A, B, lam, kw)
+        if sol is None or gate is None:
+            return sol
+        return sol if gate(sol["W"], B, kw["r_scaler"]) else None
+
+    if gate is not None:
+        # SCAN, not bisect. Bisection needs the predicate to be monotone in lam,
+        # and with the actuator gate it is NOT: the program minimises
+        # (1/lam)*chi + nu, so at small lam the chi weight is enormous (100 at
+        # lam=0.01), the solver crushes the condition number and pays for it with
+        # a large nu -- i.e. a LARGER gain for a SLOWER required rate. Measured on
+        # the car at a single state:
+        #     lam 0.01   nu 12.33  |K| 6.97  ->  70.3% of controls out of box
+        #     lam 0.10   nu  5.00  |K| 2.34  ->   9.4%
+        #     lam 0.39   nu  4.23  |K| 1.69  ->   0.0%
+        # so the realizable set is an INTERVAL, not a ray, and a bisection that
+        # probes the low bracket first fails there and returns 0. That is exactly
+        # what it did: lam* = 0 on every cell of car and quadrotor, against a
+        # shipped 0.3902 that passes the same gate at 2.7%.
+        # 24 points, geometric: enough to locate the interval's upper edge to
+        # ~15% while costing 24 solves per cell against a bisection's ~13.
+        grid = np.geomspace(lo, hi, 24)
+        best = (0.0, None)
+        for lam in grid:
+            if (sol := ok(float(lam))) is not None:
+                best = (float(lam), sol)
+        return best[0], best[1], len(grid)
+
+    base = ok(lo)
     if base is None:
         return 0.0, None, 1
-    if (top := solve_at(A, B, hi, kw)) is not None:
+    if (top := ok(hi)) is not None:
         return hi, top, 2                      # ceiling hit; true max is higher
     best, calls = (lo, base), 2
     while hi - lo > tol * max(lo, 0.05):
         mid = 0.5 * (lo + hi)
-        if (sol := solve_at(A, B, mid, kw)) is not None:
+        if (sol := ok(mid)) is not None:
             lo, best = mid, (mid, sol)
         else:
             hi = mid

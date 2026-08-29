@@ -34,6 +34,7 @@ sys.path.insert(0, str(REPO / "source" / "contractionRL"))
 sys.path.insert(0, str(REPO / "scripts"))
 
 FIG_DIR = REPO / "figures"
+VIOL_FRAC = 0.05   # same budget as find_uniform_lambda
 DATA_DIR = FIG_DIR / "data"
 
 # Every text element, one place. The defaults are matplotlib's ~10 pt, which is
@@ -75,6 +76,8 @@ def generate(env_name: str, *, grid: int, n_other: int, n_x0: int,
              n_traj: int, seed: int) -> pathlib.Path:
     import contractionRL.tasks.direct.classic  # noqa: F401
     import gymnasium as gym
+    import torch
+    from find_uniform_lambda import control_violation_rate, expand_box  # noqa: E402
     from lambda_subsets import active_dims_auto, jacobians, max_lambda  # noqa: E402
 
     env = gym.make(env_id(env_name), num_envs=n_traj, device="cpu").unwrapped
@@ -97,6 +100,32 @@ def generate(env_name: str, *, grid: int, n_other: int, n_x0: int,
     # cells differ because of the slice coordinates and not because of the RNG.
     other = rng.uniform(x_min, x_max, size=(n_other, x_min.size))
 
+    # The ACTUATOR gate, same one find_uniform_lambda applies. Without it lam* is
+    # the rate the LMI would allow if control were free, which on the car is 4.88
+    # against a shipped 0.3902 -- and reaching 4.88 needs ‖K‖₂ ≈ 60 against a ±1.5
+    # actuator, putting 99.8% of the commanded controls outside the box. That is a
+    # ceiling, not a rate any trajectory can exhibit, and drawing it as the
+    # background of a figure whose trajectories converge at 0.39 invites exactly
+    # the wrong reading. With the gate, lam* is the fastest REALIZABLE rate.
+    #
+    # Errors come from the env's own define_initial_state, never from a named box
+    # -- which box reset() reads depends on whether X_INIT is set.
+    with torch.no_grad():
+        _, xe_0, _ = env.define_initial_state(torch.arange(4096, device=env.device))
+    e_pool = xe_0.detach().cpu().numpy().astype(np.float64)
+    uref_lo = env.UREF_MIN.detach().cpu().numpy().astype(np.float64)
+    uref_hi = env.UREF_MAX.detach().cpu().numpy().astype(np.float64)
+    u_lo, u_hi = expand_box(uref_lo, uref_hi, 2.0)
+    _n_draw = 64
+    _e_draws = e_pool[rng.integers(0, len(e_pool), size=(1, _n_draw))]
+    _u_draws = rng.uniform(uref_lo, uref_hi, size=(1, _n_draw, uref_lo.size))
+
+    def actuator_ok(W, Bk, r_scaler):
+        """<= VIOL_FRAC of u = uref - K e inside the applied control box."""
+        return control_violation_rate(W, Bk, r_scaler=r_scaler, e_draws=_e_draws,
+                                      uref_draws=_u_draws,
+                                      u_lo=u_lo, u_hi=u_hi) <= VIOL_FRAC
+
     Z = np.empty((grid, grid), dtype=np.float64)
     print(f"[minproj] {env_name}: {grid}x{grid} cells, min over {n_other} "
           f"projected samples, dims={[env.state_names[d] for d in dims]}", flush=True)
@@ -108,7 +137,8 @@ def generate(env_name: str, *, grid: int, n_other: int, n_x0: int,
             A, B = jacobians(env, pts.astype(np.float32))
             # min over the projected dims: each sample alone is one certificate,
             # and the slice inherits the worst of them.
-            lams = [max_lambda(A[k:k + 1], B[k:k + 1], kw)[0] for k in range(len(pts))]
+            lams = [max_lambda(A[k:k + 1], B[k:k + 1], kw, gate=actuator_ok)[0]
+                    for k in range(len(pts))]
             Z[j, i] = float(np.min(lams))
         print(f"[minproj]   column {i + 1}/{grid} done", flush=True)
 
@@ -131,7 +161,8 @@ def generate(env_name: str, *, grid: int, n_other: int, n_x0: int,
              r=np.asarray(cfg["r"]), w_lb=np.asarray(cfg["w_lb"]),
              w_ub=np.asarray(cfg["w_ub"]), traj=traj, x0=x0,
              state_names=np.asarray(list(env.state_names)),
-             x_min=x_min, x_max=x_max)
+             x_min=x_min, x_max=x_max,
+             actuator_gated=np.asarray(True), viol_frac=np.asarray(VIOL_FRAC))
     print(f"[minproj] wrote {out}")
     return out
 
