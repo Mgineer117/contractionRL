@@ -11,6 +11,7 @@ Classic gymnasium (--classic flag, no Isaac Sim required):
 
 import argparse
 import os
+import pathlib as _pathlib
 import sys
 
 # Local wandb run files (config/history/media, not the same as tensorboard
@@ -32,7 +33,7 @@ if not _is_classic:
 
 # ─── Full argument parser ─────────────────────────────────────────────────── #
 parser = argparse.ArgumentParser(description="Train an RL agent with skrl.")
-parser.add_argument("--reference_mode", choices=["arbitrary", "contractive"], default=None,
+parser.add_argument("--reference_mode", choices=["stabilizing", "contractive"], default=None,
                     help="WHERE the reference is asked to operate. 'arbitrary' (default) is "
                          "the shipped XREF_INIT, which for a state-dependent plant is the "
                          "LOW-rate region by design (rule.md Step 3). 'contractive' uses the "
@@ -377,6 +378,66 @@ _DEFAULT_NUM_ENVS_PPO_CLASSIC = 1024
 
 
 
+def _load_vstar_pack(task: str, raw_env, ref_mode: str = "stabilizing",
+                     gamma: float | None = None):
+    """Install the offline reference set on ``raw_env`` and return its V* pack.
+
+    ``None`` for any env with no pack directory -- only the toy family has one,
+    because only there is V* computable. But a toy env whose pack is MISSING
+    raises: the whole point of that family is being measured against the global
+    optimum, and quietly training without it would produce a run that looks
+    identical and answers nothing.
+    """
+    import numpy as np
+
+    key = getattr(raw_env.unwrapped, "task", None)
+    if not getattr(raw_env.unwrapped, "ref_groups", 0):
+        return None
+    root = _pathlib.Path(__file__).resolve().parents[2] / "data" / "toy" / str(key)
+    # global.npz first: certified per-task optima from the moment-SOS hierarchy.
+    # vstar.npz is the older value-iteration grid, kept as a cross-check --
+    # measured against the certified optima its error runs 0.1-2.5% and goes
+    # both ways, which is wider than the gap this run exists to report.
+    # Each reference_mode is a DIFFERENT task set, so it has its own pack. Falling
+    # back to the arbitrary one would report a gap against the optimum of a
+    # reference this run never sees.
+    stem = "global" if ref_mode == "stabilizing" else f"global_{ref_mode}"
+    # gamma-suffixed first: V* is gamma-dependent, so the pack that matches this
+    # run's discount is the only one the guard below will accept.
+    cands = ((root / f"{stem}_g{gamma:g}.npz",) if gamma is not None else ())
+    cands += ((root / "global.npz", root / "vstar.npz") if ref_mode == "stabilizing"
+              else (root / f"{stem}.npz",))
+    path = next((p for p in cands if p.exists()), None)
+    if path is None:
+        raise SystemExit(
+            f"{task} declares ref_groups={raw_env.unwrapped.ref_groups} but there is no "
+            f"{ref_mode} optimum pack in {root}. Solve it first (it is the task set "
+            f"this run will train on, not just a metric):\n"
+            f"    python scripts/precompute_global.py --task {task} "
+            f"--reference-mode {ref_mode}")
+    pack = np.load(path)
+    raw_env.unwrapped.set_group_references(pack["xref"], pack["uref"],
+                                           pack["x0"] if "x0" in pack.files else None)
+    kind = ("moment-SOS, max rel gap "
+            f"{float(np.asarray(pack['rel_gap']).max()):.1e}" if "j_star" in pack.files
+            else f"value iteration, grid n={pack['n']}")
+    # V* is a function of the discount. optimality_gap discounts V^pi with
+    # pack["gamma"], so a pack solved at a different gamma than the agent trains
+    # at compares two different problems and still prints a number.
+    if gamma is not None and abs(float(pack["gamma"]) - float(gamma)) > 1e-12:
+        raise SystemExit(
+            f"{task}: agent discount_factor={gamma} but the optimum pack at "
+            f"{path} was solved at gamma={float(pack['gamma'])}. V* is "
+            f"gamma-dependent, so the gap would be against a different problem. "
+            f"Solve it:\n    python scripts/precompute_global.py --task {task} "
+            f"--reference-mode {ref_mode} --gamma {gamma} --out "
+            f"{path.parent / (path.stem + f'_g{gamma}.npz')}")
+    print(f"[train] optimum pack ({kind}): {pack['groups']} reference(s) x "
+          f"{pack['envs_per_group']} pinned starts, gamma={pack['gamma']}, "
+          f"horizon={pack['horizon']}, metric={pack['cm_dataset']}")
+    return pack
+
+
 def _apply_agent_overrides(agent_cfg, args):
     """Write every set agent-config override into agent_cfg, by YAML key name.
 
@@ -487,7 +548,11 @@ if _is_classic:
     )
     if _classic_dir not in sys.path:
         sys.path.insert(0, _classic_dir)
+    # The toy (polynomial) envs ship the same skrl_*_cfg entry points and run
+    # through the same --classic path; registering only `classic` left every
+    # toy config unreachable from the trainer that is supposed to read it.
     import contractionRL.tasks.direct.classic  # noqa: F401 — registers gymnasium envs (e.g. Car-v0)
+    import contractionRL.tasks.direct.toy  # noqa: F401 — registers toy-mg-v0 / toy-duff-v0
 
     # ── Config loading ────────────────────────────────────────────────────── #
     def _load_cfg(entry_point_key: str, custom_path: str | None = None) -> dict:
@@ -631,7 +696,13 @@ if _is_classic:
     from wandb_plot_wrapper import WandbPlotWrapper
 
     _is_contraction = algorithm in _CONTRACTION_ALGOS
-    num_envs = args_cli.num_envs if args_cli.num_envs is not None else _default_num_envs_classic(algorithm)
+    # An env may declare its own preferred parallelism. The toy family does: its
+    # 625 = 25 references x 25 slots is not a throughput choice but the task set
+    # V* was solved for, so a generic algorithm default would silently evaluate
+    # the policy against the optimum of a different problem.
+    _spec_envs = (gym.spec(args_cli.task).kwargs or {}).get("default_num_envs")
+    num_envs = (args_cli.num_envs if args_cli.num_envs is not None
+                else _spec_envs or _default_num_envs_classic(algorithm))
     device = getattr(args_cli, "device", None)
     if not device:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -738,6 +809,15 @@ if _is_classic:
         except Exception:
             pass  # wandb off — logging must never break a run
 
+    # AFTER the window is configured, never before: configure_ref_window resizes
+    # the reference buffers (ref_gen_len = max_episode_len + (L-1)*offset), so a
+    # pack installed earlier is wiped by the resize -- and one whose shape had
+    # happened to match would have been solved for a different horizon.
+    _vstar_pack = _load_vstar_pack(args_cli.task, raw_env,
+                                   getattr(raw_env.unwrapped, "reference_mode",
+                                           "stabilizing"),
+                                   agent_cfg["agent"].get("discount_factor"))
+
     if getattr(args_cli, "fix_ref_trajectories", False):
         if not hasattr(raw_env.unwrapped, "set_fix_ref_trajectories"):
             raise SystemExit("--fix_ref_trajectories requires a path-tracking env (got "
@@ -822,6 +902,28 @@ if _is_classic:
     # nothing downstream to protect, and any exception class here is strictly
     # less important than the run that already completed. The traceback is
     # printed in full rather than swallowed.
+    if _vstar_pack is not None:
+        from contractionRL.agents.skrl.contraction_metrics import optimality_gap
+
+        def _act(obs):
+            obs_t = raw_env.unwrapped.ref_window.flatten(
+                *(torch.as_tensor(obs[k], dtype=torch.float32, device=device)
+                  for k in ("x", "xrefs", "urefs")))
+            actions, outputs = runner.agent.act(obs_t, None, timestep=0, timesteps=0)
+            return outputs.get("mean_actions", actions)
+
+        _gap = optimality_gap(raw_env, _act, _vstar_pack, device=device)
+        # Durable copy next to the checkpoints, so the number outlives wandb.
+        try:
+            import json as _json
+            _p = _os.path.join(runner.agent.experiment_dir, "optimality_gap.json")
+            with open(_p, "w") as _fh:
+                _json.dump({"task": args_cli.task, **_gap}, _fh, indent=2)
+            print(f"[Optimality] wrote {_p}")
+        except Exception as _e:  # noqa: BLE001
+            print(f"[Optimality] could not persist the gap ({_e}); it is in wandb "
+                  f"and stdout above.")
+
     try:
         _evaluate_classic_path_tracking(task=args_cli.task, runner=runner, args_cli=args_cli,
                                         _is_classic=_is_classic)

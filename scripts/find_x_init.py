@@ -207,14 +207,24 @@ def main() -> int:
     # symmetric: shrinking segway's pitch [-0.9, 0.9] gives [-0.36, 0.36], which
     # is the EASY region, the exact opposite of Step 3's intent. So shrink the
     # WALL MARGIN instead, and only for the dims that matter.
-    drives = []
+    # Both polarities matter. Only the first was handled, which silently sent
+    # car_v1 -- the flagship state-dependent env -- down the origin-shrinking
+    # fallback even though corr(lam, |vel|) = +0.804: its Hautus margin is
+    # sigma = min(1, v), so authority VANISHES as v -> 0 and the hard region is
+    # vel in [0.20, 0.46] of a [0.20, 2.00] box. Scaling about the origin cannot
+    # express that, and nothing said so.
+    drives, drives_small = [], []
     for i in range(len(names)):
         c = np.corrcoef(lam, np.abs(x_np[:, i]))[0, 1]
+        tag = ""
         if c < -0.05:                      # harder as |x| grows
             drives.append(i)
-        print(f"   corr(lam, |{names[i]}|) = {c:+.3f}"
-              f"{'   <- drives hardness' if c < -0.05 else ''}")
-    if not drives:
+            tag = "   <- drives hardness (hard at LARGE |x|)"
+        elif c > 0.05:                     # harder as |x| shrinks
+            drives_small.append(i)
+            tag = "   <- drives hardness (hard at SMALL |x|)"
+        print(f"   corr(lam, |{names[i]}|) = {c:+.3f}{tag}")
+    if not drives and not drives_small:
         print("   no dim drives hardness; falling back to shrinking about the origin")
 
     print(f"\ncandidate X_INIT boxes (certified controller, {args.steps} steps, 128 envs):")
@@ -235,6 +245,14 @@ def main() -> int:
                 lo[i], hi[i] = q, half * shrink
                 if lo[i] >= hi[i]:
                     lo[i] = 0.5 * hi[i]      # sign dims supply both polarities
+            elif i in drives_small:
+                # Keep the low-|x| end and cap the high end at the hard region's
+                # own spread; shrink narrows TOWARD the hard end rather than
+                # toward the origin, which here is the easy direction.
+                q = float(np.percentile(np.abs(hard[:, i]), 60))
+                lo[i] = float(hard[:, i].min())
+                span = float(X_HI[i] - X_LO[i])
+                hi[i] = lo[i] + shrink * max(q - lo[i], 0.1 * span)
             else:
                 lo[i], hi[i] = -half * shrink, half * shrink
         lo, hi = np.maximum(lo, X_LO), np.minimum(hi, X_HI)
@@ -247,9 +265,15 @@ def main() -> int:
         # Capped against exactly what tests/test_rule_step3_spawn_box.py measures,
         # reach = max(|lo|,|hi|) against half, so the tool cannot emit a box its
         # own rule rejects.
-        cap = np.array([max(abs(X_LO[i]), abs(X_HI[i])) * (1.0 - MIN_HEADROOM_FRAC)
+        # Two-sided, against the ACTUAL bounds. The old form clipped to
+        # +-half*(1-frac), which is identical for a symmetric box but leaves an
+        # all-positive dim flush against its LOWER wall -- car_v1's vel starts at
+        # 0.20 and its hard region starts there too, so the box the tool would
+        # emit spawned exactly on the wall it is meant to clear.
+        pad = np.array([MIN_HEADROOM_FRAC * max(abs(X_LO[i]), abs(X_HI[i]))
                         for i in range(len(names))])
-        lo, hi = np.clip(lo, -cap, cap), np.clip(hi, -cap, cap)
+        lo = np.clip(lo, X_LO + pad, X_HI - pad)
+        hi = np.clip(hi, X_LO + pad, X_HI - pad)
         # XREF_INIT moves WITH X_INIT, which is what rule.md Step 3 says ("XREF_INIT
         # is established the same way, so the reference also starts in the low-rate
         # region") and is not optional. Moving X_INIT alone does not make the

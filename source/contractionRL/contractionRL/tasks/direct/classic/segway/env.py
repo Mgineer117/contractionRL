@@ -49,7 +49,65 @@ X_MAX = [5.0, PITCH_LIM, 1.0, math.pi]
 X_TERMINATION_MIN = list(X_MIN)
 X_TERMINATION_MAX = list(X_MAX)
 
-# Initial reference state bounds
+# Initial reference state bounds.
+#
+# Stays at the origin, and NOT because the origin happens to be an equilibrium
+# (xref_init does not need to be one -- the reference is a trajectory, and
+# stabilising is the policy's job). It stays because the origin is the only place
+# a segway reference can *dwell*, and that is a hard fact about this plant.
+#
+# rule.md Step 3 says put xref_init in the low-rate region. For segway the low-rate
+# region is where |pitch| is large (corr(lam, |pitch|) = -0.226, the only dim with
+# any dependence), and a reference cannot stay there. Measured three ways:
+#
+# 1. Relative equilibria. Allowing v free and omega = 0, rows 2-3 of f + Bu = 0
+#    are LINEAR in (v, u), so steady cruise at tilt theta solves exactly:
+#    v* = -181*theta, u* = -940*theta. At theta = 0.05 rad that is v = -9.06 m/s
+#    against a +-1.0 box and u = -57 against +-24. Only theta ~ 0 fits, i.e. the
+#    equilibrium set is the v-axis sliver |theta| < 0.006 -- physically right, a
+#    lean commands acceleration, not speed.
+# 2. Dwell time. Rolling xref forward with the uref that best holds the tilt
+#    (u = -f3/B3), time until xref leaves X, out of a 60 s episode:
+#        pitch0   0.05    0.10    0.30    0.60    0.85
+#        dwell    9.93s   5.10s   1.74s   0.90s   0.66s
+#    It always exits via vel_x_b, with peak |u| only 6.5-9.7 of the 24 available:
+#    the binding constraint is the VELOCITY box, not the actuator. Holding a lean
+#    means accelerating the wheel, which is what a segway is. Widening v to +-4
+#    moves the exit to pitch and buys 34 s at pitch 0.05 -- but 0.05 rad is
+#    already lam_max, so it buys dwell exactly where there is no rate to gain,
+#    and still only 2.4 s at pitch 0.85.
+# 3. Viability, law-independent. Greedy uref over a 65-point grid with two-step
+#    lookahead and an explicit bonus for staying tilted:
+#        x0 (pitch, omega)   dwell    mean |pitch| sustained
+#        (0.00,  0.0)        60.00s   0.0000
+#        (0.45,  0.0)         1.32s   0.5381
+#        (0.70, -1.0)         1.23s   0.6914
+#    The tilt bonus changes the trajectory at no weight (B[1,0] = 0, so u cannot
+#    touch pitch within a step). The viable set for a 60 s reference is the single
+#    point pitch = v = pitch_rate = 0 -- which is lam's MAXIMUM.
+#
+# So low lam and long dwell are mutually exclusive here: lam is low exactly where
+# the plant is falling (unstable eig +2.76, e-fold 0.36 s), and a falling state is
+# not a reference. Confirmed end to end against the deployed CMG -- every tilted
+# xref_init pins to a box face and lam FALLS:
+#     xref_init                lam(0)   lam(T)    rise    ref clamp
+#     origin (this one)        0.2112   0.1468   0.695x     0.941
+#     mid tilt   (0.45)        0.2878   0.1468   0.510x     0.981
+#     max tilt   (0.85)        0.2745   0.1466   0.534x     0.994
+#     opp-sign diagonal        0.2689   0.0782   0.291x     0.969
+#     same-sign diagonal       0.3597   0.1468   0.408x     0.997
+#     fast spin only           0.3199   0.1468   0.459x     0.995
+#     cruise v = 0.9           0.3061   0.0782   0.256x     0.951
+# All seven land on one of two lam(T) values because they have all been pinned to
+# the same box face -- the reference is no longer a plant trajectory at all.
+# (note lam(0) is not even monotone in tilt -- the -0.226 correlation is far too
+# weak to make "tilt" mean "low rate" pointwise.)
+#
+# Contrast car_v1, where this DOES work: 5.63x rate spread, low-rate set dwellable,
+# and lambda_grad migrates 1.416x at a clamp rate of exactly 0.0000. segway has
+# neither property, so it keeps reference_mode="stabilizing" (the default) and this
+# box stays at the origin. Revisit only if X's velocity box is widened and
+# re-certified, and then check dwell at the tilts that actually lower lam.
 XREF_INIT_MIN = [0.0, 0, 0.0, 0]
 XREF_INIT_MAX = [0.0, 0, 0.0, 0]
 

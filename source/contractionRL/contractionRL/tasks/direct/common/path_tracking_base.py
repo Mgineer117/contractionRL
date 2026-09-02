@@ -260,7 +260,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         Mirrors classic env_base._metric_from_cmg exactly — see
         tests/test_isaac_parity.py, which requires both families to convert the
         CMG output the same way or their Mahalanobis rewards stop being
-        comparable. cmg_method="cvstem" builds the CMG with outputs_metric=True
+        comparable. C2RL builds the CMG with outputs_metric=True
         and its forward already returns M (so this is a pass-through and the
         per-step SPD inverse disappears); "ccm" emits W and is inverted here.
         """

@@ -126,6 +126,115 @@ would then be strictly better than continuing. On the truncation channel with
 the box **disabled**: both are unstable plants started far from the reference, so with it armed
 every episode ended within a few steps and no stability metric could be computed at all.
 
+## The `toy` family: an exact metric and a global optimum
+
+Two 2-state polynomial plants — `toy-mg-v0` (Moore–Greitzer) and `toy-duff-v0` (Duffing) — exist
+to supply the two things the classic family structurally cannot:
+
+| | classic / Isaac | toy |
+|---|---|---|
+| contraction metric | CV-STEM SDP at **N sampled states** | SOS identity over the **whole box** |
+| optimal value `V*` | not computable (4–16 states, moving reference) | exhaustive value iteration |
+
+Everything else is shared. SOS writes the same `{x -> W*(x)}` npz the CV-STEM SDP does, so CMG
+regression, C2RL, C3M and CV-STEM-LQR consume it unchanged, and `lambda` is comparable across
+families because both solve the same LMI.
+
+```bash
+# Metric synthesis. SOS is a TOOL for finding W(x), not an algorithm — so it runs
+# through the entry point every metric uses, and its knobs live in the `cm:` block.
+python scripts/build_cm_dataset.py --task toy-mg-v0
+python scripts/build_cm_dataset.py --task toy-mg-v0 --bisect-lbd   # largest certifiable rate
+
+# Global optimum of the C2RL objective, with a Richardson error estimate.
+python scripts/toy_solve.py --task toy-mg-v0 --algorithm vi --save
+
+# Training is the ordinary --classic path; the toy envs register the same entry points.
+python scripts/skrl/train.py --classic --task toy-mg-v0 --algorithm c2rl-ppo --headless
+```
+
+**Certify below the ceiling, not at it.** Maximising a *uniform* rate drives the SDP to equalise
+`lambda(x)`, which destroys the state-dependence these envs exist to study. Measured on `mg`:
+
+    lbd      12.852    6.425    3.212    1.285
+    spread    1.30x    1.44x    1.87x    5.86x
+
+The shipped `lbd` is 10% of the ceiling, putting `mg` at 6.02x spread (vs car_v1's 5.61x) and
+`duff` at 2.02x (vs cartpole's 2.19x) — like-for-like stand-ins with an exact metric.
+`python scripts/env_taxonomy.py --markdown` prints the full table.
+
+## Measuring suboptimality
+
+The contraction results assume an optimal policy; training gives empirical
+convergence. The `toy` family exists to measure the size of that assumption.
+
+```bash
+# 1. Certify the metric (exact, over the whole box) — writes the coefficients too.
+python scripts/build_cm_dataset.py --task toy-mg-v0
+
+# 2. Solve the GLOBAL optimum, before any training.
+python scripts/precompute_vstar.py --task toy-mg-v0 --richardson
+
+# 3. Train. The run loads the SAME references V* was solved for, and reports
+#    Optimality/gap_* at the end.
+python scripts/skrl/train.py --classic --task toy-mg-v0 --algorithm c2rl-ppo --headless
+```
+
+**Why V\* is computable here.** With the reference *fixed*, tracking is a
+finite-horizon, time-varying MDP whose state is `x` alone — time enters only
+through which reference point is current. So V\* is **one backward sweep**:
+
+```
+V*_T(x) = 0
+V*_t(x) = min_u [ c_t(x,u) + gamma * V*_{t+1}(x') ],   x' = clamp(x + dt(f(x) + B(x)u))
+c_t     = -q(e' M(x) e - e'' M(x') e'') + r||u||^2
+```
+
+`c_t` is C2RL's reward negated, at C2RL's own `discount_factor`, against the same
+`M`. No fixed-point iteration, no tolerance, no contraction argument — exact for
+the discretised MDP. `tests/test_toy_envs.py` asserts the stage cost equals
+`-env.get_rewards` step for step, because an off-by-one in the reference index
+produces a plausible-looking gap that is indistinguishable from a real one.
+
+**Why 25 references × 25 envs.** Cost is one sweep per *reference*, so 625 tasks
+cost 25 sweeps rather than 625. The trajectories ship as an artifact
+(`data/toy/<key>/vstar.npz`) and the trainer installs them: two processes
+agreeing on a seed is not evidence they drew the same trajectories, and if they
+did not, the reported gap is against the optimum of a different problem.
+
+**What is reported.** `V^pi` is the realised discounted return of one episode,
+negated into V\*'s cost units. With deterministic dynamics and the policy mean as
+the action that is not an *estimate* of `V^pi`, it **is** `V^pi` — no policy
+evaluation, no critic. `Optimality/gap_mean` is `V^pi - V*`, which is `>= 0` by
+construction; `below_v_star_frac` reports how often discretisation breaks that,
+and is the honest size of the grid error.
+
+Note what a Bellman residual would *not* tell you here: `T^pi` is a
+gamma-contraction with a unique fixed point for **every** policy, so a perfectly
+fitted critic on a terrible policy has zero residual. An NLP or MPC lookahead
+cannot substitute for V\* either — both return a feasible trajectory, so both
+only bound `J*` from above.
+
+**The metric is analytic.** Toy C2RL runs `metric_source: sos`, evaluating the
+certified polynomial directly instead of regressing a CMG onto samples of it
+(measured median relative error in the deployed `M`: `2.5e-6` vs `2.5e-2`). The
+offline solve uses the same `M`, so a mismatch cannot masquerade as policy
+suboptimality.
+
+The classic envs use the **same** two scripts — `precompute_vstar.py` then
+`policy_gap.py`. What makes a 4-state env affordable is the discount: `V*_0`
+depends on `V*_k` only through `gamma^k`, so at `gamma = 0.01` the sweep is exact
+after 9 steps and the remaining ~490 of an episode cannot change the answer
+(measured difference between a 9-step and a 100-step sweep: `2.2e-16`, one double
+epsilon). Beyond that, value iteration is bounded by **memory, not dimension**
+(`solvers.check_budget`): the 10-state quadrotor is refused with the arithmetic
+that says why.
+
+The critic is deliberately **not** the comparison. It is a fitted, on-policy,
+moving-target estimate of `V^pi`, so a gap computed from it mixes the policy's
+suboptimality with the critic's fit error. `policy_gap.py` prints it only to show
+the size of that bias.
+
 ## Configuration
 
 One yaml per (env, algorithm), next to the env: `tasks/direct/<env>/agents/skrl_<algorithm>_cfg.yaml`.

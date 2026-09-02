@@ -1,0 +1,95 @@
+seed: 42  # Random seed for reproducibility
+
+# CV-STEM-LQR: Tsukamoto's CV-STEM contraction controller — analytical (no RL),
+# u = uref - K(x)(x-xref) with K(x) = R⁻¹B(x)ᵀM(x), M(x)=W(x)⁻¹ from the CV-STEM
+# metric SDP (one joint program over uniform state-box samples, ν/χ shared
+# — Tsukamoto's classncm.cvstem0). See agents/skrl/cvstem_lqr.py.
+
+agent:
+  # lbd/r_scaler/w_lb/w_ub come from scripts/find_uniform_lambda.py run at
+  # N=100 with --cm-eps 0.1 --cm-dt 1.0 --w-lb 0.001 --w-ub 1000, and are then
+  # Certified by the N=10000 synthesis below at cm_eps 0.01. The two eps values
+  # are deliberate, not a mismatch: eps buys a covering radius eps/L around each
+  # sample, so a 100-sample search needs the larger margin and a 10000-sample
+  # solve does not. See docs/subset_lambda_procedure.md sections 7 and 8d.
+  class: CVSTEM-LQR
+  # R = r_scaler·I, used in both the metric SDP's Riccati term and the deployed
+  # gain K = R⁻¹BᵀM — a single knob so K stays the certified CV-STEM gain.
+  r_scaler: 0.1
+  experiment:
+    directory: "tora_cvstem_lqr"
+    experiment_name: ""
+    write_interval: "auto"
+    checkpoint_interval: "auto"
+    wandb: true
+    wandb_kwargs:
+      project: contractionRL
+      name:
+
+# ── The joint CV-STEM SDP (Tsukamoto's classncm.cvstem0) ───────────────────── #
+cm:
+  # λ — the certified contraction rate. Comes from scripts/find_uniform_lambda.py
+  # (the λ-selection step; the reference's own linesearch is not run here).
+  # From scripts/find_uniform_lambda.py's uniform state-box search — measured
+  # jointly with the r/w_lb/w_ub here, one solution of one program.
+  # NOT the ceiling, and that is the whole point of this env.
+  #
+  # The largest rate SOS certifies here is 13.6328 (--bisect-lbd). But maximising
+  # the UNIFORM rate drives the optimiser to equalise lam(x) across the box, so
+  # at the ceiling the measured spread collapses to 1.00x -- a
+  # state-dependent plant certified into a flat rate field, which is precisely
+  # what these envs exist to study. Measured max/min of lam(x) vs lbd:
+  #
+  #     lbd      13.633     6.816     3.408     1.363
+  #     spread  1.00x     1.08x     1.24x     2.00x
+  #
+  # 1.363 is 10% of the ceiling and lands the spread at 2.0x, comparable to
+  # cartpole (2.22x) -- so the toy env is a like-for-like stand-in for a
+  # classic one, with an exact metric instead of a sampled one.
+  lbd: 1.363
+  cm_eps: 0.01
+  # Deployment envelope w_lb·I ⪯ W ⪯ w_ub·I, as the caps nu <= 1/w_lb and
+  # chi <= nu*w_ub on the joint program's shared nu/chi. Absent, this is the
+  # reference program (no envelope) — but lbd above was certified with them.
+  cm_w_lb: 0.001
+  cm_w_ub: 1000.0
+  cm_solver: MOSEK  # SCS (no license) | CLARABEL | MOSEK (tightest/fastest; see README)
+  # SOS knobs (toy envs only). Degree of each entry of W(x); raise this
+  # before touching w_lb/w_ub if a rate is infeasible. Find the ceiling
+  # with: build_cm_dataset.py --task toy-<k>-v0 --bisect-lbd
+  sos_w_degree: 2
+  sos_lam_hi: 40.0
+  sos_bisect_iters: 10
+  sos_verify_grid: 101
+  # Uniform state-box samples in the one joint SDP (his Nx=1000). A solver-Size
+  # knob: each sample adds an x_dim² PSD block plus two LMIs to a single problem.
+  cm_samples: 10000
+  cm_seed: 0
+  # Cache the joint solve (see CVSTEMLQRCfg.cm_data_path). Keyed on every
+  # knob that enters the program, so a config change re-solves rather than
+  # loading a metric certifying a different rate.
+  # Metric synthesis for this env is SOS, not the sampled CV-STEM SDP:
+  #   python scripts/build_cm_dataset.py --task toy-duff-v0
+  # Same LMI, same {x -> W*(x)} output, but certified over the whole
+  # box as an algebraic identity rather than at N draws.
+  cm_data_path: "data/toy/duff/cm_data.npz"
+  # Uncomment for his lambda selection instead (linesearch: walk lambda up from
+  # lo to hi in steps of da, take argmin J = chi/lambda + nu). It ignores `lbd`
+  # above and does not look at the actuator box.
+  # lbd_linesearch: [0.1, 3.0, 0.1]
+
+# ── The metric network: x -> chol(M) (nn_modules.CholMetric) ──────────────── #
+cmg:
+  # The reference's own architecture: a 3x100 ReLU MLP on the raw state.
+  cmg_hidden_dims: [100, 100, 100]
+  cmg_regress_epochs: 100
+  cmg_regress_lr: 1.0e-3
+  cmg_regress_batch_size: 320
+  cmg_regress_lr_scheduler: "StepLR"
+  cmg_regress_lr_scheduler_kwargs:
+    step_size: 1
+    gamma: 0.99
+trainer:
+  class: SequentialTrainer
+  timesteps: 10000  # Total number of environment steps to evaluate for
+  environment_info: log  # Enable logging of stability metrics from info["log"]

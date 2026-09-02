@@ -63,8 +63,6 @@ def check(task: str, algorithm: str = "c2rl_ppo") -> tuple[bool, str]:
     from contractionRL.agents.skrl.ncm_synthesis import load_cached_cm_dataset
 
     cfg, y = cfg_for(task, algorithm)
-    if getattr(cfg, "cmg_method", "") != "cvstem":
-        return True, f"cmg_method={cfg.cmg_method!r} needs no offline dataset"
     path, kwargs = cm_dataset_target(cfg)
     if path is None:
         return False, f"{y.name} sets neither cm_data_path nor dynamics_pretrain_data_path"

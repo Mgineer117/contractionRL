@@ -89,13 +89,26 @@ XE_MAX = [lim, lim, lim, lim]
 UREF_MIN = [-8.0]
 UREF_MAX = [8.0]
 
-# Initial state drawn directly from this box (see env_base.X_INIT_MIN),
-# placing every episode start in the plant's low-lambda region:
-# lbd*(x0) median 5.8603 -> 2.7354. The sign dims are
-# mirrored by one shared sign, because the slow set is two lobes on a
-# diagonal that no single box can cover.
-X_INIT_MIN = [0.6876, -1.9602, -0.5876, 1.3482]
-X_INIT_MAX = [0.9803, -0.0428, -0.0916, 1.9923]
+# Initial state drawn directly from this box (see env_base.X_INIT_MIN).
+# The sign dims are mirrored by one shared sign, because the slow set is two
+# lobes on a diagonal that no single box can cover.
+#
+# The box is NOT placed in a low-rate region, because this plant has no usable
+# one: find_x_init measures lam(x) over X at min 1.0344 / median 1.5511 /
+# max 1.6202, a spread of 1.57x, which rule.md Step 3 calls FLAT -- so X_INIT is
+# arbitrary within X and the only binding requirement is wall headroom. The
+# previous values were written before that rule existed and reached 0.9803 of
+# |X| on joint_pos_0 and 1.9923 of 2.0 on pitch_rate (0.4% headroom), which
+# clamps from step 0 and voids the certificate (Rule 1). Capped at 6% of each
+# half-width, the same margin find_x_init applies.
+#
+# Note what this does NOT fix: find_x_init found no admissible candidate at ANY
+# margin, because the certified controller does not measurably contract here --
+# e(T)/e(0) runs 0.94-1.03 over 400 steps at only ~4% clamp, so the failure is
+# not a wall artifact. That is a Step 1 question about lbd/UREF for this env,
+# tracked separately; the box below is merely legal, not validated.
+X_INIT_MIN = [0.6876, -1.88, -0.564, 1.3482]
+X_INIT_MAX = [0.94, -0.0428, -0.0916, 1.88]
 X_INIT_SIGN_DIMS = [0, 1, 2, 3]
 
 ENV_CONFIG = {

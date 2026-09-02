@@ -742,19 +742,37 @@ for gpu in "\${JOB_GPUS[@]}"; do
                 # silently, which is how it read as working while doing nothing.
                 # mem_get_info() reports the device CUDA will actually open,
                 # index or MIG UUID alike.
-                free_mb=\$(CUDA_VISIBLE_DEVICES=\$gpu python -c \\
-                    'import torch;print(torch.cuda.mem_get_info()[0]//1048576)' 2>/dev/null | tail -1)
+                # stderr is KEPT, because how the probe fails is the whole
+                # signal. mem_get_info() has to open a CUDA context of its own,
+                # so on a full card the probe cannot run -- an unreadable read is
+                # the STRONGEST evidence the GPU is busy, not an excuse to skip
+                # the check. This block used to print "PROCEEDING BLIND" after 5
+                # such reads and take a cell anyway. Measured cost of that on
+                # job 10206316 (car_weak, 2026-08-29): one trial had grown to
+                # 20430 MiB of a 23028 MiB A10, leaving 654 MiB, so every probe
+                # failed, every worker proceeded blind, and 2196 sweep cells were
+                # claimed and killed in gym.make -- one every 12 seconds for 8
+                # hours. Fails closed now.
+                probe_out=\$(CUDA_VISIBLE_DEVICES=\$gpu python -c \\
+                    'import torch;print(torch.cuda.mem_get_info()[0]//1048576)' 2>&1 | tail -1)
+                free_mb=\$(printf '%s' "\$probe_out" | grep -oE '^[0-9]+\$' || true)
+                if [[ -z "\$free_mb" ]] && printf '%s' "\$probe_out" \\
+                        | grep -qiE 'out of memory|CUDA error|no CUDA-capable'; then
+                    free_mb=0        # full is not unreadable — fall through to the wait
+                fi
                 if [[ ! "\$free_mb" =~ ^[0-9]+\$ ]]; then
-                    # Unreadable is not a pass. Wait instead, but give up after a
-                    # few tries so a broken probe idles the pool loudly rather
-                    # than deadlocking it forever.
+                    # A probe that fails for some OTHER reason (no torch, dead
+                    # driver) is a broken worker, not a busy card. Retire it
+                    # loudly: the job keeps its GPU but stops eating cells, which
+                    # is strictly better than guessing.
                     probe_fail=\$(( probe_fail + 1 ))
                     if [[ "\$probe_fail" -lt 5 ]]; then
-                        echo "[\$(date '+%F %T')] gpu \$gpu agent \$a: VRAM probe unreadable (\$probe_fail/5) — waiting"
+                        echo "[\$(date '+%F %T')] gpu \$gpu agent \$a: VRAM probe unreadable (\$probe_fail/5) — waiting; last: \$probe_out"
                         sleep 60
                         continue
                     fi
-                    echo "[\$(date '+%F %T')] gpu \$gpu agent \$a: VRAM probe still unreadable — PROCEEDING BLIND"
+                    echo "[\$(date '+%F %T')] gpu \$gpu agent \$a: VRAM probe broken 5x — RETIRING this worker, NOT taking cells. last: \$probe_out"
+                    break
                 elif [[ "\$free_mb" -lt "\$MIN_FREE_MB" ]]; then
                     probe_fail=0
                     echo "[\$(date '+%F %T')] gpu \$gpu agent \$a: \${free_mb} MiB free < \$MIN_FREE_MB — waiting, NOT taking a cell"
@@ -782,7 +800,28 @@ for gpu in "\${JOB_GPUS[@]}"; do
                 # home quota and take the cluster session down with it.
                 export WANDB_DIR="\$HOME/scratch/wandb_sweeps/\${SLURM_JOB_ID:-nojob}_g\${gpu}_a\${a}"
                 mkdir -p "\$WANDB_DIR"
-                CUDA_VISIBLE_DEVICES=\$gpu timeout "\$PER_RUN_TIMEOUT" wandb agent --count 1 "\$SWEEP_ID"
+                # `timeout` signals ONLY its direct child. wandb agent runs
+                # train.py as a GRANDCHILD, which therefore survives the watchdog
+                # as an orphan and keeps its VRAM for the rest of the job.
+                # Measured on job 10206316: two trainers still resident at
+                # 31h43m under this 24h cap, one holding 20430 MiB, which is what
+                # starved every later trial on that card.
+                #
+                # So run the trial in its own session -- the bash -c writes the
+                # new session leader's pid (== the new process group id) before
+                # exec'ing, which is race-free, unlike scraping it with pgrep --
+                # and kill the whole group once the call returns, however it
+                # returned.
+                _pgf=\$(mktemp)
+                setsid --wait bash -c 'echo \$\$ > "\$1"; shift; exec "\$@"' _ "\$_pgf" \\
+                    env CUDA_VISIBLE_DEVICES=\$gpu timeout "\$PER_RUN_TIMEOUT" \\
+                    wandb agent --count 1 "\$SWEEP_ID" || true
+                _pgid=\$(cat "\$_pgf" 2>/dev/null || true); rm -f "\$_pgf"
+                if [[ "\$_pgid" =~ ^[0-9]+\$ ]]; then
+                    kill -TERM -"\$_pgid" 2>/dev/null || true
+                    sleep 10
+                    kill -KILL -"\$_pgid" 2>/dev/null || true
+                fi
                 # Reap the local run cache. A c2rl-ppo trial leaves ~1 GB in
                 # wandb/run-*, so an 80-trial grid alone is ~80 GB and a 103 GB
                 # home quota fills before the sweep finishes — at which point

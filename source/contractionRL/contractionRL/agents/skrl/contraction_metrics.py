@@ -1541,3 +1541,131 @@ def log_tracking_plots(
         fig.suptitle(f"{label} Path Tracking")
         fig.tight_layout()
         _push(fig, "path_tracking")
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# Suboptimality against the offline global optimum (toy envs)
+# ─────────────────────────────────────────────────────────────────────────── #
+
+def optimality_gap(env, act_fn, pack, *, device="cpu", tag: str = "[Optimality]") -> dict:
+    """``V^pi - V*`` per env slot, on the reference set V* was solved for.
+
+    The contraction results assume an optimal policy; training gives empirical
+    convergence. This is the size of that assumption, measured rather than
+    asserted -- and it is a real gap, not a Bellman residual: ``T^pi`` is a
+    gamma-contraction with a unique fixed point for EVERY policy, so a
+    perfectly-fitted critic on a terrible policy has zero residual and says
+    nothing about optimality.
+
+    ``V^pi`` is the realised discounted return of one episode, negated into the
+    cost units V* is expressed in. With deterministic dynamics and the policy
+    MEAN as the action that is not an estimate of V^pi, it IS V^pi -- no policy
+    evaluation, no critic, nothing fitted. ``V*(x_0)`` is read off the offline
+    grid by interpolation.
+
+    The env's references are overwritten from the pack, because "same seed" is
+    not an argument that two processes drew the same trajectories; if they did
+    not, the difference is between a policy and the optimum of another problem.
+    """
+    from contractionRL import cm_data
+    from contractionRL.solvers import grid_value_at
+
+    raw = getattr(env, "unwrapped", env)
+    # The reward the rollout will be scored under MUST be the one V* was solved
+    # under. C2RL's metric is injected by the TRAINER, so any eval-only caller
+    # starts with no metric and get_rewards quietly falls through to the plain
+    # -q||e||^2 branch -- a different objective, and the resulting "gap" is not
+    # one. Measured on toy-mg: 247% of |V*| that way against 0.80% correctly.
+    want = {k: pack[k] for k in cm_data.reward_signature(raw) if k in pack.files}
+    have = cm_data.reward_signature(raw)
+    bad = {k: (type(have[k])(want[k]), have[k]) for k in want
+           if type(have[k])(want[k]) != have[k]}
+    if bad:
+        raise ValueError(
+            f"the env's reward does not match the one V* was solved under: "
+            + ", ".join(f"{k} pack={w!r} env={h!r}" for k, (w, h) in bad.items())
+            + ". Call cm_data.attach_metric(env, key, **reward_kw) first.")
+    # x0 too, when the pack pins it. A moment-SOS optimum is a statement about
+    # ONE (reference, initial state) pair -- unlike the V* grid, which covered
+    # every start at once -- so re-drawing x_0 here would compare the policy
+    # against the optimum of a task it was never given.
+    raw.set_group_references(pack["xref"], pack["uref"],
+                             pack["x0"] if "x0" in pack.files else None)
+    gamma = float(pack["gamma"])
+    # The episode length, not the stored reference length: the reference runs
+    # past the episode end so the observation window never clamps.
+    T = int(pack["horizon"])
+    # Two pack formats, one measurement. "j_star" is a CERTIFIED per-task
+    # optimum from the moment-SOS hierarchy (scripts/precompute_global.py);
+    # "V0" is the older value-iteration grid, kept because it reads at any x_0
+    # and so still works as a cross-check. Prefer j_star: measured at
+    # gamma=0.01, the grid's error ran 0.1-2.5% and went BOTH ways -- on one
+    # task it reported a value below the true global optimum -- while the gap
+    # being measured is itself ~0.4-1%.
+    certified = "j_star" in pack.files
+    ref = torch.as_tensor(np.asarray(pack["j_star" if certified else "V0"]),
+                          dtype=torch.float64)
+    # A certified optimum is indexed by TASK = env slot: the toy benchmark is one
+    # shared reference and num_envs distinct initial conditions, so each slot has
+    # its own J*. The older V0 grid is per reference and read at any x_0.
+    n_want = raw.num_envs if certified else raw.ref_groups
+    if ref.shape[0] != n_want:
+        raise ValueError(f"pack has {ref.shape[0]} optima but the env now has "
+                         f"{n_want} {'tasks' if certified else 'reference groups'}.")
+
+    obs, _ = raw.reset()
+    x0 = raw.x_t.clone().double()
+    disc = torch.zeros(raw.num_envs, dtype=torch.float64, device=raw.device)
+    g = 1.0
+    with torch.no_grad():
+        for _ in range(T):
+            u = act_fn(obs)
+            obs, reward, _term, _trunc, _info = raw.step(u)
+            disc += g * reward.double()
+            g *= gamma
+    v_pi = -disc                                     # reward = -cost
+
+    if certified:
+        v_star = ref.to(v_pi.device)
+    else:
+        v_star = torch.empty_like(v_pi)
+        for gi in range(raw.ref_groups):
+            m = raw._group_of == gi
+            if not bool(m.any()):
+                continue
+            v_star[m] = grid_value_at(ref[gi], x0[m], pack["x_lo"], pack["x_hi"],
+                                      int(pack["n"]), int(raw.num_dim_x), device)
+    gap = (v_pi - v_star).cpu().numpy()
+    scale = max(float(np.abs(v_star.cpu().numpy()).mean()), 1e-12)
+    m, ci = mean_confidence_interval(gap)
+    # V^pi < V* is impossible for the exact MDP, so a nonzero count is the
+    # discretisation error showing its size -- report it instead of clipping it.
+    below = float((gap < 0).mean())
+    out = {
+        "gap_mean": m, "gap_ci95": ci,
+        "gap_median": float(np.median(gap)),
+        "gap_max": float(gap.max()),
+        "gap_rel_mean": float(np.abs(gap).mean()) / scale,
+        "v_pi_mean": float(v_pi.mean()), "v_star_mean": float(v_star.mean()),
+        "below_v_star_frac": below,
+        "num_tasks": int(raw.num_envs), "num_references": int(raw.ref_groups),
+    }
+    if certified:
+        # The optimum is only as good as its own certificate, so ship it beside
+        # the gap: a gap smaller than max_rel_gap is not a measurement of the
+        # policy, it is the solver's residual.
+        out["opt_max_rel_gap"] = float(np.asarray(pack["rel_gap"]).max())
+    # Straight onto the run SUMMARY, not agent.track_data. This runs AFTER the
+    # training loop, so nothing is left to call write_tracking_data and a queued
+    # metric is simply dropped -- which is what happened: both toy runs reached
+    # wandb with no Optimality/* keys at all, and the numbers survived only in
+    # stdout. summary.update needs no flush and no live step counter.
+    run = _wandb_run()
+    if run is not None:
+        run.summary.update({f"Optimality/{k}": v for k, v in out.items()})
+
+    print(f"{tag} V^pi - V* over {out['num_tasks']} tasks "
+          f"({out['num_references']} references): mean {m:+.6e} +/- {ci:.2e}, "
+          f"median {out['gap_median']:+.6e}, {100 * out['gap_rel_mean']:.3f}% of |V*| "
+          f"(V^pi {out['v_pi_mean']:+.4e}, V* {out['v_star_mean']:+.4e}, "
+          f"{100 * below:.2f}% below V* = discretisation floor)", flush=True)
+    return out

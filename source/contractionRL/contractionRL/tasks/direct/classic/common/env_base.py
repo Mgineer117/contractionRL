@@ -72,7 +72,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
 
         # reference_mode: WHERE the reference is asked to operate.
         #
-        #   "arbitrary"   (default) the shipped XREF_INIT band. For a plant with a
+        #   "stabilizing"   (default) the shipped XREF_INIT band. For a plant with a
         #                 state-dependent rate this is deliberately the LOW-rate
         #                 region (rule.md Step 3), so the number reported is the
         #                 hard case.
@@ -102,13 +102,25 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
             _xf_lo, device=self.device, dtype=torch.float32).flatten())
         self.XREF_INIT_FAST_MAX = (None if _xf_hi is None else torch.tensor(
             _xf_hi, device=self.device, dtype=torch.float32).flatten())
-        self.reference_mode = str(env_config.get("reference_mode", "arbitrary"))
+        # How uref is synthesized for the reference trajectory.
+        #   "stabilizing" the env's own stabilizing control law, plus excitation
+        #                 (sample_reference_controls). The default.
+        #   "contractive" walk the reference from a low-rate region to a high-rate
+        #                 one, so lam(xref) ASCENDS along the episode.
+        self.reference_mode = str(env_config.get("reference_mode", "stabilizing"))
         self.migrate_gain = float(env_config.get("migrate_gain", 1.0))
-        if self.reference_mode not in ("arbitrary", "contractive"):
+        # Outer-loop gain of the underactuated cascade in _migrate_uref:
+        # how much desired DERIVATIVE one unit of configuration error asks
+        # for. Separate from migrate_gain, which scales the whole command.
+        self.migrate_cascade_gain = float(
+            env_config.get("migrate_cascade_gain", 1.0))
+        self._migrate_r = float(env_config.get("migrate_r", 1.0))
+        if self.reference_mode not in ("stabilizing", "contractive"):
             raise ValueError(
-                f"reference_mode must be 'arbitrary' or 'contractive', got "
+                f"reference_mode must be 'stabilizing' or 'contractive', got "
                 f"{self.reference_mode!r}")
-        if self.reference_mode == "contractive" and self.XREF_INIT_FAST_MIN is None:
+        if (self.reference_mode == "contractive"
+                and self.XREF_INIT_FAST_MIN is None):
             raise ValueError(
                 "reference_mode='contractive' needs xref_init_fast_min/max on this "
                 "env. Absent means the rate is not state-dependent here (or the "
@@ -257,6 +269,34 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         self._fixed_uref = torch.zeros_like(self.uref)
         self._fixed_x0 = torch.zeros_like(self.x_t)
 
+        # ref_groups: how many DISTINCT references the fixed set contains. With
+        # fix_ref_trajectories alone every slot gets its own, so num_envs=625
+        # means 625 references. Grouping lets num_envs/ref_groups slots share one
+        # reference while each keeps its own x_0, which is what makes the global
+        # optimum computable: the optimum is solved per (reference, x_0) pair
+        # (scripts/precompute_global.py), so 25 references is 25 task groups and
+        # 625 would be 625. 0 = one reference per slot, the old behaviour.
+        self.ref_groups = int(env_config.get("ref_groups", 0) or 0)
+        if self.ref_groups:
+            if not self.fix_ref_trajectories:
+                raise ValueError(
+                    "ref_groups requires fix_ref_trajectories=true: grouping "
+                    "slots onto shared references is meaningless if the "
+                    "references are redrawn every episode.")
+            if self.num_envs >= self.ref_groups and self.num_envs % self.ref_groups:
+                raise ValueError(
+                    f"num_envs={self.num_envs} is not a multiple of "
+                    f"ref_groups={self.ref_groups}; the groups would be uneven "
+                    f"and the per-reference V* would weight them unequally.")
+            self._group_of = (torch.arange(self.num_envs, device=self.device)
+                              % self.ref_groups)
+            self._group_xref = torch.zeros(
+                (self.ref_groups, *self.xref.shape[1:]), device=self.device)
+            self._group_uref = torch.zeros(
+                (self.ref_groups, *self.uref.shape[1:]), device=self.device)
+            self._group_minted = torch.zeros(self.ref_groups, dtype=torch.bool,
+                                             device=self.device)
+
         # How many episodes one reference integration serves. See
         # _pooled_system_reset: system_reset's cost is a loop over the episode's
         # max_episode_len timesteps that is vectorized over the batch, so drawing
@@ -272,7 +312,9 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         # skrl still threads `states` through, so leave it explicitly unset.
         self.state_space = None
 
+        self._constructing = True
         self.reset()
+        self._constructing = False
 
         # Markov check (see RefWindow.check_markov): the reward is Markov by
         # construction, but the value is only Markov if the window spans the
@@ -314,10 +356,101 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         """
         self.fix_ref_trajectories = bool(flag)
         self._ref_fixed[:] = False
+        if self.ref_groups:
+            self._group_minted[:] = False
+        n = self.ref_groups or self.num_envs
         print(f"[BaseEnv] fix_ref_trajectories={self.fix_ref_trajectories} "
-              f"({self.num_envs} fixed reference trajectories)"
+              f"({n} fixed reference trajectories"
+              + (f", {self.num_envs // n} envs each)" if self.ref_groups else ")")
               if self.fix_ref_trajectories else
               "[BaseEnv] fix_ref_trajectories=False (resampled every episode)")
+
+    def full_ref_length(self, offset: int = 1) -> int:
+        """The reference-window length that spans the whole episode.
+
+        train.py's default, and anything that must build the SAME env offline --
+        scripts/precompute_vstar.py in particular. Sizing the window changes
+        ``ref_gen_len`` and so the shape of the stored reference, so a solver that
+        picked its own length produced a pack the trainer could not install
+        (100 vs 199) -- and, had the shapes happened to agree, would have solved a
+        different horizon in silence.
+        """
+        return int(self.max_episode_len) // max(int(offset), 1)
+
+    def set_group_references(self, xref, uref, x0=None) -> None:
+        """Install a FIXED reference set from disk instead of minting one.
+
+        Seeds are not a reference set. The offline V* solve and the run that is
+        measured against it are separate processes, built at different times and
+        often at different num_envs, so "same seed" is not an argument that they
+        drew the same trajectories -- and if they did not, the reported gap is
+        between a policy and the optimum of a different problem. Shipping the
+        trajectories as an artifact (scripts/precompute_vstar.py writes them next
+        to V*) removes the question.
+        """
+        xref = torch.as_tensor(xref, dtype=torch.float32, device=self.device)
+        uref = torch.as_tensor(uref, dtype=torch.float32, device=self.device)
+        if xref.shape[1:] != self.xref.shape[1:] or uref.shape[1:] != self.uref.shape[1:]:
+            raise ValueError(
+                f"reference pack shape {tuple(xref.shape)}/{tuple(uref.shape)} does "
+                f"not fit this env's {tuple(self.xref.shape[1:])}/"
+                f"{tuple(self.uref.shape[1:])} per-episode layout. A pack built at a "
+                f"different dt or time_bound describes a different problem.")
+        self.fix_ref_trajectories = True
+        self.ref_groups = int(xref.shape[0])
+        self._group_of = (torch.arange(self.num_envs, device=self.device)
+                          % self.ref_groups)
+        self._group_xref = xref.clone()
+        self._group_uref = uref.clone()
+        self._group_minted = torch.ones(self.ref_groups, dtype=torch.bool,
+                                        device=self.device)
+        self._ref_fixed[:] = False
+        self._ref_pool = None
+        self.reset()
+        if x0 is not None:
+            # The global optimum is solved per (reference, INITIAL STATE) pair --
+            # unlike the V* grid, which covered every x at once, a trajectory
+            # optimum is a statement about one start. Installing the reference
+            # and re-drawing x_0 would compare the policy against the optimum of
+            # a task it was never given. One start per ENV SLOT, not per group:
+            # the toy benchmark is one reference shared by num_envs distinct
+            # initial conditions, so the slot -- not the group -- is the task.
+            x0 = torch.as_tensor(x0, dtype=torch.float32, device=self.device)
+            if x0.shape != (self.num_envs, self.num_dim_x):
+                raise ValueError(
+                    f"x0 pack is {tuple(x0.shape)}, expected "
+                    f"({self.num_envs}, {self.num_dim_x}) -- one start per env slot.")
+            self._fixed_x0[:] = x0
+            self.x_t[:] = self._fixed_x0
+            self.time_steps[:] = 0
+            if getattr(self, "ccm_gen", None) is not None:
+                with torch.no_grad():
+                    self.M[:] = self._metric_from_cmg(self.x_t)
+            e0 = self.wrap_angles(self.x_t - self.xref[:, 0])
+            self.init_tracking_error[:] = torch.norm(e0, p=2, dim=-1) ** 2
+        print(f"[BaseEnv] installed {self.ref_groups} reference trajectories from a "
+              f"pack ({self.num_envs} envs, {self.num_envs / self.ref_groups:.4g} each"
+              + (", initial states pinned)" if x0 is not None else ")"))
+
+    def group_references(self):
+        """The ``ref_groups`` distinct (xref, uref) trajectories, minted.
+
+        This is what the offline V* solve consumes: it must see EXACTLY the
+        trajectories the env will replay, not a fresh draw with the same seed --
+        a re-draw would silently solve a different problem and the reported gap
+        would not be a gap.
+        """
+        if not self.ref_groups:
+            raise RuntimeError(
+                "group_references() needs ref_groups > 0; without it every env "
+                "slot has its own reference and there is no shared set to solve.")
+        if not bool(self._group_minted.all()):
+            self.reset()
+        if not bool(self._group_minted.all()):
+            raise RuntimeError(
+                f"only {int(self._group_minted.sum())}/{self.ref_groups} groups "
+                f"minted after a reset; num_envs must cover every group.")
+        return self._group_xref.clone(), self._group_uref.clone()
 
     def get_reference_trajectory(self) -> torch.Tensor:
         """whole reference path per env: ``(num_envs, max_episode_len, x_dim)``.
@@ -424,14 +557,146 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         """
         target = 0.5 * (self.XREF_INIT_FAST_MIN + self.XREF_INIT_FAST_MAX)
         start_c = 0.5 * (self.XREF_INIT_MIN + self.XREF_INIT_MAX)
-        # only the dims the fast band actually moves
-        active = (target - start_c).abs() > 1e-9
+        # Which dims the migration is responsible for.
+        #
+        # "the dims the fast band MOVES" alone is not enough. Righting an inverted
+        # pendulum means driving its base, so pitch cannot migrate without pos_x
+        # and vel_x_b moving too -- and with those two unregulated they never come
+        # back: measured on segway, pitch arrived at +0.006 (98.7% of the way) while
+        # pos_x ran to +5.000, the box edge exactly, and 90.7% of reference steps
+        # were rewritten by the X-box clamp. The pitch migration was correct and
+        # the trajectory was still not a trajectory.
+        #
+        # The band itself says which dims are targets: a dim whose fast band is a
+        # single POINT is being pinned to that value, whereas a WIDE band is a
+        # region the reference is free to roam. So regulate every pinned dim, and
+        # migrate the ones that are also pinned somewhere new. No threshold needed
+        # and no new config key: car_v1's position/yaw bands are wide (inherited
+        # from the car's own xref_init), so its path stays free and only velocity
+        # migrates, exactly as before.
+        pinned = (self.XREF_INIT_FAST_MAX - self.XREF_INIT_FAST_MIN).abs() <= 1e-9
+        active = ((target - start_c).abs() > 1e-9) | pinned
         err = torch.where(active, target - xref_t, torch.zeros_like(xref_t))
         with torch.no_grad():
-            _, B, _ = self.get_f_and_B(xref_t, need_null=False)
+            f, B, _ = self.get_f_and_B(xref_t, need_null=False)
+            b_row = B.abs().amax(dim=2).amax(dim=0)
+            if bool((active & (b_row <= 1e-9)).any()):
+                # The band asks for a dim outside range(B). Two decoupled cascades
+                # cannot do this: righting a pendulum needs the base to move, so
+                # pos_x and pitch are BOTH targets while the plant has ONE input,
+                # and independent loops just fight. Measured: pitch arrived (99.3%)
+                # while pos_x sat on the +5.000 wall with 98.0% of steps clamped.
+                # One full-state gain resolves the coupling by construction.
+                return self._lqr_migrate(xref_t, target, active)
+            # every active dim is in range(B) here — the branch above took the rest
+            # -f cancels the drift, so the command is "hold where you are, THEN
+            # move toward the target" rather than "add a nudge to whatever the
+            # plant was already doing". Without it a tilted reference simply
+            # free-falls and the migration is indistinguishable from gravity:
+            # measured on segway, the reference ran from pitch 0.452 to 0.900,
+            # which is X_MAX exactly, with 99.1% of steps modified by the X-box
+            # clamp -- and on cartpole it fell THROUGH upright (0.404 -> -0.046,
+            # "111% of the required travel") which reads as success and is not.
+            # With the drift cancelled, u = pinv(B)(k*e - f) makes the reference
+            # HOLD its tilt when e = 0, which is the only way "start slow, end
+            # fast" is a trajectory rather than a fall.
+            #
+            # Safe to do here because only `aircraft` adds drift_trim_uref inside
+            # its own sample_reference_controls, and it declares no fast band; for
+            # car/car_v1, f has no component in range(B) so this term is zero.
             u = torch.bmm(torch.linalg.pinv(B),
-                          (self.migrate_gain * err).unsqueeze(-1)).squeeze(-1)
+                          (self.migrate_gain * err - f).unsqueeze(-1)).squeeze(-1)
         return torch.clamp(u, self.UREF_MIN, self.UREF_MAX)
+
+    def local_lambda(self, x: torch.Tensor) -> torch.Tensor:
+        """lam(x) under the injected CMG: the rate the certificate actually claims.
+
+        -0.5 * largest generalized eigenvalue of (Acl'M + M Acl, M) with
+        Acl = A - B(1/r)B'M. Same quantity as scripts/find_x_init.local_rates,
+        batched in torch so the reference generator can use it.
+        """
+        if getattr(self, "ccm_gen", None) is None:
+            raise RuntimeError(
+                "[BaseEnv] local_lambda needs a CMG. Call set_ccm() first "
+                "(C2RL does). Returning a rate without a metric would be a "
+                "number about nothing.")
+        A = self._drift_jacobian(x)
+        with torch.no_grad():
+            _, B, _ = self.get_f_and_B(x, need_null=False)
+            M = self._metric_from_cmg(x)
+        K = (1.0 / self._migrate_r) * torch.bmm(B.transpose(1, 2), M)
+        Acl = A - torch.bmm(B, K)
+        S = torch.bmm(Acl.transpose(1, 2), M) + torch.bmm(M, Acl)
+        S = 0.5 * (S + S.transpose(1, 2))
+        # generalized (S, M) -> standard via Cholesky, so eigh applies
+        L = torch.linalg.cholesky(M)
+        Li = torch.linalg.solve_triangular(
+            L, torch.eye(M.shape[-1], device=M.device).expand_as(M), upper=False)
+        C = torch.bmm(torch.bmm(Li, S), Li.transpose(1, 2))
+        return -0.5 * torch.linalg.eigvalsh(0.5 * (C + C.transpose(1, 2)))[:, -1]
+
+    def _lqr_migrate(self, xref_t: torch.Tensor, target: torch.Tensor,
+                     active: torch.Tensor) -> torch.Tensor:
+        """Migration for an UNDERACTUATED band: one LQR gain, not per-dim loops.
+
+        ``pinv(B) @ e`` serves only directions in range(B), and on segway/cartpole
+        the rate-setting coordinate (pitch) is not one -- B's nonzero rows are
+        (vel_x_b, pitch_rate) only, so the old law returned bit-exact zero and
+        reference_mode="contractive" changed literally nothing.
+
+        Routing pitch through pitch_rate fixes that dim but breaks the trajectory:
+        the base has to travel for the body to come up, and with pos_x regulated by
+        a second, independent loop through the SAME single input the two fight
+        (measured: 98.0% of reference steps rewritten by the X-box clamp). A plant
+        with one actuator and two things to regulate needs one gain that trades
+        them off, which is what LQR is.
+
+        Linearised once at the target and cached: the target is a fixed point of
+        the band, the gain does not depend on xref, and re-solving an ARE every
+        reference step would dominate reset(). ``Q`` weights only the dims the band
+        actually constrains, so a wide band (car_v1's position/yaw) stays free.
+        """
+        key = tuple(target.tolist())
+        if getattr(self, "_migrate_K_key", None) != key:
+            import numpy as np  # noqa: PLC0415
+            import scipy.linalg as sla  # noqa: PLC0415
+            xt = target.unsqueeze(0)
+            A = self._drift_jacobian(xt)[0].cpu().numpy().astype(np.float64)
+            with torch.no_grad():
+                f0, B0, _ = self.get_f_and_B(xt, need_null=False)
+            Bn = B0[0].cpu().numpy().astype(np.float64)
+            Q = np.diag(active.cpu().numpy().astype(np.float64) + 1e-6)
+            R = np.eye(Bn.shape[1])
+            try:
+                P = sla.solve_continuous_are(A, Bn, Q, R)
+            except Exception as exc:                        # noqa: BLE001
+                raise ValueError(
+                    f"[BaseEnv] no stabilising migration gain at the fast band "
+                    f"centre {key}: the linearisation there is not stabilisable "
+                    f"with this actuator, so no reference can be steered to it. "
+                    f"Pick a reachable band. ({exc})") from exc
+            self._migrate_K = torch.as_tensor(
+                np.linalg.solve(R, Bn.T @ P), dtype=torch.float32,
+                device=self.device)
+            # uref that HOLDS the target; zero for an equilibrium band like upright
+            self._migrate_u0 = torch.linalg.lstsq(
+                B0[0], -f0[0].unsqueeze(-1)).solution.squeeze(-1)
+            self._migrate_K_key = key
+        e = self.wrap_angles(xref_t - target)
+        u = self._migrate_u0 - (self.migrate_gain * e) @ self._migrate_K.T
+        return torch.clamp(u, self.UREF_MIN, self.UREF_MAX)
+
+    def _drift_jacobian(self, x: torch.Tensor) -> torch.Tensor:
+        """d f / d x, batched, via autograd on get_f_and_B's drift."""
+        xg = x.detach().clone().requires_grad_(True)
+        with torch.enable_grad():
+            f, _, _ = self.get_f_and_B(xg, need_null=False)
+            rows = []
+            for i in range(f.shape[1]):
+                g = torch.autograd.grad(f[:, i].sum(), xg, retain_graph=True,
+                                        create_graph=False)[0]
+                rows.append(g)
+        return torch.stack(rows, dim=1).detach()
 
     def ref_clamp_summary(self, *, reset: bool = False) -> dict[str, float]:
         """Fraction of synthesized reference steps the X-box clamp modified, per
@@ -473,7 +738,11 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
             uref_t = self.sample_reference_controls(
                 freqs, weights, _t, {"xref_0": xref_0, "xref_t": xref_list[-1]})
             if self.reference_mode == "contractive":
-                uref_t = uref_t + self._migrate_uref(xref_list[-1])
+                # Both terms are clamped, their SUM was not -- the stored uref
+                # ran to -3.79 on a +-3 box, i.e. outside the envelope every
+                # certificate and every u = uref + feedback controller assumes.
+                uref_t = torch.clamp(uref_t + self._migrate_uref(xref_list[-1]),
+                                     self.UREF_MIN, self.UREF_MAX)
             xref_prev = xref_list[-1]
             f_x, B_x, _ = self.get_f_and_B(xref_prev, need_null=False)
             x_dot = f_x + torch.bmm(B_x, uref_t.unsqueeze(-1)).squeeze(-1)
@@ -504,9 +773,9 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
     def _metric_from_cmg(self, x):
         """M(x) from the CMG, inverting only when the head emits W.
 
-        cmg_method="cvstem" builds the CMG with outputs_metric=True, so its
+        C2RL builds the CMG with outputs_metric=True, so its
         forward already returns M and this is a pass-through — which removes a
-        batched SPD inverse from every env step. cmg_method="ccm" emits W (its
+        batched SPD inverse from every env step. C3M's CMG emits W (its
         C1/C2 losses are written in W), so M = W^-1 is formed here.
         """
         from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
@@ -805,8 +1074,56 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
             fresh = ~self._ref_fixed[env_ids]
             if bool(fresh.any()):
                 new_ids = env_ids[fresh]
-                self._fixed_xref[new_ids] = xref_arr[fresh]
-                self._fixed_uref[new_ids] = uref_arr[fresh]
+                if self.ref_groups:
+                    # One reference per GROUP: the first slot of a group to reset
+                    # mints it, the rest copy it. x_0 stays per slot, so the
+                    # group is num_envs/ref_groups starts on one trajectory.
+                    g = self._group_of[new_ids]
+                    unminted = ~self._group_minted[g]
+                    if bool(unminted.any()):
+                        # ONE source slot per group, chosen deterministically.
+                        # `g[unminted]` repeats each group num_envs/ref_groups
+                        # times, and assigning through a repeated index is
+                        # last-write-wins with no guaranteed winner -- so the
+                        # xref scatter and the uref scatter could resolve to
+                        # DIFFERENT slots and the group kept one trajectory's
+                        # states beside another's controls. That pair is not a
+                        # trajectory of the plant, so u = uref + feedback chases
+                        # a motion no control can produce and every slot in the
+                        # group settles at the same nonzero error. Measured on
+                        # toy-mg: the stored pair missed its own dynamics by up
+                        # to 1.05 per step on 24 of 25 references.
+                        cand = unminted.nonzero().flatten()
+                        pick = torch.full((self.ref_groups,), cand.numel(),
+                                          dtype=torch.long, device=self.device)
+                        pick.scatter_reduce_(0, g[cand], cand, reduce="amin",
+                                             include_self=True)
+                        sel = pick[pick < cand.numel()]
+                        gi = g[sel]
+                        self._group_xref[gi] = xref_arr[fresh][sel]
+                        self._group_uref[gi] = uref_arr[fresh][sel]
+                        self._group_minted[gi] = True
+                    self._fixed_xref[new_ids] = self._group_xref[g]
+                    self._fixed_uref[new_ids] = self._group_uref[g]
+                    if self.X_INIT_MIN is None:
+                        # x_0 came back as xref_0 + xe_0 against this slot's OWN
+                        # xref_0, which the line above just threw away for the
+                        # group's. Carry the ERROR across, not the state, or
+                        # e(0) becomes the difference of two independent
+                        # XREF_INIT draws plus xe_0. Measured on toy-mg: 67% of
+                        # the 625 slots started outside the XE_INIT box, |e(0)|
+                        # up to 1.080 against a design max of 0.354 -- those are
+                        # the episodes that looked like the policy failing.
+                        # Skipped when X_INIT_MIN is set: there x_0 is the
+                        # primary object drawn from a certified spawn box and
+                        # e(0) is the consequence, so re-anchoring would move
+                        # the start out of the box the box exists to pin.
+                        xe = x_0[fresh] - xref_arr[fresh][:, 0]
+                        x_0[fresh] = torch.clamp(self._group_xref[g][:, 0] + xe,
+                                                 self.X_MIN, self.X_MAX)
+                else:
+                    self._fixed_xref[new_ids] = xref_arr[fresh]
+                    self._fixed_uref[new_ids] = uref_arr[fresh]
                 self._fixed_x0[new_ids] = x_0[fresh]
                 self._ref_fixed[new_ids] = True
             xref_arr = self._fixed_xref[env_ids]
@@ -1028,6 +1345,17 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         self._size_reference_buffers()
         self._fixed_xref = torch.zeros_like(self.xref)
         self._fixed_uref = torch.zeros_like(self.uref)
+        # The GROUP buffers are sized from xref too, and were allocated in
+        # __init__ at the pre-resize length. Left stale they silently keep the
+        # old horizon: group_references() then hands back a 100-step reference
+        # for a 199-step buffer, which the offline V* solve happily solves and
+        # the trainer then refuses to install.
+        if getattr(self, "ref_groups", 0):
+            self._group_xref = torch.zeros((self.ref_groups, *self.xref.shape[1:]),
+                                           device=self.device)
+            self._group_uref = torch.zeros((self.ref_groups, *self.uref.shape[1:]),
+                                           device=self.device)
+            self._group_minted[:] = False
         if hasattr(self, "_ref_fixed"):
             self._ref_fixed[:] = False
         self._ref_pool = None

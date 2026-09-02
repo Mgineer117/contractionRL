@@ -78,7 +78,7 @@ def _make_env(env_name: str, n_traj: int, ref_mode: str, migrate_gain: float):
     Set post-construction because ``reference_mode`` is read by
     ``_rollout_reference`` at reset() time, not baked in at __init__. Matters for
     car/car_v1: their ``sample_reference_controls`` only drives the STEERING
-    channel, so in "arbitrary" mode the reference velocity is frozen at its draw
+    channel, so in "stabilizing" mode the reference velocity is frozen at its draw
     for the whole episode and the reference can never leave the low-rate region.
     The migration term is the only thing that moves it."""
     import gymnasium as gym
@@ -98,13 +98,110 @@ def _make_env(env_name: str, n_traj: int, ref_mode: str, migrate_gain: float):
     return env
 
 
+def _attach_cmg(env, env_name: str) -> None:
+    """Put the SHIPPED metric on the env, so ``local_lambda`` has one.
+
+    The grid in the npz comes from the SDP directly and never touches the env.
+    """
+    from contractionRL import cm_data
+
+    try:
+        cm_data.attach_cmg(env, env_name, tag=f"[minproj:{env_name}]")
+    except FileNotFoundError as e:
+        raise SystemExit(f"{env_name}: needs a CM dataset.\n{e}") from e
+
+
+def _ceiling_grid(env, kw, dims, gx, gy, other, actuator_ok, grid):
+    """The ORIGINAL estimator: re-solve a single-state SDP per cell and take the
+    largest gated lam. Answers "how fast could you contract here if you designed a
+    metric for this state alone" -- a ceiling, not the shipped controller's rate.
+
+    Kept behind --estimator ceiling because that ceiling is a legitimate question,
+    but it is not the one this figure is captioned with, and it carries the
+    actuator gate's frame dependence into the value (see _certified_grid).
+    """
+    from lambda_subsets import jacobians, max_lambda  # noqa: PLC0415
+    Z = np.empty((grid, grid), dtype=np.float64)
+    for i, xv in enumerate(gx):
+        for j, yv in enumerate(gy):
+            pts = other.copy()
+            pts[:, dims[0]] = xv
+            pts[:, dims[1]] = yv
+            A, B = jacobians(env, pts.astype(np.float32))
+            # min over the projected dims: each sample alone is one certificate,
+            # and the slice inherits the worst of them.
+            lams = [max_lambda(A[k:k + 1], B[k:k + 1], kw, gate=actuator_ok)[0]
+                    for k in range(len(pts))]
+            Z[j, i] = float(np.min(lams))
+        print(f"[minproj]   column {i + 1}/{grid} done", flush=True)
+    return Z
+
+
+def _certified_grid(env, cfg, dims, gx, gy, other):
+    """lam(x) of the CERTIFIED metric -- the quantity the certificate is about.
+
+    The "ceiling" estimator this replaces re-solves a SEPARATE single-state SDP at
+    every cell, so it answers "how fast COULD you contract here if you designed a
+    metric just for this state". That is a real question but it is not the one the
+    figure is captioned with: the deployed controller carries ONE certified metric
+    field W(x), and the state-dependence a reader cares about is that field's rate.
+
+    Three things follow from using the right object, all of them measured:
+
+    * It is EXACT along the plant's symmetries. lam is a generalized eigenvalue of
+      (Acl'M + M Acl, M), so a congruence x -> T x with T'MT the transported metric
+      leaves it unchanged. On the car's yaw axis the ceiling estimator reported
+      1.0398x spread; this reports 1.000000x, which is what a yaw-invariant plant
+      must give. Nothing has to be denoised for that to hold.
+    * It has no actuator gate in it, so it cannot inherit the gate's frame bug --
+      the gate draws e from XE_INIT, a fixed WORLD-frame box, while K(x) rotates
+      with the state, and a box is not rotation-invariant. Measured systematic
+      ripple 3.3 sd at 200k draws, which no sample count removes. The actuator
+      question is still worth asking; it belongs on top as a mask, not multiplied
+      into the value.
+    * ONE SDP instead of ~54000. The grid points are variables of the same program,
+      so no cell gets a nearest-neighbour W substituted for its own.
+    """
+    sys.path.insert(0, str(REPO / "scripts"))
+    from contractionRL.agents.skrl.ncm_synthesis import (  # noqa: I001, PLC0415
+        cvstem_joint,
+        drift_jacobians,
+    )
+    from find_x_init import local_rates  # noqa: E402, PLC0415
+
+    pts = []
+    for xv in gx:
+        for yv in gy:
+            q = other.copy()
+            q[:, dims[0]] = xv
+            q[:, dims[1]] = yv
+            pts.append(q)
+    pts = np.concatenate(pts, axis=0)                     # (grid*grid*n_other, x_dim)
+    print(f"[minproj] certified metric: ONE joint SDP over {len(pts)} states "
+          f"(lbd={cfg['lbd']}, r={cfg['r']}, eps={cfg['cm_eps']})", flush=True)
+    A, B = drift_jacobians(env.get_f_and_B, pts.astype(np.float32))
+    sol = cvstem_joint(A, B, lbd=cfg["lbd"], eps=cfg["cm_eps"], dt=1.0,
+                       solver="MOSEK", r_scaler=cfg["r"],
+                       w_lb=cfg["w_lb"], w_ub=cfg["w_ub"])
+    if sol is None:
+        raise SystemExit(
+            f"joint SDP infeasible at the env's shipped lbd={cfg['lbd']} over the "
+            f"plot grid. That is a rule.md Step 1 result about this env, not a "
+            f"plotting failure -- settle the rate before drawing it.")
+    lam = local_rates(env, pts, sol["W"], cfg["r"])
+    # Same "min over the projected-out dims" semantics the ceiling estimator uses,
+    # so the two panels are directly comparable.
+    return lam.reshape(len(gx), len(gy), -1).min(axis=2).T   # Z[j, i]
+
+
 def generate(env_name: str, *, grid: int, n_other: int, n_x0: int,
-             n_traj: int, seed: int, ref_mode: str = "arbitrary",
-             migrate_gain: float = 1.0) -> pathlib.Path:
+             n_traj: int, seed: int, ref_mode: str = "stabilizing",
+             migrate_gain: float = 1.0,
+             estimator: str = "certified") -> pathlib.Path:
     import contractionRL.tasks.direct.classic  # noqa: F401
     import torch
     from find_uniform_lambda import control_violation_rate, expand_box  # noqa: E402
-    from lambda_subsets import active_dims_auto, jacobians, max_lambda  # noqa: E402
+    from lambda_subsets import active_dims_auto  # noqa: E402
 
     env = _make_env(env_name, n_traj, ref_mode, migrate_gain)
     x_min = env.X_MIN.detach().cpu().numpy().astype(np.float64)
@@ -124,7 +221,19 @@ def generate(env_name: str, *, grid: int, n_other: int, n_x0: int,
     rng = np.random.default_rng(seed)
     # One draw of the projected-out dims, REUSED at every cell, so neighbouring
     # cells differ because of the slice coordinates and not because of the RNG.
-    other = rng.uniform(x_min, x_max, size=(n_other, x_min.size))
+    #
+    # Drawn ONLY over dims A(x)/B(x) actually depend on. Position is the case that
+    # matters: the car's f = [v cos(th), v sin(th), 0, 0] ignores x and y outright,
+    # so randomising them across the 8 projected samples cannot change lam and can
+    # only add spread to the min taken over them -- variation in a figure about
+    # the rate, sourced from coordinates the rate provably cannot see. Inactive
+    # dims are pinned at the box centre instead. active_dims_auto already keeps
+    # them off the plotted axes for the same reason; this applies the same rule to
+    # what is projected out.
+    act = set(active_dims_auto(env).tolist())
+    other = np.tile(0.5 * (x_min + x_max), (n_other, 1))
+    for d in sorted(act):
+        other[:, d] = rng.uniform(x_min[d], x_max[d], size=n_other)
 
     # The ACTUATOR gate, same one find_uniform_lambda applies. Without it lam* is
     # the rate the LMI would allow if control were free, which on the car is 4.88
@@ -142,7 +251,24 @@ def generate(env_name: str, *, grid: int, n_other: int, n_x0: int,
     uref_lo = env.UREF_MIN.detach().cpu().numpy().astype(np.float64)
     uref_hi = env.UREF_MAX.detach().cpu().numpy().astype(np.float64)
     u_lo, u_hi = expand_box(uref_lo, uref_hi, 2.0)
-    _n_draw = 64
+    # 2000, not 64. The gate is called ONE STATE AT A TIME here (max_lambda hands
+    # it W[k:k+1]), so n_draw IS the entire sample -- unlike find_uniform_lambda,
+    # which pools num_samples x n_draws = 1000 x 100 and lands at sd 0.0006.
+    #
+    # At 64 the violation fraction has sd 0.023 against a 0.05 budget that the true
+    # value (0.0350-0.0367 across every car cell) sits only 0.65 sd under, so ~26%
+    # of cells gate out on RNG alone. And because the draws are SHARED across cells,
+    # those errors are spatially correlated -- correlated noise renders as smooth
+    # contiguous blobs, which read as physics. Measured damage on the car: 17.3% of
+    # cells painted lam*=0, and the survivors split across two adjacent scan bins
+    # for an apparent 1.46x state dependence, on a plant whose rate is flat to five
+    # digits (local_rates over 2000 states: 0.44198-0.44199). 1.46x is exactly one
+    # bin of the geomspace in max_lambda -- the figure was drawing the coin flip.
+    # Quadrotor's 2.13x was the same flip two bins wide (1.4597^2).
+    #
+    # 2000 gives sd 0.0041, z = 3.65, i.e. 0.3 falsely-gated cells in a 2500-cell
+    # figure. The cost is one (2000, u_dim) matmul per solve, against a MOSEK SDP.
+    _n_draw = 2000
     _e_draws = e_pool[rng.integers(0, len(e_pool), size=(1, _n_draw))]
     _u_draws = rng.uniform(uref_lo, uref_hi, size=(1, _n_draw, uref_lo.size))
 
@@ -152,21 +278,13 @@ def generate(env_name: str, *, grid: int, n_other: int, n_x0: int,
                                       uref_draws=_u_draws,
                                       u_lo=u_lo, u_hi=u_hi) <= VIOL_FRAC
 
-    Z = np.empty((grid, grid), dtype=np.float64)
     print(f"[minproj] {env_name}: {grid}x{grid} cells, min over {n_other} "
-          f"projected samples, dims={[env.state_names[d] for d in dims]}", flush=True)
-    for i, xv in enumerate(gx):
-        for j, yv in enumerate(gy):
-            pts = other.copy()
-            pts[:, dims[0]] = xv
-            pts[:, dims[1]] = yv
-            A, B = jacobians(env, pts.astype(np.float32))
-            # min over the projected dims: each sample alone is one certificate,
-            # and the slice inherits the worst of them.
-            lams = [max_lambda(A[k:k + 1], B[k:k + 1], kw, gate=actuator_ok)[0]
-                    for k in range(len(pts))]
-            Z[j, i] = float(np.min(lams))
-        print(f"[minproj]   column {i + 1}/{grid} done", flush=True)
+          f"projected samples, dims={[env.state_names[d] for d in dims]}, "
+          f"estimator={estimator}", flush=True)
+    if estimator == "certified":
+        Z = _certified_grid(env, cfg, dims, gx, gy, other)
+    else:
+        Z = _ceiling_grid(env, kw, dims, gx, gy, other, actuator_ok, grid)
 
     # x0 from the env's OWN reset, not a uniform box draw. reset() takes
     # x_0 = clamp(xref_0, box) + xe_0, and for car_v1 xref's velocity is drawn
@@ -189,14 +307,15 @@ def generate(env_name: str, *, grid: int, n_other: int, n_x0: int,
              state_names=np.asarray(list(env.state_names)),
              x_min=x_min, x_max=x_max,
              actuator_gated=np.asarray(True), viol_frac=np.asarray(VIOL_FRAC),
-             reference_mode=np.asarray(ref_mode))
+             reference_mode=np.asarray(ref_mode),
+             cm_dataset=np.asarray(getattr(env, "_cm_dataset", "")),
+             estimator=np.asarray(estimator))
     print(f"[minproj] wrote {out}")
     return out
 
 
 def refresh_x0(env_name: str, *, n_x0: int, n_traj: int, seed: int,
-               ref_mode: str = "arbitrary",
-               migrate_gain: float = 1.0) -> pathlib.Path:
+               ref_mode: str = "stabilizing", migrate_gain: float = 1.0) -> pathlib.Path:
     """Rewrite x0/traj in the cached npz from the CURRENT env; keep Z.
 
     lambda* depends on the plant and the envelope, so a change to how episodes
@@ -220,6 +339,7 @@ def refresh_x0(env_name: str, *, n_x0: int, n_traj: int, seed: int,
     old["traj"], old["traj_ref"] = _rollout(env, n_traj)
     old["x_min"], old["x_max"] = lo, hi
     old["reference_mode"] = np.asarray(ref_mode)
+    old["cm_dataset"] = np.asarray(getattr(env, "_cm_dataset", ""))
     np.savez(src, **old)
     print(f"[minproj] refreshed x0/traj in {src}  "
           f"({out_frac:.2%} of x0 outside the box)")
@@ -240,6 +360,33 @@ def _reset_x0(env, n: int, *, seed: int = 0) -> np.ndarray:
         if k > 4000:                     # a stuck env must not spin forever
             break
     return np.concatenate(out, axis=0)[:n].astype(np.float64)
+
+
+CONST_REL_TOL = 1e-3          # 0.1% of the mean rate
+
+
+def _is_constant(Z) -> bool:
+    """Is this field constant, in a way that does not depend on its units?
+
+    The test used to be ``Z.max() - Z.min() < 1e-6``, an ABSOLUTE tolerance, and
+    it is scale-dependent by construction: a plant whose lambda is ten times
+    larger needs ten times the slack to read as equally flat. car came out at
+    max-min = 1.870e-06 against that 1e-6 -- constant to 4.2e-06 RELATIVE, i.e.
+    0.0004%, and still judged "varying", so the panel fell through to viridis with
+    matplotlib's autoscale and painted a full rainbow across a range of 1.9e-06.
+    Every fix upstream was intact and the figure still showed a state-dependent
+    rate, because the last step invented one.
+
+    0.1% of the mean is far above the numerical floor (4e-06 here) and far below
+    any real effect -- the smallest genuine state-dependence measured in this repo
+    is car_v1's 2.7x.
+    """
+    import numpy as np
+    Z = np.asarray(Z)
+    pos = Z[Z > 0]
+    if pos.size == 0:
+        return True
+    return float(pos.max() - pos.min()) <= CONST_REL_TOL * float(abs(pos.mean()))
 
 
 def _cm_cfg(env_name: str) -> dict:
@@ -363,7 +510,7 @@ def plot(env_name: str, *, n_traj: int = N_TRAJ_SHOWN,
     # a single value through the colormap put car and quadrotor at the very bottom
     # of the scale, so their panels rendered dark purple -- which reads as "low
     # lambda*" beside the varying-field panels where purple genuinely is low.
-    if float(Z.max() - Z.min()) < 1e-6:
+    if _is_constant(Z):
         mesh = ax.pcolormesh(ex, ey, np.zeros_like(Z), cmap="Greys",
                              vmin=0.0, vmax=1.0, shading="flat")
     else:
@@ -374,7 +521,7 @@ def plot(env_name: str, *, n_traj: int = N_TRAJ_SHOWN,
     # stated on the panel instead. The colorbar COLUMN is still reserved and just
     # switched off, so all five figures keep identical panel geometry and can be
     # laid side by side.
-    is_const = float(Z.max() - Z.min()) < 1e-6
+    is_const = _is_constant(Z)
     if is_const:
         cax.axis("off")
         ax.text(0.5, 0.045,
@@ -607,10 +754,15 @@ def main() -> int:
                         "(default: whichever one lambda* varies along)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--reference-mode", "--reference_mode",
-                   choices=["arbitrary", "contractive"], default="arbitrary",
+                   choices=["stabilizing", "contractive"], default="stabilizing",
                    help="contractive: the reference starts in the low-rate "
                         "region and migrates toward XREF_INIT_FAST")
     p.add_argument("--migrate-gain", "--migrate_gain", type=float, default=1.0)
+    p.add_argument("--estimator", choices=["certified", "ceiling"],
+                   default="certified",
+                   help="certified: lam(x) of the shipped metric field (exact, "
+                        "one SDP, invariant along the plant's symmetries). "
+                        "ceiling: the old per-cell re-solved max rate.")
     p.add_argument("--rate-only", "--rate_only", action="store_true",
                    help="also write rate_<env>.svg: the state-dependent "
                         "contraction rate alone, no rollouts or x0 marginal")
@@ -621,7 +773,7 @@ def main() -> int:
         if a.generate or not (DATA_DIR / f"minproj_{e}.npz").exists():
             generate(e, grid=a.grid, n_other=a.n_other, n_x0=a.n_x0,
                      n_traj=a.n_traj, seed=a.seed,
-                     ref_mode=a.reference_mode, migrate_gain=a.migrate_gain)
+                     ref_mode=a.reference_mode, migrate_gain=a.migrate_gain, estimator=a.estimator)
         elif a.refresh_x0:
             refresh_x0(e, n_x0=a.n_x0, n_traj=a.n_traj, seed=a.seed,
                        ref_mode=a.reference_mode, migrate_gain=a.migrate_gain)

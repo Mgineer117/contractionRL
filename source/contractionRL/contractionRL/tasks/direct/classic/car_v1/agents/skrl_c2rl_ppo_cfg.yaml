@@ -50,7 +50,6 @@ models:
       input: STATE_ACTION
       layers: [128, 128]
       activations: tanh
-  # Always built (see c2rl.py module docstring). cmg_method=cvstem (below):
   # trained via CV-STEM SDP regression. Always a BoundedCCM_Generator
   # regardless of constrain_eigenvalues here — the runner forces it.
   cmg:
@@ -150,7 +149,6 @@ agent:
                          # w_lb/w_ub-dependent Mahalanobis-reward scale/heavy-tail before GAE; see rl_glue.
 
   discount_factor: 0.01  # deployed policy's discount factor (single policy — no con/opt duality)
-  # NOTE: the contraction-metric / Mahalanobis-reward config (cmg_method, w_ub,
   # w_lb, lbd, tracking_scaler, control_scaler, cm_eps, cm_solver) lives in the
   # top-level `cm:` block below; the offline CMG synthesis (Phase A, always
   # runs) additionally reads `cmg:`; use_empirical_dynamics reads `empirical_dynamics:`.
@@ -167,7 +165,6 @@ agent:
 # ── Contraction metric + Mahalanobis reward ────────────────────────────────── #
 cm:
   # Metric source — how the env computes the Mahalanobis reward. "cmg": the
-  # frozen Phase-A network below (cmg_method selects how it is trained).
   # does) — impractical here at this num_envs. See c2rl.py's module docstring.
   # Mahalanobis reward + the CV-STEM envelope w_lb·I ⪯ W ⪯ w_ub·I. These are one
   # measurement with lbd/cvstem_r_scaler below, not four independent knobs — the
@@ -176,7 +173,6 @@ cm:
   # scale, so it is not reward-neutral.
   w_ub: 1000.0
   w_lb: 0.001
-  # Contraction rate λ — used by cmg_method's synthesis loss (CM SDP LMI for
   # "cvstem", CMG Cu/C1 loss for "ccm").
   # 0.0771 with cvstem_r_scaler 3.2 / w_lb 0.001 / w_ub 1000: measured 2026-08-17
   # by scripts/find_uniform_lambda.py under uniform state-box sampling — the joint
@@ -203,10 +199,8 @@ cm:
   lbd: 0.0771
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled, already 0)
-  # SDP contraction metric (cm_eps used by both cmg_method paths; cm_solver "cvstem" only)
   cm_eps: 0.01
   cm_solver: MOSEK  # cvxpy SDP solver: SCS (default, no license) | CLARABEL (no license, tighter/slower) | MOSEK (commercial license, tightest/fastest — see README.md Installation)
-  # cmg_method selects the training pipeline (see c2rl.py module docstring):
   #   "ccm"    — trains the CMG directly via C1/C2 loss minimization
   #             (train_cmg_ccm) — no SDP, so cvstem_r_scaler/
   #             are unused here.
@@ -223,7 +217,6 @@ cm:
   #              W = M⁻¹ congruence — it is what makes K above the certified gain.)
   #              Control is penalized via this Riccati term, not bounded over an
   #              action range — see ncm_synthesis.py module docstring.
-  cmg_method: cvstem
   # 3.2, not car's 1.6 — measured together with lbd: 0.0771 above, not tuned
   # separately. r is live only where the ν term in J competes; at car_v1's rate
   # it took the box violations from ~7% at r=0.1 down to 4.82% at r=3.2.

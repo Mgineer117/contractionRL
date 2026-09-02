@@ -1,0 +1,14 @@
+# latexmk build artifacts — the .tex/.bib/.cls/.sty/.bst and figures are tracked,
+# everything latexmk regenerates is not.
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.synctex*
+*.toc
+*.lof
+*.lot

@@ -731,7 +731,7 @@ class BoundedCCM_Generator(nn.Module):
     """CMG with hard eigenvalue bounds baked into the forward pass.
 
     ``outputs_metric`` selects which of the two mutually-inverse matrices the
-    forward pass produces, and it is set from ``cmg_method``:
+    forward pass produces. C2RL sets it True; C3M leaves it False:
 
       * ``cvstem`` -> ``outputs_metric=True``: the head emits ``M`` directly,
         with eigenvalues squashed into ``[1/w_ub, 1/w_lb]``. The reward needs
@@ -876,3 +876,74 @@ class BoundedCCM_Generator(nn.Module):
 # Measured worse than the post-hoc actuator filter once deployed through regressed
 # networks: 98.4% held-out violation vs 24.6%. See ncm_synthesis.py's matching note.
 # Recover with `git log -S CVSTEMBoundedLQRBase`.
+
+
+class AnalyticSOSMetric(nn.Module):
+    """M(x) = W(x)^-1 evaluated from the SOS polynomial itself.
+
+    Drop-in for ``BoundedCCM_Generator`` wherever a frozen metric is wanted, but
+    with no network and nothing fitted: ``solvers.sos_cm`` certifies W(x) as an
+    algebraic identity over the whole box, so regressing it into an MLP only adds
+    error. Measured on toy-mg: the regression's median relative error in the
+    DEPLOYED metric is 2.5%, which is not what "exact contraction metric" means,
+    and it is the same M the offline V* solve uses -- any gap between them would
+    show up as apparent suboptimality that is really a metric mismatch.
+
+    Exposes ``bounded=True`` and ``outputs_metric=True`` so ``bound_W`` is a
+    pass-through and ``BaseEnv._metric_from_cmg`` returns this forward directly.
+    Being a polynomial it is exactly differentiable in x, which ``local_lambda``
+    and the ``lambda_grad`` reference law both need.
+    """
+
+    def __init__(self, coeffs: dict, w_degree: int, x_dim: int = 2,
+                 w_lb: float = 0.0, box=None):
+        super().__init__()
+        if x_dim != 2:
+            raise ValueError(f"AnalyticSOSMetric is 2-state only, got {x_dim}; "
+                             f"sos_cm's polynomial basis is 2-variable.")
+        self.x_dim, self.w_lb = x_dim, float(w_lb)
+        self.bounded, self.outputs_metric = True, True
+
+        exps = [e for a in range(w_degree + 1) for b in range(w_degree + 1 - a)
+                for e in ((a, b),)]
+        self.register_buffer("exps", torch.tensor(exps, dtype=torch.float32))
+        c = torch.zeros(3, len(exps))
+        for k, (a, b) in enumerate(exps):
+            for j, (i0, i1) in enumerate(((0, 0), (0, 1), (1, 1))):
+                c[j, k] = float(coeffs[f"w_{i0}{i1}_{a}{b}"])
+        self.register_buffer("coef", c)
+
+        # W is PD on the box by certificate, so the closed-form 2x2 inverse below
+        # needs no runtime guard -- but only if this really is that certificate.
+        # Check once, here, rather than clamping a determinant every step and
+        # hiding a mismatched or truncated coefficient set.
+        if box is not None:
+            lo, hi = box
+            g = torch.stack(torch.meshgrid(
+                torch.linspace(float(lo[0]), float(hi[0]), 65),
+                torch.linspace(float(lo[1]), float(hi[1]), 65),
+                indexing="ij"), -1).reshape(-1, 2)
+            w00, w01, w11 = self._entries(g)
+            det = w00 * w11 - w01 ** 2
+            if float(det.min()) <= 0 or float(w00.min()) <= 0:
+                raise ValueError(
+                    f"the supplied SOS coefficients do not give a positive-"
+                    f"definite W on the box (min det {float(det.min()):.3e}, "
+                    f"min W00 {float(w00.min()):.3e}). M = W^-1 would be garbage "
+                    f"and every Mahalanobis reward with it.")
+
+    def _entries(self, x):
+        basis = (x.unsqueeze(1).abs().clamp_min(1e-30) ** self.exps.unsqueeze(0)).prod(-1)
+        # abs+clamp only guards 0**0; restore the sign the exponents imply.
+        sign = torch.where((x.unsqueeze(1) < 0) & (self.exps.unsqueeze(0) % 2 == 1),
+                           -1.0, 1.0).prod(-1)
+        basis = basis * sign
+        w = basis @ self.coef.T                              # (N, 3)
+        return w[:, 0], w[:, 1], w[:, 2]
+
+    def forward(self, x):
+        w00, w01, w11 = self._entries(x)
+        det = w00 * w11 - w01 ** 2
+        M = torch.stack([torch.stack([w11, -w01], -1),
+                         torch.stack([-w01, w00], -1)], -2) / det[:, None, None]
+        return M, None

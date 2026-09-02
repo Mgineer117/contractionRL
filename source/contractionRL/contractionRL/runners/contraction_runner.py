@@ -18,7 +18,7 @@ C3M / LQR / SDLQR / C2RL-PPO / C2RL-SAC:
     the same C2RLAgent class — the algo string just selects which
     base_algorithm (PPO or SAC) its single deployed policy is built on. C2RL
     always synthesizes an offline, frozen CMG network (Neural Contraction
-    Metric); ``cmg_method`` selects how it's trained ("ccm" C1/C2 loss
+    Metric), trained by CV-STEM SDP regression
     minimization, or "cvstem" SDP regression). See _setup_c2rl.
 
 Classic env: internally creates SyncVectorEnv + wrap_env.
@@ -844,7 +844,7 @@ class ContractionRunner:
                     cm_cfg=None, cmg_cfg=None, empirical_dynamics_cfg=None):
         """Build a single-policy C2RLAgent. Always builds a CMG network
         (MetricModel), synthesized offline before Phase B and then frozen
-        (Tsukamoto NCM) — ``cmg_method`` (yaml `cm:` block) selects how: "ccm"
+        (Tsukamoto NCM), trained by CV-STEM SDP regression
         (default) trains it directly via C1/C2 loss minimization; "cvstem" solves
         a per-state SDP and MSE-regresses the network onto the solutions. The CMG
         is always built as a ``BoundedCCM_Generator`` (``constrain_eigenvalues``
@@ -896,15 +896,17 @@ class ContractionRunner:
         cmg_net = models_cfg.get("cmg", {}).get("network", [{}])
         cmg_hd = cmg_net[0].get("layers", [256, 256]) if cmg_net else [256, 256]
         cmg_act = cmg_net[0].get("activations", "tanh") if cmg_net else "tanh"
-        # cmg_method decides which matrix the head emits: "cvstem" -> M
+        # The head emits M (never W): see outputs_metric below.
         # directly (its SDP targets invert once offline, and the reward wants
         # M, so every env step drops a batched SPD inverse); "ccm" -> W, whose
         # C1/C2 losses are written in W. See BoundedCCM_Generator.
-        _cmg_method = str(agent_cfg.get("cmg_method", "cvstem")).lower()
         cmg_model = MetricModel(
             obs_space, act_space, device, hidden_dim=cmg_hd, activation=cmg_act,
             x_dim=x_dim, angle_idx=angle_idx, sym=_cmg_symmetry(sym), constrain_eigenvalues=True, w_lb=w_lb, w_ub=w_ub,
-            outputs_metric=(_cmg_method == "cvstem"),
+            # Unconditional since 2026-08-31: cmg_method="ccm" was the only
+            # caller that wanted a W-emitting head, and it is gone. The CMG
+            # emits M directly, so no SPD inverse per env step.
+            outputs_metric=True,
         )
         models["cmg"] = cmg_model
 

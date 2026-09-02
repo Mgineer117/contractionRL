@@ -57,7 +57,6 @@ agent:
   grad_norm_clip: 1.0  # Maximum permitted magnitude for gradients (prevents exploding gradients)
   use_state_norm: false  # Off by default — see c2rl.py module docstring / rl_glue.make_base_rl_cfg
   discount_factor: 0.99  # deployed policy's discount factor (single policy — no con/opt duality)
-  # NOTE: the contraction-metric / Mahalanobis-reward config (cmg_method, w_ub,
   # w_lb, lbd, tracking_scaler, control_scaler, cm_eps, cm_solver) lives in the
   # top-level `cm:` block below; the offline CMG synthesis (Phase A, always
   # runs) additionally reads `cmg:`.
@@ -77,7 +76,6 @@ cm:
   # solve the CV-STEM SDP per env per step at the states the rollout visits
   # metric and an infeasible state aborts the run — no Phase A, no CMG
   # regression. c2rl_sac uses "online", c2rl_ppo uses "cmg"; forced to "cmg"
-  # when cmg_method is "ccm" (that pipeline has no per-state SDP).
   #
   # Cost, on Isaac far more than on the classic envs: the solve is a serial
   # per-env cvxpy loop (~7 ms/env/step measured on a 4-state classic env), so
@@ -87,10 +85,8 @@ cm:
   # Mahalanobis reward
   w_ub: 10.0  # Upper eigenvalue bound for the metric M(x)
   w_lb: 0.1   # Lower eigenvalue bound for the metric M(x)
-  lbd: 0.5    # Contraction rate λ — used by cmg_method's synthesis loss (default "ccm": CMG C1 loss)
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled)
-  # SDP contraction metric (cm_eps used by both cmg_method paths; cm_solver "cvstem" only)
   cm_eps: 0.01  # Strict-definiteness margin on the contraction LMI
   cm_solver: MOSEK  # cvxpy SDP solver: SCS (default, no license) | CLARABEL (no license, tighter/slower) | MOSEK (commercial license, tightest/fastest — see README.md Installation)
 

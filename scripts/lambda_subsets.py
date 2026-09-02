@@ -182,14 +182,39 @@ def max_lambda(A, B, kw, *, lo=0.01, hi=60.0, tol=0.005, gate=None):
         # probes the low bracket first fails there and returns 0. That is exactly
         # what it did: lam* = 0 on every cell of car and quadrotor, against a
         # shipped 0.3902 that passes the same gate at 2.7%.
-        # 24 points, geometric: enough to locate the interval's upper edge to
-        # ~15% while costing 24 solves per cell against a bisection's ~13.
+        # 24 points, geometric, to BRACKET the interval's upper edge -- then
+        # bisect inside that bracket, because the scan alone cannot resolve
+        # anything the plant does below one bin.
+        #
+        # One bin is (60/0.01)**(1/23) = 1.4597x, and the scan's output alphabet
+        # is the grid itself, so every ratio it can ever report is an integer
+        # power of 1.4597. That is not a detail: it made minproj_plot draw the
+        # quadrotor at "2.131x state-dependent" (= 1.4597**2, two bins) and the
+        # segway at the same 2.131x, on grids whose cells held THREE distinct
+        # values out of 225. A single cell flipping one bin -- from solver
+        # tolerance at the feasibility boundary, or from the actuator gate's
+        # sampling -- is rendered as a 46% swing in the certified rate.
+        #
+        # Bisecting the WHOLE range is still wrong for the reason above, and the
+        # final bracket is not: it is a known-pass / known-fail pair, so bisecting
+        # between them converges on the edge by construction. ~7 extra solves buy
+        # 46% -> 0.5% resolution.
         grid = np.geomspace(lo, hi, 24)
-        best = (0.0, None)
-        for lam in grid:
+        best, best_i = (0.0, None), -1
+        for i, lam in enumerate(grid):
             if (sol := ok(float(lam))) is not None:
-                best = (float(lam), sol)
-        return best[0], best[1], len(grid)
+                best, best_i = (float(lam), sol), i
+        n = len(grid)
+        if best[1] is not None and best_i + 1 < len(grid):
+            b_lo, b_hi = best[0], float(grid[best_i + 1])
+            while b_hi - b_lo > tol * max(b_lo, 0.05):
+                mid = 0.5 * (b_lo + b_hi)
+                n += 1
+                if (sol := ok(mid)) is not None:
+                    b_lo, best = mid, (mid, sol)
+                else:
+                    b_hi = mid
+        return best[0], best[1], n
 
     base = ok(lo)
     if base is None:

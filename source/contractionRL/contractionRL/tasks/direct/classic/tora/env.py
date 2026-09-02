@@ -100,8 +100,17 @@ UREF_MAX = [80.0]
 # lbd*(x0) median 0.7334 -> 0.4160. The sign dims are
 # mirrored by one shared sign, because the slow set is two lobes on a
 # diagonal that no single box can cover.
-X_INIT_MIN = [0.0337, -2.0, -2.1151, 0.051]
-X_INIT_MAX = [0.9566, 2.0, -1.1153, 0.2354]
+# Capped at 6% of each half-width (the margin find_x_init applies). The
+# previous values shared an edge with X on joint_vel_0 (reach 2.0 of 2.0, 0%
+# headroom) and came within 4.3% on joint_pos_0, so episodes clamped from step 0
+# and the plant stopped being f+Bu -- Rule 1, the same failure segway had.
+#
+# The box was NOT re-derived from the rate field, because it cannot be: the
+# joint CV-STEM SDP is INFEASIBLE at this config's lbd, so find_x_init exits
+# before Step 3 runs. Capping is therefore the most that can be asserted here --
+# the box is legal, not placed. Settle lbd (Step 1) and re-run find_x_init.
+X_INIT_MIN = [0.0337, -1.88, -2.1151, 0.051]
+X_INIT_MAX = [0.94, 1.88, -1.1153, 0.2354]
 X_INIT_SIGN_DIMS = [0, 2, 3]
 
 ENV_CONFIG = {

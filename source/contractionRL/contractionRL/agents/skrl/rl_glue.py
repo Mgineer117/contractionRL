@@ -50,7 +50,7 @@ def make_base_rl_cfg(
 ) -> dict:
     """Project a raw C2RL-style config dict down to a real PPO_CFG/SAC_CFG dict.
 
-    Passing C2RL/CMG-specific keys (W_lr, lbd, cmg_method, ...) to
+    Passing C2RL/CMG-specific keys (W_lr, lbd, cm_eps, ...) to
     PPO_CFG(**cfg) / SAC_CFG(**cfg) would raise TypeError, since those are
     kw_only dataclasses that reject unknown kwargs. Also rebuilds `experiment`
     as a plain dict (the raw value may be an ExperimentCfg object, which is not

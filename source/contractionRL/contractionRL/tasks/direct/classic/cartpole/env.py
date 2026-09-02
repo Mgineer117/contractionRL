@@ -56,8 +56,20 @@ XE_MAX = [lim, lim, lim, lim]
 # 0.01, 2026-08-27); at +-12 the joint SDP gives lbd=0.0771. Shrinking X to 0.75x
 # reaches the SAME lambda, so the two are equivalent here and doubling the force
 # is the smaller change to what the benchmark means.
-UREF_MIN = [-12.0]
-UREF_MAX = [12.0]
+# +-24, not +-12. Nothing certifies at +-12: the joint SDP was INFEASIBLE over
+# 10000 samples after 38 h on the cluster, and the reason is arithmetic, not the
+# solver. Holding the pitch box edge pi/3 statically needs
+# (mc+mp)*g*tan(pi/3) = 19.62*1.7321 = 33.98 N, against the 24 N the +-12 box
+# gives once env_base.py:37 doubles it -- the reference cannot be HELD at the
+# corner, so no metric certifies there at any lambda. At +-24 (applied +-48) the
+# corner fits with margin and find_uniform_lambda certifies lbd=0.3902, r=1.6,
+# verified on 3 independent draws at N=1000 (2026-08-31).
+#
+# The old comment claimed "+-12 N applied holds 0.55 rad", which is right about
+# the arithmetic (19.62*tan(0.55) = 12.03) and wrong about the box: UREF +-12 is
+# applied +-24, and 0.55 rad was never the limit that mattered -- pi/3 was.
+UREF_MIN = [-24.0]
+UREF_MAX = [24.0]
 
 # Initial state drawn directly from this box (see env_base.X_INIT_MIN),
 # placing every episode start in the plant's low-lambda region:

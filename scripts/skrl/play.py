@@ -190,19 +190,16 @@ def _rollout_stability(env, agent, *, max_steps: int) -> dict:
 
 # ── Classic route ────────────────────────────────────────────────────────── #
 
-def run_classic(args) -> list[dict]:
-    _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    _src_dir = os.path.join(_root, "source", "contractionRL")
-    if _src_dir not in sys.path:
-        sys.path.insert(0, _src_dir)
-    _classic_dir = os.path.join(_src_dir, "contractionRL", "tasks", "direct")
-    if _classic_dir not in sys.path:
-        sys.path.insert(0, _classic_dir)
-    sys.path.append(os.path.dirname(__file__))
+def build_classic_eval_runner(task, algorithm, agent_cfg, *, device, num_envs,
+                              num_envs_for_eval, ref_length=None):
+    """Env + runner for evaluating a trained CLASSIC checkpoint.
 
-    import contractionRL.tasks.direct.classic  # noqa: F401 — registers classic envs
+    Shared with scripts/policy_gap.py rather than copied into it: the
+    ref-window sizing below is subtle enough that this script once got it wrong
+    and could not load a single C2RL checkpoint (see the comment inline).
+    Returns ``(env, runner)``; the caller loads the weights and closes the env.
+    """
     import gymnasium as gym
-    import yaml
     from contractionRL.agents.skrl.contraction_metrics import StatManagerEnvWrapper
     from contractionRL.agents.skrl.runner import CLActorRunner
     from contractionRL.runners import ContractionRunner
@@ -213,6 +210,83 @@ def run_classic(args) -> list[dict]:
         _inject_angle_idx,
         _resolve_symmetry_for_env,
     )
+
+    # Eval-time config hygiene: no wandb, throwaway experiment dir, headless.
+    exp = agent_cfg["agent"].setdefault("experiment", {})
+    exp["wandb"] = False
+    exp["directory"] = os.path.abspath(os.path.join("logs", "play", "_scratch"))
+    exp["checkpoint_interval"] = 0
+    exp["write_interval"] = 0
+    agent_cfg.setdefault("trainer", {})
+    agent_cfg["trainer"]["close_environment_at_exit"] = False
+    agent_cfg["trainer"]["headless"] = True
+
+    num_envs = num_envs if num_envs is not None else _default_num_envs_classic(algorithm)
+    num_envs = max(num_envs, num_envs_for_eval)
+
+    env = gym.make(task, num_envs=num_envs, device=device)
+    # Playback is a measurement, same as train.py's evaluator — see
+    # _disarm_termination_for_eval for why a truncated horizon inverts AUC.
+    _disarm_termination_for_eval(env, "[play]")
+    # Rebuild the same reference window the checkpoint was trained with.
+    # train.py sizes it AUTO from gamma (RefWindow.length_for_horizon) unless
+    # --ref_length was given, and its evaluator mirrors the training env's
+    # window explicitly. play.py did neither, so it built a length-1 window
+    # and every AUTO-sized checkpoint failed to load with a state_dict shape
+    # mismatch (w2 18-wide in the checkpoint vs 9-wide here at gamma=0.01) —
+    # i.e. this script could not evaluate any C2RL run at all.
+    if hasattr(env.unwrapped, "configure_ref_window"):
+        from contractionRL.agents.skrl.ref_window import RefWindow as _RW
+        _gamma = float(agent_cfg["agent"].get("discount_factor", 0.99))
+        _offset = int(agent_cfg["agent"].get("ref_offset", 1) or 1)
+        _len = ref_length if ref_length else _RW.length_for_horizon(
+            _gamma, int(env.unwrapped.max_episode_len), _offset)
+        env.unwrapped.configure_ref_window(length=_len, offset=_offset, gamma=_gamma)
+    env = BatchedGymnasiumWrapper(env)
+    env = StatManagerEnvWrapper(env, num_envs_for_eval=num_envs_for_eval)
+
+    if algorithm in _CONTRACTION_ALGOS:
+        if algorithm in ("c2rl-ppo", "c2rl-sac"):
+            agent_cfg["agent"]["use_empirical_dynamics"] = False
+        runner = ContractionRunner(env, agent_cfg, task_id=task,
+                                   num_envs=num_envs, is_classic=True)
+    else:
+        # Standalone PPO/SAC: strip the norm flags train.py handles and
+        # inject angle_idx so the rebuilt models match the trained ones.
+        _a = agent_cfg["agent"]
+        _a.pop("use_state_norm", None)
+        _a.pop("use_value_norm", None)
+        for _k in ("state_preprocessor", "state_preprocessor_kwargs"):
+            _a.pop(_k, None)
+        if algorithm == "ppo":
+            _a["value_preprocessor"] = "RunningStandardScaler"
+            _a["value_preprocessor_kwargs"] = None
+        for _k in ("anneal_stddev", "anneal_log_std", "std_dev_annealing",
+                   "std_dev_annealing_kwargs"):
+            _a.pop(_k, None)
+        _angle_idx = list(getattr(env.unwrapped, "angle_idx", []) or [])
+        _inject_angle_idx(agent_cfg, _angle_idx, _resolve_symmetry_for_env(env))
+        runner = CLActorRunner(env, agent_cfg)
+    return env, runner
+
+
+def run_classic(args) -> list[dict]:
+    _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    _src_dir = os.path.join(_root, "source", "contractionRL")
+    if _src_dir not in sys.path:
+        sys.path.insert(0, _src_dir)
+    _classic_dir = os.path.join(_src_dir, "contractionRL", "tasks", "direct")
+    if _classic_dir not in sys.path:
+        sys.path.insert(0, _classic_dir)
+    sys.path.append(os.path.dirname(__file__))
+
+    # The toy (polynomial) envs ship the same skrl_*_cfg entry points and run
+    # through the same --classic path; registering only `classic` left every
+    # toy config unreachable from the trainer that is supposed to read it.
+    import contractionRL.tasks.direct.classic  # noqa: F401 — registers classic envs
+    import contractionRL.tasks.direct.toy  # noqa: F401 — registers toy-mg-v0 / toy-duff-v0
+    import gymnasium as gym
+    import yaml
 
     def _load_agent_cfg(algorithm: str) -> dict:
         entry_key = f"skrl_{algorithm.replace('-', '_')}_cfg_entry_point"
@@ -238,67 +312,13 @@ def run_classic(args) -> list[dict]:
         print(f"\n[play] === {algorithm} ===  ({ckpt})")
         agent_cfg = _load_agent_cfg(algorithm)
         agent_cfg["seed"] = args.seed if args.seed is not None else agent_cfg.get("seed", 42)
-        # Eval-time config hygiene: no wandb, throwaway experiment dir, headless.
-        exp = agent_cfg["agent"].setdefault("experiment", {})
-        exp["wandb"] = False
-        exp["directory"] = os.path.abspath(os.path.join("logs", "play", "_scratch"))
-        exp["checkpoint_interval"] = 0
-        exp["write_interval"] = 0
-        agent_cfg.setdefault("trainer", {})
-        agent_cfg["trainer"]["close_environment_at_exit"] = False
-        agent_cfg["trainer"]["headless"] = True
-
-        num_envs = args.num_envs if args.num_envs is not None else _default_num_envs_classic(algorithm)
-        num_envs = max(num_envs, args.num_envs_for_eval)
-
-        env = gym.make(args.task, num_envs=num_envs, device=device)
-        # Playback is a measurement, same as train.py's evaluator — see
-        # _disarm_termination_for_eval for why a truncated horizon inverts AUC.
-        _disarm_termination_for_eval(env, "[play]")
-        # Rebuild the same reference window the checkpoint was trained with.
-        # train.py sizes it AUTO from gamma (RefWindow.length_for_horizon) unless
-        # --ref_length was given, and its evaluator mirrors the training env's
-        # window explicitly. play.py did neither, so it built a length-1 window
-        # and every AUTO-sized checkpoint failed to load with a state_dict shape
-        # mismatch (w2 18-wide in the checkpoint vs 9-wide here at gamma=0.01) —
-        # i.e. this script could not evaluate any C2RL run at all.
-        if hasattr(env.unwrapped, "configure_ref_window"):
-            from contractionRL.agents.skrl.ref_window import RefWindow as _RW
-            _gamma = float(agent_cfg["agent"].get("discount_factor", 0.99))
-            _offset = int(agent_cfg["agent"].get("ref_offset", 1) or 1)
-            _len = args.ref_length if getattr(args, "ref_length", None) else _RW.length_for_horizon(
-                _gamma, int(env.unwrapped.max_episode_len), _offset)
-            env.unwrapped.configure_ref_window(length=_len, offset=_offset, gamma=_gamma)
-        env = BatchedGymnasiumWrapper(env)
-        env = StatManagerEnvWrapper(env, num_envs_for_eval=args.num_envs_for_eval)
-
+        env, runner = build_classic_eval_runner(
+            args.task, algorithm, agent_cfg, device=device,
+            num_envs=args.num_envs, num_envs_for_eval=args.num_envs_for_eval,
+            ref_length=getattr(args, "ref_length", None))
         try:
-            if algorithm in _CONTRACTION_ALGOS:
-                if algorithm in ("c2rl-ppo", "c2rl-sac"):
-                    agent_cfg["agent"]["use_empirical_dynamics"] = False
-                runner = ContractionRunner(env, agent_cfg, task_id=args.task,
-                                           num_envs=num_envs, is_classic=True)
-            else:
-                # Standalone PPO/SAC: strip the norm flags train.py handles and
-                # inject angle_idx so the rebuilt models match the trained ones.
-                _a = agent_cfg["agent"]
-                _a.pop("use_state_norm", None)
-                _a.pop("use_value_norm", None)
-                for _k in ("state_preprocessor", "state_preprocessor_kwargs"):
-                    _a.pop(_k, None)
-                if algorithm == "ppo":
-                    _a["value_preprocessor"] = "RunningStandardScaler"
-                    _a["value_preprocessor_kwargs"] = None
-                for _k in ("anneal_stddev", "anneal_log_std", "std_dev_annealing",
-                           "std_dev_annealing_kwargs"):
-                    _a.pop(_k, None)
-                _angle_idx = list(getattr(env.unwrapped, "angle_idx", []) or [])
-                _inject_angle_idx(agent_cfg, _angle_idx, _resolve_symmetry_for_env(env))
-                runner = CLActorRunner(env, agent_cfg)
-
             print("  loading checkpoint …")
             runner.agent.load(ckpt)
-
             max_steps = int(getattr(env, "max_episode_length", getattr(env, "max_episode_len", 1000))) + 1
             summary = _rollout_stability(env, runner.agent, max_steps=max_steps)
         finally:
@@ -307,7 +327,6 @@ def run_classic(args) -> list[dict]:
         _print_summary(algorithm, summary)
         results.append({"algorithm": algorithm, "checkpoint": ckpt, **summary})
     return results
-
 
 # ── Isaac route ──────────────────────────────────────────────────────────── #
 
@@ -331,7 +350,8 @@ def run_isaac(args, simulation_app) -> list[dict]:
     results: list[dict] = []
     for algorithm, ckpt in models:
         print(f"\n[play] === {algorithm} ===  ({ckpt})")
-        entry_key = "skrl_cfg_entry_point" if algorithm == "ppo" else f"skrl_{algorithm.replace('-', '_')}_cfg_entry_point"
+        entry_key = ("skrl_cfg_entry_point" if algorithm == "ppo"
+                     else f"skrl_{algorithm.replace('-', '_')}_cfg_entry_point")
         try:
             agent_cfg = load_cfg_from_registry(args.task, entry_key)
         except Exception as e:  # noqa: BLE001

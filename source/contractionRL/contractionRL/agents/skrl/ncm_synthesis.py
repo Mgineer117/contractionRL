@@ -3,12 +3,11 @@
 All of C2RL's offline CMG synthesis (Phase A, always run): the convex (SDP)
 machinery from Tsukamoto, Chung & Slotine, "Neural Contraction Metrics for
 Robust Estimation and Control: A Convex Optimization Approach", plus the two
-``cmg_method`` pipelines built on it:
+the CV-STEM pipeline built on it:
 
   * "cvstem": ``cvstem_joint`` solves ONE feasibility SDP over all sampled states ->
     dual metric ``W``; ``build_cm_dataset`` assembles ``{x -> W*}``;
     ``regress_cmg`` MSE-regresses the CMG onto it.
-  * "ccm" (default): ``train_cmg_ccm`` trains the CMG directly on the C1/C2
     differentiable contraction losses, bypassing the SDP entirely. Shares no
     state with any of the above.
 
@@ -98,7 +97,7 @@ def _require_cvxpy():
         import cvxpy as cp  # noqa: F401
     except ImportError as e:  # pragma: no cover - environment-dependent
         raise ImportError(
-            "C2RL's CMG synthesis (cmg_method='cvstem') needs cvxpy (with an SDP "
+            "C2RL's CMG synthesis needs cvxpy (with an SDP "
             "solver such as SCS). Install it with `pip install cvxpy`."
         ) from e
     return cp
@@ -581,16 +580,24 @@ def load_cached_cm_dataset(
         return None
     print(f"{tag} Loaded cached CM dataset ({npz['x'].shape[0]} states) from {cache_path} "
           f"— skipping the per-state SDP solve.")
-    return {
-        "x": npz["x"],
-        "W": npz["W"],
+    # SDP-config keys stay out: they are the cache KEY, already checked above,
+    # and returning them would invite a caller to re-read a setting instead of
+    # its own config. Everything else in the npz is payload and comes through --
+    # save_cm_dataset writes extras verbatim, so a whitelist here would drop them
+    # on the way back in and reintroduce exactly the bug that fixed.
+    cfg_keys = {"lbd", "w_lb", "w_ub", "eps", "solver", "num_samples", "r_scaler",
+                "chi_weight", "nu_weight", "wdot_dt", "random_ratio",
+                "wdot_trajectory", "temporal_dt", "u_bound", "rho"}
+    out = {k: npz[k] for k in npz.files if k not in cfg_keys}
+    out.update({
         "feasibility_rate": float(npz["feasibility_rate"]),
         "residual_mean": float(npz["residual_mean"]),
         "residual_max": float(npz["residual_max"]),
         # .get(...) — older caches predate the λ-backoff mechanism.
         "lambda_reduced_count": int(npz.get("lambda_reduced_count", 0)),
         "lambda_reduced_rate": float(npz.get("lambda_reduced_rate", 0.0)),
-    }
+    })
+    return out
 
 
 def save_cm_dataset(
@@ -617,10 +624,20 @@ def save_cm_dataset(
     """Persist a freshly-synthesized CM dataset (``build_cm_dataset``'s return
     value) alongside the SDP config it was solved under, so a later run with the
     same config (``load_cached_cm_dataset``) can skip the expensive per-state
-    solve entirely."""
+    solve entirely.
+
+    Keys of ``dataset`` beyond the ones named below are written through verbatim.
+    They used to be dropped in silence, which cost the SOS path its analytic
+    coefficients: ``_build_via_sos`` returned ``sos_coeffs``, the npz simply did
+    not contain them, and the only symptom was a KeyError much later in whatever
+    tried to read them back."""
+    known = {"x", "W", "feasibility_rate", "residual_mean", "residual_max",
+             "lambda_reduced_count", "lambda_reduced_rate"}
+    extra = {k: v for k, v in dataset.items() if k not in known}
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         cache_path,
+        **extra,
         x=dataset["x"],
         W=dataset["W"],
         feasibility_rate=dataset["feasibility_rate"],
@@ -641,6 +658,40 @@ def save_cm_dataset(
 # ─────────────────────────────────────────────────────────────────────────── #
 # CMG regression (for CV-STEM)
 # ─────────────────────────────────────────────────────────────────────────── #
+
+def _metric_space_error(ccm_gen, dataset, w_lb, x_dim, device):
+    """Median relative error of the DEPLOYED metric against the SDP's own.
+
+    Reported, not enforced. An earlier version raised here, on the belief that
+    regressing on W and inverting per step was destroying the certificate -- that
+    was wrong: for cvstem the head sets ``outputs_metric=True`` and the block
+    above already inverts ``W* -> M`` once, in float64, so the net is fit on M
+    directly. Measured on the real path, lambda survives (car_v1 0.0% of states
+    flipped sign, segway 3.0%); the 96% figure that motivated the guard came from
+    a test harness that used a bare W-emitting CCM_Generator instead.
+
+    Kept because the pair (cond(W*), deployed metric error) is a cheap and honest
+    thing to print -- segway runs cond 826 against car_v1's 4.0, which is exactly
+    why that float64 inversion is load-bearing.
+    """
+    import numpy as np  # noqa: I001, PLC0415
+    import torch  # noqa: PLC0415
+    from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse  # noqa: PLC0415
+
+    x = torch.as_tensor(np.asarray(dataset["x"])[:512], dtype=torch.float32,
+                        device=device)
+    W_t = np.asarray(dataset["W"])[:512].astype(np.float64)
+    with torch.no_grad():
+        raw, _ = ccm_gen(x)
+        out = bound_W(raw, w_lb, x_dim, getattr(ccm_gen, "bounded", False))
+        M_hat = (out if getattr(ccm_gen, "outputs_metric", False)
+                 else spd_inverse(out)).double().cpu().numpy()
+    M_ref = np.linalg.inv(W_t)
+    num = np.linalg.norm(M_hat - M_ref, axis=(1, 2))
+    den = np.linalg.norm(M_ref, axis=(1, 2))
+    return float(np.median(num / np.maximum(den, 1e-12))), float(
+        np.linalg.cond(W_t).mean())
+
 
 def regress_cmg(
     ccm_gen,
@@ -779,11 +830,16 @@ def regress_cmg(
         final_loss = losses[-1] if losses else float("nan")
         final_val_loss = float("nan")
     ccm_gen.eval()
+    m_err, cond_w = _metric_space_error(ccm_gen, dataset, w_lb, x_dim, device)
+    print(f"{tag} CMG regression: cond(W*) {cond_w:.1f}, median relative error in "
+          f"the DEPLOYED metric {m_err:.3%}.")
     return {
         "loss_history": losses,
         "final_loss": final_loss,
         "val_loss_history": val_losses,
         "final_val_loss": final_val_loss,
+        "metric_rel_error": m_err,
+        "cond_W": cond_w,
     }
 
 
@@ -801,207 +857,12 @@ def regress_cmg(
 # CCM neural-network synthesis (C1 + C2 losses — no per-state SDP)
 # ─────────────────────────────────────────────────────────────────────────── #
 
-def train_cmg_ccm(
-    ccm_gen,
-    get_f_and_B,
-    get_rollout,
-    *,
-    x_dim: int,
-    u_dim: int,
-    lbd: float,
-    w_lb: float,
-    w_ub: float,
-    eps: float,
-    epochs: int,
-    lr: float,
-    batch_size: int,
-    num_samples: int,
-    lr_scheduler: str = "",
-    lr_scheduler_kwargs: dict | None = None,
-    device="cpu",
-    tag: str = "[C2RL]",
-    on_epoch: Callable[[int, float, float, float], None] | None = None,
-    val_frac: float = 0.1,
-    early_stop_patience: int = 10,
-    x_samples: np.ndarray | None = None,
-    random_ratio: float = 0.0,
-    pd_loss_num_samples: int = 1024,
-    orthonormalize_bbot: bool = False,
-) -> dict:
-    """Train the CMG network directly with C1 and C2 differentiable contraction
-    losses — the Manchester CCM conditions satisfied pointwise via gradient
-    descent, **no per-state SDP solve and no MSE regression**.
-
-    This is the CCM formulation's alternative to the ``build_cm_dataset`` +
-    ``regress_cmg`` pipeline: instead of solving a convex SDP at every state
-    to get ``W*`` targets and then regressing the CMG onto them, the CMG network
-    is optimized end-to-end so its output ``W(x)`` satisfies C1 and C2.
-
-    Stopping is driven solely by the held-out validation loss (see
-    ``EarlyStopper``) — with a held-out split configured, the best-val-epoch
-    weights are restored afterward.
-    """
-    from .math_utils import (
-        b_jacobian,
-        loss_pos_matrix_random_sampling,
-        weighted_gradients,
-    )
-
-    x_np = _sample_cm_states(
-        get_rollout, num_samples=num_samples, x_dim=x_dim,
-        x_samples=x_samples, random_ratio=random_ratio, tag=tag,
-    )
-    x_all = torch.as_tensor(x_np).to(torch.float32).to(device)
-    n = x_all.shape[0]
-    print(f"{tag} CCM neural synthesis: training CMG on {n} states "
-          f"(C1+C2 losses, λ={lbd}, ε={eps}, w_lb={w_lb}, w_ub={w_ub}).")
-
-    train_idx, val_idx = train_val_split(n, val_frac, device=device)
-    n_train = train_idx.shape[0]
-    stopper = EarlyStopper(patience=early_stop_patience if val_idx.shape[0] > 0 else 0)
-
-    opt = torch.optim.Adam(ccm_gen.parameters(), lr=lr)
-    scheduler = build_lr_scheduler(opt, lr_scheduler, lr_scheduler_kwargs)
-    ccm_gen.train()
-
-    bounded = getattr(ccm_gen, "bounded", False)
-    I_xdim = torch.eye(x_dim, device=device)
-    losses: list[float] = []
-    c1_history: list[float] = []
-    c2_history: list[float] = []
-    val_losses: list[float] = []
-
-    def _ccm_loss(x_batch: torch.Tensor) -> tuple[torch.Tensor, float, float]:
-        # The whole body needs autograd (jacobian/weighted_gradients both call
-        # torch.autograd.grad internally) regardless of the caller's ambient
-        # grad mode — the validation branch below calls this from inside
-        # torch.no_grad(), where a bare `with torch.enable_grad():` around only
-        # get_f_and_B isn't enough: torch.autograd.grad() itself checks
-        # torch.is_grad_enabled() at call time, so jacobian()/weighted_gradients()
-        # calls made after that inner block closes (back under the outer
-        # no_grad) raise "does not require grad and does not have a grad_fn"
-        # even though their inputs do have a grad_fn.
-        with torch.enable_grad():
-            x = x_batch.detach().clone().requires_grad_(True)
-            bs = x.shape[0]
-
-            raw_W, _ = ccm_gen(x)
-            W = bound_W(raw_W, w_lb, x_dim, bounded)
-
-            f, B, Bbot = get_f_and_B(x)
-            f = f.to(torch.float32).to(device)
-            B = B.to(torch.float32).to(device)
-            Bbot = Bbot.to(torch.float32).to(device)
-
-            DfDx = jacobian(f, x, create_graph=False).detach()   # (bs, x, x)
-            DBDx = b_jacobian(B, x, u_dim, create_graph=False).detach()  # (bs, x, x, u)
-            f = f.detach(); B = B.detach(); Bbot = Bbot.detach()
-
-            if orthonormalize_bbot:
-                Bbot = torch.linalg.qr(Bbot).Q
-
-            DfW = weighted_gradients(W, f, x)  # (bs, x, x)
-            DfDxW = torch.matmul(DfDx, W)
-            sym_DfDxW = 0.5 * (DfDxW + DfDxW.transpose(1, 2))
-            C1_inner = -DfW + 2 * sym_DfDxW + 2 * lbd * W
-            C1 = torch.matmul(torch.matmul(Bbot.transpose(1, 2), C1_inner), Bbot)
-            nd = C1.shape[-1]
-            C1_reg = C1 + eps * torch.eye(nd, device=device)
-            c1_loss = loss_pos_matrix_random_sampling(-C1_reg, num_samples=pd_loss_num_samples)
-
-            c2_loss = torch.zeros(1, device=device)
-            for j in range(u_dim):
-                DbW = weighted_gradients(W, B[:, :, j], x)  # (bs, x, x)
-                DbDxW = torch.matmul(DBDx[:, :, :, j], W)
-                sym_DbDxW = 0.5 * (DbDxW + DbDxW.transpose(1, 2))
-                C2_inner = DbW - 2 * sym_DbDxW
-                C2 = torch.matmul(torch.matmul(Bbot.transpose(1, 2), C2_inner), Bbot)
-                c2_loss = c2_loss + (C2 ** 2).reshape(bs, -1).sum(1).mean()
-
-            if not bounded:
-                overshoot = W - w_ub * I_xdim
-                os_loss = loss_pos_matrix_random_sampling(-overshoot, num_samples=pd_loss_num_samples)
-            else:
-                os_loss = torch.zeros((), device=device)
-
-            loss = c1_loss + c2_loss + os_loss
-            return loss, float(c1_loss.item()), float(c2_loss.item())
-
-    pbar = _tqdm.tqdm(range(epochs), desc=f"{tag} CCM neural synthesis", file=sys.stdout)
-    for epoch in pbar:
-        perm = train_idx[torch.randperm(n_train, device=device)]
-        iters = max(1, n_train // batch_size)
-        total, total_c1, total_c2 = 0.0, 0.0, 0.0
-        batch_pbar = _tqdm.tqdm(
-            range(iters), desc=f"{tag} epoch {epoch + 1}/{epochs}",
-            file=sys.stdout, leave=False,
-        )
-        for b in batch_pbar:
-            idx = perm[b * batch_size : (b + 1) * batch_size]
-            loss, c1_v, c2_v = _ccm_loss(x_all[idx])
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            total += loss.item()
-            total_c1 += c1_v
-            total_c2 += c2_v
-            batch_pbar.set_postfix(loss=f"{loss.item():.4g}")
-        batch_pbar.close()
-        epoch_loss = total / iters
-        losses.append(epoch_loss)
-        c1_history.append(total_c1 / iters)
-        c2_history.append(total_c2 / iters)
-
-        if scheduler is not None:
-            scheduler.step()
-        cur_lr = opt.param_groups[0]["lr"]
-
-        postfix = {"loss": f"{epoch_loss:.4g}", "c1": f"{c1_history[-1]:.4g}",
-                   "c2": f"{c2_history[-1]:.4g}", "lr": f"{cur_lr:.3g}"}
-        stop_val = False
-        val_loss = float("nan")
-        if val_idx.shape[0] > 0:
-            ccm_gen.eval()
-            with torch.no_grad():
-                val_loss_val, _, _ = _ccm_loss(x_all[val_idx])
-                val_loss = val_loss_val.item()
-            ccm_gen.train()
-            val_losses.append(val_loss)
-            postfix["val"] = f"{val_loss:.4g}"
-            stop_val = stopper.step(val_loss, ccm_gen, epoch)
-
-        pbar.set_postfix(**postfix)
-        if on_epoch is not None:
-            on_epoch(epoch, epoch_loss, cur_lr, val_loss)
-        if stop_val:
-            print(f"{tag} CCM neural synthesis early-stopped at epoch {epoch + 1}/{epochs} "
-                  f"(best val loss {stopper.best:.4g} @ epoch {stopper.best_epoch + 1}).")
-            pbar.close()
-            break
-
-    if val_idx.shape[0] > 0:
-        stopper.restore_best(ccm_gen)
-        final_loss = losses[stopper.best_epoch]
-        final_val_loss = stopper.best
-        print(f"{tag} CCM neural synthesis: using best-val epoch {stopper.best_epoch + 1}/{len(losses)} "
-              f"(train loss {final_loss:.4g}, val loss {final_val_loss:.4g}).")
-    else:
-        final_loss = losses[-1] if losses else float("nan")
-        final_val_loss = float("nan")
-    ccm_gen.eval()
-    print(f"{tag} CCM neural synthesis: c1_loss {c1_history[0]:.4g} → {c1_history[-1]:.4g}, "
-          f"c2_loss {c2_history[0]:.4g} → {c2_history[-1]:.4g}")
-    return {
-        "loss_history": losses,
-        "c1_history": c1_history,
-        "c2_history": c2_history,
-        "final_loss": final_loss,
-        "val_loss_history": val_losses,
-        "final_val_loss": final_val_loss,
-        # The exact states the CMG was trained over — for post-training
-        # diagnostics on the same distribution (e.g. condition-number stats).
-        "x": x_np,
-    }
+# Removed 2026-08-31: train_cmg_ccm — trained the CMG directly on the C1/C2
+# contraction losses with no SDP (cmg_method="ccm"). Never used in practice,
+# and it was the only reason the CMG head could emit W instead of M; dropping
+# it makes outputs_metric unconditional and removes an SPD inverse from every
+# env step. C3M is unaffected — its own pd/c1/c2 losses live in math_utils.
+# Recover with `git log -S train_cmg_ccm -- <this file>`.
 
 
 # ─────────────────────────────────────────────────────────────────────────── #

@@ -63,5 +63,4 @@ parameters:
   agent.learning_rate:
     value: 5e-4
   # Pinned — see c2rl-ppo-cvstem.yaml for the feasibility-bar rationale.
-  cm.cmg_method:
     value: cvstem

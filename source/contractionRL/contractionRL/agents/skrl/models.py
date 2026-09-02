@@ -225,7 +225,7 @@ class MetricModel(Model):
                       device=str(device) if not isinstance(device, str) else device,
                       angle_idx=list(angle_idx or []), sym=sym)
         if kwargs.get("constrain_eigenvalues", False):
-            # outputs_metric: cmg_method="cvstem" emits M directly (its SDP
+            # outputs_metric: C2RL's CMG emits M directly (its SDP
             # targets can be inverted once offline, and the reward wants M), so
             # every env step drops a batched SPD inverse. "ccm" emits W, since
             # its C1/C2 losses are written in W and there is no dataset to

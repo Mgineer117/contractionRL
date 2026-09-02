@@ -96,7 +96,7 @@ class C3MCfg(AgentCfg):
     # columns carry factors like k₂·sinθ·k₃), so the C1_reg = C1 + ε·I margin
     # means a different thing at every state and the random-projection PD loss
     # weights each state by ‖B_null‖² — the same inconsistency
-    # ncm_synthesis.train_cmg_ccm's own orthonormalize_bbot option fixes via QR.
+    # the removed train_cmg_ccm fixed via QR (orthonormalize_bbot); see git history.
     # Off by default here (unlike there, where QR is free): C1/C2 are the
     # Training signal, so orthonormalizing
     # reweights the loss across states and shifts C3M's (seed-sensitive) training

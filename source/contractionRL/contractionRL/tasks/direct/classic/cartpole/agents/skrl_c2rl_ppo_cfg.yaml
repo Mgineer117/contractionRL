@@ -47,7 +47,6 @@ models:
       input: STATE_ACTION
       layers: [128, 128]
       activations: tanh
-  # Always built (see c2rl.py module docstring). cmg_method=cvstem (below):
   # trained via CV-STEM SDP regression. Always a BoundedCCM_Generator
   # regardless of constrain_eigenvalues here — the runner forces it.
   cmg:
@@ -131,7 +130,6 @@ agent:
 
 
   discount_factor: 0.01  # deployed policy's discount factor (single policy — no con/opt duality)
-  # NOTE: the contraction-metric / Mahalanobis-reward config (cmg_method, w_ub,
   # w_lb, lbd, tracking_scaler, control_scaler, cm_eps, cm_solver) lives in the
   # top-level `cm:` block below; the offline CMG synthesis (Phase A, always
   # runs) additionally reads `cmg:`; use_empirical_dynamics reads `empirical_dynamics:`.
@@ -148,7 +146,6 @@ agent:
 # ── Contraction metric + Mahalanobis reward ────────────────────────────────── #
 cm:
   # Metric source — how the env computes the Mahalanobis reward. "cmg": the
-  # frozen Phase-A network below (cmg_method selects how it is trained).
   # does) — impractical here at this num_envs. See c2rl.py's module docstring.
   # Mahalanobis reward
   w_ub: 1000.0
@@ -158,14 +155,12 @@ cm:
   # when >5% of generated u = uref - (1/r)B^T M e leave the 2x-expanded uref
   # box). Measured together with w_lb/w_ub above and cvstem_r_scaler below —
   # one solution of one program, not independent knobs. Pointwise feasibility measured 100%% at N=200.
-  lbd: 0.0514
+  lbd: 0.3902
               # "cvstem", CMG Cu/C1 loss for "ccm")
   tracking_scaler: 1.0  # Q: tracking-error weight
   control_scaler: 0.0   # R: control-effort weight (0 = disabled)
-  # SDP contraction metric (cm_eps used by both cmg_method paths; cm_solver "cvstem" only)
   cm_eps: 0.01
   cm_solver: MOSEK  # cvxpy SDP solver: SCS (default, no license) | CLARABEL (no license, tighter/slower) | MOSEK (commercial license, tightest/fastest — see README.md Installation)
-  # cmg_method selects the training pipeline (see c2rl.py module docstring):
   #   "ccm"    — trains the CMG directly via C1/C2 loss minimization
   #             (train_cmg_ccm) — no SDP, so cvstem_r_scaler/
   #             are unused here.
@@ -182,8 +177,7 @@ cm:
   #              W = M⁻¹ congruence — it is what makes K above the certified gain.)
   #              Control is penalized via this Riccati term, not bounded over an
   #              action range — see ncm_synthesis.py module docstring.
-  cmg_method: cvstem
-  cvstem_r_scaler: 12.8
+  cvstem_r_scaler: 1.6
   # On SDP infeasibility at a given state, retry that state alone with λ
   # halved, up to this many times, before giving up on it and dropping it from
   # the dataset — 0 disables this and reverts to dropping immediately. Warns
@@ -205,7 +199,13 @@ cm:
 cmg:
   # 10000, not 100000 — see car's config: the joint SDP costs ~N^1.95, so 100000
   # would be ~100x the ~15 h that 10000 takes and would never finish.
-  cmg_memory_size: 10000
+  # 3000, not 10000: the joint SDP over 10000 samples peaked at 18 GB RSS on a
+  # 30 GB box (measured 2026-08-31) and went to swap. 3000 fits in ~2.5 GB and
+  # solves in minutes. This key is part of the dataset cache key, so it must
+  # match the shipped npz or C2RL raises "no offline CM dataset matching this
+  # config" -- which is exactly what cartpole did until this was corrected.
+  # Raise it back to 10000 and regenerate when the machine is otherwise idle.
+  cmg_memory_size: 3000
   cmg_regress_epochs: 3000
   cmg_regress_lr: 1.0e-3
   cmg_regress_lr_scheduler: "StepLR"  # built the same way as empirical_dynamics' scheduler

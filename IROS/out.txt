@@ -1,0 +1,1323 @@
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+1
+
+State-Dependent Contraction Bounds for Reinforcement
+Learning-Based Nonlinear Control
+Anonymous Authors
+
+Abstract—While proving uniform contraction bounds is now a
+tractable convex optimization problem, analyzing state-dependent
+rates to establish tighter contraction bounds remains a longstanding challenge. In this work, we provide the conditions on
+system dynamics necessary for the existence of state-dependent
+contraction rates. We propose a theoretical reinforcement learning (RL) framework that offers a natural pathway to leverage
+higher contraction rates using its optimality. Specifically, for RL
+algorithms designed to minimize cumulative tracking errors defined by uniform-rate contraction metrics, we formally establish
+state-dependent contraction bounds that decay at the highest
+feasible contraction rate at each state.
+Index Terms—Article submission, IEEE, IEEEtran, journal,
+LATEX, paper, template, typesetting.
+
+Nested Contraction Sets
+
+𝒳3
+
+𝒳2
+
+State-Dependent Contraction Bounds
+
+𝒳1
+
+𝒳4
+
+(a)
+
+(b)
+
+Fig. 1: (a) Nested contraction sets, where each successive subset guarantees
+a higher contraction rate. (b) An illustrative error (cost) plot showing how
+state-dependent contraction takes place across the subsets in (a). It highlights
+that progressively faster contraction rates become available as the system
+transitions to state subsets where higher contraction is available.
+
+I. I NTRODUCTION
+
+T
+
+HE existence of contraction metrics [1]—Riemannian
+metrics under which any two trajectories of a dynamical
+system converge exponentially—certifies incremental exponential stability (IES). For control-affine systems, the contraction metrics are used to synthesize control laws that render the
+closed-loop systems contracting [2]. Such synthesis, however,
+is often conservative, as the contraction condition is imposed
+with a single rate that must hold uniformly across the state
+space. Thus, the resulting controller is limited when a subset
+of states allows for higher contraction rates, as it only certifies
+a much lower global rate.
+We show that reinforcement learning (RL)—minimizing the
+cumulative tracking error defined by a contraction metric—
+resolves this conservatism through its optimality. Specifically,
+we propose state-dependent contraction bounds of optimal
+policies trained by the RL algorithms and show the bounds
+decay at the highest feasible rate at that state, while the optimal
+policies were optimized using contraction metrics that certify a
+slower uniform rate. However, we note that this benefit comes
+at a cost, as it requires a larger overshoot margin.
+To establish this, we proceed in two steps. First, we characterize when a state-dependent contraction rate exists—that is,
+when the highest certifiable rate genuinely varies across the
+state space rather than remaining fixed. Second, for systems in
+this regime, we derive state-dependent contraction bounds for
+RL-optimized policies: at each state, the tracking error decays
+at the highest feasible rate for that state, even though the
+underlying metric is certified with only a uniform contraction
+rate. In the worst case, the bound reduces gracefully to that
+uniform rate.
+This manuscript is submitted for double-blind review.
+
+II. P RELIMINARIES
+A. Dynamical System and Contraction Metrics
+In this work, we consider control-affine nonlinear dynamical
+systems of the form:
+ẋ = f (x) + B(x)u,
+
+(1)
+
+where x ∈ X ⊂ Rn is the n-dimensional state, u ∈ U ⊂ Rm
+is the m-dimensional control input, f : X → Rn represents
+the drift dynamics, and B : X → Rn × Rn is the actuation
+matrix function.
+Solution trajectories of Equation (1) contract toward one
+another if there exists a uniformly bounded, positive-definite
+contraction metric M (x) satisfying mI ⪯ M (x) ⪯ m̄I for
+0 < m ≤ m < ∞, along with the following condition:
+¤
+Ṁ + M
+(A + BK) + 2λM ⪯ 0,
+
+(2)
+
+where the arguments are omitted for brevity. Here, λ > 0
+defines the contraction rate, and the hat operator denotes the
+⊤
+b
+symmetric
+Pm sum∂b(i A := A + A ). The matrix A(x, u) =
+∂f
+i=1 ui ∂x is the Jacobian of the system dynamics,
+∂x +
+c
+and K(x, t) = ∂π
+∂x represents the differential feedback gain
+of the baseline policy.
+B. Reinforcement Learning
+We formulate the nonlinear control problem as a discounted
+Markov decision process (MDP) [3], defined by the tuple
+(S, U, P, R, γ), where S and U denote the state and control
+spaces, respectively. The environment dynamics are characterized by the transition probability density P (s′ | s, u) :
+S ×U ×S → [0, ∞), while R(s, u, s′ ) : S ×U ×S → [0, Rmax ]
+represents the reward function, and γ ∈ [0, 1) is the discount
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+2
+
+factor. The value function VRπ (s) and the overall performance
+JR (π) under policy π are defined as:
+"∞
+#
+X
+π
+k
+VR (s) := Eπ
+γ R(st+k , ut+k ) | st = s ,
+(3)
+k=0
+
+JR (π) := Es0 ∼d0 [VRπ (s0 )] ,
+
+(4)
+
+where d0 denotes the initial state distribution. The deterministic optimal policy π ⋆ is then given by:
+π ⋆ := argmax JR (π).
+
+(5)
+
+and introduce a margin ε ≥ 0 that, under appropriate smoothness conditions, extends the certificate to a neighborhood
+of each sample. For a prescribed rate λ, we obtain the
+largest-margin contraction metric over E using the ConVex
+optimization-based Steady-state Tracking Error Minimization
+(CV-STEM) framework [4]:
+min
+W̄k , ν, χ
+
+c0 χ + c1 ν
+
+s.t. I ⪯ W̄k ⪯ χI,
+
+π
+
+Sk ⪯ −εI,
+ν > 0,
+
+III. S TATE -D EPENDENT C ONTRACTION A NALYSIS
+We characterize when a control-affine system admits a statedependent contraction rate and reduce this question to a single,
+checkable condition on the pair (A(x), B(x)), where A(x) :=
+∂f /∂x.
+For a contraction-feasible system, let the per-state optimal
+certified rate be defined as follows:
+
+λ∗ (x) := sup λ : P({x}) is feasible .
+(6)
+Definition 1 (Contraction-Rate Classes). The dynamics are
+uniform-rate (Class I) if λ∗ (·) is constant on X , and statedependent (Class II) if λ∗ (x1 ) ̸= λ∗ (x2 ) for some x1 , x2 ∈ X .
+The certification problem P({x}) is invariant under the
+orthogonal congruence W̄ 7→ T W̄ T ⊤ , T ∈ O(n). Hence
+λ∗ (x) depends on (A(x), B(x)) only through its orthogonalequivalence class, which yields the following test.
+
+(9)
+∀k ∈ {1, . . . , N },
+
+∀k ∈ {1, . . . , N },
+
+ν≤w
+
+−1
+
+,
+
+χ ≤ νw,
+
+(10)
+(11)
+(12)
+
+where c0 penalizes the steady-state tracking error, c1 penalizes
+the feedback gain, Ak := A(xk ), Bk := B(xk ), and
+˙ + A W̄ + W̄ A⊤ + 2λW̄ − 2ν B B ⊤ .
+Sk := W̄
+k k
+k
+k k
+k k
+k
+r
+
+(13)
+
+The set-level rate λ∗ (E) is then recovered by maximizing λ
+over the feasibility of this program, e.g., by bisection. The
+deployed metric follows by undoing the normalization W̄ =
+νW :
+M (xk ) = W (xk )−1 =
+
+Å
+
+W̄k
+ν
+
+ã−1
+
+= ν W̄k−1 .
+
+(14)
+
+Proposition 1 (Orthogonal Reduction Test). If there exist a
+map T : X → O(n) and a fixed pair (A0 , B0 ) such that
+T (x)A(x)T (x)⊤ = A0 , T (x)B(x)B(x)⊤ T (x)⊤ = B0 B0⊤
+(7)
+for all x ∈ X , then λ∗ (x) = λ∗0 for all x ∈ X , where λ∗0
+is the optimal certified rate of (A0 , B0 ); the rate is uniform.
+Consequently, a state-dependent rate can arise only when no
+such reduction exists.
+Proof Sketch. Under (7), the congruence W̄ 7→ T (x)W̄ T (x)⊤
+(with T (x)⊤ T (x) = I) maps P({x}) onto the fixed problem
+for (A0 , B0 ); orthogonal invariance of the underlying condition then gives identical feasibility at every x, so λ∗ (·) :=
+λ∗0 .
+Proposition 1 acts as a structural screen. If the pairs reduce
+to a common (A0 , B0 ), the system is uniform-rate and no perstate analysis is needed; if the reduction fails, the certified rate
+may vary over the state space.
+A. Discovery of the contraction rate
+We now describe how λ∗ (·) is computed in practice for
+the control-affine system in Equation (1), with drift Jacobian
+A(x) := ∂f /∂x. Because certifying the contraction condition
+at every point of the continuous set X is generally intractable,
+we enforce it on a finite sample
+E = {xk }N
+k=1 ⊂ X ,
+
+xk ∼ Unif(X ),
+
+(8)
+
+B. Examples of State-Dependent Contraction Rates
+We present control-affine systems where the certified contraction rate is inherently state-dependent, and identify the
+structural properties that induce this behavior. Both examples
+utilize the state vector x = (p, θ, v, ω)—representing position,
+pitch, body velocity, and pitch rate, respectively—feature a single control input, and are certified over the domain |θ| ≤ π/3.
+a) CartPole: Let mc denote the cart mass, mp the pole
+mass, l the pole length, and g the gravitational acceleration.
+Defining ∆(θ) := mc + mp sin2 θ, the system dynamics f (x)
+and input matrix B(x) are given by:
+
+v
+
+
+ω
+
+
+
+2
+
+
+m
+sin
+θ
+lω
+−
+g
+cos
+θ
+p
+,
+f (x) = 
+
+
+∆(θ)
+
+
+ mp lω 2 cos θ sin θ − (mc + mp )g sin θ 
+l ∆(θ)
+ï
+ò
+1
+cos θ ⊤
+0
+0
+B(x) =
+.
+∆(θ) l ∆(θ)
+
+
+(15)
+
+b) Segway: Utilizing the linearized-actuator model, and
+maintaining the same state ordering, the dynamics are ex-
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+3
+
+accounts for the transient overshoot caused by prioritizing
+long-term optimality and state-dependent contraction rate.
+We formally analyze the stability of the optimal policy
+defined in Equation (5) by establishing its state-dependent
+IES. Let ∥δx(t)∥2M := δx⊤ M (x)δx represent the Riemannian
+energy defined by CCMs along the geodesic joining x(t) and
+x∗ (t). We define a reward function as follows:
+Fig. 2: Certified rate λ∗ (x) over the each state subsets (grids). The CartPole
+and Segway systems exhibit varying control authority (tr(BB ⊤ )), confirming
+state-dependent optimal rates that vary by states.
+
+R(x, δx) = −∥δx∥2M ,
+
+In both systems, the pitch angle θ appears in the denominator of every non-zero entry of B(x). Physically, this indicates
+that the effective inertia perceived by the actuator changes as
+the body tilts. This structural variation is precisely what the
+following mathematical test detects.
+c) Certifying State-Dependent Contraction Rates: To
+apply Proposition 1 in practice, we evaluate the trace of
+B(x)B(x)⊤ . If a system admits an orthogonal reduction to a
+uniform rate, this trace must remain strictly constant across the
+state space X . For the CartPole (15), tr(B(x)B(x)⊤ ) varies
+monotonically by a factor of 4.9 across its domain. Similarly,
+the Segway model (16) exhibits a trace ranging from 3.368 to
+4.372. Because this invariant scalar fluctuates in both systems,
+no orthogonal reduction T (x) can exist. This mathematically
+confirms that both plants admit state-dependent contraction
+rates. Ultimately, as illustrated in Figure 2, the certified optimal
+rate λ∗ (x) varies by 0.977 for the CartPole and by 0.339 for
+the Segway.
+d) Computation of the Contraction Rate Field: To compute the localized contraction rates (Figure 2), we evaluate a
+15×15 grid over the two most active state dimensions for each
+plant using CV-STEM defined in Equations (9) to (12). The
+remaining state variables are marginalized by minimizing over
+8 samples per grid cell, ensuring the mathematically required
+worst-case certification for the bounded subset. At each cell,
+the optimal rate λ∗ is found via bisection on λ ∈ [0.01, 60]
+(to a relative tolerance of 5 × 10−3 ), selecting the highest λ
+for which the localized CV-STEM program remains feasible.
+
+We depict a notional diagram of Assumption 1 in Figure 1a.
+1) State-Dependent IES: Let π ⋆ denote the optimizer of
+Equation (5) with the reward function defined in Equation (17).
+Let Sn := Xn × Xn × U be augmented RL state space for state
+space Xn . We additionally define the state-dependent functions
+β(s) and Λ(s) used in the analysis as follows:
+®
+λN , if s ∈ SN ,
+Λ(s) :=
+(19)
+λn , if s ∈ Sn \ Sn+1 ,
+
+(17)
+
+such that the optimal policy minimizes discounted cumulative
+Riemannian energy defined by CCMs. While [5] used normalized form of Equation (17) for numerical stability, we chose
+pressed as:
+Equation (17) for analytical convenience.
+
+
+v
+Throughout the analysis, we assume the existence of a set
+ of contracting policies.
+
+ω
+
+
+2
+
+
+f (x) =  cos θ (9.8 sin θ + 11.5v) + 68.4v − 1.2 ω sin θ  , Assumption 1. Let {Xn }N
+n=1 be a collection of nested, de
+
+cos
+θ
+−
+24.7
+ creasing state subsets such that Xn+1 ⊂ Xn ⊂ X1 := X . For
+
+2
+−58.8 v cos θ − 243.5 v − sin θ (208.3 + ω cos θ)
+each n = 1, 2, . . . , N , there exists a deterministic contracting
+cos2 θ − 24.7
+
+
+policy π̂n that satisfies Equation (2) with respect to ∥δx(t)∥2M
+0
+at
+a rate λn as follows:
+
+
+0
+
+
+
+
+∥δx(tk )∥2M ≤ ∥δx(t0 )∥2M e−2λn k∆t , ∀k ∈ N, ∀δx(t0 ) ∈ Xn ,
+B(x) =  −1.8 cos θ − 10.9  .
+ cos θ − 24.7 
+(18)
+ 9.3 cos θ + 38.6 
+where
+0
+<
+λ
+<
+λ
+<
+·
+·
+·
+<
+λ
+<
+∞,
+and
+each
+X
+1
+2
+N
+n is
+cos2 θ − 24.7
+forward
+invariant
+under
+its
+respective
+contracting
+policy
+π̂n .
+(16)
+
+IV. S TATE -D EPENDENT IES FOR O PTIMAL P OLICIES
+We analyze the incremental exponential stability (IES) of
+the RL-trained optimal policy defined in Equation (5), which
+
+®
+β(s) :=
+
+(1 − γe−2λN ∆t )−1 ,
+(1 − γe−2λn ∆t )−1 ,
+
+if s ∈ SN ,
+if s ∈ Sn \ Sn+1 ,
+
+(20)
+
+for n = 1, 2, . . . , N − 1.
+Theorem 1 (State-Dependent IES). Suppose there exists a set
+of contracting policies {π̂n }N
+n as in Assumption 1. Then, the
+optimal policy π ⋆ of Equation (5) is incrementally exponentially stable at a state-dependent rate as follows:
+C(sk ) ≤ β(s0 )C(s0 )e−2λ(0,k)k∆t ,
+
+∀k ∈ N, s0 ∈ S, (21)
+
+where
+β(s) is defined in Equation (20), λ(0, k) :=
+Pk−1
+k −1 k′ =0 Λ(sk′ ), and Λ(s) is defined in Equation (19).
+Proof. See Appendix A.
+Figure 1b illustrates a notional state-dependent contraction
+bound, which permits the potentially faster contraction rates
+established in Theorem 1.
+Corollary 1 (Nominal IES). When Assumption 1 is restricted
+to a single subset (N = 1), Theorem 1 reduces to the nominal
+IES at the uniform rate λ1 . Furthermore, restricting γ → 0
+gives overshoot-free nominal contracting policy.
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+4
+
+Remark 1 (Advantages of Minimizing Error Defined by
+Contraction Metrics). An optimal policy that minimizes the
+Euclidean error (i.e., ∥δx∥2I ) does not guarantee IES under the
+framework of Theorem 1, unless the dynamics in Equation (1)
+admit I as contraction metrics.
+Proof. See Appendix B.
+Remark 2 (Comparison to IES Established in [5]). [5] does
+not account for transient overshoot when proving the IES of
+the optimal policy π ⋆ , resulting in a conservative guarantee
+where IES holds only if the discount factor is below a certain
+threshold. In contrast, Theorem 1 holds for any discount factor
+γ ∈ (0, 1) by accounting for the transient overshoot introduced
+by long-term optimality via β(s0 ).
+V. T OY P ROBLEMS
+In this section, we illustrate the theoretical results established in Theorem 1 and Remark 1 using two polynomial
+(nonlinear) dynamical systems, where the exact contraction
+metrics and corresponding (our proposed) optimal controls are
+analytically derived, by answering the following questions:
+1) Does the optimal control policy actively exploit the
+highest contraction rate satisfying Assumption 1 at each
+state?
+2) Does a high discount factor accelerate long-term convergence at the expense of a larger initial state overshoot?
+In this analysis, we scope our study to two types of
+reference trajectories per each system: (i) a reference trajectory
+generated by the stabilizing control law, and (ii) a reference
+trajectory generated by lambda ascent control law, which we
+describe in Appendix ??. With these, the analysis will be
+done with multiple initial conditions, and we will compare
+the performance of the optimal control policy with different
+discount factors γ.
+A. Polynomial Dynamical Systems
+We consider the two-dimensional state and one-dimensional
+control (n = 2, m = 1) Moore–Greitzer jet-engine model
+and the Duffing double-well oscillator —whose control-affine
+dynamics are defined as below. Moore–Greitzer jet-engine
+model.
+ẋ1 = −x2 − 32 x21 − 12 x31 ,
+(22)
+ẋ2 = 3x1 + u,
+where x1 is the mass flow and x2 is the pressure rise. The
+control input u represents the throttle setting. The control
+problem here is to stabilize the system at the origin, which
+is an unstable equilibrium of the open-loop dynamics. For the
+Moore–Greitzer model, we apply the stabilizing control law
+u∗ (x) = −x2 to generate a reference trajectory for an arbitrary
+(unstable) initial condition,
+Duffing double-well oscillator. The normalized Duffing
+oscillator, (meaning what and for what), is given by:
+ẋ1 = x2 ,
+3
+ẋ2 = −x1 + 13 x31 − 10
+x2 + u,
+
+(23)
+
+where x1 is the position and x2 is the velocity. The control
+input u represents the external force applied to the oscillator.
+
+The control problem here is to stabilize the system at the
+origin, which is an unstable equilibrium of the open-loop
+dynamics. The control problem here is to stabilize the system
+at the origin, which is an unstable equilibrium of the openloop dynamics. while for the Duffing oscillator, we utilize
+u∗ (x) = −2x1 .
+Each of systems above will be simulated in discrete time
+dt = 0.05 and H = 100 timesteps, so T = H∆t = 5 s.
+Rational behind in these numbers are to choose fine enough
+discretization to reduce the numerical integration error and
+also ensure the given tracking admits the 95% of reduction of
+initial error over the horizon.
+B. Contraction Metric Synthesis using SoS Programming
+We follow [] that solves the following optimization:
+ss
+
+(24)
+
+where . stands for . and .. stands for ...
+Intuitively, the output contraction metric is analytical expressions in terms of state x whose condition number is
+between . and .., and is exact under . criteria. Note that this
+differs from contraction metric synthesis approach CV-STEM,
+which we will use for non-polynomial nonlinear systems in
+??, and the reason is CV-STEM is sample-based and does
+not provide analytical expressions of contraction metrics but
+in sample wise to reduce any approximation and estimation
+errors.
+C. Optimal Control Synthesis using SoS Programming
+Discuss abbout Moment-SOS thing with proper citation.
+VI. C ONCLUSION
+In this paper, we proposed a theoretical condition to determine whether control-affine systems exhibit state-dependent
+contraction rates. Building on this, we established statedependent contraction bounds for optimal policies trained via
+reinforcement learning (RL) to minimize cumulative tracking
+errors. Crucially, we demonstrated that through RL policy
+optimization, these bounds decay at the highest feasible contraction rate for any given state, even when the underlying
+contraction metric relies on a conservative, uniform rate. Future work will focus on rigorous empirical validation of these
+theoretical guarantees, specifically verifying that accelerated
+error decay is actively realized in regions of the state space
+that admit higher contraction rates.
+A PPENDIX A
+P ROOF OF T HEOREM 1
+We introduce the following two lemmas to prove Theorem 1.
+Lemma 1 (Sandwiched Value Function). Suppose there exists
+a set of contracting policies {π̂n }N
+n as in Assumption 1.
+Then, the cost value function for the optimal policy π ⋆ of
+Equation (5) satisfies the following inequality:
+⋆
+
+C(s) ≤ VCπ (s) ≤ β(s)C(s),
+
+(25)
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+5
+
+for all k ∈ N and st ∈ S. Setting t = 0 gives Equation (21).
+
+where β(s) is defined in Equation (20).
+Proof. The lower bound holds trivially for C ≥ 0, as the value
+function is the sum of non-negative costs. The upper bound
+follows from the optimality of π ⋆ , yielding
+C(s)
+, ∀s ∈ SN ,
+(26)
+1 − γe−2λN ∆t
+⋆
+C(s)
+VCπ (s) ≤ VCπc (s) ≤
+, ∀s ∈ Sn \ Sn+1 ,
+1 − γe−2λn ∆t
+(27)
+
+A PPENDIX B
+P ROOF OF R EMARK 1
+
+⋆
+
+VCπ (s) ≤ VCπc∗ (s) ≤
+
+where we use the convergence of a geometric series.
+Lemma 2 (Value Contraction). Suppose there exists a set of
+contracting policies {π̂n }N
+n as in Assumption 1. Let Λ(s) be
+defined as in Equation (19). Then, the cost value function for
+the optimal policy π ⋆ of Equation (5) achieves contraction at
+a running mean rate as follows:
+⋆
+
+The optimal policy minimizing Euclideanp error satisfies
+m/m, as the
+Lemma 1 with an additional slack term,
+contraction bound of policy π̂n in Euclidean space becomes:
+»
+C(sk ) ≤ m/mC(s0 )e−λk∆t , ∀k ∈ N, s0 ∈ S. (38)
+This renders Equation (31) invalid; consequently, the value
+contraction in Lemma 2 is no longer guaranteed.
+A PPENDIX C
+C OMPUTATION OF THE C ONTRACTION -R ATE F IELD
+
+⋆
+
+VCπ (sk ) ≤ VCπ (s0 )e−2λ(0,k)k∆t , ∀k ∈ N, s0 ∈ S, (28)
+Pk−1
+where λ(0, k) := k −1 k′ =0 Λ(sk′ ) is the running average
+contraction rate along the trajectory.
+⋆
+
+Proof. Suppose the cost C is nonzero, so is VCπ . Given the
+deterministic dynamics and the deterministic optimal policy,
+we begin with the Bellman optimality equation:
+⋆
+
+⋆
+
+VCπ (st ) = C(st ) + γVCπ (st+1 ),
+
+(29)
+
+We detail the procedure summarized in Section III-B and
+the conditions under which it is valid. Throughout, Q denotes
+the finite set of query states at which the field is evaluated.
+a) Two Estimators: The map x 7→ λ∗ (x) of (6) admits
+two distinct finite-sample surrogates, and they answer different
+questions:
+•
+
+which can be rearranged to isolate the contraction factor:
+Å
+ã
+⋆
+C(st )
+π⋆
+−1
+VC (st+1 ) = γ
+1 − π⋆
+VCπ (st ).
+(30)
+VC (st )
+|
+{z
+}
+ρ(st )
+
+⋆
+
+Dividing the upper bounds in Lemma 1 by VCπ (st ) > 0 yields:
+C(st )
+C(st )
+−1
+=⇒ β(st ) ≤ π⋆
+≤ 1, ∀st ∈ S.
+⋆
+VCπ (st )
+VC (st )
+(31)
+Rearranging Equation (31) and scaling by γ −1 establishes the
+following uniform bounds on ρ(st ):
+−1 
+= e−2Λ(st )∆t < 1, ∀st ∈ S,
+ρ(st ) ≤ γ −1 1 − β(st )
+(32)
+which yields the step-wise value contraction:
+1 ≤ β(st )
+
+⋆
+
+⋆
+
+VCπ (st+1 ) ≤ e−2Λ(st )∆t VCπ (st ).
+
+(33)
+
+Recursively applying the value contraction over k steps gives:
+⋆
+
+⋆
+
+VCπ (st+k ) ≤ VCπ (st )
+
+k−1
+Y
+
+e−2Λ(st+k′ )∆t
+
+(34)
+
+k′ =0
+⋆
+
+= VCπ (st )e−2λ(t,t+k)k∆t ,
+(35)
+P
+k−1
+where λ(t, t + k) := k −1 k′ =0 Λ(st+k′ ) denotes the running
+average contraction rate along the trajectory.
+Proof of Theorem 1. Applying the value sandwich inequality (see Lemma 1) to the value contraction inequality (see
+Lemma 2 gives the desired results as follows:
+⋆
+
+⋆
+
+VCπ (st+k ) ≤ VCπ (st )e−2λ(t,t+k)k∆t
+=⇒ C(st+k ) ≤ β(st )C(st )e
+
+−2λ(t,t+k)k∆t
+
+(36)
+,
+
+(37)
+
+Certified. Solve (9)–(12) once over all of Q at the
+prescribed uniform rate, then report the local rate of the
+resulting single metric field at each query state,
+
+Acl := A − 1r BB ⊤ M,
+(39)
+where λmax (·, ·) denotes the largest generalized eigenvalue and the arguments are omitted for brevity. This is
+the rate of the metric that is actually deployed.
+• Ceiling. Re-solve the program independently at each
+query state and report λ∗ ({x}) by search over λ. This
+is the rate attainable if the metric were redesigned for
+that state alone; it upper bounds the certified rate and is
+not realized by any single controller.
+
+’
+λ(x) := − 21 λmax M
+Acl , M ,
+
+Both are invariant under the orthogonal congruence of Proposition 1, hence exactly constant on uniform-rate plants. Figure 2
+reports the certified estimator. If the joint program is infeasible
+at the prescribed rate, this is a statement about the certified
+envelope of the plant and not a failure of the visualization;
+it must be reported as such rather than worked around by
+lowering λ.
+b) Marginalization: Two of the n dimensions are gridded
+and the remainder are marginalized by minimization, which
+is the worst-case certification required for a bounded subset:
+reporting an average or a single slice would claim a rate that
+does not hold on part of the cell. Only active dimensions—
+those on which A(·) and B(·) actually depend—are sampled;
+inactive dimensions, in particular the translation directions of
+X , are pinned at the box center. Randomizing an inactive
+dimension inflates the sample count without adding a single
+distinct constraint, and any spread it appears to produce is
+solver noise.
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+6
+
+c) Actuator Feasibility: A certificate is admissible only
+if the induced feedback respects U, so each cell is additionally
+screened on
+
+
+∗
+
+Prδx,u∗ u
+
+− 1r B ⊤ M δx ∈
+/U
+
+
+
+≤ η,
+
+η = 0.05,
+
+(40)
+
+estimated by Monte Carlo. The number of draws is not a free
+parameter. The gate is evaluated one state at a time, so the
+draw count is the entire sample: at 64 draws the estimator’s
+standard deviation is 0.023 against a budget of η = 0.05,
+and for a plant whose true violation rate sits 0.65σ below the
+budget this rejects 25.7% of cells at random—17.3% observed
+on the car. Because a rejected cell falls back to a lower reported
+rate, the coin flip is drawn directly into the figure as spatial
+structure. We use 2 × 103 draws per cell.
+A residual ripple in (40) survives any draw count and is
+not noise. Constructing W (ψ) = T (ψ)W0 T (ψ)⊤ from the
+exact symmetry of Proposition 1—no solver in the loop, so
+the true rate is constant by construction—still yields a violation
+rate ranging over 0.02585–0.02704, a peak-to-peak spread of
+3.3σ at 2 × 105 draws. The cause is a frame mismatch: δx is
+drawn from a fixed box in world coordinates while K(x) =
+r−1 B ⊤ M co-rotates with the state, so the gate measures the
+box, not the plant. The draw box must be expressed in the
+same frame as the gain.
+d) Resolution: Searching λ on a fixed geometric ladder
+λ ∈ [0.01, 60] of L points reports only ladder values, so
+the coarsest spread the estimator can express is one bin,
+(60/0.01)1/(L−1) . At L = 24 this equals 1.4597, and every
+spread we initially measured was an integer power of it (1.46,
+2.131, 3.110, 20.613), with as few as two distinct values
+across 225 cells: the reported state dependence was the ladder.
+Feasibility in λ is non-monotone—χ carries weight c0 , so the
+realizable set is an interval rather than a ray—which is why
+the ladder is swept rather than bisected. We therefore keep
+the sweep to bracket the interval and then bisect only between
+the last feasible ladder point and its successor, to a relative
+tolerance of 5 × 10−3 , at a cost of 24–40 solves per cell.
+e) Declaring a Field Constant: Whether a field is constant is a scale-free question and must be tested as one.
+An absolute tolerance fails: the car’s certified field spans
+1.87 × 10−6 in absolute terms, which is 4.2 × 10−6 relative to
+its mean rate of 0.442, yet exceeds a 10−6 absolute threshold
+and is then rendered on an autoscaled colormap—painting a
+plant that is uniform to six digits as a rate gradient. We declare
+a field constant when its peak-to-peak spread is at most 10−3
+of its mean, and render it at a fixed level.
+f) Verification: The uniform-rate classification of the
+car and the quadrotor is confirmed by three independent
+computations: with (40) disabled, the ceiling estimator returns
+λ∗ = 5.03358 at all 15 heading values with a spread of
+1.000000; the certified estimator spans 1.87 × 10−6 and
+2.11 × 10−7 respectively; and (39) evaluated over 2 × 103 and
+3 × 103 uniform samples of X gives a ratio of 1.0000. For
+the two state-dependent plants of Section III-B the certified
+spreads are 3.503 (Segway) and 2.217 (CartPole).
+
+A PPENDIX D
+C ERTIFICATION ON P OLYNOMIAL P LANTS :
+S UM - OF -S QUARES VS . S AMPLED CV-STEM
+Both plant families are certified against the same condition
+on the dual metric W = M −1 ,
+⊤
+S = Ẇ +AW +W A⊤ +2λW − 2ν
+r BB ⪯ 0,
+
+Ẇ =
+
+n
+X
+∂W
+
+∂xi
+(41)
+with A = ∂f /∂x. For a general nonlinear f this is imposed
+at N drawn states, which is the program of (9)–(12), repeated
+here:
+i=1
+
+min c0 χ + c1 ν
+
+(42)
+
+W̄k , ν, χ
+
+s.t. I ⪯ W̄k ⪯ χI,
+ν > 0,
+
+Sk ⪯ −εI,
+
+ν ≤ w−1 ,
+
+∀k ∈ {1, . . . , N },
+(43)
+
+χ ≤ νw,
+
+(44)
+
+Sk being (41) evaluated at xk . When f and B are polynomial
+the same condition
+can instead be certified
+P on the αwhole
+Q
+box X = i [xi , xi ]. Writing W (x) =
+|α|≤d Cα x with
+Cα ∈ Sn unknown makes S(x) a polynomial matrix, which
+is scalarized with a fresh v ∈ Rn and discharged by Putinar’s
+Positivstellensatz on the box generators gi (x) := (xi −xi )(xi −
+xi ):
+find {Cα }, {σj , τj , ρj }
+⊤
+
+s.t. − v S(x)v = σ0 +
+
+(45)
+P
+
+i σi gi ,
+
+(46)
+
+⊤
+
+P
+
+(47)
+
+⊤
+
+P
+
+v (W (x) − wI)v = τ0 +
+v (wI − W (x))v = ρ0 +
+
+i τi gi ,
+i ρi gi ,
+
+σj , τj , ρj SOS in (x, v), quadratic in v.
+
+(48)
+(49)
+
+In both programs λ multiplies the unknown metric, so each is
+a linear SDP at fixed λ and the rate follows by bisection. The
+four subsections below isolate what changes between them.
+A. Quantifier: N samples vs. the whole box
+(43) is N separate matrix inequalities and its solution is
+N unrelated matrices W̄k ; a metric field is recovered only
+afterwards, by regressing a network onto them. The certificate
+holds at the N queried states, and away from them rests on
+the regression residual, which is why the sampled estimator is
+reported together with a verification sweep. By contrast (46)
+is one polynomial identity: a single finite SDP discharges the
+uncountable family {S(x) ⪯ 0 : x ∈ X }, and its output is an
+analytic W (x), hence an M (x) = W (x)−1 that is rational in
+x and exact at every state.
+B. The derivative Ẇ : finite differences vs. exact
+˙ has
+W̄ in (43) is a table of numbers, not a function, so W̄
+k
+to be finite differenced along stored trajectories — a second
+approximation, on top of the sampling,
+P sitting inside the
+certificate. In the polynomial case Ẇ = i (∂W/∂xi )fi (x) is
+formed symbolically from the same coefficients {Cα } that are
+being solved for, so it is exact and needs no trajectory data at
+all.
+
+fi (x),
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+C. Normalization: (ν, χ) vs. certified bounds
+(43)–(44) pin the metric scale indirectly, through the normalization W̄ = νW and the variables ν, χ, because I ⪯
+W̄k ⪯ χI constrains only the sampled matrices. (47)–(48)
+bound W at every x directly, so ν and χ disappear as variables,
+w and w enter as constants, and (41) is used at ν = 1. The
+SOS program is consequently pure feasibility at each λ: there
+is no c0 χ + c1 ν objective, hence no trade-off weight to tune.
+D. Problem size and applicability
+The sampled program has O(N ) PSD blocks of size n,
+so its cost is set by the sample count and it applies to
+any f . The SOS program’s unknowns are {Cα } plus one
+Gram matrix per multiplier, and its constraints are coefficientmatching equalities, one per monomial in (x, v) — the count
+is set by the degree, not by a sample count. The restriction of
+σj , τj , ρj to degree two in v in (49) is what makes the righthand sides reproduce v ⊤ (·)v exactly, with no spurious v 0 or v 4
+terms. The price is that f and B must bepolynomial and that
+for a multiplier of
+each Gram block has side n n+⌈δ/2⌉−1
+⌈δ/2⌉
+degree δ in x, so the construction is practical for the lowdimensional polynomial plants and not for the full classic
+and Isaac families. Sampled CV-STEM is the general-purpose
+instrument; SOS is the exact one where the plant admits it.
+Because both certify (41) with the same r, w, w and sign
+convention, the rates they report are the same quantity and
+remain directly comparable.
+A PPENDIX E
+R EFERENCE T RAJECTORIES WITH A SCENDING
+C ONTRACTION R ATE
+Assumption 1 orders the subsets Xn by increasing λn , so
+exercising the state-dependent bound of Equation (21) requires
+a reference that begins in a low-rate region and migrates to a
+high-rate one. The reference is not free to be placed pointwise:
+it must satisfy (1) exactly, so the only design variable is u∗ ∈
+U in
+
+x∗t+1 = x∗t + ∆t f (x∗t ) + B(x∗t )u∗t .
+(50)
+a) Ascent by Inverse Dynamics: Differentiating the local
+rate (39) along (50) separates the two contributions,
+⊤
+λ̇ = ∇λ⊤ f + B ⊤ ∇λ u∗ ,
+(51)
+in which only the second term is actuated. Maximizing it over
+a ball gives u∗ ∝ B ⊤ ∇λ, but this alone is insufficient: the drift
+term is sign-indefinite and dominates on an unstable plant, and
+applying the ascent direction by itself drove λ from 0.1232 to
+−0.6885 on the Segway even though its ascent contribution is
+nonnegative by construction. We therefore cancel the drift by
+inverse dynamics before ascending,
+
+
+
+u∗t = ΠU B † −f (x∗t ) + k B ⊤ ∇λ(x∗t ) ,
+(52)
+| {z }
+|
+{z
+}
+drift cancellation
+
+steepest ascent
+
+with ΠU the projection onto the input box, which yields
+λ̇ ≈ k∥B ⊤ ∇λ∥2 ≥ 0 whenever the box is inactive. Using the
+pseudoinverse makes the law underactuation-safe: it realizes
+the best available projection of the requested direction, and
+
+7
+
+if ∇λ lies entirely outside range(B) then B ⊤ ∇λ = 0
+and the law reports that immediately rather than issuing a
+silent no-op. We take ∇λ by central differences with step
+h = h0 (xmax − xmin ), since (39) already contains a Jacobian
+and a generalized eigendecomposition and an analytic gradient
+would require second derivatives of f . Components of ∇λ
+pointing out of X within a margin of a face are zeroed, so the
+ascent runs along the boundary instead of through it; otherwise
+the reference leaves X and the metric is evaluated where it was
+never certified.
+b) When the Construction Applies: (52) requires two
+properties, and both must be verified before use. First, the rate
+must genuinely vary, per Appendix C. Second—and this is the
+binding condition—the low-rate region must be one in which
+a reference can dwell for a useful fraction of the horizon. The
+two are independent, and the second fails on the Segway (16)
+even though the first holds:
+• Its low-rate region is the large-|θ| set, and θ is the
+only coordinate with any rate dependence (corr(λ, |θ|) =
+−0.226).
+• Holding a tilt is a relative equilibrium: with ω = 0 and
+v free, the last two rows of f + Bu = 0 are linear in
+(v, u) and solve exactly as v ∗ ≈ −181 θ, u∗ ≈ −940 θ.
+At θ = 0.05 this demands v ∗ = −9.06 against |v| ≤ 1
+and u∗ = −56.97 against |u| ≤ 24, so only |θ| < 0.006
+is admissible.
+• Consequently the reference leaves X within 9.93, 1.74
+and 0.66 seconds of a 60-second horizon from θ0 = 0.05,
+0.30 and 0.85, always through the velocity bound and at
+a peak |u| of 6.5–9.7 of the 24 available: the binding
+constraint is X , not U. Under a greedy input maximizing
+the distance to the faces of X , the only initial condition
+that survives the full horizon sustains a mean tilt of
+0.0000, which is the maximum of λ.
+On the Segway, therefore, low rate and long dwell are mutually
+exclusive: the rate is low exactly where the plant is falling (unstable eigenvalue +2.76, e-folding time 0.36 s), and a falling
+state is not a reference. Every candidate reference initialization
+we evaluated under (52)—centered, mid-tilt, maximum tilt,
+and both (θ, ω) diagonals—pins to a face of X within a few
+seconds and λ decreases by a factor of 0.26–0.70. Where both
+properties hold, the construction behaves as designed. On the
+kinematic car restricted to a low-speed velocity box—where
+the Hautus margin min(1, v) makes the rate state-dependent,
+while the drift acts only along the translation directions, so
+u∗ = 0 holds every state of the active subspace exactly and
+dwell is never binding—the certified field spans 5.635 and
+(52) raises λ by 1.401× along the reference with the input
+box never active.
+A PPENDIX F
+R EFERENCE C ONTROLS AND C ONTRACTION M ETRICS FOR
+THE T OY P ROBLEMS
+This appendix certifies the two ingredients Section V takes
+for granted: that the reference controls u∗ stabilize their plants,
+and that the metrics used to measure the Riemannian energy
+are contraction metrics on the stated boxes.
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+8
+
+A. The Reference Controls Are Stabilizing
+Neither drift is stable, so the reference of (50) cannot be
+generated with u∗ = 0. We use
+u∗mg (x) = −x2 ,
+
+u∗duff (x) = −2x1 ,
+
+(53)
+
+which give the closed loops
+
+gmg (x) = −x2 − 32 x21 − 12 x31 , 3x1 − x2 ,
+
+3
+gduff (x) = x2 , −3x1 + 13 x31 − 10
+x2 .
+
+(54)
+
+Both are Hurwitz at the origin: √ the Jacobians are
+[ 0 −1; 3 −1 ] with eigenvalues − 12 ± 211 ȷ = −0.5±1.658ȷ,
+3
+and [ 0 1; −3 − 10
+] with eigenvalues −0.15 ± 1.726ȷ. The
+sign matters and is easy to get backwards: the opposite choice
+u = +2x1 on (23) yields eigenvalues {+0.861, −1.161}, a
+saddle.
+Local stability is not enough, since the reference must
+remain well behaved over the whole box. We therefore certify
+each closed loop on its own X by sum of squares, seeking V
+with
+V − ε∥x∥2 ⪰SOS 0,
+
+−∇V ⊤ g − ε∥x∥2 ⪰SOS 0
+
+on X ,
+(55)
+each certificate carrying its own multipliers for the box faces
+(xi − xi )(xi − xi ), with ε = 10−3 and V normalized by fixing
+the coefficient of x21 to 1.
+Proposition 2 (Stabilization on X ). For (54) the programs
+(55) are infeasible at deg V = 2 and feasible at deg V = 4,
+with
+
+B. Certified Contraction Metrics
+The metrics are obtained from the same condition used
+throughout, imposed as an algebraic identity rather than at
+sampled states. For a polynomial plant,Pa polynomial p is nonnegative on a box whenever p = σ0 + i σi (xi − xi )(xi − xi )
+with every σj SOS, which holds at every point of the box
+and not at a draw from it. We take W (x) with entries of total
+degree 2 and impose
+−Ẇ +AW +W A⊤ − 2r BB ⊤ +2λW ⪯ 0,
+
+wI ⪯ W (x) ⪯ wI,
+(56)
+P
+on X , with Ẇ =
+i (∂W/∂xi )fi , w = 0.1, w = 10 and
+r = 0.1. Since λ multiplies W , the largest certifiable rate is
+found by bisection, each trial being one linear SDP. This is the
+CV-STEM condition of (9)–(12), not the B⊥ -projected CCM
+condition: the latter drops the r term, so its λ would certify that
+some contracting controller exists while the deployed feedback
+is the Riccati form u = − 1r B ⊤ M δx, and the certified and the
+measured rate would then be different quantities.
+The bisection gives ceilings of λ = 1.7188 for (22) and
+λ = 2.8516 for (23). We deploy 10% of each, λ = 0.1719 and
+λ = 0.2852, and this is deliberate. Maximizing the uniform
+rate flattens λ(x): the optimizer equalizes it across the box, and
+a state-dependent plant certified into a near-constant rate field
+is precisely what these examples exist not to be. Measured on
+a 1012 grid for (22), the spread maxx λ(x)/ minx λ(x) runs
+2.510, 3.232, 3.937, 4.975 at λ = 1.7188, 0.8594, 0.4297,
+0.1719 respectively.
+The resulting certificates, with W symmetric and M =
+W −1 , are
+mg
+W11
+= 0.7991 + 0.2064 x1 − 0.0935 x2 + 0.1987 x21
+
+− 0.0978 x1 x2 + 0.0132 x22 ,
+2
+2
+3
+2
+Vmg (x) = x1 + 0.3600 x2 − 0.3286 x1 x2 − 0.2735 x1 + 0.6541 x1 x2 mg
+W12 = 1.4753 − 0.3299 x1 − 0.0896 x2 − 0.0744 x21
+2
+3
+4
+3
+− 0.2234 x1 x2 + 0.1581 x2 + 0.0608 x1 − 0.1519 x1 x2
+− 0.0257 x1 x2 − 0.0234 x22 ,
++ 0.1843 x21 x22 − 0.0715 x1 x32 + 0.0333 x42 ,
+mg
+W22 = 5.1170 − 0.4997 x1 − 0.3038 x2 − 0.0371 x21
+Vduff (x) = x21 + 0.3364 x22 + 0.0404 x1 x2 − 0.0443 x41 + 0.0206 x31 x2
++ 0.0253 x1 x2 − 0.0288 x22 ,
+2 2
+3
+4
++ 0.0268 x1 x2 + 0.0191 x1 x2 + 0.0052 x2 .
+Hence the origin is asymptotically stable with X contained in
+its region of attraction, and every reference generated by (50)
+under (53) stays bounded on X .
+That no quadratic V certifies either box is worth stating
+rather than hiding: on both plants the cubic term is what carries
+the state dependence, and a quadratic certificate would be
+claiming a rate whose validity is exactly the question. Verified
+independently of the solver on a 6012 grid over X , the printed
+(rounded) certificates satisfy
+
+(22)
+(23)
+
+min V /∥x∥2
+
+max V /∥x∥2
+
+max ∇V ⊤ g/∥x∥2
+
+0.1375
+0.3360
+
+2.5949
+1.0000
+
+−0.0492
+−0.0690
+
+so V is positive definite and V̇ negative definite on X \ {0}.
+(The exponential rate implied by these constants, V̇ ≤
+−(c2 /c3 )V , is very conservative and is not the rate reported
+anywhere else in this paper; it certifies stabilization only.)
+
+and, for the Duffing oscillator, a field even in x (its plant is
+odd, so no linear terms survive),
+duff
+W11
+= 1.0379 + 0.0482 x21 + 0.0666 x1 x2 + 0.0397 x22 ,
+duff
+W12
+= −1.9431 − 0.0938 x21 − 0.0611 x1 x2 − 0.0259 x22 ,
+duff
+W22
+= 5.2872 + 0.1134 x21 + 0.0014 x1 x2 − 0.0405 x22 .
+
+Both verify on a 1012 grid with the largest LMI eigenvalue
+of (56) strictly negative. Their properties on X , evaluated on
+a 2012 grid, are
+
+(22)
+(23)
+
+λ deployed
+
+λ(x) range
+
+spread
+
+κ(W )
+
+0.1719
+0.2852
+
+[0.489, 2.433]
+[1.035, 1.899]
+
+4.98×
+1.84×
+
+≤ 27.7
+≤ 34.0
+
+with λ(x) the certified pointwise estimator (39) of the deployed metric, and eig W ∈ [0.217, 6.980] and [0.201, 7.477]
+respectively, comfortably inside [w, w]. The gap between the
+deployed uniform λ and minx λ(x) is the slack Assumption 1
+formalizes and Theorem 1 allows an optimal policy to convert
+into faster decay.
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+C. Where the Rate Can Actually Be Held
+Exercising Assumption 1 requires the reference to migrate
+from a low-rate region to a high-rate one, and the migration
+cannot target an arbitrary high-λ state: the reference must
+satisfy (50), so a state can be held only where f (x) + Bu = 0
+for some admissible u. For (22) this makes x1 = c an
+equilibrium exactly when x2 = − 32 c2 − 12 c3 and u = −3c,
+so |u| ≤ 3 caps |c| ≤ 1, and λ along that curve runs
+[0.554, 1.165]—a 2.10× span against the field’s 4.98×. The
+faster part of the field is reachable only in passing, by any
+reference whatsoever. We therefore place the start and target
+bands at c = −0.90 (λ = 0.571) and c = +0.90 (λ = 1.140),
+which keeps 0.30 of the actuator in reserve for the migration
+itself; holding either endpoint c = ±1 would consume the
+entire input box and leave nothing to steer with. For (23)
+every (x1 , 0) is an equilibrium, with u = x1 − 31 x31 well inside
+[−4, 4], so the choice is not actuator-limited and the target is
+simply where λ is largest on that curve.
+R EFERENCES
+[1] W. Lohmiller and J.-J. E. Slotine, “On contraction analysis for
+non-linear systems,” Automatica, vol. 34, no. 6, pp. 683–696,
+1998. [Online]. Available: https://www.sciencedirect.com/science/article/
+pii/S0005109898000193
+[2] I. R. Manchester and J.-J. E. Slotine, “Control contraction metrics:
+Convex and intrinsic criteria for nonlinear feedback design,” IEEE Transactions on Automatic Control, vol. 62, no. 6, pp. 3046–3053, 2017.
+[3] M. L. Puterman, Markov decision processes: discrete stochastic dynamic
+programming. John Wiley & Sons, 2014.
+[4] H. Tsukamoto and S.-J. Chung, “Robust controller design for stochastic nonlinear systems via convex optimization,” IEEE Transactions on
+Automatic Control, vol. 66, no. 10, pp. 4731–4746, 2020.
+[5] M. Cho, H. Tsukamoto, and H. T. Tran, “Contraction-aware reinforcement
+learning for nonlinear control with statistical robustness,” IEEE Transactions on Robotics, pp. 1–20, 2026.
+
+9
+
+
