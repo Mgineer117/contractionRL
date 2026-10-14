@@ -175,7 +175,7 @@ cm:
   w_lb: 0.001
   # "cvstem", CMG Cu/C1 loss for "ccm").
   # 0.0771 with cvstem_r_scaler 3.2 / w_lb 0.001 / w_ub 1000: measured 2026-08-17
-  # by scripts/find_uniform_lambda.py under uniform state-box sampling — the joint
+  # by scripts/skrl/c2rl/find_uniform_lambda.py under uniform state-box sampling — the joint
   # CV-STEM SDP, stepping λ down by 1.5 on LMI infeasibility and r up by 2
   # whenever >5% of the generated controls u = uref - (1/r)BᵀM·e leave the
   # 2x-expanded uref box. 4.82% land outside at this (λ, r); ν=13.56, χ=8.417.

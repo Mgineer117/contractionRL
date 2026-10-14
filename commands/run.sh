@@ -289,7 +289,7 @@ done
 wait
 
 echo "[\$(date '+%F %T')] training done — aggregating"
-python scripts/aggregate_seeds.py --run-tag "$TAG" --out "results/$TAG" \\
+python scripts/skrl/utility/aggregate_seeds.py --run-tag "$TAG" --out "results/$TAG" \\
     || echo "Aggregation failed — rerun: ./run_seeds.sh --aggregate-only --tag $TAG"
 echo "[\$(date '+%F %T')] all done. CSV: results/$TAG.csv"
 EOF

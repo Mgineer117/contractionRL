@@ -116,7 +116,7 @@ if [[ "$AGGREGATE_ONLY" -eq 1 ]]; then
         exit 1
     fi
     _header "Aggregating $TAG"
-    python scripts/aggregate_seeds.py --run-tag "$TAG" --out "results/$TAG"
+    python scripts/skrl/utility/aggregate_seeds.py --run-tag "$TAG" --out "results/$TAG"
     exit $?
 fi
 
@@ -333,7 +333,7 @@ fi
 
 # ── Aggregate ───────────────────────────────────────────────────────────── #
 _header "Aggregating Stability results"
-python scripts/aggregate_seeds.py --run-tag "$TAG" --out "results/$TAG" || \
+python scripts/skrl/utility/aggregate_seeds.py --run-tag "$TAG" --out "results/$TAG" || \
     _error "Aggregation failed — rerun with: ./commands/run_seeds.sh --aggregate-only --tag $TAG"
 
 _header "Done"

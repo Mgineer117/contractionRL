@@ -274,7 +274,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         # means 625 references. Grouping lets num_envs/ref_groups slots share one
         # reference while each keeps its own x_0, which is what makes the global
         # optimum computable: the optimum is solved per (reference, x_0) pair
-        # (scripts/precompute_global.py), so 25 references is 25 task groups and
+        # (scripts/toy/utility/precompute_global.py), so 25 references is 25 task groups and
         # 625 would be 625. 0 = one reference per slot, the old behaviour.
         self.ref_groups = int(env_config.get("ref_groups", 0) or 0)
         if self.ref_groups:
@@ -369,7 +369,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         """The reference-window length that spans the whole episode.
 
         train.py's default, and anything that must build the SAME env offline --
-        scripts/precompute_vstar.py in particular. Sizing the window changes
+        scripts/toy/utility/precompute_vstar.py in particular. Sizing the window changes
         ``ref_gen_len`` and so the shape of the stored reference, so a solver that
         picked its own length produced a pack the trainer could not install
         (100 vs 199) -- and, had the shapes happened to agree, would have solved a
@@ -385,7 +385,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         often at different num_envs, so "same seed" is not an argument that they
         drew the same trajectories -- and if they did not, the reported gap is
         between a policy and the optimum of a different problem. Shipping the
-        trajectories as an artifact (scripts/precompute_vstar.py writes them next
+        trajectories as an artifact (scripts/toy/utility/precompute_vstar.py writes them next
         to V*) removes the question.
         """
         xref = torch.as_tensor(xref, dtype=torch.float32, device=self.device)

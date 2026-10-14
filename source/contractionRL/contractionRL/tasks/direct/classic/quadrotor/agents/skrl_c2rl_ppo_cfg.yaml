@@ -166,7 +166,7 @@ cm:
   # every top-13 feasible trial used eps=1.0 (one exception at eps=0.1), so the
   # true optimum may sit at an even looser margin than this grid covered.
   w_lb: 0.001
-  # From scripts/find_uniform_lambda.py's uniform state-box search (the joint
+  # From scripts/skrl/c2rl/find_uniform_lambda.py's uniform state-box search (the joint
   # CV-STEM SDP at cm_dt=1.0, lbd down by 1.5 on LMI infeasibility, r up by 2
   # when >5% of generated u = uref - (1/r)B^T M e leave the 2x-expanded uref
   # box). Measured together with w_lb/w_ub above and cvstem_r_scaler below —

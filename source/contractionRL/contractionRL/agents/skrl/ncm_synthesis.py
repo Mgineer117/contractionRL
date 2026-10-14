@@ -435,7 +435,7 @@ def build_cm_dataset(
             f"{tag} joint CV-STEM SDP INFEASIBLE at lbd={lbd:g}, eps={eps:g}, "
             f"w=[{w_lb:g},{w_ub:g}], r={r_scaler:g} over {n} samples. This is a real "
             "result, not a transient failure: no single metric family certifies that "
-            "rate over this state box. Re-run scripts/find_uniform_lambda.py for this "
+            "rate over this state box. Re-run scripts/skrl/c2rl/find_uniform_lambda.py for this "
             "env and use what it certifies.")
     # The LMI residual, measured rather than reported by the solver. cvstem_joint
     # returns only {W, nu, chi, J}, so a `sol.get("residual")` here is silently

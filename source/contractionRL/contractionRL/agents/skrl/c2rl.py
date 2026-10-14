@@ -222,7 +222,7 @@ class C2RLPPOCfg(AgentCfg):
     # "cvstem" method only.
     cm_data_path: str = ""
     # SOS metric synthesis (toy/polynomial envs only; see
-    # scripts/build_cm_dataset.py::_build_via_sos). Inert on the classic
+    # scripts/skrl/c2rl/build_cm_dataset.py::_build_via_sos). Inert on the classic
     # envs, which have no polynomial f and take the CV-STEM path.
     sos_w_degree: int = 2
     sos_lam_hi: float = 4.0
@@ -341,7 +341,7 @@ class C2RLSACCfg(AgentCfg):
     cm_nu_weight: float = 1.0
     cm_data_path: str = ""
     # SOS metric synthesis (toy/polynomial envs only; see
-    # scripts/build_cm_dataset.py::_build_via_sos). Inert on the classic
+    # scripts/skrl/c2rl/build_cm_dataset.py::_build_via_sos). Inert on the classic
     # envs, which have no polynomial f and take the CV-STEM path.
     sos_w_degree: int = 2
     sos_lam_hi: float = 4.0
@@ -384,7 +384,7 @@ def cm_dataset_target(cfg) -> tuple[Path | None, dict]:
 
     The single source of truth for both sides of the contract: the agent
     (``_synthesize_cmg_cvstem``) loads from here, and
-    ``scripts/build_cm_dataset.py`` writes here. Deriving the path or the
+    ``scripts/skrl/c2rl/build_cm_dataset.py`` writes here. Deriving the path or the
     ``cache_kwargs`` twice is how a generator silently produces a file the agent
     then key-misses and refuses — the two must be computed by one function.
 
@@ -987,7 +987,7 @@ class C2RLAgent(Agent):
                 f"{cache_path} has none. That dataset came from the CV-STEM SDP, "
                 f"which has no closed form -- only the polynomial toy envs do. "
                 f"Either set metric_source: regress, or rebuild with "
-                f"scripts/build_cm_dataset.py --task toy-<key>-v0.")
+                f"scripts/skrl/c2rl/build_cm_dataset.py --task toy-<key>-v0.")
         coeffs = {str(k): float(v) for k, v in zip(names, values)}
         # The PD check runs over the dataset's own sample hull rather than the
         # env box: that is exactly the region these coefficients were certified
@@ -1010,7 +1010,7 @@ class C2RLAgent(Agent):
         """CV-STEM path: Load the offline ``{x → W*(x)}`` dataset, then MSE-regress.
 
         The per-state SDP is not solved here. C2RL consumes a dataset generated
-        ahead of time by ``scripts/build_cm_dataset.py`` and committed under
+        ahead of time by ``scripts/skrl/c2rl/build_cm_dataset.py`` and committed under
         ``data/``; a missing cache raises instead of silently re-solving.
 
         Solving at agent construction meant every seed, every gamma and every
@@ -1031,7 +1031,7 @@ class C2RLAgent(Agent):
                 "neither cm_data_path nor dynamics_pretrain_data_path is set, so there "
                 "is nowhere to load one from. Set cm.cm_data_path in the agent yaml "
                 "(e.g. 'data/classic/cartpole/cm_data.npz') and generate it with "
-                "scripts/build_cm_dataset.py."
+                "scripts/skrl/c2rl/build_cm_dataset.py."
             )
         dataset = load_cached_cm_dataset(cache_path, **cache_kwargs)
         if dataset is None:
@@ -1044,7 +1044,7 @@ class C2RLAgent(Agent):
                 f"(lbd={cfg.lbd}, w_lb={cfg.w_lb}, w_ub={cfg.w_ub}, "
                 f"r={cfg.cvstem_r_scaler}, eps={cfg.cm_eps}, solver={cfg.cm_solver}, "
                 f"N={cfg.cmg_memory_size}).\nGenerate it first:\n"
-                f"  python scripts/build_cm_dataset.py --task <task> --algorithm "
+                f"  python scripts/skrl/c2rl/build_cm_dataset.py --task <task> --algorithm "
                 f"<c2rl-ppo|c2rl-sac>\n"
                 f"The SDP is no longer solved at agent construction — see "
                 f"_synthesize_cmg_cvstem."

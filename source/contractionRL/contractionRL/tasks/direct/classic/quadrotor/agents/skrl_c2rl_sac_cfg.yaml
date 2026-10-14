@@ -86,7 +86,7 @@ cm:
   # why an earlier local-heuristic pass (lbd=0.1/r_scaler=5.0) was wrong
   # (feasible but weak: AUC=9.72 vs. the sweep's AUC=1.79 best).
   w_lb: 0.001
-  # From scripts/find_uniform_lambda.py's uniform state-box search — measured
+  # From scripts/skrl/c2rl/find_uniform_lambda.py's uniform state-box search — measured
   # jointly with the r/w_lb/w_ub here, one solution of one program.
   lbd: 1.3169
               # "cvstem", CMG Cu/C1 loss for "ccm")

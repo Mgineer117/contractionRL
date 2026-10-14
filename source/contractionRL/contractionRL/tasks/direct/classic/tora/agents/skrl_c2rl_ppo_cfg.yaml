@@ -142,7 +142,7 @@ cm:
   # Mahalanobis reward
   w_ub: 1000.0
   w_lb: 0.001
-  # From scripts/find_uniform_lambda.py's uniform state-box search (the joint
+  # From scripts/skrl/c2rl/find_uniform_lambda.py's uniform state-box search (the joint
   # CV-STEM SDP at cm_dt=1.0, lbd down by 1.5 on LMI infeasibility, r up by 2
   # when >5% of generated u = uref - (1/r)B^T M e leave the 2x-expanded uref
   # box). Measured together with w_lb/w_ub above and cvstem_r_scaler below —

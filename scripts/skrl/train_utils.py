@@ -27,7 +27,7 @@ def _run_metadata(args_cli, task: str) -> dict:
     The metrics in eval_results.json are anonymous on their own — the run
     directory is named by timestamp only, so nothing in the file says which
     seed/env/algorithm it came from. Multi-seed aggregation (run_seeds.sh +
-    scripts/aggregate_seeds.py) needs exactly that to group runs, so it is
+    scripts/skrl/utility/aggregate_seeds.py) needs exactly that to group runs, so it is
     written into the json rather than parsed back out of a path.
 
     CRL_RUN_TAG is set by run_seeds.sh to a per-launch tag, so the aggregator

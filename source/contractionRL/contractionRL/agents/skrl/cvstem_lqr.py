@@ -25,7 +25,7 @@ directly, his ``cvstem0`` at a fixed α.
 
 Nothing here deviates from the reference: the Ẇ term is always his ``(W̄-I)/dt``,
 the samples are always i.i.d. uniform over the box, and the network is fit to
-exactly the states the joint program certified. ``scripts/find_uniform_lambda.py``
+exactly the states the joint program certified. ``scripts/skrl/c2rl/find_uniform_lambda.py``
 runs this same program at a smaller sample count to pick ``lbd``.
 
 The one thing his code leaves implicit is that ``dt`` is the CV-STEM sampling
@@ -298,7 +298,7 @@ class CVSTEMLQRAgent(Agent):
                 f"{INFEASIBLE_MARKER}: the joint CV-STEM SDP over {cfg.cm_samples} "
                 f"uniform state-box samples is infeasible at lbd={cfg.lbd}, "
                 f"cm_eps={cfg.cm_eps}, dt={self._dt}. LOWER lbd — "
-                f"scripts/find_uniform_lambda.py reports the largest rate this "
+                f"scripts/skrl/c2rl/find_uniform_lambda.py reports the largest rate this "
                 f"same program certifies."
             )
             print(msg, flush=True)

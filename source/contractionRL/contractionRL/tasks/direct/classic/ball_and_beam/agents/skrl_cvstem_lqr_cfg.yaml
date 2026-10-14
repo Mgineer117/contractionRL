@@ -6,7 +6,7 @@ seed: 42  # Random seed for reproducibility
 # — Tsukamoto's classncm.cvstem0). See agents/skrl/cvstem_lqr.py.
 
 agent:
-  # lbd/r_scaler/w_lb/w_ub come from scripts/find_uniform_lambda.py run at
+  # lbd/r_scaler/w_lb/w_ub come from scripts/skrl/c2rl/find_uniform_lambda.py run at
   # N=100 with --cm-eps 0.1 --cm-dt 1.0 --w-lb 0.001 --w-ub 1000, and are then
   # Certified by the N=10000 synthesis below at cm_eps 0.01. The two eps values
   # are deliberate, not a mismatch: eps buys a covering radius eps/L around each
@@ -28,9 +28,9 @@ agent:
 
 # ── The joint CV-STEM SDP (Tsukamoto's classncm.cvstem0) ───────────────────── #
 cm:
-  # λ — the certified contraction rate. Comes from scripts/find_uniform_lambda.py
+  # λ — the certified contraction rate. Comes from scripts/skrl/c2rl/find_uniform_lambda.py
   # (the λ-selection step; the reference's own linesearch is not run here).
-  # From scripts/find_uniform_lambda.py's uniform state-box search — measured
+  # From scripts/skrl/c2rl/find_uniform_lambda.py's uniform state-box search — measured
   # jointly with the r/w_lb/w_ub here, one solution of one program.
   lbd: 0.8779
   cm_eps: 0.01

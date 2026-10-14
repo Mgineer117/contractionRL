@@ -22,7 +22,7 @@ agent:
 
 # ── The joint CV-STEM SDP (Tsukamoto's classncm.cvstem0) ───────────────────── #
 cm:
-  # λ — the certified contraction rate. Comes from scripts/find_uniform_lambda.py
+  # λ — the certified contraction rate. Comes from scripts/skrl/c2rl/find_uniform_lambda.py
   # (the λ-selection step; the reference's own linesearch is not run here).
   # 0.0152, verified at the protocol's stage 2 (N=1000, cm_eps=0.01,
   # cm_dt=1.0): nu=1000, chi=1319, 0.68% of generated controls out of box.

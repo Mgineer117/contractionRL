@@ -1,5 +1,7 @@
 # UIUC Campus Cluster runbook
 
+**Placement policy (2026-09-11): UIUC-CC → A4000 → Delta → Europa → Titan.** Follow the [shared machine rules](../../AGENTS.md#machine-placement-priority) for new work and authorized retries; this order supersedes historical placement recommendations below.
+
 *(Lives in `docs/`. Shell entry points referenced here are in `commands/`.)*
 
 Everything needed to run this repo's sweeps on the UIUC Campus Cluster
@@ -92,8 +94,8 @@ recoverable after the fact either: `gdb -p <pid> -ex 'call fflush(0)'` on the
 compute node fails with `ptrace: Operation not permitted`.
 
 ```bash
-python -u scripts/find_uniform_lambda.py ...   # right
-python    scripts/find_uniform_lambda.py ...   # a timeout erases the whole run
+python -u scripts/skrl/c2rl/find_uniform_lambda.py ...   # right
+python    scripts/skrl/c2rl/find_uniform_lambda.py ...   # a timeout erases the whole run
 ```
 
 Two companions to it:
@@ -106,7 +108,7 @@ Two companions to it:
 
 ```bash
 set -uo pipefail        # no -e
-python -u scripts/find_uniform_lambda.py ... ; rc=$?
+python -u scripts/skrl/c2rl/find_uniform_lambda.py ... ; rc=$?
 echo "[$(date)] done rc=$rc"
 exit 0
 ```

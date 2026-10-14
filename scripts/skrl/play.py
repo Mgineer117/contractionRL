@@ -280,11 +280,7 @@ def run_classic(args) -> list[dict]:
         sys.path.insert(0, _classic_dir)
     sys.path.append(os.path.dirname(__file__))
 
-    # The toy (polynomial) envs ship the same skrl_*_cfg entry points and run
-    # through the same --classic path; registering only `classic` left every
-    # toy config unreachable from the trainer that is supposed to read it.
     import contractionRL.tasks.direct.classic  # noqa: F401 — registers classic envs
-    import contractionRL.tasks.direct.toy  # noqa: F401 — registers toy-mg-v0 / toy-duff-v0
     import gymnasium as gym
     import yaml
 

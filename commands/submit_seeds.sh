@@ -9,7 +9,7 @@
 # units, which fills three partitions far better than 12 fat cells could.
 #
 # PREFLIGHT + DEPENDENCY. Every env is first checked against its own CM dataset
-# with scripts/preflight_cm_data.py. An env that fails does NOT get skipped and
+# with scripts/skrl/c2rl/preflight_cm_data.py. An env that fails does NOT get skipped and
 # does NOT block the others: this submits a build_cm job for it and chains its 30
 # training jobs behind that build with --dependency=afterok. So the whole batch is
 # launched in one pass and SLURM does the waiting, instead of a human remembering
@@ -49,10 +49,10 @@ for ENVNAME in classic-cartpole-v0 classic-segway-v0 classic-car-v0 classic-car-
 
     # Does this env's configured CM dataset exist and match its yaml?
     DEP=""
-    if python scripts/preflight_cm_data.py "$ENVNAME" >/dev/null 2>&1; then
+    if python scripts/skrl/c2rl/preflight_cm_data.py "$ENVNAME" >/dev/null 2>&1; then
         echo "== $ENVNAME: CM dataset ready"
     else
-        python scripts/preflight_cm_data.py "$ENVNAME" 2>&1 | grep -E '^\[' || true
+        python scripts/skrl/c2rl/preflight_cm_data.py "$ENVNAME" 2>&1 | grep -E '^\[' || true
         if [ "$DRY" = 1 ]; then
             echo "== $ENVNAME: would submit build_cm + chain 30 jobs on it"
             DEP="afterok:BUILDID"

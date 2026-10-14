@@ -32,7 +32,7 @@ source /sw/apps/anaconda3/2024.10/etc/profile.d/conda.sh
 conda activate env_isaaclab
 cd "$HOME/contractionRL"
 echo "[$(date)] host=$(hostname) build cm dataset env=$ENVNAME"
-python -u scripts/build_cm_dataset.py --task "$ENVNAME" --algorithm c2rl-ppo
+python -u scripts/skrl/c2rl/build_cm_dataset.py --task "$ENVNAME" --algorithm c2rl-ppo
 rc=$?
 echo "[$(date)] done rc=$rc env=$ENVNAME"
 # Propagate the real status: the RL jobs chain on afterok, so a failed solve must

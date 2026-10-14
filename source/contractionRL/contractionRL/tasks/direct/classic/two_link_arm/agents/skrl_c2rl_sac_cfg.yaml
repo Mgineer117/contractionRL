@@ -81,7 +81,7 @@ cm:
   # Mahalanobis reward
   w_ub: 1000.0
   w_lb: 0.001
-  # From scripts/find_uniform_lambda.py's uniform state-box search — measured
+  # From scripts/skrl/c2rl/find_uniform_lambda.py's uniform state-box search — measured
   # jointly with the r/w_lb/w_ub here, one solution of one program.
   lbd: 0.8779
               # "cvstem", CMG Cu/C1 loss for "ccm")
