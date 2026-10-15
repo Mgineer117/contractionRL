@@ -97,9 +97,6 @@ search/sweep_*.yaml
 # Teleop Recorded Dataset
 /datasets/
 
-# Tests
-tests/
-
 # Docker history
 .isaac-lab-docker-history
 

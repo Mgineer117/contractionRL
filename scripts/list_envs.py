@@ -6,10 +6,9 @@
     python scripts/list_envs.py --dynamics --keyword auv
 
 Classic envs are pure NumPy/PyTorch and are instantiated here, so x_dim, u_dim
-and the sv(B) spread are measured, not declared. Isaac envs need Isaac Sim to
-construct and define their dynamics through the simulator rather than an
-analytic ``get_f_and_B``; they are listed with None in those columns rather than
-omitted, so the table stays a complete inventory.
+and the sv(B) spread are measured, not declared. Isaac envs are listed without
+construction, with their dynamics source shown. The exact classic-in-Isaac
+tasks reuse the analytical plants; robot tasks use PhysX.
 
 The sv(B) column is the diagnostic that decides whether restricting to a state
 subset can certify a faster contraction rate. B enters the CV-STEM LMI only
@@ -47,9 +46,8 @@ def classic_names() -> list[str]:
 
 
 def isaac_names() -> list[str]:
-    skip = {"classic", "common", "__pycache__"}
-    return sorted(p.name for p in DIRECT_DIR.iterdir()
-                  if p.is_dir() and p.name not in skip and not p.name.startswith("__"))
+    from list_experiments import environments
+    return [row["id"] for row in environments() if row["family"] == "Isaac"]
 
 
 def probe(task: str) -> dict:
@@ -136,11 +134,11 @@ def main() -> int:
         print(f"{('classic-' + t):22s} {info['x_dim']:5d} {info['u_dim']:5d} "
               f"{info['sv_spread']:12.3f} {info['f_norm']:8.3f}  {dep}")
 
+    from list_experiments import environments
+    isaac_rows = {row["id"]: row for row in environments() if row["family"] == "Isaac"}
     for t in isaac:
-        # Isaac envs define their dynamics through the simulator; there is no
-        # analytic f/B to report, and constructing one needs Isaac Sim.
-        print(f"{t:22s} {'None':>5s} {'None':>5s} {'None':>12s} {'None':>8s}  "
-              f"None (Isaac Sim; no analytic get_f_and_B)")
+        row = isaac_rows[t]
+        print(f"{t:22s} {'-':>5s} {'-':>5s} {'-':>12s} {'-':>8s}  {row['dynamics']}")
 
     if rows:
         print("\nsv(B) spread = max over singular values of (max_x sv / min_x sv). "
@@ -160,8 +158,8 @@ def main() -> int:
             print(textwrap.dedent(info["b_src"]).rstrip())
         if isaac:
             print("\n" + "=" * 78)
-            print("Isaac envs: f(x) = None, B(x) = None — dynamics come from the "
-                  "simulator,\nnot an analytic model, so there is no source to print.")
+            print("Isaac robot tasks use PhysX. Exact classic-in-Isaac tasks reuse "
+                  "the corresponding classic f(x) and B(x) above.")
             for t in isaac:
                 print(f"  {t}")
     return 0

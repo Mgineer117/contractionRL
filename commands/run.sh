@@ -87,7 +87,7 @@ ALL_ALGOS=(ppo sac c3m lqr sdlqr cvstem-lqr c2rl-ppo c2rl-sac)
 ALGO_ARG=$(prompt_choice "Algorithm to run (or 'all'):" "${ALL_ALGOS[@]}" all)
 
 CLASSIC_ENVS=(classic-car-v0 classic-car-v1 classic-cartpole-v0 classic-segway-v0 classic-quadrotor-v0)
-ISAAC_ENVS=(Humanoid-PathTracking-v0 Humanoid-VelTracking-v0 Manipulator-PathTracking-v0 Manipulator-VelTracking-v0 Quadruped-PathTracking-v0 Quadruped-VelTracking-v0)
+ISAAC_ENVS=(Humanoid-PathTracking-v0 Humanoid-VelTracking-v0 Manipulator-PathTracking-v0 Manipulator-VelTracking-v0 Quadruped-PathTracking-v0 Quadruped-VelTracking-v0 "Isaac-Car-v0" "Isaac-Car-v1" "Isaac-Quadrotor-v0")
 ENV_ARG=$(prompt_choice "Env (or 'all' for every classic env):" \
     car cartpole segway quadrotor "${ISAAC_ENVS[@]}" all)
 

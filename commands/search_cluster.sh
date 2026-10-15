@@ -214,7 +214,7 @@ _success "Algorithm: ${C_BOLD}$ALGORITHM${C_RESET}"
 
 # ── Env ───────────────────────────────────────────────────────────────────── #
 CLASSIC_ENVS=("classic-car-v0" "classic-car-v1" "classic-cartpole-v0" "classic-segway-v0" "classic-quadrotor-v0")
-ISAAC_ENVS=("Humanoid-PathTracking-v0" "Humanoid-VelTracking-v0" "Manipulator-PathTracking-v0" "Manipulator-VelTracking-v0" "Quadruped-PathTracking-v0" "Quadruped-VelTracking-v0")
+ISAAC_ENVS=("Humanoid-PathTracking-v0" "Humanoid-VelTracking-v0" "Manipulator-PathTracking-v0" "Manipulator-VelTracking-v0" "Quadruped-PathTracking-v0" "Quadruped-VelTracking-v0" "Isaac-Car-v0" "Isaac-Car-v1" "Isaac-Quadrotor-v0")
 if [[ -z "$ENV_ARG" ]]; then
     ENV_ARG=$(prompt_choice "Select env to sweep (or 'all' for every classic env):" \
         car cartpole segway quadrotor "${ISAAC_ENVS[@]}" all)

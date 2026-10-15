@@ -59,6 +59,9 @@ ISAACLAB_ENVS = (
     "Manipulator-VelTracking-v0",
     "Quadruped-PathTracking-v0",
     "Quadruped-VelTracking-v0",
+    "Isaac-Car-v0",
+    "Isaac-Car-v1",
+    "Isaac-Quadrotor-v0",
 )
 
 

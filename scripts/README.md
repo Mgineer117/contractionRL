@@ -1,6 +1,7 @@
 # Script entry points
 
 - `list_envs.py`: environment inventory.
+- `list_experiments.py`: colorful algorithm/environment inventory and key YAML settings; use `--env` and `--algorithm` to inspect a task without launching Isaac Sim.
 - `skrl/train.py`, `skrl/play.py`: PPO/C2RL training and evaluation.
 - `skrl/c2rl/`: metric dataset generation, preflight, verification, rate search and configuration updates.
 - `skrl/utility/`: seed aggregation and GPU sizing.

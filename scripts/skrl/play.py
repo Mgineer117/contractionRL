@@ -373,7 +373,8 @@ def run_isaac(args, simulation_app) -> list[dict]:
         try:
             _alg = algorithm.lower()
             if _alg in _CONTRACTION_ALGOS:
-                agent_cfg["agent"]["use_empirical_dynamics"] = True
+                agent_cfg["agent"]["use_empirical_dynamics"] = not getattr(
+                    env.unwrapped, "has_analytical_dynamics", False)
                 runner = ContractionRunner(env, agent_cfg, is_classic=False)
             else:
                 runner = CLActorRunner(env, agent_cfg)

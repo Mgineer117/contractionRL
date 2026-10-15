@@ -572,6 +572,7 @@ class ContractionRunner:
 
         # Deepest raw env — the one exposing get_rollout / get_f_and_B / x_dim.
         raw_env = _unwrap_env(env)
+        has_analytical_dynamics = is_classic or getattr(raw_env, "has_analytical_dynamics", False)
 
         agent_cfg = copy.deepcopy(cfg.get("agent", {}))
         agent_cfg.pop("class", None)
@@ -581,7 +582,7 @@ class ContractionRunner:
         # injected here, or get_f_and_B raises mid-rollout. No-op for classic
         # envs and for C3M/C2RL, which own their dynamics model directly.
         dynamics_model = _resolve_dynamics_model(
-            algo, agent_cfg, is_classic, skrl_env.device, dynamics_model
+            algo, agent_cfg, has_analytical_dynamics, skrl_env.device, dynamics_model
         )
         if dynamics_model is not None and hasattr(raw_env, "set_dynamics_model"):
             raw_env.set_dynamics_model(dynamics_model)
@@ -616,7 +617,7 @@ class ContractionRunner:
             use_empirical_dynamics = agent_cfg.get(
                 "use_empirical_dynamics", empirical_dynamics_cfg.get("use_empirical_dynamics", False)
             )
-            if not use_empirical_dynamics and not is_classic:
+            if not use_empirical_dynamics and not has_analytical_dynamics:
                 raise ValueError(
                     "Analytical dynamics (use_empirical_dynamics=False) is only valid for "
                     "classic envs that expose an analytical get_f_and_B. Isaac Sim envs have "

@@ -1031,6 +1031,8 @@ else:
         if isinstance(env_cfg, ManagerBasedRLEnvCfg):
             env_cfg.export_io_descriptors = args_cli.export_io_descriptors
         env_cfg.log_dir = log_dir
+        if hasattr(env_cfg, "reference_mode") and args_cli.reference_mode is not None:
+            env_cfg.reference_mode = args_cli.reference_mode
 
         if hasattr(env_cfg, "vel_cmd"):
             vc = env_cfg.vel_cmd
@@ -1044,6 +1046,27 @@ else:
             )
 
         env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
+        if getattr(env.unwrapped, "has_analytical_dynamics", False):
+            raw = env.unwrapped
+            length = args_cli.ref_length
+            if length is None:
+                length = raw.full_ref_length(offset=args_cli.ref_offset)
+            raw.configure_ref_window(length, args_cli.ref_offset,
+                                     agent_cfg["agent"].get("discount_factor", 0.99))
+            if args_cli.fix_ref_trajectories:
+                raw.set_fix_ref_trajectories(True)
+            if args_cli.terminate_out_of_box is not None or args_cli.terminate_as_terminal:
+                raw.set_terminate_out_of_box(
+                    True if args_cli.terminate_out_of_box is None else args_cli.terminate_out_of_box,
+                    terminal=args_cli.terminate_as_terminal)
+            if args_cli.eig_reshape is not None:
+                raw.set_eig_reshape(args_cli.eig_reshape)
+            if args_cli.reward_euclidean or args_cli.reward_level:
+                raw.plant.reward_euclidean = args_cli.reward_euclidean
+                raw.plant.reward_level = args_cli.reward_level
+            # Persist the actual Dict observation space after window sizing.
+            dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
 
         if isinstance(env.unwrapped, DirectMARLEnv) and algorithm in ["ppo"]:
             env = multi_agent_to_single_agent(env)
@@ -1104,11 +1127,12 @@ else:
 
         if _is_contraction:
             from contractionRL.runners import ContractionRunner
-            # Isaac envs have no closed-form dynamics, so they always learn a
-            # NeuralDynamics (pretrain + online). Forcing use_empirical_dynamics=True
-            # here also makes the runner's guard reject any config that tries to
-            # request analytical dynamics (use_empirical_dynamics=False) for Isaac.
-            agent_cfg["agent"]["use_empirical_dynamics"] = True
+            # PhysX robot tasks learn their dynamics; exact classic-in-Isaac
+            # tasks expose the same analytical f/B as their classic counterparts.
+            agent_cfg["agent"]["use_empirical_dynamics"] = (
+                args_cli.use_empirical_dynamics
+                or not getattr(_isaac_env.unwrapped, "has_analytical_dynamics", False)
+            )
             # lqr/sdlqr/cvstem-lqr own no dynamics model — they need a pretrained
             # one loaded from disk here (ContractionRunner raises with the flag
             # to pass if it's missing). See --dynamics_checkpoint.

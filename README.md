@@ -9,6 +9,14 @@ evaluates on any environment and the reported stability metrics are directly com
   trajectory every `reset()`. Nine are registered (`car-v0`, `car-v1`, `cartpole`, `segway`,
   `quadrotor`, `aircraft`, `ball_and_beam`, `tora`, `two_link_arm`).
 - **Isaac envs** — quadruped / humanoid / manipulator velocity- and path-tracking. Need Isaac Lab.
+- **Exact classic plants in Isaac** — `Isaac-Car-v0`, `Isaac-Car-v1`, and `Isaac-Quadrotor-v0` reuse the classic equations, bounds, time step, references, rewards, and algorithm configs. Isaac displays a blue body and green reference point; the markers do not add contact or rigid-body dynamics. The old Isaac `Cartpole-v0` is no longer registered.
+
+List the available tasks, algorithms, and key settings without starting Isaac Sim:
+
+```bash
+python scripts/list_experiments.py
+python scripts/list_experiments.py --env Isaac-Car-v1 --algorithm c2rl-ppo
+```
 
 ## Install
 
@@ -33,6 +41,8 @@ python scripts/skrl/train.py --classic --task classic-car-v0 --algorithm c2rl-pp
 # Isaac: pretrain locomotion on velocity-tracking, then do contraction control on path-tracking
 python scripts/skrl/train.py --task Quadruped-VelTracking-v0  --algorithm ppo --num_envs 4096
 python scripts/skrl/train.py --task Quadruped-PathTracking-v0 --algorithm c3m
+# Exact car equations with Isaac visuals (omit --classic).
+python scripts/skrl/train.py --task Isaac-Car-v0 --algorithm c2rl-ppo --num_envs 16 --headon
 # Isaac Sim runs headless by default; pass --headon to render a window.
 
 # Evaluate / watch
@@ -83,10 +93,10 @@ saturation and silently collapses the certified feedback Jacobian. Use the tanh-
 
 One policy, two phases.
 
-1. **Synthesize the metric, then freeze it.** `cmg_method: cvstem` solves one SDP per sampled
-   state and regresses the metric network onto `{x -> W*}`; `ccm` instead trains it directly on
-   Manchester's C1/C2 losses (no SDP — required for a driftless plant, which is
-   CV-STEM-infeasible at every `lambda`). The `cvstem` solve is expensive, so its result is cached
+1. **Synthesize the metric, then freeze it.** CV-STEM solves a joint SDP over sampled
+   states and regresses the metric network onto `{x -> W*}`. The former C2RL
+   `cmg_method: ccm` option is no longer supported; C3M still trains with C1/C2 losses.
+   The CV-STEM solve is expensive, so its result is cached
    under `data/` and the agent **refuses to run** rather than silently re-solve when no cached
    dataset matches the config.
 2. **Ordinary PPO/SAC against that frozen metric,** on the reward
