@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from contractionRL.agents.skrl.ref_window import RefWindow
+from contractionRL.agents.skrl.math_utils import quadratic_energy, energy_decrease
 from contractionRL.tasks.direct.common.state_guard import carry_forward_nonfinite
 from contractionRL.tasks.direct.common.termination_box import TerminationBoxMixin
 
@@ -887,11 +888,8 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
                 M = self._apply_eig_reshape(M)
                 next_M = self._apply_eig_reshape(next_M)
 
-                err_t = error.unsqueeze(-1)
-                next_err_t = next_error.unsqueeze(-1)
-
-                V = torch.bmm(torch.bmm(err_t.transpose(1, 2), M), err_t).squeeze(-1).squeeze(-1)
-                next_V = torch.bmm(torch.bmm(next_err_t.transpose(1, 2), next_M), next_err_t).squeeze(-1).squeeze(-1)
+                V = quadratic_energy(error, M)
+                next_V = quadratic_energy(next_error, next_M)
 
                 if getattr(self, "reward_level", False):
                     # Level form: R(t) = -‖e(t+1)‖²_M. Same rationale as the
@@ -905,7 +903,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
                     # signal never vanishes.
                     reward = -self.tracking_scaler * next_V - self.control_scaler * control_effort
                 else:
-                    reward = self.tracking_scaler * (V - next_V) - self.control_scaler * control_effort
+                    reward = self.tracking_scaler * energy_decrease(V, next_V) - self.control_scaler * control_effort
                 # Mahalanobis tracking error V = eᵀM(x)e (squared, like
                 # "tracking_error" above) — the metric-weighted analog of the
                 # plain Euclidean error, so StatManagerEnvWrapper can plot a

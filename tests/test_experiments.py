@@ -38,8 +38,7 @@ def test_catalog_and_config_aliases():
     car = rows["Isaac-Car-v1"]["configs"]
     assert car["ppo"].parent.parent.name == "car"
     assert car["c2rl-ppo"].parent.parent.name == "car_v1"
-    assert key_settings("c2rl-ppo", car["c2rl-ppo"])["metric_source"] == "regress"
-    assert "cmg_method" not in key_settings("c2rl-ppo", car["c2rl-ppo"])
+    assert key_settings("c2rl-ppo", car["c2rl-ppo"])["cmg_method"] == "cvstem"
     assert "Q_scaler" in key_settings("lqr", car["lqr"])
     import contractionRL.tasks.direct.classic_isaac  # noqa: F401
     assert "Cartpole-v0" not in gym.registry

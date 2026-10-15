@@ -1,61 +1,14 @@
-"""C2RL — single-policy contraction-metric RL against a Neural Contraction
-Metric (NCM) reward.
+"""C2RL: a frozen bounded metric and one PPO/SAC policy.
 
-C2RLAgent trains one real skrl PPO/SAC sub-agent (per ``base_algorithm``)
-against a Mahalanobis tracking reward
+Phase A uses cmg_method="cvstem" to regress onto offline SDP metric samples,
+or cmg_method="ccm" to train M(x) with full Killing identities, projected drift
+contraction and bounded-total-input feasibility for E=e' M(x)e. CCM training
+has no learned-controller Jacobian loss. Its held-out residuals are empirical
+checks, not uniform contraction certificates.
 
-    ``tracking_scaler·(V_t - V_{t+1}) - control_scaler·||u||²``,   V = eᵀM(x)e
-
-with ``e = x - xref``. The tracking term is the per-step decrease of ``V`` — a
-contraction signal, not a level penalty — computed identically by both env
-families. The control term is disabled (``control_scaler = 0``) in every
-shipped config.
-
-The env computes that reward from the frozen Phase-A CMG,
-since the chosen object is injected into the env and called from its
-``get_rewards()``:
-
-  * "cmg" (default) — a CMG network ``W(x)`` synthesized in Phase A then frozen
-    for the whole run (Tsukamoto's NCM recipe). Mandatory ``models["cmg"]``.
-
-
-so the pair is three real configurations, not four.
-
-CMG training, in ``ncm_synthesis.py``:
-
-  * "cvstem" — sample ``cmg_memory_size`` states, solve one SDP per state for
-    ``W*(x)`` (``build_cm_dataset``), MSE-regress the CMG onto the feasible
-    ``{x -> W*}`` (``regress_cmg``). No differentiable certificate loss.
-  * "ccm" — train the CMG directly on Manchester's C1 (contraction) and C2
-
-Both require a ``BoundedCCM_Generator`` (hard eigenvalue bounds in the forward
-pass, not a soft penalty); ``__init__`` raises otherwise, and ContractionRunner
-always passes ``constrain_eigenvalues=True`` regardless of yaml.
-
-States are drawn from the classic env's analytic state space (``get_rollout``,
-unlimited) or, with ``dynamics_pretrain_data_path`` set, from that offline
-``dynamics_data.npz`` (capped to its size, warning if it's short).
-
-Phase b is identical across all three configurations: each hands off one object
-with the same ``W, _ = metric(x)`` contract. The reward is never overwritten
-agent-side — ``_inject_ccm`` puts that object in the env via ``set_ccm``, and
-the env's own ``get_rewards()`` returns the Mahalanobis reward natively. So what
-reaches ``record_transition`` (and thus PPO's GAE / SAC's replayed critic
-target) is already correct, with no per-algorithm reward plumbing to keep in
-sync. ``_inject_ccm`` raises if no env accepted it — silently missing it would
-mean training on the plain baseline reward.
-
-Normalization: the metric and reward always use raw observations. ``M(x)`` and
-``e = x - xref`` are defined in physical coordinates, and per-dimension
-normalization would scale ``x`` and ``xref`` independently, distorting ``e``.
-``uref`` and ``angle_idx`` columns are likewise excluded (see
-``rl_glue.make_base_rl_cfg``). ``use_state_norm`` is False in every config.
-
-Learned dynamics (Isaac / ``use_empirical_dynamics``): a ``NeuralDynamics``
-model supplies f/B/B_null and ∂f/∂x, pretrained once before Phase A. Under
-"cmg" that is its only consumer (synthesis needs them; Phase B never touches it
-again, the CMG being frozen). Under "online" the opposite — queried every step.
-Classic envs use analytical ``get_f_and_B`` and skip pretraining.
+Phase B maximizes R=-(E_next-E_current), with moving-reference tracking errors
+in raw physical coordinates. Other reward forms and added penalties are
+rejected for C2RL. The metric is frozen before the policy begins learning.
 """
 
 from __future__ import annotations
@@ -136,17 +89,7 @@ class C2RLPPOCfg(AgentCfg):
     # Deployed policy's discount factor — a single policy trained against the
     # Mahalanobis reward, so there is no con/opt duality here.
     discount_factor: float = 0.99
-    # ── Metric source: Where the env's Mahalanobis reward gets M(x) ──────── #
-    # "cmg" (default): a CMG network synthesized in Phase A (one path: the
-    # how) and frozen for the whole run. "online": no Phase A at all — solve the
-    # CV-STEM SDP per env per step at the visited states
-    # feasible metric instead of a regression of one, at the cost of num_envs
-    # SDP solves per step. (Removed 2026-08-31: cmg_method="ccm", direct C1/C2
-    # training of the CMG with no SDP -- never used, and it was the only reason
-    # the CMG could emit W rather than M. `git log -S train_cmg_ccm` to recover.
-    # C3M still uses the C1/C2 loss math in math_utils; only C2RL's option went.
-    # (there is no per-state
-    # SDP to solve online under the C1/C2 pipeline).
+    # The bounded head emits M; its eigenvalues lie in [1/w_ub, 1/w_lb].
     w_ub: float = 10.0
     w_lb: float = 0.1
     # "regress" (default): MSE-fit the CMG network onto the offline {x -> W*(x)}
@@ -157,6 +100,13 @@ class C2RLPPOCfg(AgentCfg):
     # polynomial; the offline V* solve uses the same M, so a mismatch would
     # surface as apparent policy suboptimality that is really a metric gap.
     metric_source: str = "regress"
+    cmg_method: str = "cvstem"  # "cvstem" regression | "ccm" direct metric training
+    cmg_ccm_epochs: int = 1000
+    cmg_ccm_lr: float = 1e-3
+    cmg_ccm_batch_size: int = 128
+    ccm_killing_weight: float = 1.0
+    ccm_contraction_weight: float = 1.0
+    ccm_feasibility_weight: float = 1.0
     tracking_scaler: float = 1.0
     control_scaler: float = 0.0
     lbd: float = 1e-2  # contraction rate λ — used by the SDP synthesis and the reward
@@ -326,6 +276,13 @@ class C2RLSACCfg(AgentCfg):
     # polynomial; the offline V* solve uses the same M, so a mismatch would
     # surface as apparent policy suboptimality that is really a metric gap.
     metric_source: str = "regress"
+    cmg_method: str = "cvstem"  # "cvstem" regression | "ccm" direct metric training
+    cmg_ccm_epochs: int = 1000
+    cmg_ccm_lr: float = 1e-3
+    cmg_ccm_batch_size: int = 128
+    ccm_killing_weight: float = 1.0
+    ccm_contraction_weight: float = 1.0
+    ccm_feasibility_weight: float = 1.0
     tracking_scaler: float = 1.0
     control_scaler: float = 0.0
     lbd: float = 1e-2
@@ -465,6 +422,8 @@ class C2RLAgent(Agent):
         u_dim: int | None = None,
         num_envs: int = 1,
         angle_idx: list | None = None,
+        u_min=None,
+        u_max=None,
     ) -> None:
         self._angle_idx = list(angle_idx or [])
         CfgCls = C2RLSACCfg if base_algorithm.upper() == "SAC" else C2RLPPOCfg
@@ -500,6 +459,15 @@ class C2RLAgent(Agent):
         self._u_dim = u_dim
         self._device = device
         self._cfg = parsed_cfg
+        if parsed_cfg.cmg_method not in ("cvstem", "ccm"):
+            raise ValueError("C2RL cmg_method must be 'cvstem' or 'ccm'.")
+        if parsed_cfg.cmg_method == "ccm" and parsed_cfg.metric_source != "regress":
+            raise ValueError("C2RL CCM trains the neural metric directly; metric_source must be 'regress'.")
+        if (parsed_cfg.tracking_scaler != 1.0 or parsed_cfg.control_scaler != 0.0
+                or parsed_cfg.reward_euclidean or parsed_cfg.reward_level
+                or getattr(parsed_cfg, "residual_anchor_scale", 0.0) != 0.0):
+            raise ValueError("C2RL reward is exactly -(E_next - E_current); reward variants and penalties must be disabled.")
+        self._u_min, self._u_max = u_min, u_max
         self._base_algorithm = base_algorithm.upper()
         self._num_envs = num_envs
         self._get_rollout = get_rollout
@@ -801,29 +769,14 @@ class C2RLAgent(Agent):
         self.track_data("Loss / C2RL/cmg/cond_q95", cond_q95)
 
     def synthesize_cmg(self, *, timesteps: int = 0) -> dict:
-        """Offline CMG synthesis (Phase A, always runs before Phase B) —
-        runs the cvstem pipeline:
+        """Train the metric with CV-STEM regression or direct CCM losses.
 
-        * **``"cvstem"``** (CV-STEM): convex optimization.  Sample states, solve
-          one pointwise SDP per state (``build_cm_dataset``), MSE-regress the CMG
-          network onto the feasible ``{x → W*}`` targets (``regress_cmg``), then
-          freeze.  The SDP results are cached to disk.
-
-        * **``"ccm"``** (default — C1/C2 loss minimization): neural-network
-          training.  Train the CMG network end-to-end with C1 (contraction) and
-          — no per-state SDP, no MSE regression.  C2 makes the metric
-          ``u``-independent by construction, so no u-box vertex enumeration is
-          needed.
-
-        Called once by the trainer before Phase B — needs the dynamics already
-        pretrained so the SDP / gradient computation has meaningful
-        ``f``/``B``/``∂f/∂x``.
-
-        Logs per-epoch loss/LR curves at negative timesteps so they precede
-        Phase B on the ``global_step`` x-axis — same convention
-        ``dynamics_pretrain.py`` uses for the NeuralDynamics fit.
+        Both routes freeze the CMG before Phase B. The CCM route includes full
+        Killing identities, unactuated contraction and bounded-input feasibility;
+        it contains no policy/controller-Jacobian loss.
         """
-        info = self._synthesize_cmg_cvstem(timesteps=timesteps)
+        info = (self._synthesize_cmg_ccm(timesteps=timesteps) if self._cfg.cmg_method == "ccm"
+                else self._synthesize_cmg_cvstem(timesteps=timesteps))
         self._attach_critic_potential()
         return info
 
@@ -1005,6 +958,37 @@ class C2RLAgent(Agent):
                 "residual_mean": float(dataset["residual_mean"]),
                 "residual_max": float(dataset["residual_max"]),
                 "lambda_reduced_rate": 0.0, "metric_source": "sos"}
+
+    def _synthesize_cmg_ccm(self, *, timesteps: int = 0) -> dict:
+        from .ccm_synthesis import train_cmg_ccm
+        if self._u_min is None or self._u_max is None:
+            raise ValueError("CCM synthesis requires the environment's applied u_min/u_max bounds.")
+        data = self._get_rollout(self._cfg.cmg_memory_size, "c3m")
+        epochs = self._cfg.cmg_ccm_epochs
+        log_every = max(1, epochs // 100)
+
+        def report(epoch, training, validation):
+            for split, values in (("train", training), ("validation", validation)):
+                for key, value in values.items():
+                    self.track_data(f"Loss / C2RL/ccm/{split}/{key}", value)
+            if epoch % log_every == 0 or epoch == epochs - 1:
+                print(f"[C2RL] CCM epoch {epoch + 1}/{epochs}: loss={training['loss']:.4g}, "
+                      f"validation={validation['loss']:.4g}, Killing max={validation['killing_max']:.4g}, "
+                      f"contraction max={validation['contraction_max']:.4g}, "
+                      f"input residual max={validation['feasibility_max']:.4g}", flush=True)
+                if getattr(self, "writer", None) is not None:
+                    self.write_tracking_data(timestep=epoch - epochs, timesteps=timesteps)
+
+        info = train_cmg_ccm(self._ccm_gen, self._get_f_and_B, data, self._u_min, self._u_max,
+                             cfg=self._cfg, device=self._device, angle_idx=self._angle_idx, on_epoch=report)
+        self.freeze_cmg()
+        self._log_cmg_condition_numbers(data["x"])
+        # Persist the restored metric's diagnostics and the actual input box.
+        import json
+        os.makedirs(self.experiment_dir, exist_ok=True)
+        with open(os.path.join(self.experiment_dir, "ccm_synthesis.json"), "w") as output:
+            json.dump(info, output, indent=2)
+        return info
 
     def _synthesize_cmg_cvstem(self, *, timesteps: int = 0) -> dict:
         """CV-STEM path: Load the offline ``{x → W*(x)}`` dataset, then MSE-regress.
@@ -1238,11 +1222,14 @@ class C2RLSkrlTrainer(Trainer):
         # metric_source='sos' fits nothing, so there is no regression loss to
         # report -- say which metric is in use instead of printing a 0 that
         # reads like a perfect fit.
-        _fit = (f"loss {info['regress_mse']:.4g}" if "regress_mse" in info
-                else f"source {info.get('metric_source', '?')} (exact, no fit)")
-        print("[C2RL] Phase A (cvstem) — CMG synthesized "
-              f"(feasible {info['feasibility_rate']:.1%}, λ-reduced "
-              f"{info['lambda_reduced_rate']:.1%}, {_fit}) and frozen.")
+        if agent._cfg.cmg_method == "ccm":
+            print(f"[C2RL] Phase A (ccm) — metric frozen; sampled validation {info['validation']}")
+        else:
+            _fit = (f"loss {info['regress_mse']:.4g}" if "regress_mse" in info
+                    else f"source {info.get('metric_source', '?')} (exact, no fit)")
+            print("[C2RL] Phase A (cvstem) — CMG synthesized "
+                  f"(feasible {info['feasibility_rate']:.1%}, λ-reduced "
+                  f"{info['lambda_reduced_rate']:.1%}, {_fit}) and frozen.")
 
         # ── Phase B: rollout + train the deployed policy against the Mahalanobis
         # reward computed from the frozen CMG. ─────────────────────────────

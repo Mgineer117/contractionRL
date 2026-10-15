@@ -107,6 +107,8 @@ def main() -> int:
     )
 
     cfg, cfg_path = _load_cfg(args.task, args.algorithm)
+    if cfg.cmg_method == "ccm":
+        raise SystemExit("CCM trains the metric directly in train.py; no CV-STEM dataset is needed.")
     if args.lbd is not None:
         print(f"[build_cm] lbd OVERRIDE {cfg.lbd} -> {args.lbd} (probe; the config "
               f"still says {cfg.lbd})", flush=True)

@@ -49,6 +49,8 @@ parser.add_argument(
     "--algorithm", "--algo", type=str, default="PPO",
     help="Algorithm: ppo | sac | c3m | lqr | sdlqr | c2rl-ppo | c2rl-sac | AMP | DDPG | TD3 | …"
 )
+parser.add_argument("--cmg_method", "--cmg-method", choices=["cvstem", "ccm"], default=None,
+                    help="C2RL metric synthesis: CV-STEM regression or direct CCM losses.")
 parser.add_argument("--num_envs", type=int, default=None, help="Number of parallel environments.")
 parser.add_argument("--seed", type=int, default=None, help="Random seed.")
 parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint path to resume from.")
@@ -387,6 +389,8 @@ def _apply_agent_overrides(agent_cfg, args):
     destination differs from a plain ``agent[<dest>]`` write.
     """
     a = agent_cfg["agent"]
+    if args.cmg_method is not None:
+        a["cmg_method"] = args.cmg_method
     simple = (
         "learning_rate", "discount_factor", "rollouts", "learning_epochs",
         "mini_batches", "ratio_clip", "entropy_loss_scale", "kl_threshold",

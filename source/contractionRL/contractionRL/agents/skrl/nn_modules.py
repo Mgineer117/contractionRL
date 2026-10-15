@@ -733,15 +733,14 @@ class BoundedCCM_Generator(nn.Module):
     ``outputs_metric`` selects which of the two mutually-inverse matrices the
     forward pass produces. C2RL sets it True; C3M leaves it False:
 
-      * ``cvstem`` -> ``outputs_metric=True``: the head emits ``M`` directly,
+      * C2RL (both synthesis methods) -> ``outputs_metric=True``: emits ``M`` directly,
         with eigenvalues squashed into ``[1/w_ub, 1/w_lb]``. The reward needs
         ``e^T M e``, so emitting ``M`` removes a batched SPD inverse from every
         env step (env_base.get_rewards used to call ``spd_inverse(W)`` per step
         per env, on top of the eigh this forward already does). The regression
         target is inverted once offline instead.
-      * ``ccm`` -> ``outputs_metric=False``: the head emits ``W``, because the
-        C1/C2 contraction losses are written in ``W`` and there is no SDP
-        dataset to pre-invert. The reward inverts per step, as before.
+        The direct CCM loss is also written in M.
+      * C3M -> ``outputs_metric=False``: emits ``W`` for its dual C1/C2 losses.
 
     Fitting ``M`` directly is also better aligned with its use: inverting a
     fitted ``W`` amplifies relative error exactly where ``W`` is smallest, which

@@ -843,14 +843,10 @@ class ContractionRunner:
                     agent_cfg, trainer_cfg, models_cfg, memory_cfg, get_rollout, get_f_and_B, x_dim=None, u_dim=None,
                     base_algorithm: str = "PPO", angle_idx=None, sym=None, raw_cfg_snapshot=None,
                     cm_cfg=None, cmg_cfg=None, empirical_dynamics_cfg=None):
-        """Build a single-policy C2RLAgent. Always builds a CMG network
-        (MetricModel), synthesized offline before Phase B and then frozen
-        (Tsukamoto NCM), trained by CV-STEM SDP regression
-        (default) trains it directly via C1/C2 loss minimization; "cvstem" solves
-        a per-state SDP and MSE-regresses the network onto the solutions. The CMG
-        is always built as a ``BoundedCCM_Generator`` (``constrain_eigenvalues``
-        forced ``True`` here, regardless of yaml) — see c2rl.py's module
-        docstring for why.
+        """Build one C2RL policy and a structurally bounded M-emitting CMG.
+
+        Phase A uses CV-STEM regression or direct CCM losses; Phase B freezes
+        the metric and trains the policy with the energy-decrease reward.
 
         ``cm_cfg``/``cmg_cfg``/``empirical_dynamics_cfg`` are the yaml's
         top-level ``cm:``/``cmg:``/``empirical_dynamics:`` blocks — merged into
@@ -897,16 +893,10 @@ class ContractionRunner:
         cmg_net = models_cfg.get("cmg", {}).get("network", [{}])
         cmg_hd = cmg_net[0].get("layers", [256, 256]) if cmg_net else [256, 256]
         cmg_act = cmg_net[0].get("activations", "tanh") if cmg_net else "tanh"
-        # The head emits M (never W): see outputs_metric below.
-        # directly (its SDP targets invert once offline, and the reward wants
-        # M, so every env step drops a batched SPD inverse); "ccm" -> W, whose
-        # C1/C2 losses are written in W. See BoundedCCM_Generator.
+        # Both synthesis methods use the same bounded M-emitting head.
         cmg_model = MetricModel(
             obs_space, act_space, device, hidden_dim=cmg_hd, activation=cmg_act,
             x_dim=x_dim, angle_idx=angle_idx, sym=_cmg_symmetry(sym), constrain_eigenvalues=True, w_lb=w_lb, w_ub=w_ub,
-            # Unconditional since 2026-08-31: cmg_method="ccm" was the only
-            # caller that wanted a W-emitting head, and it is gone. The CMG
-            # emits M directly, so no SPD inverse per env step.
             outputs_metric=True,
         )
         models["cmg"] = cmg_model
@@ -948,6 +938,10 @@ class ContractionRunner:
         # drop any PPO/SAC-specific field not also declared on the matching C2RL
         # cfg dataclass (this bit us for base_algorithm before it became an
         # explicit constructor kwarg — see C2RLAgent.__init__).
+        raw_env = _unwrap_env(env)
+        u_min, u_max = _env_attrs(raw_env, "U_MIN", "U_MAX")
+        if u_min is None or u_max is None:
+            u_min, u_max = act_space.low, act_space.high
         agent = C2RLAgent(
             cfg=agent_cfg,
             models=models,
@@ -962,6 +956,8 @@ class ContractionRunner:
             u_dim=u_dim,
             num_envs=env.num_envs,
             angle_idx=angle_idx,
+            u_min=u_min,
+            u_max=u_max,
         )
         trainer_cfg.setdefault("timesteps", 300000)
         trainer = C2RLSkrlTrainer(

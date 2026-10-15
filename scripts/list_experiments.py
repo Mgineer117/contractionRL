@@ -24,8 +24,8 @@ KEY_ARGS = {
     "lqr": ("Q_scaler", "R_scaler"),
     "sdlqr": ("Q_scaler", "R_scaler"),
     "cvstem-lqr": ("lbd", "cm_samples", "cm_solver", "cm_w_lb", "cm_w_ub"),
-    "c2rl-ppo": ("metric_source", "lbd", "w_lb", "w_ub", "discount_factor", "learning_rate"),
-    "c2rl-sac": ("metric_source", "lbd", "w_lb", "w_ub", "discount_factor", "learning_rate"),
+    "c2rl-ppo": ("cmg_method", "lbd", "w_lb", "w_ub", "discount_factor", "learning_rate"),
+    "c2rl-sac": ("cmg_method", "lbd", "w_lb", "w_ub", "discount_factor", "learning_rate"),
 }
 CFG_CLASSES = {
     "c3m": ("c3m.py", "C3MCfg"),
@@ -37,8 +37,8 @@ CFG_CLASSES = {
 }
 METHODS = {"c3m": "C1/C2 joint metric/controller training",
            "cvstem-lqr": "CV-STEM metric + analytical feedback",
-           "c2rl-ppo": "CV-STEM metric regression + PPO",
-           "c2rl-sac": "CV-STEM metric regression + SAC"}
+           "c2rl-ppo": "CV-STEM or CCM metric training + PPO",
+           "c2rl-sac": "CV-STEM or CCM metric training + SAC"}
 
 
 def _entry(node, package, imports):
@@ -142,7 +142,7 @@ def main():
             print(f"  {algo:13}  {', '.join(keys)}")
             if algo in METHODS:
                 print(f"                 {METHODS[algo]}")
-    print("\n  C2RL uses CV-STEM. Its former cmg_method=ccm option is not supported in this code.")
+    print("\n  cmg_method: cvstem = SDP regression; ccm = full Killing + projected contraction + bounded-input feasibility.")
     print("  Settings below come from each task's YAML and algorithm defaults; they are not CLI flags.")
     title(f"ENVIRONMENTS · {len(rows)} registered tasks")
     for row in rows:

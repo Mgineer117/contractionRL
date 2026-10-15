@@ -227,9 +227,8 @@ class MetricModel(Model):
         if kwargs.get("constrain_eigenvalues", False):
             # outputs_metric: C2RL's CMG emits M directly (its SDP
             # targets can be inverted once offline, and the reward wants M), so
-            # every env step drops a batched SPD inverse. "ccm" emits W, since
-            # its C1/C2 losses are written in W and there is no dataset to
-            # pre-invert. See BoundedCCM_Generator.
+            # every env step drops a batched SPD inverse. C2RL's direct CCM
+            # losses also use M; C3M keeps the W-emitting default.
             self.ccm_gen = BoundedCCM_Generator(
                 w_lb=kwargs.get("w_lb", 0.1), w_ub=kwargs.get("w_ub", 10.0),
                 outputs_metric=bool(kwargs.get("outputs_metric", False)), **common)

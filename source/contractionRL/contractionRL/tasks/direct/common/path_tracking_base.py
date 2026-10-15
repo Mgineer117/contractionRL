@@ -23,6 +23,7 @@ from isaaclab.envs import DirectRLEnv
 
 from contractionRL.agents.skrl.angle_utils import wrap_diff
 from contractionRL.agents.skrl.ref_window import RefWindow
+from contractionRL.agents.skrl.math_utils import quadratic_energy, energy_decrease
 
 from .eval_metrics import fit_exponential_envelope
 from .state_guard import carry_forward_nonfinite
@@ -745,13 +746,11 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
             with torch.no_grad():
                 next_M = self._metric_from_cmg(x)
 
-                prev_err_t = self._prev_error.unsqueeze(-1)
-                next_err_t = error.unsqueeze(-1)
-                V = torch.bmm(torch.bmm(prev_err_t.transpose(1, 2), self._prev_M), prev_err_t).squeeze(-1).squeeze(-1)
-                next_V = torch.bmm(torch.bmm(next_err_t.transpose(1, 2), next_M), next_err_t).squeeze(-1).squeeze(-1)
+                V = quadratic_energy(self._prev_error, self._prev_M)
+                next_V = quadratic_energy(error, next_M)
 
                 control_effort = torch.norm(self._actions, p=2, dim=-1) ** 2
-                reward = self.tracking_scaler * (V - next_V) - self.control_scaler * control_effort
+                reward = self.tracking_scaler * energy_decrease(V, next_V) - self.control_scaler * control_effort
 
                 self._prev_error = error.clone()
                 self._prev_M = next_M

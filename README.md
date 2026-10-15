@@ -94,14 +94,23 @@ saturation and silently collapses the certified feedback Jacobian. Use the tanh-
 One policy, two phases.
 
 1. **Synthesize the metric, then freeze it.** CV-STEM solves a joint SDP over sampled
-   states and regresses the metric network onto `{x -> W*}`. The former C2RL
-   `cmg_method: ccm` option is no longer supported; C3M still trains with C1/C2 losses.
+   states and regresses the metric network onto `{x -> W*}` when `cmg_method: cvstem`.
+   With `cmg_method: ccm`, the bounded M-emitting network trains directly on full Killing identities,
+   projected drift contraction, and bounded-input feasibility for `E = eᵀM(x)e`, including the
+   reference dynamics. This method has no learned-controller contraction loss. It uses the
+   environment's applied input box, which is distinct from the reference-input box.
    The CV-STEM solve is expensive, so its result is cached
    under `data/` and the agent **refuses to run** rather than silently re-solve when no cached
    dataset matches the config.
 2. **Ordinary PPO/SAC against that frozen metric,** on the reward
-   `tracking_scaler·(V_t - V_{t+1}) - control_scaler·||u||^2`, with `V = e'M(x)e`. The tracking
-   term is the per-step *decrease* of `V` — a contraction signal, not a level penalty.
+   `-(E_next - E_current)`, with `E = e'M(x)e` and moving-reference tracking error `e`.
+   C2RL requires unit tracking weight, zero control penalty, and disabled reward variants.
+
+Select CCM with `--cmg_method ccm` or `cmg_method: ccm` under `cm:`. Its training knobs are
+`cmg_ccm_epochs`, `cmg_ccm_lr`, and `cmg_ccm_batch_size` under `cmg:`. The three loss weights
+are `ccm_killing_weight`, `ccm_contraction_weight`, and `ccm_feasibility_weight` (all default to 1).
+`ccm_synthesis.json` records sampled validation residuals and input bounds; it is not a uniform
+certificate. CCM requires finite applied-input bounds and full-column-rank actuation on its samples. Derivatives are continuous-time; the finite-step environment still needs separate validation.
 
 The **environment** computes that reward: `_inject_ccm` hands the frozen metric to the env via
 `set_ccm` and the env's own `get_rewards()` returns it, so PPO's GAE and SAC's replayed critic

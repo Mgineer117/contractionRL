@@ -315,6 +315,10 @@ def run_classic(args) -> list[dict]:
         try:
             print("  loading checkpoint …")
             runner.agent.load(ckpt)
+            from contractionRL.agents.skrl.c2rl import C2RLAgent, C2RLSkrlTrainer
+            if isinstance(runner.agent, C2RLAgent):
+                runner.agent.freeze_cmg()
+                C2RLSkrlTrainer._inject_ccm(env, runner.agent)
             max_steps = int(getattr(env, "max_episode_length", getattr(env, "max_episode_len", 1000))) + 1
             summary = _rollout_stability(env, runner.agent, max_steps=max_steps)
         finally:
@@ -380,6 +384,10 @@ def run_isaac(args, simulation_app) -> list[dict]:
                 runner = CLActorRunner(env, agent_cfg)
             print("  loading checkpoint …")
             runner.agent.load(ckpt)
+            from contractionRL.agents.skrl.c2rl import C2RLAgent, C2RLSkrlTrainer
+            if isinstance(runner.agent, C2RLAgent):
+                runner.agent.freeze_cmg()
+                C2RLSkrlTrainer._inject_ccm(env, runner.agent)
 
             max_steps = int(getattr(env, "max_episode_length", 1000)) + 1
             summary = _rollout_stability(env, runner.agent, max_steps=max_steps)

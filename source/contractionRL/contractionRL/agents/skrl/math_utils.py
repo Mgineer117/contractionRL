@@ -10,6 +10,16 @@ import torch
 from torch.autograd import grad
 
 
+def quadratic_energy(error: torch.Tensor, metric: torch.Tensor) -> torch.Tensor:
+    """Batched e' M e in physical coordinates."""
+    return torch.einsum("bi,bij,bj->b", error, metric, error)
+
+
+def energy_decrease(current_energy, next_energy):
+    """R = -(E(next state) - E(current state))."""
+    return -(next_energy - current_energy)
+
+
 def jacobian(f: torch.Tensor, x: torch.Tensor, create_graph: bool = True) -> torch.Tensor:
     """Batched autograd Jacobian ∂f/∂x → (n, f_dim, x_dim)."""
     n, f_dim, x_dim = x.shape[0], f.shape[-1], x.shape[-1]

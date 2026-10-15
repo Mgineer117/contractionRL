@@ -36,17 +36,16 @@ BATCH = ["classic-cartpole-v0", "classic-segway-v0", "classic-car-v0", "classic-
 def cfg_for(task: str, algorithm: str):
     """Build the algorithm Cfg exactly as train.py does: yaml -> filtered dataclass."""
     import yaml
-    from contractionRL.agents.skrl.c2rl import C2RLPPOCfg
+    from contractionRL.agents.skrl.c2rl import C2RLPPOCfg, C2RLSACCfg
     from contractionRL.agents.skrl.rl_glue import filter_cfg_fields
 
-    env_dir = task.removeprefix("classic-")
-    # classic-car-v1's package directory is car_v1: the id's "-v1" is a version
-    # suffix, the directory's "_v1" is part of the name.
-    env_dir = env_dir.removesuffix("-v0").replace("-v1", "_v1")
-    y = (REPO / "source/contractionRL/contractionRL/tasks/direct/classic"
-         / env_dir / "agents" / f"skrl_{algorithm}_cfg.yaml")
-    if not y.is_file():
-        raise FileNotFoundError(f"no yaml for {task} at {y}")
+    import importlib
+    import gymnasium as gym
+    import contractionRL.tasks.direct.classic_isaac  # noqa: F401
+    algorithm = algorithm.replace("-", "_")
+    entry = gym.spec(task).kwargs[f"skrl_{algorithm}_cfg_entry_point"]
+    package, filename = entry.split(":")
+    y = Path(importlib.import_module(package).__file__).parent / filename
     raw = yaml.safe_load(y.read_text())
     # Section merge order is ContractionRunner._setup_c2rl's, agent last so it
     # wins (its line 870). Reversing it would read a `cm:` value the agent does
@@ -54,15 +53,19 @@ def cfg_for(task: str, algorithm: str):
     merged = {**(raw.get("cm") or {}), **(raw.get("cmg") or {}),
               **(raw.get("empirical_dynamics") or {}), **(raw.get("agent") or {})}
     merged.pop("class", None)
-    return C2RLPPOCfg(**filter_cfg_fields(merged, C2RLPPOCfg,
-                                          context="preflight")), y
+    Cfg = C2RLSACCfg if algorithm == "c2rl_sac" else C2RLPPOCfg
+    return Cfg(**filter_cfg_fields(merged, Cfg, context="preflight")), y
 
 
-def check(task: str, algorithm: str = "c2rl_ppo") -> tuple[bool, str]:
+def check(task: str, algorithm: str = "c2rl_ppo", cmg_method: str | None = None) -> tuple[bool, str]:
     from contractionRL.agents.skrl.c2rl import cm_dataset_target
     from contractionRL.agents.skrl.ncm_synthesis import load_cached_cm_dataset
 
     cfg, y = cfg_for(task, algorithm)
+    if cmg_method is not None:
+        cfg.cmg_method = cmg_method
+    if cfg.cmg_method == "ccm":
+        return True, "CCM trains the metric directly; no CV-STEM dataset is required"
     path, kwargs = cm_dataset_target(cfg)
     if path is None:
         return False, f"{y.name} sets neither cm_data_path nor dynamics_pretrain_data_path"
@@ -84,6 +87,7 @@ def main() -> int:
     ap.add_argument("tasks", nargs="*", help="task ids, e.g. classic-car-v1")
     ap.add_argument("--batch", action="store_true", help="check the four gamma-batch envs")
     ap.add_argument("--algorithm", default="c2rl_ppo")
+    ap.add_argument("--cmg-method", choices=["cvstem", "ccm"])
     a = ap.parse_args()
     tasks = a.tasks or (BATCH if a.batch else [])
     if not tasks:
@@ -92,7 +96,7 @@ def main() -> int:
     bad = 0
     for t in tasks:
         try:
-            ok, msg = check(t, a.algorithm)
+            ok, msg = check(t, a.algorithm, a.cmg_method)
         except Exception as e:  # a broken yaml is also a launch blocker
             ok, msg = False, f"{type(e).__name__}: {e}"
         bad += not ok

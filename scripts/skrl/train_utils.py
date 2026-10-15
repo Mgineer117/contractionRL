@@ -791,6 +791,10 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
 
     device = agent.device
     env = gym.make(task, device=device)
+    from contractionRL.agents.skrl.c2rl import C2RLAgent, C2RLSkrlTrainer
+    if isinstance(agent, C2RLAgent):
+        agent.freeze_cmg()
+        C2RLSkrlTrainer._inject_ccm(env, agent)
     _disarm_termination_for_eval(env, "[Eval]")
 
     if held_out_seed is not None:
@@ -1005,6 +1009,10 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
         if model is not None:
             model.eval()
 
+    from contractionRL.agents.skrl.c2rl import C2RLAgent, C2RLSkrlTrainer
+    if isinstance(agent, C2RLAgent):
+        agent.freeze_cmg()
+        C2RLSkrlTrainer._inject_ccm(isaac_env, agent)
     unwrapped = isaac_env.unwrapped
     # Same rule as the classic evaluator, and it bites harder here: this loop
     # runs a fixed T steps without checking dones, so an env that terminated
