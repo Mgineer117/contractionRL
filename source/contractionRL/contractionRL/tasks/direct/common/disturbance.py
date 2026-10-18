@@ -42,4 +42,3 @@ class BoundedGust:
         applied = self.value.clone()
         self.remaining.sub_(self.dt).clamp_min_(0)
         return applied
-

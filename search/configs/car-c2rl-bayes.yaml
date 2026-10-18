@@ -48,4 +48,3 @@ parameters:
       max_lr: 1.0e-4
   agent.kl_threshold:
     value: 0.032
-

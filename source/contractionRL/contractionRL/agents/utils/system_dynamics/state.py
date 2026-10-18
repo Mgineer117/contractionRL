@@ -382,4 +382,3 @@ class StateSymmetry:
                 f"yaw={self.yaw_idx} rot_pairs={list(self.rot_pairs)} "
                 f"angles={list(self.angle_idx)} -> pair_dim={self.pair_dim()} "
                 f"single_dim={self.single_dim()}")
-

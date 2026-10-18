@@ -244,7 +244,7 @@ class PathTrackingObservationScaler(nn.Module):
 
 class BatchedGymnasiumWrapper(GymnasiumWrapper):
     """Overrides SKRL's default GymnasiumWrapper to prevent tensor-copy warnings.
-    
+
     Our classic environments natively output PyTorch tensors for speed. SKRL's default
     wrapper forces torch.tensor() on the outputs, which throws a UserWarning in PyTorch
     when the output is already a tensor. This wrapper safely applies torch.as_tensor
@@ -286,4 +286,3 @@ class BatchedGymnasiumWrapper(GymnasiumWrapper):
             self._info = info
 
         return observation, reward, terminated, truncated, info
-

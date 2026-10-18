@@ -84,4 +84,3 @@ parameters:
       lr_factor: 1.5
       min_lr: 1.0e-6
       max_lr: 1.0e-4
-

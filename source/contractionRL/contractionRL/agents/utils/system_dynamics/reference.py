@@ -517,4 +517,3 @@ class TrackingFeatures(torch.nn.Module):
             features[:, n:n + n] = self.error(xi[:, :n], xref) / self.scale[n:n + n]
         # xref remains in physical world coordinates: it locates the box faces.
         return features
-
