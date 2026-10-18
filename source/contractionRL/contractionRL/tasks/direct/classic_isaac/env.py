@@ -19,6 +19,11 @@ class ClassicIsaacEnv(DirectRLEnv):
         self.plant = gym.make(
             cfg.classic_task, num_envs=cfg.scene.num_envs, device=cfg.sim.device,
             reference_mode=cfg.reference_mode,
+            compact_reference=True,
+            disturbance_scales=(getattr(cfg, "disturbance_scales", None)
+                                if getattr(cfg, "disturbance_enabled", True)
+                                else [0.] * len(cfg.disturbance_scales)),
+            reference_margin_fraction=getattr(cfg, "reference_margin_fraction", .05),
         ).unwrapped
         if cfg.decimation != 1 or abs(cfg.sim.dt - self.plant.dt) > 1e-12:
             raise ValueError("Isaac timing must match the classic plant (decimation=1).")
@@ -58,6 +63,17 @@ class ClassicIsaacEnv(DirectRLEnv):
         self.cfg.observation_space = self.plant.observation_space
         self._configure_gym_env_spaces()
 
+    def configure_ref_preview(self, length, stride=1):
+        self.plant.configure_ref_preview(length, stride)
+        self.cfg.observation_space = self.plant.observation_space
+        self._configure_gym_env_spaces()
+
+    def configure_temporal_context(self, horizon, use_history=True):
+        self.plant.configure_temporal_context(horizon, use_history)
+        self.cfg.observation_space = self.plant.observation_space
+        self._configure_gym_env_spaces()
+
+
     def get_tracking_error(self):
         plant = self.plant
         rows = torch.arange(self.num_envs, device=self.device)
@@ -71,6 +87,9 @@ class ClassicIsaacEnv(DirectRLEnv):
         plant = self.plant
         rows = torch.arange(self.num_envs, device=self.device)
         ref = plant.xref[rows, plant.time_steps.clamp(max=plant.xref.shape[1] - 1)]
+        if plant.task in ('cartpole', 'segway'):
+            self._draw_planar(ref, rows)
+            return
         positions = torch.zeros(2 * self.num_envs, 3, device=self.device)
         dim = 3 if plant.task == "quadrotor" else 2
         positions[:self.num_envs, :dim] = plant.x_t[:, :dim]
@@ -90,6 +109,24 @@ class ClassicIsaacEnv(DirectRLEnv):
                 plant.x_t[:, 7], plant.x_t[:, 8], plant.x_t[:, 9],
             )
         indices = torch.cat((torch.zeros_like(rows), torch.ones_like(rows)))
+        self.markers.visualize(positions, orientations, marker_indices=indices)
+
+    def _draw_planar(self, ref, rows):
+        plant = self.plant
+        down = plant.task == 'cartpole'
+        pivot = 1.5 if down else .3
+        sign = -1. if down else 1.
+        positions = torch.zeros(4*self.num_envs, 3, device=self.device)
+        positions[:self.num_envs, 0] = plant.x_t[:, 0]
+        positions[self.num_envs:2*self.num_envs, 0] = ref[:, 0]
+        positions[:2*self.num_envs, 2] = pivot
+        for offset, state in [(2*self.num_envs, plant.x_t), (3*self.num_envs, ref)]:
+            positions[offset:offset+self.num_envs, 0] = state[:, 0] + sign*torch.sin(state[:, 1])
+            positions[offset:offset+self.num_envs, 2] = pivot + sign*torch.cos(state[:, 1])
+        positions += self.scene.env_origins.repeat(4, 1)
+        orientations = torch.zeros(4*self.num_envs, 4, device=self.device)
+        orientations[:, 0] = 1.
+        indices = torch.cat((torch.zeros_like(rows), torch.ones_like(rows), torch.zeros_like(rows), torch.ones_like(rows)))
         self.markers.visualize(positions, orientations, marker_indices=indices)
 
     def reset(self, seed=None, options=None):
@@ -118,3 +155,15 @@ class ClassicIsaacEnv(DirectRLEnv):
 
     def _debug_vis_callback(self, event):
         self._draw()
+
+
+def make_env(cfg, render_mode=None, **kwargs):
+    from .backend import configure_backend
+    configure_backend(cfg)
+    if cfg.mode == "sim_to_real":
+        if cfg.classic_task in ('classic-cartpole-v0', 'classic-segway-v0'):
+            from .planar_env import PlanarTrackingEnv
+            return PlanarTrackingEnv(cfg, render_mode, **kwargs)
+        from .physx_env import PhysXTrackingEnv
+        return PhysXTrackingEnv(cfg, render_mode, **kwargs)
+    return ClassicIsaacEnv(cfg, render_mode, **kwargs)

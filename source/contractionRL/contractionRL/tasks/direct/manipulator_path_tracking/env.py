@@ -41,10 +41,10 @@ class ManipulatorPathTrackingEnv(PathTrackingBase):
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self._prev_actions = self._actions.clone()
         self._actions = actions.clone()
-        limits = self._robot.data.soft_joint_pos_limits[:, self._arm_ids, :]
-        mid = 0.5 * (limits[..., 0] + limits[..., 1])
-        half_range = 0.5 * (limits[..., 1] - limits[..., 0])
-        self._joint_targets = mid + half_range * self._actions
+        # Match the velocity-policy action coordinates used in saved references.
+        default = self._robot.data.default_joint_pos[:, self._arm_ids]
+        scale = actions.new_tensor([.20] * 4 + [.025] * 3)
+        self._joint_targets = default + scale * self._actions
 
     def _apply_action(self) -> None:
         self._robot.set_joint_position_target(self._joint_targets, joint_ids=self._arm_ids)
@@ -82,7 +82,7 @@ class ManipulatorPathTrackingEnv(PathTrackingBase):
         )
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
+        time_out = self.episode_length_buf >= self.max_episode_length
         # Path tracking never terminates early — non-finite/diverged states are
         # handled by the carry-forward guard in _sanitize_state instead (see
         # PathTrackingBase). Manipulators have no "fell" concept.

@@ -95,13 +95,9 @@ import torch
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
 sys.path.insert(0, os.path.join(_ROOT, "source", "contractionRL"))
 
-from contractionRL.agents.skrl.contraction_metrics import per_env_metrics  # noqa: E402
+from contractionRL.agents.utils.contraction.metrics import per_env_metrics  # noqa: E402
 from contractionRL.agents.skrl.cvstem_lqr import CVSTEMLQRAgent  # noqa: E402
-from contractionRL.agents.skrl.ncm_synthesis import (  # noqa: E402
-    cvstem_joint,
-    drift_jacobians,
-    sample_state_box,
-)
+from contractionRL.agents.utils.contraction.ncm_synthesis import cvstem_joint, drift_jacobians, sample_state_box
 
 
 def eps_for_n(n: int) -> float:
@@ -537,10 +533,14 @@ def main() -> int:
           f"             cm_eps: {eps_eval:g}   (the search ran at {eps_search:g})\n"
           f"             cm_w_lb: {w_lb:g}\n"
           f"             cm_w_ub: {w_ub:g}\n"
-          f"\n    skrl_c2rl_ppo_cfg.yaml / skrl_c2rl_sac_cfg.yaml / skrl_c3m_cfg.yaml\n"
-          f"      cm:    lbd: {lbd:.4f}\n"
+          f"\n    skrl_c2rl_ppo_cfg.yaml / skrl_c2rl_sac_cfg.yaml\n"
+          f"      cm:    cvstem_lbd: {lbd:.4f}\n"
           f"             cvstem_r_scaler: {r:g}\n"
           f"             cm_eps: {eps_eval:g}\n"
+          f"             cvstem_w_lb: {w_lb:g}\n"
+          f"             cvstem_w_ub: {w_ub:g}\n"
+          f"\n    skrl_c3m_cfg.yaml\n"
+          f"      cm:    lbd: {lbd:.4f}\n"
           f"             w_lb: {w_lb:g}\n"
           f"             w_ub: {w_ub:g}\n"
           f"\n  Then REGENERATE the CM dataset (lbd is in the cache key, so the old npz\n"

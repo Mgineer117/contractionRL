@@ -58,7 +58,7 @@ def _load_cfg(task: str, algorithm: str):
     ``{**cm, **cmg, **empirical_dynamics, **agent}``. Reading the yaml blocks in
     a different order here would change which duplicate key wins."""
     from contractionRL.agents.skrl.c2rl import C2RLPPOCfg, C2RLSACCfg
-    from contractionRL.agents.skrl.rl_glue import filter_cfg_fields
+    from contractionRL.agents.utils.RL.config import filter_cfg_fields, migrate_c2rl_metric_cfg
 
     path = _agents_dir(task) / f"skrl_{algorithm.replace('-', '_')}_cfg.yaml"
     if not path.exists():
@@ -69,7 +69,7 @@ def _load_cfg(task: str, algorithm: str):
               **raw.get("empirical_dynamics", {}), **raw.get("agent", {})}
     merged.pop("class", None)
     CfgCls = C2RLSACCfg if "sac" in algorithm else C2RLPPOCfg
-    return CfgCls(**filter_cfg_fields(merged, CfgCls, context="build_cm_dataset")), path
+    return CfgCls(**filter_cfg_fields(migrate_c2rl_metric_cfg(merged), CfgCls, context="build_cm_dataset")), path
 
 
 
@@ -99,7 +99,7 @@ def main() -> int:
 
     import contractionRL.tasks.direct.classic  # noqa: F401
     from contractionRL.agents.skrl.c2rl import cm_dataset_target
-    from contractionRL.agents.skrl.ncm_synthesis import (
+    from contractionRL.agents.utils.contraction.ncm_synthesis import (
         build_cm_dataset,
         load_cached_cm_dataset,
         sample_state_box,
@@ -112,7 +112,7 @@ def main() -> int:
     if args.lbd is not None:
         print(f"[build_cm] lbd OVERRIDE {cfg.lbd} -> {args.lbd} (probe; the config "
               f"still says {cfg.lbd})", flush=True)
-        cfg.lbd = args.lbd
+        cfg.cvstem_lbd = args.lbd
     if args.num_samples is not None:
         print(f"[build_cm] N OVERRIDE {cfg.cmg_memory_size} -> {args.num_samples} "
               f"(probe; the shipped size is {cfg.cmg_memory_size})", flush=True)

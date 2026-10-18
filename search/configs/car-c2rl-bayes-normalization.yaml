@@ -1,0 +1,87 @@
+name: analytical-car-c2rl-ppo-normalization-lr-method
+method: bayes
+run_cap: 96
+metric:
+  name: Evaluation/Stability/validation_auc_mean
+  goal: minimize
+program: search/train_bayes.py
+command:
+- ${env}
+- ${interpreter}
+- ${program}
+- --root
+- ..
+- ${args}
+parameters:
+  network_family:
+    values:
+    - compact_mlp
+    - dual_gru
+  ccm_bounds:
+    values:
+    - 0.1:1.0
+    - 0.1:3.0
+    - 0.3:3.0
+  agent.use_value_norm:
+    values:
+    - true
+    - false
+  agent.use_state_norm:
+    value: false
+  agent.use_value_expansion:
+    values:
+    - true
+    - false
+  agent.learning_rate:
+    value: 1.0e-5
+  agent.grad_norm_clip:
+    values:
+    - 0.5
+    - 1.0
+    - 2.0
+  agent.gae_lambda:
+    values:
+    - 0.9
+    - 0.95
+    - 0.99
+    - 1.0
+  agent.rollouts:
+    values:
+    - 64
+    - 128
+  agent.learning_epochs:
+    values:
+    - 3
+    - 5
+    - 10
+  agent.mini_batches:
+    values:
+    - 4
+    - 8
+    - 16
+  agent.discount_factor:
+    value: 0.9
+  agent.action_bound_penalty_beta:
+    value: 1.0
+  policy_architecture:
+    values:
+    - structured_residual
+    - factorized
+  agent.use_reward_norm:
+    values:
+    - true
+    - false
+  lr_schedule:
+    value: kl_adaptive
+  agent.kl_threshold:
+    value: 0.032
+  agent.learning_rate_scheduler:
+    value: KLAdaptiveLR
+  agent.learning_rate_scheduler_kwargs:
+    value:
+      kl_threshold: 0.008
+      kl_factor: 2
+      lr_factor: 1.5
+      min_lr: 1.0e-6
+      max_lr: 1.0e-4
+

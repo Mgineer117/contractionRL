@@ -388,7 +388,8 @@ class CVSTEMPretrainedMetric:
         )
 
         cm = cfg.get("cm", {})
-        cmg = cfg.get("cmg", {})
+        from contractionRL.agents.utils.RL.config import migrate_c2rl_metric_cfg
+        cmg = migrate_c2rl_metric_cfg(cfg.get("cmg", {}))
         agent = cfg.get("agent", {})
         self.lbd = float(cm.get("lbd", 0.5))
         self.w_lb = float(cm.get("w_lb", 0.1))
@@ -490,7 +491,8 @@ class CCMTrainedMetric:
         from contractionRL.agents.skrl.ncm_synthesis import train_cmg_ccm
 
         cm = cfg.get("cm", {})
-        cmg = cfg.get("cmg", {})
+        from contractionRL.agents.utils.RL.config import migrate_c2rl_metric_cfg
+        cmg = migrate_c2rl_metric_cfg(cfg.get("cmg", {}))
         self.lbd = float(cm.get("lbd", 0.5))
         self.w_lb = float(cm.get("w_lb", 0.1))
         self.w_ub = float(cm.get("w_ub", 10.0))
@@ -502,7 +504,7 @@ class CCMTrainedMetric:
         activation = net.get("activations", "tanh")
         epochs = int(cmg.get("cmg_regress_epochs", 10))
         lr = float(cmg.get("cmg_regress_lr", 1e-3))
-        batch_size = int(cmg.get("cmg_regress_batch_size", 1024))
+        batch_size = int(cmg.get("cmg_ccm_batch_size", cmg.get("cmg_regress_batch_size", 1024)))
         random_ratio = float(cmg.get("cmg_random_ratio", 0.0))
         # Default to the config's own budget (what c2rl trains this CMG with),
         # not to --cmg-samples: that flag sizes the CV-STEM SDP dataset, where
@@ -511,7 +513,7 @@ class CCMTrainedMetric:
         # cmg_memory_size/batch_size * epochs is the gradient-step budget, so
         # e.g. 2048 samples at 10 epochs is 20 steps and trains nothing.
         if num_samples is None:
-            num_samples = int(cmg.get("cmg_memory_size", 8192))
+            num_samples = int(cmg.get("ccm_memory_size", 8192))
 
         gen_kwargs = dict(
             x_dim=scen.x_dim, hidden_dim=hidden, activation=activation,

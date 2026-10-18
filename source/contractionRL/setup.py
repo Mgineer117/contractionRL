@@ -17,13 +17,15 @@ EXTENSION_TOML_DATA = toml.load(os.path.join(EXTENSION_PATH, "config", "extensio
 
 # Minimum dependencies required prior to installation
 INSTALL_REQUIRES = [
+    # Isaac Sim's native array bindings require the NumPy 1.x ABI.
+    "numpy>=1.26,<2",
     "psutil",
     "torch",
     "skrl>=2.1.0",
     "wandb",
     "gymnasium",
     "scipy",
-    # convex (SDP) solve for C2RL's CMG synthesis (agents/skrl/ncm_synthesis.py).
+    # convex (SDP) solve for C2RL's CMG synthesis (agents/utils/contraction/ncm_synthesis.py).
     # Pinned <1.7: cvxpy 1.7+ hard-requires numpy>=2.0 and osqp>=1.0, which conflict with the
     # Isaac Sim/Lab pins (numpy<2, osqp==0.6.7.post3). 1.6.x supports numpy 1.26 + osqp 0.6.x and
     # still ships the SCS solver C2RL uses.
@@ -51,6 +53,7 @@ setup(
     install_requires=INSTALL_REQUIRES,
     license="Apache-2.0",
     include_package_data=True,
+    package_data={"contractionRL": ["tasks/direct/classic_isaac/assets/*.usda", "tasks/direct/common/skrl_contraction_ppo_cfg.yaml"]},
     python_requires=">=3.10",
     classifiers=[
         "Natural Language :: English",

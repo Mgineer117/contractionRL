@@ -75,6 +75,7 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        actions = actions.nan_to_num().clamp(-1., 1.)
         self._prev_actions = self._actions.clone()
         self._actions = actions.clone()
         default_pos = self._robot.data.default_joint_pos[:, self._arm_ids]
@@ -158,8 +159,14 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
+        time_out = self.episode_length_buf >= self.max_episode_length
         terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        state = self.get_physical_state()
+        self.extras["terminal_physical_state"] = state.clone()
+        self.extras["terminal_tracking_error"] = self.get_tracking_error().clone()
+        ee = state[:, 14:17]
+        terminated |= (ee[:, :2].abs() > 1.5).any(-1) | (ee[:, 2] < .05) | (ee[:, 2] > 1.5)
+        terminated |= (~torch.isfinite(state)).any(-1)
         return terminated, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
@@ -188,7 +195,7 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
                 # (mean)" tracker uses a different key name and can't be unified
                 # with it, so it was leaving total_reward_mean written only once
                 # (by the post-training evaluator) instead of throughout training.
-                from contractionRL.agents.skrl.contraction_metrics import reward_log_dict, reward_summary
+                from contractionRL.agents.utils.contraction.metrics import reward_log_dict, reward_summary
                 self.extras["log"].update(
                     reward_log_dict(reward_summary(undisc_returns, mask), self.device)
                 )

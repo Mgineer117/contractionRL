@@ -1,0 +1,110 @@
+mode: analytical
+seed: 42
+models:
+  separate: true
+  policy:
+    class: GaussianMixin
+    backbone: mlp-squashed
+    clip_actions: false
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    network:
+    - name: net
+      input: OBSERVATIONS
+      layers:
+      - 256
+      - 256
+      activations: relu
+    output: ACTIONS
+    control_mode: structured
+  critic_1:
+    class: DeterministicMixin
+    network:
+    - name: net
+      input: concatenate([OBSERVATIONS, ACTIONS])
+      layers:
+      - 256
+      - 256
+      activations: relu
+    output: ONE
+  critic_2:
+    class: DeterministicMixin
+    network:
+    - name: net
+      input: concatenate([OBSERVATIONS, ACTIONS])
+      layers:
+      - 256
+      - 256
+      activations: relu
+    output: ONE
+  target_critic_1:
+    class: DeterministicMixin
+    network:
+    - name: net
+      input: concatenate([OBSERVATIONS, ACTIONS])
+      layers:
+      - 256
+      - 256
+      activations: relu
+    output: ONE
+  target_critic_2:
+    class: DeterministicMixin
+    network:
+    - name: net
+      input: concatenate([OBSERVATIONS, ACTIONS])
+      layers:
+      - 256
+      - 256
+      activations: relu
+    output: ONE
+memory:
+  class: RandomMemory
+  memory_size: 100000
+agent:
+  class: MBPO
+  gradient_steps: 20
+  batch_size: 256
+  discount_factor: 0.99
+  polyak: 0.005
+  learning_rate: 1.0e-5
+  learn_entropy: true
+  initial_entropy_value: 0.2
+  random_timesteps: 100
+  learning_starts: 100
+  grad_norm_clip: 1.0
+  experiment:
+    directory: mbpo
+    experiment_name: ''
+    write_interval: 500
+    checkpoint_interval: 10000
+    wandb: true
+    wandb_kwargs:
+      project: contractionRL
+      name: null
+  use_state_norm: false
+  use_value_norm: false
+  use_reward_norm: false
+  ensemble_size: 7
+  num_elites: 5
+  model_hidden:
+  - 200
+  - 200
+  - 200
+  - 200
+  model_learning_rate: 0.001
+  model_weight_decay: 1.0e-05
+  model_batch_size: 256
+  model_train_frequency: 250
+  model_train_epochs: 50
+  model_patience: 5
+  model_holdout_ratio: 0.2
+  model_min_samples: 1000
+  model_max_samples: 100000
+  model_rollout_batch_size: 10000
+  model_buffer_size: 100000
+  real_data_ratio: 0.05
+trainer:
+  class: SequentialTrainer
+  timesteps: 300000
+  environment_info: log

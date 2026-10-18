@@ -72,6 +72,7 @@ class QuadrupedPathTrackingEnv(PathTrackingBase):
             + ("vel_x_b", "vel_y_b", "vel_z_b")
             + ("ang_vel_x_b", "ang_vel_y_b", "ang_vel_z_b")
             + tuple(f"joint_vel_{i}" for i in range(n_j))
+            + ("base_height",)
         )
 
     def _get_physical_state(self) -> torch.Tensor:
@@ -86,13 +87,15 @@ class QuadrupedPathTrackingEnv(PathTrackingBase):
                 self._robot.data.root_lin_vel_b,
                 self._robot.data.root_ang_vel_b,
                 self._robot.data.joint_vel[:, self._joint_ids],
+                self._robot.data.root_pos_w[:, 2:3],
             ],
             dim=-1,
         )
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
+        time_out = self.episode_length_buf >= self.max_episode_length
         fell = self._robot.data.root_pos_w[:, 2] < self.cfg.base_height_min
+        fell |= self._robot.data.projected_gravity_b[:, 2] > -0.71
         if not getattr(self.cfg, "terminate_on_fall", True):
             fell = torch.zeros_like(time_out)
         # Non-finite/diverged states are handled by the carry-forward guard in
@@ -131,8 +134,11 @@ class QuadrupedPathTrackingEnv(PathTrackingBase):
         )
         root = self._robot.data.default_root_state[env_ids].clone()
         root[:, :2] = self.scene.env_origins[env_ids, :2] + xy_ref + xy_noise
-        zeros = torch.zeros(n, device=self.device)
-        quat = quat_from_euler_xyz(zeros, zeros, yaw_ref + yaw_noise)
+        root[:, 2] = x_ref_init[:, -1]
+        gravity = x_ref_init[:, 3:6]
+        roll = torch.atan2(-gravity[:, 1], -gravity[:, 2])
+        pitch = torch.asin(gravity[:, 0].clamp(-1., 1.))
+        quat = quat_from_euler_xyz(roll, pitch, yaw_ref + yaw_noise)
         root[:, 3:7] = quat
 
         # base twist is stored body-frame in x, but write_root_velocity_to_sim

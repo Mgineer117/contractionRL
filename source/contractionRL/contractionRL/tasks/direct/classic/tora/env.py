@@ -202,7 +202,7 @@ class TORAEnv(BaseEnv):
         Bbot[:, 3, 2] = -i12
         return Bbot
 
-    def sample_reference_controls(self, freqs, weights, _t, infos, add_noise=False):
+    def sample_reference_controls(self, freqs, weights, _t, infos):
         n = weights.shape[0]
         uref = torch.zeros(n, self.num_dim_control, device=self.device)
         # The origin is an equilibrium and the spring is a restoring force, so
@@ -215,9 +215,7 @@ class TORAEnv(BaseEnv):
             uref[:, 0] = -0.5 * xr[:, 3]      # light rotor damping, keeps it bounded
         for i, freq in enumerate(freqs):
             weight = weights[:, i, :]
-            uref[:, 0] += weight[:, 0] * math.sin(freq * _t / self.time_bound * 2 * math.pi)
-        if add_noise:
-            uref += torch.randn_like(uref) * torch.abs(0.1 * uref)
+            uref[:, 0] += weight[:, 0] * torch.sin(torch.as_tensor(freq * _t / self.time_bound * 2 * math.pi, device=self.device))
         return torch.clamp(uref, self.UREF_MIN, self.UREF_MAX)
 
     def system_reset(self, env_ids: torch.Tensor):

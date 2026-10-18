@@ -403,7 +403,7 @@ These are already handled in-repo; don't re-solve them:
   `checkpoint_interval = 0` when `WANDB_SWEEP_ID` is in the environment, which
   in skrl gates *both* the periodic `agent_<step>.pt` and `best_agent.pt`.
 - **Normal runs keep only the newest checkpoint.** `patch_prune_checkpoints`
-  (`agents/skrl/agent_patches.py`) deletes stale `agent_*.pt` after each write,
+  (`agents/utils/RL/agent_patches.py`) deletes stale `agent_*.pt` after each write,
   leaving the latest snapshot plus `best_agent.pt`.
 - **No TensorBoard files are ever written.** `disable_tensorboard_files()`
   (`scripts/skrl/train_utils.py`, called from `train.py`) no-ops skrl's

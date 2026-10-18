@@ -30,6 +30,9 @@ class TrajectoryBuffer:
                 "Please generate it first."
             )
         data = np.load(traj_path)
+        self.reference_source = str(data["reference_source"].item()) if "reference_source" in data else None
+        self.action_coordinates = str(data["action_coordinates"].item()) if "action_coordinates" in data else None
+        self.dt = float(data["dt"].item()) if "dt" in data else None
         states_key = "x" if "x" in data else "states"
         actions_key = "u" if "u" in data else "actions"
         self._states = torch.tensor(data[states_key], dtype=torch.float32, device=device)
@@ -45,9 +48,34 @@ class TrajectoryBuffer:
         self.state_dim = self._states.shape[2]
         self.action_dim = self._actions.shape[2]
         self.device = device
+        self._valid_ids = torch.arange(self.num_trajs, device=device)
+
+    def require_nominal(self, dt):
+        if (self.reference_source != "physx_nominal_rollout" or
+                self.action_coordinates != "pd_offset_v1" or
+                self.dt is None or not np.isclose(self.dt, dt, rtol=1e-6, atol=1e-9)):
+            raise ValueError("Reference archive has missing/incompatible PhysX provenance, control coordinates or dt; regenerate nominal trajectories")
+
+    def validate(self, low, high, margin, control_low, control_high, min_length, upright_index=None):
+        """Reject unsafe stored references; never repair them by state clipping."""
+        low, high, margin = [torch.as_tensor(v, device=self.device) for v in (low, high, margin)]
+        keep = torch.isfinite(self._states).all(dim=(1, 2)) & torch.isfinite(self._actions).all(dim=(1, 2))
+        keep &= ((self._states >= low + margin) & (self._states <= high - margin)).all(dim=(1, 2))
+        keep &= ((self._actions >= torch.as_tensor(control_low, device=self.device)) &
+                 (self._actions <= torch.as_tensor(control_high, device=self.device))).all(dim=(1, 2))
+        keep &= self._lengths >= min_length
+        if upright_index is not None:
+            keep &= (self._states[:, :, upright_index] < -0.85).all(-1)
+        self._valid_ids = keep.nonzero(as_tuple=True)[0]
+        if not len(self._valid_ids):
+            raise ValueError("No full-length reference trajectory satisfies the configured state/control bounds and margins; regenerate nominal trajectories")
+
+    def wrap_angles(self, indices):
+        if indices:
+            self._states[:, :, indices] = (self._states[:, :, indices] + np.pi) % (2 * np.pi) - np.pi
 
     def sample_traj_ids(self, num_envs: int) -> torch.Tensor:
-        return torch.randint(0, self.num_trajs, (num_envs,), device=self.device)
+        return self._valid_ids[torch.randint(0, len(self._valid_ids), (num_envs,), device=self.device)]
 
     def full(self, traj_ids: torch.Tensor) -> torch.Tensor:
         """The whole reference trajectory per env: ``(N, traj_len, state_dim)``.

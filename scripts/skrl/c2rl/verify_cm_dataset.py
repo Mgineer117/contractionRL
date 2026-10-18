@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.join(_ROOT, "source", "contractionRL"))
 
 import contractionRL.tasks.direct.classic  # noqa: E402,F401
 import gymnasium as gym  # noqa: E402
-from contractionRL.agents.skrl.math_utils import jacobian  # noqa: E402
+from contractionRL.agents.utils.contraction.math_utils import jacobian  # noqa: E402
 
 
 def verify(short: str, task: str, algorithm: str) -> bool:
@@ -52,8 +52,8 @@ def verify(short: str, task: str, algorithm: str) -> bool:
         short, "agents", f"skrl_{algorithm.replace('-', '_')}_cfg.yaml")
     with open(cfg_path) as fh:
         cm = yaml.safe_load(fh)["cm"]
-    lbd, r = float(cm["lbd"]), float(cm["cvstem_r_scaler"]) + 1e-5
-    w_lb, w_ub = float(cm["w_lb"]), float(cm["w_ub"])
+    lbd, r = float(cm["cvstem_lbd"]), float(cm["cvstem_r_scaler"]) + 1e-5
+    w_lb, w_ub = float(cm["cvstem_w_lb"]), float(cm["cvstem_w_ub"])
 
     d = np.load(paths[0])
     x_np = np.asarray(d["x"], dtype=np.float64)

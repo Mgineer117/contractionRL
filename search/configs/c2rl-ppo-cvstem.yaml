@@ -2,205 +2,57 @@ label: c2rl (rl=ppo, cm=cvstem)
 algorithm: c2rl-ppo
 num_envs: 1024
 
-# Bayes, not grid. The PPO trust-region / GAE knobs are re-opened below (see the
-# parameters block), and their cross product with the CM feasibility axes is far
-# too large to enumerate — surrogate-guided search is the point. Under bayes a
-# parameter may be either a discrete `values:` list or a continuous
-# `distribution:` (the latter is what a plain grid could not express).
 method: bayes
 
 metric:
-  # AUC, not reward. Large parts of the CV-STEM {w_lb, w_ub} x lbd x r_scaler
-  # grid are structurally infeasible, so this sweep is as much a feasibility
-  # question as a tuning one — and AUC measures the certified contraction
-  # quantity directly, on the same scale as the infeasibility poison value.
   name: "Stability/auc_mean"
   goal: minimize
 
 runner:
-  # An infeasible SDP would otherwise either grind through all 131072 per-state
-  # solves before build_cm_dataset raises, or train a full run on a CMG
-  # regressed onto a handful of surviving states. Either way the run dies or
-  # finishes without writing the metric — and a metric-less run is simply
-  # Ignored by bayes bookkeeping, so nothing is learned and the same dead
-  # region gets sampled again. The wrapper makes the wall a real datapoint.
   wrapper: true
   bad_value: 100.0
 
-# The PPO trust-region / GAE block is swept again below (re-opened from the
-# per-env pin: rollouts 4, gae_lambda 0.99, ratio_clip 0.3, kl_threshold 0.02).
-# models.policy.backbone stays pinned at `control` — the CLActor u = uref +
-# feedback(x-xref) form is load-bearing for C2RL's Mahalanobis reward, not a
-# free tuning axis, so it is deliberately not re-opened here.
-# Static flags on every trial's command line. NOTE the reference-window length
-# is deliberately absent: it defaults to AUTO, derived per trial from that
-# trial's discount_factor (RefWindow.length_for_horizon), so a swept gamma
-# resizes the observation to span its own effective horizon 1/(1-gamma).
-# Pinning a length here is what previously let the window be sized for one gamma
-# and used at another. Only the stride is fixed, since it is a layout choice
-# rather than a horizon one.
 extra_flags:
   - "--ref_offset"
   - "1"
-  # 50k, not the yaml's 500k. A search trial has to RANK configurations, not
-  # produce a shipped model, and at the measured 2.5-3.3 steps/s on a shared A10 a
-  # 500k trial is 42-55 h -- past the 48 h wall, so NOT ONE trial would have
-  # finished and the sweep would have returned nothing at all. Measured locally on
-  # segway, the ranking is already legible far earlier: AUC 2.43 at 44k against
-  # 2.10 at 500k, while the arms this sweep separates differ by 100x (167 vs 1.8).
-  # 50k is ~5.5 h/trial, so an agent completes ~8 in the window instead of 0.
   - "--num_timesteps"
   - "50000"
 
 parameters:
-  # gamma=0.9 -> effective horizon 10 steps -> AUTO ref_length 11 (offset 1).
-  # The window is sized per-trial from this value (RefWindow.length_for_horizon),
-  # so changing gamma here resizes the observation to match automatically.
   agent.discount_factor:
     value: 0.999
-  # ── Reference-window encoding (actor W2 + critic psi) ────────────────────── #
-  # "mlp" flattens the (strided) points; "gru"/"attn" consume them as a
-  # sequence — see nn_modules.PreviewSequenceEncoder. The stride applies
-  # Uniformly to all three (keep every stride-th point, nearest-first; 1 =
-  # dense/every point) — it is not specific to one encoder type.
-  # Simultaneous, not independent: these two synthetic keys each fan out to
-  # Both models.policy.encoder/encoder_stride and models.critic.encoder/
-  # encoder_stride (see train_utils.apply_wandb_sweep_overrides) — one trial
-  # always uses the same encoder and stride on both sides, since wandb's
-  # per-path nested-dict join only works when the two targets share a parent
-  # key, which models.policy.* and models.critic.* don't.
   xref_encoder:
     value: gru
-  # The full ladder, INCLUDING stride 1. Stride is a modelling choice -- how
-  # finely the window resolves the horizon -- and it must be decided by the
-  # sweep, not silently removed by whichever card the job landed on.
-  #
-  # It is not free, though, and the cost is the reason jobs OOM'd here first.
-  # AUTO sizes the window to the env's FULL EPISODE, not to gamma (train.py
-  # prints "ref_length FULL -> 2000 ... gamma=0.999 does NOT change it"), so
-  # retained points = episode/stride and that differs 4x across the envs one
-  # config serves. At num_envs 1024 the measured cost is ~11.8 MiB per retained
-  # point (attn, stride 1, 500-point window peaked at 5.9 GiB):
-  #     episode  500 (car, car_v1, cartpole)  stride 1 ->  500 pts,  5.9 GiB
-  #     episode  400 (quadrotor)              stride 1 ->  400 pts,  4.7 GiB
-  #     episode 2000 (segway)                 stride 1 -> 2000 pts, 23.6 GiB
-  # segway at stride 1 therefore does not fit a 22.06 GiB A10 even alone -- a
-  # trial tried to allocate 26.80 GiB and died. It is placed on a 48 GB L40S
-  # instead; see commands/launch_cvstem_search.sh for the per-env placement.
-  #
-  # NOTE what stride costs statistically. It preserves the SPAN of the horizon
-  # but subsamples within it, and RefWindow.check_markov is explicit that the
-  # skipped reference points "are never observed, so the window is a subsampling
-  # of the horizon, exact only to the extent the reference is smooth". So a
-  # strided window is only APPROXIMATELY a sufficient statistic for V -- fine for
-  # these smooth sinusoidal references, but it is a real approximation and
-  # precisely why stride belongs in the search rather than being assumed away.
   xref_encoder_stride:
     values: [1, 2, 3, 5, 10, 20]
-  # ── PPO / GAE knobs (re-opened) ──────────────────────────────────────── #
-  # GAE bias/variance trade-off. Same ladder as the standalone ppo.yaml, plus
-  # 0.99 (the current per-env pin) so bayes can confirm or move off it.
   agent.gae_lambda:
     values: [0.9, 0.95, 0.975, 0.99, 1.0]
-  # PPO trust-region clip on the probability ratio.
   agent.ratio_clip:
     values: [0.1, 0.2, 0.3]
-  # Gradient passes over each rollout batch, and how finely it is split.
   agent.learning_epochs:
     values: [2, 5, 10]
-  # 4 is REMOVED, and unlike the stride ladder this one really is infeasible
-  # rather than merely expensive. The encoder unrolls the window over the PPO
-  # mini-batch, B = rollouts * num_envs / mini_batches, and the cost goes as
-  # B * seq. At mini_batches 4 that is B = 6144, so segway's stride-1 window
-  # (seq 2000) needs ~61.6 GiB -- more than the largest card reachable here
-  # (L40S, 44 GiB). Keeping it would mean bayes eventually samples a trial that
-  # cannot run on any GPU and takes its neighbours down with it.
-  # At 8 the same trial is ~30.8 GiB and fits an L40S on its own.
   agent.mini_batches:
     values: [8, 16]
-  # Non-biasing running-std reward normalizer (r/std, no centering). The
-  # Mahalanobis reward's scale swings with w_lb/w_ub across the state box, and
-  # PPO's advantage normalization only partly absorbs that — see rl_glue.
   agent.use_reward_norm:
     value: false
-  # Pinned at 0.0 -- pure tracking reward, no control-effort term. Not a swept
-  # axis. This line previously read `value:` with an EMPTY right-hand side, which
-  # YAML parses as None, so every trial had been running control_scaler=None
-  # instead of a number.
   cm.control_scaler:
     value: 0.0
 
-  # ── KL-adaptive LR: five coherent (KL budget, LR band) configurations ──── #
-  # Re-opened deliberately. These were pinned across all envs after a spread of
-  # 0.004/0.016/0.032 was left behind with no per-plant rationale; the pin is
-  # lifted here because the learning rate, learning_epochs and initial_log_std
-  # have all moved since, so the old point is no longer the tuned one.
-  #
-  # Sampled as ONE nested parameter under `agent` rather than as separate flat
-  # keys, because these five numbers are not independent. skrl steps the
-  # scheduler once per epoch on that epoch's mean KL:
-  #     kl > kl_threshold * kl_factor  ->  lr /= lr_factor  (floor min_lr)
-  #     kl < kl_threshold / kl_factor  ->  lr *= lr_factor  (ceil  max_lr)
-  # so the DECREASE branch can only ever fire if
-  #     sched_kl_threshold * kl_factor  <=  agent.kl_threshold (the PPO early stop)
-  # Otherwise PPO stops the epoch before KL is ever observed that high and the
-  # controller can only ratchet the LR upward -- which is precisely the failure
-  # recorded in the env yamls. Every row below satisfies it with equality at
-  # kl_factor 4, and each row also sets learning_rate == min_lr so the run starts
-  # at the slowest rate it is allowed and has to earn its way up.
-  #
-  # The whole dict REPLACES agent.learning_rate_scheduler_kwargs (the merge is
-  # shallow), so every key it needs is written out in full here -- an inherited
-  # kl_factor or lr_factor would be silently dropped.
-  agent:
-    values:
-      # 1. the shipped pin, as the control arm
-      - {kl_threshold: 0.016, learning_rate: 1.0e-6,
-         learning_rate_scheduler_kwargs: {kl_threshold: 0.004, kl_factor: 4,
-                                          lr_factor: 1.2, min_lr: 1.0e-6, max_lr: 1.0e-4}}
-      # 2. tighter trust region, slower band
-      - {kl_threshold: 0.008, learning_rate: 1.0e-7,
-         learning_rate_scheduler_kwargs: {kl_threshold: 0.002, kl_factor: 4,
-                                          lr_factor: 1.2, min_lr: 1.0e-7, max_lr: 3.0e-5}}
-      # 3. looser trust region, faster band
-      - {kl_threshold: 0.032, learning_rate: 1.0e-6,
-         learning_rate_scheduler_kwargs: {kl_threshold: 0.008, kl_factor: 4,
-                                          lr_factor: 1.2, min_lr: 1.0e-6, max_lr: 3.0e-4}}
-      # 4. loosest, for plants that need to move quickly early
-      - {kl_threshold: 0.064, learning_rate: 1.0e-5,
-         learning_rate_scheduler_kwargs: {kl_threshold: 0.016, kl_factor: 4,
-                                          lr_factor: 1.2, min_lr: 1.0e-5, max_lr: 1.0e-3}}
-      # 5. shipped KL budget, but a much wider LR band to let the controller work
-      - {kl_threshold: 0.016, learning_rate: 1.0e-7,
-         learning_rate_scheduler_kwargs: {kl_threshold: 0.004, kl_factor: 4,
-                                          lr_factor: 1.2, min_lr: 1.0e-7, max_lr: 1.0e-3}}
-
-  # ── Initial exploration sigma = exp(initial_log_std) ─────────────────────── #
-  # sigma is plant-relative, not a universal constant: measured against the
-  # feedback the certified controller must produce, the -0.5 every env shipped is
-  # right for car (sigma/p95 0.83) and 11x too small for segway (0.087). Fixing
-  # segway took its AUC from 167 to 1.8 with nothing else changed.
-  #
-  # One sweep config serves every env, so the ladder has to span the whole range
-  # the plants ask for: sigma 0.61 (car) to 7.4 (segway). scripts/
-  # check_exploration_scale.py predicts the right rung per env from that env's own
-  # p95 -- for segway it said 1.94 and the sweep optimum landed there -- so a trial
-  # far from that prediction is expected to lose, and this axis is partly a test of
-  # that rule on the envs where it has not yet been checked.
+  agent.kl_threshold:
+    value: 0.032
   models.policy.initial_log_std:
     values: [-0.5, 0.0, 0.7, 1.4, 2.0]
 
-  # Pinned. C2RL consumes the metric only as a reward (not a deployed
-  # certificate), so a little per-state λ-backoff and a <100% bar are
-  # acceptable: the offline synthesis samples the full uniform state box,
-  # whose far-from-reference tail (e.g. cartpole |θ|→π/3) is genuinely
-  # infeasible at λ and would otherwise fail an all-or-nothing bar even
-  # though the deployed policy rarely operates there.
+  agent.cmg_method:
     value: cvstem
-
-# std_dev_annealing stays OFF and unsearched: PPO learns log_std through the
-# policy loss, so annealing it on a schedule fights the gradient. initial_log_std
-# above sets only the STARTING point, which is a different question.
-#
-# kl_threshold IS searched again, as part of the joint `agent` group above --
-# see the reasoning there for why it cannot be a flat independent axis.
+  agent.learning_rate:
+    value: 1.0e-5
+  agent.learning_rate_scheduler:
+    value: KLAdaptiveLR
+  agent.learning_rate_scheduler_kwargs:
+    value:
+      kl_threshold: 0.008
+      kl_factor: 2
+      lr_factor: 1.5
+      min_lr: 1.0e-6
+      max_lr: 1.0e-4

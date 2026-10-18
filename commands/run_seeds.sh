@@ -23,14 +23,14 @@
 #   ./commands/run_seeds.sh --aggregate-only --tag seeds_20260720_120000
 #
 # Flags (all optional; anything omitted is prompted for):
-#   --algorithms list    comma/space separated: ppo, sac, c3m, lqr, sdlqr,
+#   --algorithms list    comma/space separated: ppo, sac, mbpo, c3m, lqr, sdlqr,
 #                        cvstem-lqr, c2rl-ppo, c2rl-sac
 #   --env NAME           car|cartpole|segway|quadrotor, an Isaac Lab
 #                        task id, or 'all' for every classic env
 #   --seeds SPEC         a count (e.g. 5 → seeds 0..4) or an explicit list
 #   --gpu SPEC           GPU index, a comma/space list of indices to round-robin
 #                        over (e.g. "0,2,3"), or 'all' (default: all detected)
-#   --num-timesteps N    override the cfg's training length
+#   --num-timesteps N    override the task's default training length
 #   --parallel N         runs executed concurrently (default 1 = sequential)
 #   --tag NAME           run tag / output basename (default: seeds_<timestamp>)
 #   --aggregate-only     skip training, just rebuild the CSVs for --tag
@@ -125,7 +125,7 @@ if [[ "$DETACHED" -ne 1 ]]; then
 fi
 
 # ── Algorithms ──────────────────────────────────────────────────────────── #
-ALL_ALGOS=(ppo sac c3m lqr sdlqr cvstem-lqr c2rl-ppo c2rl-sac)
+ALL_ALGOS=(ppo sac mbpo c3m lqr sdlqr cvstem-lqr c2rl-ppo c2rl-sac)
 if [[ -z "$ALGO_ARG" ]]; then
     ALGO_ARG=$(prompt_choice "Select algorithm to run (or 'all'):" "${ALL_ALGOS[@]}" all)
 fi

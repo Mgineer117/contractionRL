@@ -37,7 +37,7 @@ def cfg_for(task: str, algorithm: str):
     """Build the algorithm Cfg exactly as train.py does: yaml -> filtered dataclass."""
     import yaml
     from contractionRL.agents.skrl.c2rl import C2RLPPOCfg, C2RLSACCfg
-    from contractionRL.agents.skrl.rl_glue import filter_cfg_fields
+    from contractionRL.agents.utils.RL.config import filter_cfg_fields, migrate_c2rl_metric_cfg
 
     import importlib
     import gymnasium as gym
@@ -54,12 +54,12 @@ def cfg_for(task: str, algorithm: str):
               **(raw.get("empirical_dynamics") or {}), **(raw.get("agent") or {})}
     merged.pop("class", None)
     Cfg = C2RLSACCfg if algorithm == "c2rl_sac" else C2RLPPOCfg
-    return Cfg(**filter_cfg_fields(merged, Cfg, context="preflight")), y
+    return Cfg(**filter_cfg_fields(migrate_c2rl_metric_cfg(merged), Cfg, context="preflight")), y
 
 
 def check(task: str, algorithm: str = "c2rl_ppo", cmg_method: str | None = None) -> tuple[bool, str]:
     from contractionRL.agents.skrl.c2rl import cm_dataset_target
-    from contractionRL.agents.skrl.ncm_synthesis import load_cached_cm_dataset
+    from contractionRL.agents.utils.contraction.ncm_synthesis import load_cached_cm_dataset
 
     cfg, y = cfg_for(task, algorithm)
     if cmg_method is not None:

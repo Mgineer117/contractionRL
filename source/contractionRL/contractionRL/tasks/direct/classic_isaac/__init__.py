@@ -1,4 +1,4 @@
-"""Isaac visualization of the exact classic analytical plants."""
+"""Classic-derived Isaac tasks with analytical or PhysX dynamics."""
 
 import gymnasium as gym
 
@@ -11,7 +11,7 @@ def _register(task, classic_task, cfg_class):
     kwargs["env_cfg_entry_point"] = f"{__name__}.env_cfg:{cfg_class}"
     gym.register(
         id=task,
-        entry_point=f"{__name__}.env:ClassicIsaacEnv",
+        entry_point=f"{__name__}.env:make_env",
         disable_env_checker=True,
         kwargs=kwargs,
     )
@@ -20,3 +20,6 @@ def _register(task, classic_task, cfg_class):
 _register("Isaac-Car-v0", "classic-car-v0", "CarEnvCfg")
 _register("Isaac-Car-v1", "classic-car-v1", "CarV1EnvCfg")
 _register("Isaac-Quadrotor-v0", "classic-quadrotor-v0", "QuadrotorEnvCfg")
+
+_register("Isaac-Classic-Cartpole-v0", "classic-cartpole-v0", "CartpoleEnvCfg")
+_register("Isaac-Classic-Segway-v0", "classic-segway-v0", "SegwayEnvCfg")

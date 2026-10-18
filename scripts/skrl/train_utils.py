@@ -3,7 +3,9 @@ import sys
 
 import torch
 
-_SAC_LIKE_ALGOS = {"sac", "c2rl-sac", "c2rl_sac", "c3m", "lqr", "sdlqr", "cvstem-lqr", "cvstem_lqr"}
+from contractionRL.agents.utils.RL.logging import log_metrics
+
+_SAC_LIKE_ALGOS = {"sac", "mbpo", "c2rl-sac", "c2rl_sac", "c3m", "lqr", "sdlqr", "cvstem-lqr", "cvstem_lqr"}
 _DEFAULT_NUM_ENVS_SAC = 64
 _DEFAULT_NUM_ENVS_PPO_CLASSIC = 1024
 _VEL_TASK_TO_ROBOT = {"Quadruped": "quadruped", "Humanoid": "humanoid", "Manipulator": "manipulator"}
@@ -19,6 +21,121 @@ _DATA_ROOT = os.path.join(_ROOT, "data")
 
 def _default_num_envs_classic(algo: str) -> int:
     return _DEFAULT_NUM_ENVS_SAC if algo.lower() in _SAC_LIKE_ALGOS else _DEFAULT_NUM_ENVS_PPO_CLASSIC
+
+
+def evaluation_act(agent, observations, states=None):
+    """Use the policy mean and bypass random warmup for evaluation/references."""
+    timestep = max(0, int(getattr(agent.cfg, "random_timesteps", 0)))
+    actions, outputs = agent.act(observations, states, timestep=timestep, timesteps=max(timestep + 1, 1))
+    return outputs.get("mean_actions", actions), outputs
+
+
+def validate_tracking_options(env, args):
+    """Reject legacy switches that the compact MDP cannot apply."""
+    if not getattr(getattr(env, "ref_window", None), "compact", False):
+        return
+    if getattr(args, "ref_length", None) not in (None, 1) or getattr(args, "ref_offset", 1) != 1:
+        raise ValueError("Compact tracking uses (x, xref, xi), not a reference window; ref_length/ref_offset must be 1")
+    if (getattr(args, "eig_reshape", None) is not None or getattr(args, "reward_level", False)
+            or getattr(args, "reward_euclidean", False)):
+        raise ValueError("Compact tracking uses its fixed energy-decrease reward; legacy reward/eig_reshape switches do not apply")
+    if getattr(args, "terminate_out_of_box", None) is False:
+        raise ValueError("Compact tracking keeps mandatory position/failure termination; the legacy disable switch does not apply")
+
+
+def restore_checkpoint_model_config(agent_cfg, checkpoint):
+    """Keep historical C2RL critics loadable without hiding their old layout."""
+    if not checkpoint or not os.path.isfile(checkpoint):
+        return
+    from pathlib import Path
+    from contractionRL.agents.utils.RL.config import normalize_experiment_mode
+    if "mode" not in agent_cfg:
+        env_path = Path(checkpoint).parent.parent / "params" / "env.yaml"
+        if env_path.is_file():
+            import yaml
+            recorded = yaml.load(env_path.read_text(), Loader=yaml.BaseLoader) or {}
+            if recorded.get("mode") in ("analytical", "sim_to_real"):
+                agent_cfg["mode"] = recorded["mode"]
+            elif recorded.get("dynamics_backend") in ("analytical", "physx"):
+                agent_cfg["mode"] = "sim_to_real" if recorded["dynamics_backend"] == "physx" else "analytical"
+    normalize_experiment_mode(agent_cfg)
+    saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    critic = saved.get("value", saved.get("critic_1", {}))
+    if any(key.startswith("phi.") for key in critic):
+        agent_cfg.setdefault("models", {}).setdefault("critic", {})["legacy_reference_critic"] = True
+
+
+def configure_tracking_preview(raw_env, agent_cfg):
+    """Configure an optional nominal preview before creating models or rollout memory."""
+    policy = agent_cfg.get('models', {}).get('policy', {})
+    temporal = policy.get('temporal_context', False)
+    if not isinstance(temporal, bool) or not isinstance(policy.get('use_history', True), bool):
+        raise ValueError('temporal_context and use_history must be booleans')
+    if temporal:
+        import math
+        gamma = float(agent_cfg['agent']['discount_factor'])
+        if not 0. <= gamma < 1.:
+            raise ValueError('Temporal context requires 0 <= discount_factor < 1')
+        if policy.get('preview_steps', 0):
+            raise ValueError('temporal_context derives its horizon from gamma; remove preview_steps')
+        if not hasattr(raw_env, 'configure_temporal_context'):
+            raise ValueError('Temporal context requires a supported analytical tracking environment')
+        # Avoid ceil(10.000000000000002) turning gamma=0.9 into eleven points.
+        horizon = max(1, math.ceil(round(1. / (1. - gamma), 10)))
+        raw_env.configure_temporal_context(horizon, policy.get('use_history', True))
+        return
+    steps = policy.get('preview_steps', 0)
+    if not isinstance(steps, int) or isinstance(steps, bool) or steps < 0:
+        raise ValueError('models.policy.preview_steps must be a nonnegative integer')
+    if steps:
+        if not hasattr(raw_env, 'configure_ref_preview'):
+            raise ValueError('Reference preview requires a supported analytical tracking environment')
+        raw_env.configure_ref_preview(steps + 1)
+    elif getattr(getattr(raw_env, 'ref_window', None), 'preview_length', 0):
+        raw_env.configure_ref_preview(0)
+
+
+def tracking_state_metadata(window, models_cfg=None):
+    if not getattr(window, "compact", False):
+        return {}
+    from contractionRL.agents.utils.system_dynamics.reference import TrackingFeatures
+    features = TrackingFeatures(window)
+    preview = getattr(window, 'preview_length', 0)
+    temporal = getattr(window, 'temporal_context', False)
+    width = features.output_dim
+    if temporal:
+        width = window.base_dim + window.x_dim * (1 + bool(window.history_length)) + 2 * len(features.position)
+    elif preview:
+        width = (window.x_dim + window.xi_dim + 2 * len(features.position)
+                 + models_cfg.get('policy', {}).get('encoder_hidden', 64)) if models_cfg is not None else None
+    return {"observation_width": window.flat_dim, "policy_input_width": width,
+            "reference_preview_points": preview, "reference_preview_stride": getattr(window, 'preview_stride', 1),
+            "reference_preview_start": getattr(window, 'preview_start', 0),
+            "temporal_context": temporal, "history_points": getattr(window, 'history_length', 0),
+            "embedding_dim": window.x_dim if temporal else None,
+            "tracking_state_representation": "relative_position_with_boundaries" if features.position else "physical_tracking",
+            "relative_position_axes": [window.state_names[i] for i in features.position]}
+
+
+def save_classic_config(agent_cfg, raw_env, directory):
+    """Record the resolved model and MDP settings beside their checkpoints."""
+    import copy
+    from pathlib import Path
+    import yaml
+    cfg = copy.deepcopy(agent_cfg)
+    cfg.get("agent", {}).get("experiment", {}).get("wandb_kwargs", {}).pop("settings", None)
+    cfg["environment"] = {
+        "task": raw_env.spec.id if raw_env.spec else None,
+        "compact_reference": bool(getattr(raw_env.ref_window, "compact", False)),
+        "reference_mode": raw_env.reference_mode,
+        "time_bound": raw_env.time_bound, "dt": raw_env.dt,
+        "ref_length": raw_env.ref_window.length, "ref_offset": raw_env.ref_window.offset,
+        "disturbance_scales": raw_env.disturbance.scales.cpu().tolist(),
+        **tracking_state_metadata(raw_env.ref_window, cfg.get('models')),
+    }
+    target = Path(directory)/"params"
+    target.mkdir(parents=True, exist_ok=True)
+    (target/"agent.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
 
 
 def _run_metadata(args_cli, task: str) -> dict:
@@ -123,36 +240,43 @@ def disable_tensorboard_files() -> None:
 
 
 def install_wandb_scalar_hook() -> None:
-    """Mirror every skrl ``SummaryWriter.add_scalar`` into the active W&B run.
-
-    Logged against a custom step metric (``global_step``) rather than wandb's
-    internal step counter: any ``wandb.log()`` without ``step=`` (video/media
-    uploads, the PathTracking figures) advances that internal counter, after
-    which scalars logged with an explicit smaller ``step=`` are silently dropped
-    ("steps must be monotonically increasing"). A step *metric* has no
-    monotonicity requirement.
-
-    Process-wide and shared by both routes, which is also what lets C2RL's inner
-    PPO/SAC sub-agents reach the same run without ever calling ``wandb.init()``
-    themselves (see ``rl_glue.make_base_rl_cfg``).
-    """
+    """Batch each skrl scalar write into the common W&B metric layout."""
+    from contextvars import ContextVar
     import skrl.utils.tensorboard as _skrl_tb
-    import wandb
+    from skrl.agents.torch import Agent
+    from contractionRL.agents.utils.RL.logging import log_metrics, metric_name
 
-    orig_add_scalar = _skrl_tb.SummaryWriter.add_scalar
-    defined = [False]
+    if getattr(_skrl_tb.SummaryWriter.add_scalar, "_contractionrl_logging", False):
+        return
+    pending = ContextVar("wandb_scalar_batch", default=None)
+    original_scalar = _skrl_tb.SummaryWriter.add_scalar
+    original_write = Agent.write_tracking_data
 
     def _add_scalar(self, *, tag: str, value: float, timestep: int) -> None:
-        orig_add_scalar(self, tag=tag, value=value, timestep=timestep)
-        if wandb.run is None:
+        tag = metric_name(tag)
+        if tag is None:
             return
-        if not defined[0]:
-            wandb.define_metric("global_step")
-            wandb.define_metric("*", step_metric="global_step")
-            defined[0] = True
-        wandb.log({tag: value, "global_step": timestep})
+        batch = pending.get()
+        if batch is not None and tag in batch and batch[tag] == value:
+            return  # A legacy alias must not write the same scalar twice.
+        original_scalar(self, tag=tag, value=value, timestep=timestep)
+        if batch is None:
+            log_metrics({tag: value}, step=timestep)
+        else:
+            batch[tag] = value
 
+    def _write_tracking_data(self, *, timestep: int, timesteps: int) -> None:
+        batch = {}
+        token = pending.set(batch)
+        try:
+            original_write(self, timestep=timestep, timesteps=timesteps)
+        finally:
+            pending.reset(token)
+        log_metrics(batch, step=timestep)
+
+    _add_scalar._contractionrl_logging = True
     _skrl_tb.SummaryWriter.add_scalar = _add_scalar
+    Agent.write_tracking_data = _write_tracking_data
 
 
 def apply_wandb_sweep_overrides(agent_cfg: dict) -> None:
@@ -217,6 +341,8 @@ def _disarm_termination_for_eval(env, tag: str = "[Eval]") -> None:
     change, so it is disarmed here regardless of the training setting.
     """
     unwrapped = getattr(env, "unwrapped", env)
+    if getattr(getattr(unwrapped, "ref_window", None), "compact", False):
+        return  # Compact tracking MDPs preserve failure termination during evaluation.
     if getattr(unwrapped, "terminate_out_of_box", False):
         unwrapped.set_terminate_out_of_box(False)
         print(f"{tag} early termination disarmed for evaluation — AUC is defined on the "
@@ -281,80 +407,10 @@ def finish_wandb(args_cli) -> None:
         wandb.finish()
 
 
-def normalize_agent_cfg(agent_cfg: dict, *, algorithm: str) -> dict:
-    """Strip this repo's non-skrl ``agent:`` keys and resolve the preprocessors.
-
-    Shared by both of train.py's routes so a yaml key means the same thing on
-    each. Returns the std-dev-annealing decision, which the caller passes to
-    ``agent_patches.patch_ppo_std_annealing`` after the agent is built.
-
-    Observation/state normalization is disabled unconditionally: the Mahalanobis
-    reward and the CV-STEM metric are defined in raw physical coordinates, and
-    per-dimension scaling would distort the tracking error ``e = x - xref`` (see
-    c2rl.py's module docstring). Value normalization stays available for PPO,
-    where it only rescales the critic target.
-    """
-    from contractionRL.agents.skrl.runner import CONTROL_BACKBONES
-
-    a = agent_cfg.setdefault("agent", {})
-    a.pop("use_state_norm", None)
-    use_value_norm = a.pop("use_value_norm", True)
-    # C2RL builds its own PPO/SAC sub-agent from the raw yaml dict via
-    # rl_glue.make_base_rl_cfg, which reads ``use_value_norm`` itself (defaulting
-    # to True when absent). Popping it here therefore made the key invisible to
-    # C2RL: the `algorithm == "ppo"` branch below never fires for "c2rl-ppo", so
-    # the flag was consumed, discarded, and then silently re-defaulted to True —
-    # i.e. `use_value_norm: false` / `--use_value_norm false` did nothing at all
-    # on any c2rl run, and the critic always got a RunningStandardScaler.
-    # Put it back for the contraction algorithms, which are the ones that read it
-    # downstream. (Plain ppo/sac still consume it here, as before.)
-    if algorithm not in ("ppo", "sac"):
-        a["use_value_norm"] = use_value_norm
-    for key in ("state_preprocessor", "state_preprocessor_kwargs",
-                "observation_preprocessor", "observation_preprocessor_kwargs"):
-        a.pop(key, None)
-
-    if use_value_norm and algorithm == "ppo":
-        a["value_preprocessor"] = "RunningStandardScaler"
-        a["value_preprocessor_kwargs"] = None
-    else:
-        a.pop("value_preprocessor", None)
-        a.pop("value_preprocessor_kwargs", None)
-
-    # Legacy annealing spellings — superseded by the backbone-driven decision
-    # below, but still present in older configs, and skrl's PPO_CFG/SAC_CFG
-    # would reject them as unknown fields.
-    for key in ("anneal_stddev", "anneal_log_std"):
-        a.pop(key, None)
-    # std_dev_annealing/_kwargs follow the reward_euclidean rule below: skrl's
-    # PPO_CFG/SAC_CFG reject them, but C2RL builds its sub-agent from this same
-    # dict via rl_glue.make_base_rl_cfg and reads both off C2RLPPOCfg. Popping
-    # unconditionally made them invisible to C2RL, which then fell back to the
-    # dataclass/patch defaults: `std_dev_annealing: true` (so
-    # `--std_dev_annealing false` did nothing) and kwargs=None (so the yaml
-    # schedule was ignored and log_std annealed linearly to -2.0, sigma~=0.135,
-    # instead of exponentially to the configured final_log_std).
-    # reward_euclidean/reward_level are env-side switches (applied straight to
-    # the raw env in train.py's standalone branch — see _apply_agent_overrides'
-    # caller), not real PPO_CFG/SAC_CFG fields. C2RL reads them off its own
-    # dataclass instead (c2rl.py), so only pop for the two skrl-native algos —
-    # left in place they'd raise the same "unexpected keyword argument" crash
-    # the `models` dotted-path bug did.
-    std_kwargs = a.get("std_dev_annealing_kwargs")
-    if algorithm in ("ppo", "sac"):
-        a.pop("reward_euclidean", None)
-        a.pop("reward_level", None)
-        a.pop("std_dev_annealing", None)
-        a.pop("std_dev_annealing_kwargs", None)
-    return {
-        "std_dev_annealing": (
-            agent_cfg.get("models", {}).get("policy", {}).get("backbone") in CONTROL_BACKBONES
-        ),
-        "std_dev_annealing_kwargs": std_kwargs,
-    }
+from contractionRL.agents.utils.RL.config import normalize_agent_cfg
 
 
-def apply_agent_patches(agent, *, algorithm: str, annealing: dict,
+def apply_agent_patches(agent, *, algorithm: str,
                         namespace: bool = True) -> None:
     """Apply every post-construction patch an agent needs, in dependency order.
 
@@ -363,29 +419,24 @@ def apply_agent_patches(agent, *, algorithm: str, annealing: dict,
     ``.policy``/``.scheduler``/``.scaler`` and patches its inner PPO/SAC
     sub-agent itself (see c2rl.py).
 
-    ``patch_auc_checkpoint`` goes last because it wraps ``post_interaction``,
-    and it must see (and therefore run after) the annealing wrapper installed by
-    ``patch_ppo_std_annealing``. ``namespace=False`` for the contraction
-    algorithms, which already namespace their own ``track_data`` keys.
+    ``namespace=False`` for contraction algorithms, which already namespace
+    their own ``track_data`` keys.
     """
-    from contractionRL.agents.skrl.agent_patches import (
+    from contractionRL.agents.utils.RL.agent_patches import (
         best_metric_for,
         patch_algo_namespace,
         patch_auc_checkpoint,
         patch_kl_logging,
-        patch_ppo_std_annealing,
         patch_prune_checkpoints,
         patch_sac_entropy_clamp,
+        patch_terminal_observations,
     )
 
     patch_kl_logging(agent)
+    patch_terminal_observations(agent)
     patch_sac_entropy_clamp(agent)
-    patch_ppo_std_annealing(agent, annealing["std_dev_annealing"],
-                            annealing["std_dev_annealing_kwargs"])
     if namespace:
         patch_algo_namespace(agent, algorithm.upper())
-    # Wraps write_checkpoint (not post_interaction), so it is independent of
-    # the patch_auc_checkpoint ordering rule above.
     patch_prune_checkpoints(agent)
     patch_auc_checkpoint(agent, metric=best_metric_for(algorithm))
 
@@ -488,7 +539,7 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
         # We run for slightly more than T steps to ensure all envs finish their first episode
         for _ in range(T + 1):
             with torch.no_grad():
-                actions, _ = agent.act(obs, None, timestep=0, timesteps=0)
+                actions, _ = evaluation_act(agent, obs)
             obs_dict, rewards, terminated, truncated, _ = skrl_env.step(actions)
             obs = _get_obs(obs_dict)
 
@@ -549,30 +600,31 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
 
     # _act_low/_act_high (defined above, alongside `unwrapped`) are used only
     # when writing into the saved `u` array below, never to modify what's
-    # stepped through the env. The policy samples with clip_actions=False
+    # stepped through the env. The policy mean can exceed the action bounds
     # (clipping inside the actor corrupts the log-prob), and the env already
     # enforces action bounds on its own (its actuator/physics pipeline), so
     # re-clipping before `skrl_env.step()` would be redundant. But the *saved*
     # dynamics_data.npz must record actions within the declared action space —
-    # an unclipped, possibly out-of-range sample is not a valid "u" for
+    # an unclipped, possibly out-of-range command is not a valid "u" for
     # fitting f(x) + B(x)u.
 
     # Pre-allocate tensors to avoid massive python list overhead
     with torch.no_grad():
-        actions, _ = agent.act(obs, None, timestep=0, timesteps=0)
+        actions, _ = evaluation_act(agent, obs)
     state_tensor = unwrapped.get_physical_state()
     state_dim = state_tensor.shape[1]
     u_dim = actions.shape[1]
 
-    ep_states = torch.zeros((num_envs, T, state_dim), dtype=torch.float32, device=skrl_env.device)
-    ep_actions = torch.zeros((num_envs, T, u_dim), dtype=torch.float32, device=skrl_env.device)
+    ep_states = torch.zeros((num_envs, T + 1, state_dim), dtype=torch.float32, device=skrl_env.device)
+    ep_actions = torch.zeros((num_envs, T + 1, u_dim), dtype=torch.float32, device=skrl_env.device)
     step_counts = torch.zeros(num_envs, dtype=torch.long, device=skrl_env.device)
 
     pbar = tqdm.tqdm(total=pool_target, desc="[RefTraj] Collecting candidates")
 
+    attempted_episodes = 0
     while len(all_states) < pool_target:
         with torch.no_grad():
-            actions, _ = agent.act(obs, None, timestep=0, timesteps=0)
+            actions, _ = evaluation_act(agent, obs)
         state_tensor = unwrapped.get_physical_state()
 
         # Record state and action for envs that are still within T steps
@@ -586,28 +638,27 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
 
         step_counts[valid_indices] += 1
 
-        obs_dict, _, terminated, truncated, _ = skrl_env.step(actions)
+        obs_dict, _, terminated, truncated, transition_info = skrl_env.step(actions)
         obs = _get_obs(obs_dict)
         done = (terminated | truncated).squeeze(-1)
 
         if done.any():
             done_indices = done.nonzero(as_tuple=True)[0]
-            # Accept trajectories that survived at least min_ref_traj_length_frac
-            # of the max length (default 0.5 = half of T). This handles policies
-            # that fall slightly early but pass the quality gate, as well as
-            # off-by-one errors with Isaac Gym's max_episode_length.
-            min_len = int(args_cli.min_ref_traj_length_frac * T)
-            success_mask = step_counts[done_indices] >= min_len
+            # References need every transition and the true pre-reset endpoint.
+            attempted_episodes += len(done_indices)
+            success_mask = (step_counts[done_indices] == T) & (~terminated.reshape(-1)[done_indices])
             success_indices = done_indices[success_mask]
+            if attempted_episodes >= 20 * pool_target and len(all_states) < pool_target and not len(success_indices):
+                raise RuntimeError("Nominal controller failed to produce enough full-length references after the collection budget")
+            if len(success_indices):
+                terminal_state = transition_info.get("terminal_physical_state")
+                if terminal_state is None:
+                    raise RuntimeError("Reference generation requires the pre-reset terminal physical state")
+                ep_states[success_indices, T] = terminal_state[success_indices]
+                ep_actions[success_indices, T] = ep_actions[success_indices, T - 1]
+                step_counts[success_indices] = T + 1
 
             if len(success_indices) > 0:
-                # Pad any missing steps with the final valid state to ensure x_dot is stable
-                for i in success_indices:
-                    length = step_counts[i].item()
-                    if length < T and length > 0:
-                        ep_states[i, length:] = ep_states[i, length - 1].clone()
-                        ep_actions[i, length:] = ep_actions[i, length - 1].clone()
-
                 # Move to CPU in bounded chunks. Episodes are length-synchronized
                 # (fixed T), so on the first `done` event success_indices can be
                 # ~num_envs at once — gathering all of them in one fancy-index
@@ -720,7 +771,10 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
     #   lengths (N,)           number of valid steps per trajectory — consumers
     #                          mask with arange(T) < lengths[:, None]
     dyn_path = os.path.join(out_dir, "dynamics_data.npz")
-    np.savez_compressed(dyn_path, x=states_arr, u=actions_arr, x_dot=x_dot_arr, lengths=lengths_arr)
+    from contractionRL.tasks.direct.common.reference_domain import save_nominal_references
+    accepted = save_nominal_references(dyn_path, x=states_arr, u=actions_arr,
+                                       x_dot=x_dot_arr, lengths=lengths_arr, dt=dt)
+    print(f"[RefTraj] Accepted {accepted} full-length references inside the domain margins")
     print(f"[RefTraj] Saved dynamics  → {dyn_path}")
     print(f"       x       shape: {states_arr.shape}")
     print(f"       u       shape: {actions_arr.shape}   (clipped to action-space bounds)")
@@ -790,7 +844,15 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
             model.eval()
 
     device = agent.device
-    env = gym.make(task, device=device)
+    from contractionRL.runners.contraction_runner import _unwrap_env
+    training_env = _unwrap_env(getattr(runner, "_env", None))
+    env_kwargs = {}
+    if training_env is not None and hasattr(training_env, "ref_window"):
+        env_kwargs = {"compact_reference": bool(getattr(training_env.ref_window, "compact", False)),
+                      "reference_mode": training_env.reference_mode,
+                      "time_bound": training_env.time_bound, "dt": training_env.dt,
+                      "disturbance_scales": training_env.disturbance.scales.cpu().tolist()}
+    env = gym.make(task, device=device, **env_kwargs)
     from contractionRL.agents.skrl.c2rl import C2RLAgent, C2RLSkrlTrainer
     if isinstance(agent, C2RLAgent):
         agent.freeze_cmg()
@@ -815,6 +877,10 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
     _w = getattr(_train_env, "ref_window", None)
     if _w is not None and hasattr(env.unwrapped, "configure_ref_window"):
         env.unwrapped.configure_ref_window(length=_w.length, offset=_w.offset)
+        if getattr(_w, 'temporal_context', False):
+            env.unwrapped.configure_temporal_context(_w.preview_length, bool(_w.history_length))
+        elif getattr(_w, 'preview_length', 0):
+            env.unwrapped.configure_ref_preview(_w.preview_length, _w.preview_stride)
         print(f"[Eval] reference window mirrored: length={_w.length} offset={_w.offset}")
 
     reward_list, auc_list, C_list, lbd_list = [], [], [], []
@@ -822,18 +888,18 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
     for _g in range(num_groups):
         error_trajs = []
         for _e in range(episodes_per_group):
-            obs, _ = env.reset()
+            obs, reset_info = env.reset()
             done = False
             ep_reward = 0.0
-            error_traj = []
+            initial_error = float(torch.as_tensor(reset_info["tracking_error"]).reshape(-1)[0].clamp_min(0).sqrt())
+            error_traj = [initial_error]
             dt = env.unwrapped.dt
             while not done:
                 if isinstance(obs, dict):
                     # {x, xrefs, urefs} — flatten exactly as skrl does so the
                     # models see the same layout they were built for.
-                    obs_t = env.unwrapped.ref_window.flatten(
-                        *(torch.as_tensor(obs[k], dtype=torch.float32, device=device)
-                          for k in ("x", "xrefs", "urefs")))
+                    obs_t = torch.cat([torch.as_tensor(obs[k], dtype=torch.float32, device=device).reshape(env.unwrapped.num_envs, -1)
+                                       for k in sorted(obs)], dim=-1)
                 elif isinstance(obs, torch.Tensor):
                     obs_t = obs.clone().detach().to(dtype=torch.float32, device=device)
                 else:
@@ -843,7 +909,7 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
                 with torch.no_grad():
                     # see _evaluate_best_model for why agent.act() (not
                     # agent.policy.act()) is the algorithm-agnostic interface
-                    actions, outputs = agent.act(obs_t, None, timestep=0, timesteps=0)
+                    actions, outputs = evaluation_act(agent, obs_t)
                     action = outputs.get("mean_actions", actions)
                 obs, reward, terminated, truncated, info = env.step(action)
 
@@ -856,14 +922,18 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
                 error_traj.append(float(np.sqrt(max(err_val, 0.0))))
             e0 = max(error_traj[0], 1e-8) if error_traj else 1.0
             norm_traj = np.asarray(error_traj) / e0
-            error_trajs.append(norm_traj)
-            reward_list.append(ep_reward)
-            auc_list.append(float(np.trapezoid(norm_traj, dx=dt)) if hasattr(np, "trapezoid")
-                             else float(np.trapz(norm_traj, dx=dt)))
+            complete = (not term_val and not bool(torch.as_tensor(info.get("episode_ended_early", False)).any())
+                        and len(error_traj) == env.unwrapped.max_episode_len + 1)
+            if complete:
+                error_trajs.append(norm_traj)
+                auc_list.append(float(np.trapezoid(norm_traj, dx=dt)) if hasattr(np, "trapezoid")
+                                 else float(np.trapz(norm_traj, dx=dt)))
+            reward_list.append(ep_reward / max(len(error_traj) - 1, 1))
         # paper fit: one overshoot C* per group, one convergence rate per curve
-        C, lbds = fit_exponential_envelope(error_trajs, dt)
-        C_list.append(C)
-        lbd_list.extend(float(x) for x in lbds)
+        if error_trajs:
+            C, lbds = fit_exponential_envelope(error_trajs, dt)
+            C_list.append(C)
+            lbd_list.extend(float(x) for x in lbds)
     # Read before close() — used for the divergence threshold below.
     _time_bound = float(getattr(env.unwrapped, "time_bound", 0.0) or 0.0)
     env.close()
@@ -876,10 +946,16 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
         **_run_metadata(args_cli, task),
         "checkpoint": best_ckpt if os.path.exists(best_ckpt) else "final",
         "num_episodes": num_groups * episodes_per_group,
-        "total_reward_mean": rew_mean, "total_reward_ci95": rew_ci,
+        "completed_episodes": len(auc_list),
+        "episode_completion": len(auc_list) / max(len(reward_list), 1),
+        "average_reward_mean": rew_mean, "average_reward_ci95": rew_ci,
+        "average_reward_stddev": float(np.std(reward_list)),
         "auc_mean": auc_mean, "auc_ci95": auc_ci,
+        "auc_stddev": float(np.std(auc_list)) if auc_list else None,
         "overshoot_mean": C_mean, "overshoot_ci95": C_ci,
+        "overshoot_stddev": float(np.std(C_list)) if C_list else None,
         "contraction_rate_mean": lbd_mean, "contraction_rate_ci95": lbd_ci,
+        "contraction_rate_stddev": float(np.std(lbd_list)) if lbd_list else None,
         "num_fit_groups": num_groups,
         # Raw per-episode contraction rates (one per evaluated episode, before
         # the running/population mean above collapses them) — kept alongside
@@ -895,9 +971,9 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
         # exactly the symptom under investigation, so the per-episode
         # distribution is kept alongside the robust summaries below.
         "auc_all": [round(float(x), 6) for x in auc_list],
-        "auc_median": float(np.median(auc_list)),
-        "auc_p90": float(np.percentile(auc_list, 90)),
-        "auc_max": float(np.max(auc_list)),
+        "auc_median": float(np.median(auc_list)) if auc_list else None,
+        "auc_p90": float(np.percentile(auc_list, 90)) if auc_list else None,
+        "auc_max": float(np.max(auc_list)) if auc_list else None,
         # Fraction of episodes whose normalized error never really contracts.
         # AUC = int(||e||/||e0||) dt over a time_bound-long episode, so an
         # episode that merely holds its initial error scores ~time_bound.
@@ -915,15 +991,22 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
         # is a robustness heuristic for spotting heavy tails, not a sharp
         # classifier -- read it next to auc_p90/auc_max, never alone.
         "auc_diverged_frac": (float(np.mean(np.asarray(auc_list) > (1.0 / 3.0) * _time_bound))
-                              if _time_bound > 0 else None),
+                              if _time_bound > 0 and auc_list else None),
     }
+    if not auc_list:
+        results.update(auc_mean=None, auc_ci95=None)
+    if not lbd_list:
+        results.update(contraction_rate_mean=None, contraction_rate_ci95=None,
+                       overshoot_mean=None, overshoot_ci95=None)
 
     _tag = f"[Eval{'-' + label if label else ''}]"
     print(f"{_tag} ── Best-model evaluation (classic path-tracking){(' — ' + label) if label else ''} ──")
     print(f"{_tag} total reward     : {rew_mean:.2f} ± {rew_ci:.2f} (95% CI, n={len(reward_list)})")
-    print(f"{_tag} error AUC        : {auc_mean:.4f} ± {auc_ci:.4f}")
-    print(f"{_tag} overshoot C      : {C_mean:.3f} ± {C_ci:.3f}")
-    print(f"{_tag} contraction rate : {lbd_mean:.4f} ± {lbd_ci:.4f}  (C·e^(−λkΔt), min AUC)")
+    if auc_list:
+        print(f"{_tag} error AUC        : {auc_mean:.4f} ± {results['auc_stddev']:.4f} (stddev)")
+        print(f"{_tag} contraction rate : {lbd_mean:.4f} ± {results['contraction_rate_stddev']:.4f} (stddev)")
+    else:
+        print(f"{_tag} stability unavailable: no full-length successful episode")
 
     # wandb first, disk second. Training has already succeeded by this point and
     # the numbers above are the result; a filesystem problem must not be able to
@@ -938,7 +1021,7 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
                     wandb_logs[f"Stability/{k}"] = v
                 else:
                     wandb_logs[f"final_eval/{k}"] = v
-        sys.modules["wandb"].log(wandb_logs)
+        log_metrics(wandb_logs)
 
     # makedirs, because agent.experiment_dir may not exist. skrl creates it
     # lazily on its first write there, and for a sweep trial train.py sets
@@ -967,10 +1050,10 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
 def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli, num_groups: int = 10):
     """Post-training evaluation of the best checkpoint (CAC-dev style).
 
-    Loads best_agent.pt, disables fall termination (episodes always run the
-    full length so metrics are comparable across policies), rolls out one full
-    episode in every parallel env with deterministic (mean) actions clipped to
-    the action space, and reports mean +/- 95% CI of:
+    Loads best_agent.pt and rolls out one episode per environment, preserving
+    failure termination. Reports reward/failure statistics and full-horizon
+    stability statistics only for surviving episodes. Actions are deterministic
+    policy means clipped to the action space.
 
       * total reward
       * AUC of the velocity-tracking error (trapezoid, dt-weighted)
@@ -1033,10 +1116,9 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
     _act_low = torch.as_tensor(skrl_env.action_space.low, dtype=torch.float32, device=skrl_env.device)
     _act_high = torch.as_tensor(skrl_env.action_space.high, dtype=torch.float32, device=skrl_env.device)
 
-    # Non-terminating evaluation: flip the cfg flag (read every step by
-    # _get_dones) and restore afterwards.
+    # Preserve the configured fall rule during evaluation.
     prev_flag = getattr(unwrapped.cfg, "terminate_on_fall", True)
-    unwrapped.cfg.terminate_on_fall = False
+    # Preserve robot failures; never join a reset episode to the original curve.
     try:
         if hasattr(skrl_env, "_reset_once"):
             skrl_env._reset_once = True
@@ -1044,10 +1126,13 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
         obs = obs_dict["policy"] if isinstance(obs_dict, dict) else obs_dict
 
         total_reward = torch.zeros(num_envs, device=skrl_env.device)
+        reward_steps = torch.zeros(num_envs, device=skrl_env.device)
         errors = torch.zeros(num_envs, T + 1, device=skrl_env.device)
         errors[:, 0] = unwrapped.get_tracking_error()
 
-        print(f"[Eval] Rolling out {num_envs} non-terminating episodes of {T} steps …")
+        alive = torch.ones(num_envs, dtype=torch.bool, device=skrl_env.device)
+        failed = torch.zeros_like(alive)
+        print(f"[Eval] Rolling out {num_envs} episodes of at most {T} steps …")
         for k in range(T):
             with torch.no_grad():
                 # agent.act() is the uniform interface across every skrl Agent
@@ -1057,17 +1142,25 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
                 # policies) gives the deterministic action; deterministic
                 # policies (e.g. C3M's CLDeterministicActorModel) have no
                 # separate mean, so their raw action is already deterministic.
-                actions, outputs = agent.act(obs, None, timestep=0, timesteps=0)
+                actions, outputs = evaluation_act(agent, obs)
                 actions = torch.clamp(outputs.get("mean_actions", actions), _act_low, _act_high)
-            obs_dict, rewards, terminated, truncated, _ = skrl_env.step(actions)
+            obs_dict, rewards, terminated, truncated, transition_info = skrl_env.step(actions)
             obs = obs_dict["policy"] if isinstance(obs_dict, dict) else obs_dict
-            total_reward += rewards.squeeze(-1)
-            errors[:, k + 1] = unwrapped.get_tracking_error()
+            total_reward += rewards.reshape(-1) * alive
+            reward_steps += alive
+            failed |= alive & terminated.reshape(-1)
+            terminal_error = transition_info.get("terminal_tracking_error")
+            if terminal_error is None and "tracking_error" in transition_info:
+                terminal_error = transition_info["tracking_error"].clamp(min=0).sqrt()
+            endpoint_error = unwrapped.get_tracking_error() if terminal_error is None else terminal_error.reshape(-1)
+            errors[:, k + 1] = torch.where(alive & ~terminated.reshape(-1), endpoint_error, torch.nan)
+            alive &= ~(terminated | truncated).reshape(-1)
     finally:
         unwrapped.cfg.terminate_on_fall = prev_flag
 
     err_np = errors.cpu().numpy()  # (N, T+1)
-    rew_np = total_reward.cpu().numpy()
+    rew_np = (total_reward / reward_steps.clamp_min(1)).cpu().numpy()
+    failure_rate = float(failed.float().mean())
 
     # Cap the Stability-tab sample size to the SAC-family env count, regardless
     # of how many parallel envs this run actually used. PPO-family algorithms
@@ -1088,12 +1181,13 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
     e0_np_safe = np.maximum(e0_np, 1e-8)
     norm_err_np = err_np / e0_np_safe[:, None]
     auc_np = _trapz(norm_err_np, dx=dt, axis=1)
+    auc_np = auc_np[np.isfinite(auc_np)]
 
     # Contraction envelope on normalized error e(t)/e(0) — CAC-dev convention.
     # Envs whose initial error is ~0 (near-zero commanded velocity) carry no
     # contraction information and are excluded from the fit.
     e0 = err_np[:, 0]
-    fit_mask = e0 > 0.05
+    fit_mask = (e0 > 0.05) & np.isfinite(err_np).all(axis=1)
     C_list, lbd_list, score_list = [], [], []
     fit_ids = np.nonzero(fit_mask)[0]
     if len(fit_ids) >= num_groups:
@@ -1113,10 +1207,13 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
     results = {
         **_run_metadata(args_cli, task),
         "checkpoint": best_ckpt if os.path.exists(best_ckpt) else "final",
+        "failure_rate": failure_rate,
         "num_episodes": int(num_envs),
         "episode_steps": int(T),
-        "total_reward_mean": rew_mean, "total_reward_ci95": rew_ci,
+        "average_reward_mean": rew_mean, "average_reward_ci95": rew_ci,
+        "average_reward_stddev": float(np.std(rew_np)),
         "auc_mean": auc_mean, "auc_ci95": auc_ci,
+        "auc_stddev": float(np.std(auc_np)),
     }
     if C_list:
         C_mean, C_ci = mean_confidence_interval(C_list)
@@ -1124,13 +1221,16 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
         score_mean, score_ci = mean_confidence_interval(score_list)
         results.update({
             "overshoot_mean": C_mean, "overshoot_ci95": C_ci,
+            "overshoot_stddev": float(np.std(C_list)),
             "contraction_rate_mean": lbd_mean, "contraction_rate_ci95": lbd_ci,
+            "contraction_rate_stddev": float(np.std(lbd_list)),
             "contraction_score_mean": score_mean, "contraction_score_ci95": score_ci,
+            "contraction_score_stddev": float(np.std(score_list)),
             "num_fit_groups": len(C_list),
         })
 
-    print("[Eval] ── Best-model evaluation (non-terminating) ──")
-    print(f"[Eval] total reward     : {rew_mean:.2f} ± {rew_ci:.2f} (95% CI, n={num_envs})")
+    print("[Eval] ── Best-model evaluation (failure termination enabled) ──")
+    print(f"[Eval] average reward   : {rew_mean:.2f} ± {rew_ci:.2f} (95% CI, n={num_envs})")
     print(f"[Eval] error AUC        : {auc_mean:.4f} ± {auc_ci:.4f}")
     if C_list:
         print(f"[Eval] overshoot C      : {C_mean:.3f} ± {C_ci:.3f}")
@@ -1151,57 +1251,10 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
                     wandb_logs[f"Stability/{k}"] = v
                 else:
                     wandb_logs[f"final_eval/{k}"] = v
-        sys.modules["wandb"].log(wandb_logs)
+        log_metrics(wandb_logs)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Classic route  (--classic flag)
 # ══════════════════════════════════════════════════════════════════════════════
-import gymnasium
-from skrl.envs.wrappers.torch.gymnasium_envs import GymnasiumWrapper
-
-
-class BatchedGymnasiumWrapper(GymnasiumWrapper):
-    """Overrides SKRL's default GymnasiumWrapper to prevent tensor-copy warnings.
-    
-    Our classic environments natively output PyTorch tensors for speed. SKRL's default
-    wrapper forces torch.tensor() on the outputs, which throws a UserWarning in PyTorch
-    when the output is already a tensor. This wrapper safely applies torch.as_tensor
-    instead, fully implementing PyTorch's recommendation without modifying SKRL's library.
-    """
-    def step(self, actions: torch.Tensor):
-        from skrl.utils.spaces.torch import (
-            flatten_tensorized_space,
-            tensorize_space,
-            unflatten_tensorized_space,
-            untensorize_space,
-        )
-
-        actions = untensorize_space(
-            self.action_space,
-            unflatten_tensorized_space(self.action_space, actions),
-            squeeze_batch_dimension=not self._vectorized,
-        )
-        if self._vectorized and isinstance(self.action_space, gymnasium.spaces.Discrete):
-            actions = actions.flatten()
-
-        observation, reward, terminated, truncated, info = self._env.step(actions)
-
-        # Convert to torch using .clone().detach() or as_tensor (implementing the PyTorch recommendation)
-        observation = flatten_tensorized_space(tensorize_space(self.observation_space, observation, device=self.device))
-
-        # Here we fix the SKRL warning by checking if it's already a tensor!
-        if torch.is_tensor(reward):
-            reward = reward.clone().detach().to(self.device).view(self.num_envs, -1)
-            terminated = terminated.clone().detach().to(self.device).view(self.num_envs, -1)
-            truncated = truncated.clone().detach().to(self.device).view(self.num_envs, -1)
-        else:
-            reward = torch.tensor(reward, device=self.device, dtype=torch.float32).view(self.num_envs, -1)
-            terminated = torch.tensor(terminated, device=self.device, dtype=torch.bool).view(self.num_envs, -1)
-            truncated = torch.tensor(truncated, device=self.device, dtype=torch.bool).view(self.num_envs, -1)
-
-        if self._vectorized:
-            self._observation = observation
-            self._info = info
-
-        return observation, reward, terminated, truncated, info
+from contractionRL.agents.utils.RL.env import BatchedGymnasiumWrapper

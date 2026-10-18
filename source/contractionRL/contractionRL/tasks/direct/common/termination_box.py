@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import torch
 
-from contractionRL.agents.skrl.angle_utils import wrap_diff
+from contractionRL.agents.utils.system_dynamics.state import wrap_diff
 
 
 class TerminationBoxMixin:

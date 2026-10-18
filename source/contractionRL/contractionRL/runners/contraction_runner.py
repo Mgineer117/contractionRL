@@ -26,9 +26,8 @@ Isaac env:   env is already a SkrlVecEnvWrapper — passed through.
 
 Custom YAML flags handled here (stripped before passing to skrl)
 -----------------------------------------------------------------
-use_state_norm: true/false  →  observation_preprocessor
+use_state_norm: false      →  physical observations; models scale neural inputs
 use_value_norm: true/false  →  value_preprocessor (PPO only)
-anneal_log_std: true/false  →  exponential log_std schedule 0 → -20
 """
 
 from __future__ import annotations
@@ -38,9 +37,9 @@ import os
 
 import gymnasium as gym
 
-from contractionRL.agents.skrl.rl_glue import filter_cfg_fields as _filter_cfg_fields
+from contractionRL.agents.utils.RL.config import filter_cfg_fields as _filter_cfg_fields
 
-_SKRL_ALGOS = frozenset({"ppo", "sac", "td3", "ddpg", "amp", "ippo", "mappo"})
+_SKRL_ALGOS = frozenset({"ppo", "contractionppo", "contraction-ppo", "contraction_ppo", "sac", "mbpo", "td3", "ddpg", "amp", "ippo", "mappo"})
 _CONTRACTION_ALGOS = frozenset({"c3m", "lqr", "sdlqr", "cvstem-lqr", "c2rl-ppo", "c2rl-sac"})
 
 # Contraction algorithms that build and train no dynamics network of their own:
@@ -93,7 +92,7 @@ def _make_cmg_bounds_fn(cmg_model, w_lb: float):
     metric's eigenvalue extremes over a batch of states, not the static
     w_lb/w_ub config bounds.
     """
-    from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
+    from contractionRL.agents.utils.contraction.math_utils import bound_W, spd_inverse
 
     ccm_gen = cmg_model.ccm_gen
     x_dim = cmg_model.x_dim
@@ -107,7 +106,7 @@ def _make_cmg_bounds_fn(cmg_model, w_lb: float):
             # otherwise the plotted contraction envelope would use a different
             # metric than the deployed one. Mirrors c2rl.py's bound_W calls.
             W = bound_W(raw_W, w_lb, x_dim, getattr(ccm_gen, "bounded", False))
-            M = spd_inverse(W)
+            M = W if getattr(ccm_gen, "outputs_metric", False) else spd_inverse(W)
             eigvals = torch.linalg.eigvalsh(M)
         return float(eigvals.max().item()), float(eigvals.min().clamp(min=1e-12).item())
 
@@ -115,30 +114,13 @@ def _make_cmg_bounds_fn(cmg_model, w_lb: float):
 
 
 def _resolve_symmetry(raw_env, x_dim, angle_idx):
-    """Which symmetry of the tracking problem the networks may quotient out.
+    """Use verified translation symmetry while keeping position errors in world axes.
 
-    Two stages, and both must pass:
-
-    1. The env's ``state_names`` say what each state dim is (see
-       agents/skrl/state_symmetry.py). Names alone decide the candidate: a
-       pos_x/pos_y pair plus a yaw and otherwise only recognised yaw-invariant
-       dims -> SE(2); any pos_* dim -> translation; nothing -> none. An
-       unrecognised name fails closed to translation rather than being assumed
-       invariant.
-    2. The candidate is checked against the env's own dynamics -- translation
-       needs f, B invariant; SE(2) needs them equivariant (f(R.x) = R f(x)).
-       A declaration is not a proof, and this is what catches e.g. the
-       quadrotor, whose roll/pitch are world referenced so a yaw rotation mixes
-       them: it is silently demoted to translation instead of mis-modelled.
-
-    Envs with no analytical ``get_f_and_B`` (Isaac Sim) cannot be checked, so
-    they keep the name-derived candidate but are capped at translation -- the
-    conservative choice, since an unverifiable SE(2) claim would corrupt every
-    network input if wrong.
-
-    Returns a StateSymmetry (mode "none" disables everything) or None.
+    Native PhysX tasks without analytical dynamics retain a name-derived,
+    explicitly unverified translation candidate. Rotation is never selected
+    for new policies. Returns None when no usable translation symmetry exists.
     """
-    from contractionRL.agents.skrl.state_symmetry import StateSymmetry
+    from contractionRL.agents.utils.system_dynamics.state import StateSymmetry
 
     (names,) = _env_attrs(raw_env, "state_names", default=())
     names = tuple(names or ())
@@ -148,19 +130,13 @@ def _resolve_symmetry(raw_env, x_dim, angle_idx):
                   f"x_dim={x_dim} — symmetry quotient DISABLED.")
         return None
 
-    sym = StateSymmetry.from_names(names)
+    sym = StateSymmetry.from_names(names).demote_to_translation()
     if sym.mode == "none":
         return None
 
     get_f_and_B, x_min, x_max = _env_attrs(raw_env, "get_f_and_B", "X_MIN", "X_MAX")
     if get_f_and_B is None or x_min is None or x_max is None:
-        # Isaac Sim: no closed-form dynamics to test against, so the schema is
-        # the only evidence. from_names() already refused SE(2) unless every dim
-        # is a recognised yaw-invariant name, which for the quadruped/humanoid is
-        # a real argument (projected_gravity_b, root_lin_vel_b, root_ang_vel_b and
-        # the joint states are body frame, hence yaw invariant by construction).
-        # Accepted, but announced as unverified so a wrong frame suffix on some
-        # future env is discoverable from the log rather than silent.
+        # No analytical plant is available to verify the named translation symmetry.
         print(f"[ContractionRunner] symmetry quotient: {sym.describe()}  "
               f"[UNVERIFIED — no analytical f/B; trusting state_names. A "
               f"world-frame dim misnamed as body-frame (_b) would break this.]")
@@ -170,25 +146,12 @@ def _resolve_symmetry(raw_env, x_dim, angle_idx):
         print("[ContractionRunner] f/B DO depend on the declared position dims — "
               "symmetry quotient DISABLED (check state_names).")
         return None
-    if sym.mode == "se2" and not sym.verify_rotation(get_f_and_B, x_min, x_max):
-        sym = sym.demote_to_translation()
-        print("[ContractionRunner] f/B are translation invariant but NOT yaw "
-              "equivariant — demoted to 'translation'.")
     print(f"[ContractionRunner] symmetry quotient: {sym.describe()}")
     return sym
 
 
-def _cmg_symmetry(sym):
-    """The symmetry the CMG's W(x) may use — never SE(2).
-
-    A metric is a tensor, not a scalar: under a symmetry g it must transform as
-    W(g.x) = dg W(x) dg^T, so W cannot simply be fed yaw-free features the way an
-    invariant control output can. Making W yaw-equivariant needs an explicit
-    conjugation (build W in the canonical frame, rotate it back), which also
-    changes C3M's Wdot / LMI terms — a separate change. Until then W keeps the
-    translation quotient, which is a genuine invariance for it (f and B do not
-    depend on position at all, so neither should the metric).
-    """
+def _dynamics_symmetry(sym):
+    """Translation-invariant dynamics features; metrics retain the full state."""
     return None if sym is None else sym.demote_to_translation()
 
 
@@ -249,10 +212,10 @@ def _build_c3m_models(models_cfg: dict, agent_cfg: dict, obs_space, act_space, d
                 "(the default) — GaussianMixin + control-squashed isn't supported for "
                 "C3M's certification, which calls compute() directly rather than act()."
             )
-        from contractionRL.agents.skrl.models import CLActorModel
+        from contractionRL.agents.utils.RL.models import CLActorModel
         policy_cls = CLActorModel
     else:
-        from contractionRL.agents.skrl.models import CLDeterministicActorModel, SquashedCLDeterministicActorModel
+        from contractionRL.agents.utils.RL.models import CLDeterministicActorModel, SquashedCLDeterministicActorModel
         policy_cls = SquashedCLDeterministicActorModel if squashed else CLDeterministicActorModel
 
     policy_kwargs = models_cfg.get(policy_key, {}).copy()
@@ -261,26 +224,24 @@ def _build_c3m_models(models_cfg: dict, agent_cfg: dict, obs_space, act_space, d
     policy_kwargs.pop("backbone", None)
     policy_kwargs.pop("angle_idx", None)  # angle_idx below is the single source of truth
     policy_kwargs.pop("sym", None)    # ditto: the env is the source of truth
-
-    constrain_eigenvalues = models_cfg.get("cmg", {}).get("network", [{}])[0].get("constrain_eigenvalues", False)
+    constrain_eigenvalues = True
     w_lb = agent_cfg.get("w_lb", 0.1)
     w_ub = agent_cfg.get("w_ub", 10.0)
 
-    from contractionRL.agents.skrl.models import MetricModel
+    from contractionRL.agents.utils.RL.models import MetricModel
     models = {
         "policy": policy_cls(obs_space, act_space, device, hidden_dim=hd_policy, activation=act_policy, x_dim=x_dim, angle_idx=angle_idx, sym=sym, **policy_kwargs),
-        "cmg": MetricModel(obs_space, act_space, device, hidden_dim=hd_cmg, activation=act_cmg, x_dim=x_dim, angle_idx=angle_idx, sym=_cmg_symmetry(sym), constrain_eigenvalues=constrain_eigenvalues, w_lb=w_lb, w_ub=w_ub),
+        "cmg": MetricModel(obs_space, act_space, device, hidden_dim=hd_cmg, activation=act_cmg, x_dim=x_dim, angle_idx=angle_idx, sym=None, constrain_eigenvalues=constrain_eigenvalues, w_lb=w_lb, w_ub=w_ub),
     }
 
-    # Only build a NeuralDynamics when learning dynamics (use_empirical_dynamics
-    # =True). Under analytical dynamics the agent ignores it (C3MAgent uses the
+    # Only build a NeuralDynamics when learning dynamics (mode=sim_to_real). Under analytical dynamics the agent ignores it (C3MAgent uses the
     # env's get_f_and_B), so building it would just waste params/memory.
-    if "dynamics" in models_cfg and agent_cfg.get("use_empirical_dynamics", False):
-        from contractionRL.agents.skrl.nn_modules import NeuralDynamics
+    if "dynamics" in models_cfg and agent_cfg.get("mode", "analytical") == "sim_to_real":
+        from contractionRL.agents.utils.system_dynamics.dynamics import NeuralDynamics
         dyn_net = models_cfg["dynamics"].get("network", [{}])[0]
         dyn_hd = dyn_net.get("layers", [256, 256])
         dyn_act = dyn_net.get("activations", "relu")
-        models["dynamics"] = NeuralDynamics(x_dim, u_dim, hidden_dim=dyn_hd, activation=dyn_act, device=device, angle_idx=angle_idx, sym=_cmg_symmetry(sym))
+        models["dynamics"] = NeuralDynamics(x_dim, u_dim, hidden_dim=dyn_hd, activation=dyn_act, device=device, angle_idx=angle_idx, sym=_dynamics_symmetry(sym))
 
     return models
 
@@ -293,7 +254,7 @@ def _build_gaussian_policy(models_cfg: dict, block_name: str, obs_space, state_s
     ``_gaussian_factory`` reject unbounded backbones for SAC-based agents
     (divergence) and squashed backbones for PPO-based ones.
     """
-    from contractionRL.agents.skrl.runner import _gaussian_factory
+    from contractionRL.agents.utils.RL.runner import _gaussian_factory
 
     spec = models_cfg.get(block_name, {}).copy()
     spec.pop("class", None)
@@ -328,7 +289,14 @@ def _build_critics(models_cfg: dict, block_name: str, base_algorithm: str, obs_s
     actor's ``W1(x)`` / ``W2(xrefs)`` split. ``critic_encoder`` selects psi's
     encoder (mlp | gru | attn); it defaults to the actor's ``--encoder``.
     """
-    from contractionRL.agents.skrl.models import RefWindowValueModel
+    from contractionRL.agents.utils.RL.models import FullControlValueModel, RefWindowValueModel
+
+    compact = hasattr(obs_space, "reference_state") and not models_cfg.get(block_name, {}).get("legacy_reference_critic", False)
+    value_model = FullControlValueModel if compact else RefWindowValueModel
+    preview = compact and getattr(obs_space.reference_state, 'preview_length', 0)
+    if compact and not preview and (critic_encoder not in (None, "mlp") or critic_encoder_stride != 1
+                    or critic_combine != "concat" or critic_embed_dim != 64):
+        raise ValueError("Compact critics use a plain MLP; sequence encoder/combine/embed options require legacy_reference_critic")
 
     net = models_cfg.get(block_name, {}).get("network", [{}])
     hd = net[0].get("layers", [256, 256]) if net else [256, 256]
@@ -338,13 +306,13 @@ def _build_critics(models_cfg: dict, block_name: str, base_algorithm: str, obs_s
                   encoder_stride=critic_encoder_stride, combine=critic_combine)
 
     if base_algorithm == "PPO":
-        return {f"{key_prefix}value": RefWindowValueModel(
+        return {f"{key_prefix}value": value_model(
             obs_space, act_space, device, use_actions=False,
             analytic_potential=critic_analytic_potential, w_lb=w_lb, **common,
         )}
     elif base_algorithm == "SAC":
         return {
-            f"{key_prefix}{k}": RefWindowValueModel(
+            f"{key_prefix}{k}": value_model(
                 obs_space, act_space, device, use_actions=True, **common)
             for k in ("critic_1", "critic_2", "target_critic_1", "target_critic_2")
         }
@@ -375,7 +343,7 @@ def _resolve_dynamics_model(algo: str, agent_cfg: dict, is_classic: bool, device
     if explicit_model is not None:
         return explicit_model
     if path:
-        from contractionRL.agents.skrl.nn_modules import NeuralDynamics
+        from contractionRL.agents.utils.system_dynamics.dynamics import NeuralDynamics
         if not os.path.isfile(path):
             raise FileNotFoundError(
                 f"dynamics_checkpoint '{path}' not found. It should point at a "
@@ -393,55 +361,22 @@ def _resolve_dynamics_model(algo: str, agent_cfg: dict, is_classic: bool, device
     return None
 
 
-def _prepare_skrl_cfg(cfg: dict, algo: str) -> tuple[dict, bool]:
-    """Pop ContractionRL-specific keys and translate to skrl conventions."""
+def _prepare_skrl_cfg(cfg: dict, algo: str, device=None) -> dict:
+    """Use the same configuration contract as the CLI entry points."""
+    from contractionRL.agents.utils.RL.config import normalize_agent_cfg
     cfg = copy.deepcopy(cfg)
-    a = cfg.setdefault("agent", {})
-
-    a.pop("use_state_norm", None)  # state norm disabled everywhere (see module docstring)
-    use_value = a.pop("use_value_norm", True)
-    anneal = a.pop("anneal_log_std", False)
-
-    for k in ("state_preprocessor", "state_preprocessor_kwargs",
-              "observation_preprocessor", "observation_preprocessor_kwargs"):
-        a.pop(k, None)
-
-    if use_value and algo == "ppo":
-        a["value_preprocessor"] = "RunningStandardScaler"
-        a["value_preprocessor_kwargs"] = None
-    else:
-        a.pop("value_preprocessor", None)
-        a.pop("value_preprocessor_kwargs", None)
-
-    return cfg, anneal
+    normalize_agent_cfg(cfg, algorithm=algo, device=device)
+    return cfg
 
 
-# ────────────────────────────────────────────────────────────────────────── #
-# Helper: PPO log_std annealing hook
-# ────────────────────────────────────────────────────────────────────────── #
-
-def _patch_ppo_annealing(runner) -> None:
-    """Exponential schedule: log_std = 0*(1-t^5) + (-20)*t^5, t=progress."""
-    import torch
-    _orig = runner.agent.post_interaction
-
-    def _hook(timestep: int, timesteps: int) -> None:
-        _orig(timestep=timestep, timesteps=timesteps)
-        ratio = (timestep / max(1, timesteps)) ** 5.0
-        val = max(-20.0, min(2.0, float(-20.0 * ratio)))
-        with torch.no_grad():
-            runner.agent.policy.log_std_parameter.fill_(val)
-
-    runner.agent.post_interaction = _hook
-
-
-# ────────────────────────────────────────────────────────────────────────── #
-# Helper: build skrl env wrapper for contraction agents
 # ────────────────────────────────────────────────────────────────────────── #
 
 def _make_skrl_env(env, task_id: str | None, num_envs: int, is_classic: bool):
     """Return a skrl-wrapped env suitable for contraction agents."""
     if is_classic:
+        if isinstance(env, gym.Env) and hasattr(env.unwrapped, "num_envs"):
+            from contractionRL.agents.utils.RL.env import BatchedGymnasiumWrapper
+            env = BatchedGymnasiumWrapper(env)
         # Reuse the caller's env if it's already a real, usable one instead of
         # unconditionally rebuilding a bare duplicate. train.py's classic path
         # already constructs SyncVectorEnv + wrap_env + WandbPlotWrapper before
@@ -452,7 +387,7 @@ def _make_skrl_env(env, task_id: str | None, num_envs: int, is_classic: bool):
         # normalized_error/path_tracking plots. Building fresh from `task_id`
         # remains the fallback for callers that pass a bare/unvectorized env
         # (see the module docstring's documented usage).
-        from ..agents.skrl.contraction_metrics import StatManagerEnvWrapper
+        from contractionRL.agents.utils.contraction.metrics import StatManagerEnvWrapper
         if hasattr(env, "step") and hasattr(env, "observation_space") and hasattr(env, "num_envs"):
             # Auto-collect path-tracking metrics on every reset/step so eval loops
             # don't hand-thread stats.update(...) (see StatManagerEnvWrapper).
@@ -510,10 +445,18 @@ class ContractionRunner:
         dynamics_model=None,
     ) -> None:
         algo = cfg.get("agent", {}).get("class", "ppo").lower()
+        from contractionRL.agents.utils.RL.config import normalize_experiment_mode, validate_observation_normalization
+        validate_observation_normalization(cfg.get("agent", {}), allow_features=algo in ('c2rl-ppo', 'c2rl_ppo'))
+        raw = _unwrap_env(env)
+        analytical = getattr(raw, "has_analytical_dynamics", None)
+        normalize_experiment_mode(cfg, physx_only=analytical is False or (not is_classic and not analytical))
 
         if algo in _SKRL_ALGOS:
             self._setup_skrl(env, cfg, algo, task_id, num_envs, is_classic, ml_framework)
         elif algo in _CONTRACTION_ALGOS:
+            if cfg.get("seed") is not None:
+                from skrl.utils import set_seed
+                set_seed(cfg["seed"])
             self._setup_contraction(env, cfg, algo, task_id, num_envs, is_classic, dynamics_model)
         else:
             raise ValueError(
@@ -524,34 +467,30 @@ class ContractionRunner:
     # ── skrl-native algos (PPO/SAC/etc.) ───────────────────────────────── #
 
     def _setup_skrl(self, env, cfg, algo, task_id, num_envs, is_classic, ml_framework):
-        skrl_cfg, anneal = _prepare_skrl_cfg(cfg, algo)
+        skrl_cfg = _prepare_skrl_cfg(cfg, algo, getattr(env, "device", None))
         skrl_cfg["trainer"]["close_environment_at_exit"] = False
 
         # Unwrap to the deepest raw env to check for angle_idx
         (angle_idx,) = _env_attrs(_unwrap_env(env), "angle_idx", default=[])
         angle_idx = list(angle_idx or [])
 
-        if skrl_cfg.get("agent", {}).get("observation_preprocessor") == "RunningStandardScaler" and angle_idx:
-            raise ValueError(
-                "use_state_norm=True (RunningStandardScaler) is fundamentally incompatible "
-                "with environments that expose angle_idx. Normalizing raw angles linearly "
-                "destroys the periodicity required by embed_angles(cos, sin). "
-                "Disable use_state_norm or use a custom scaler."
-            )
-
         skrl_env = _make_skrl_env(env, task_id, num_envs, is_classic)
 
         if ml_framework.startswith("torch"):
-            from skrl.utils.runner.torch import Runner
+            from contractionRL.agents.utils.RL.runner import CLActorRunner as Runner
         else:
             from skrl.utils.runner.jax import Runner
 
+        _inject = list(_env_attrs(_unwrap_env(env), "angle_idx", default=[])[0] or [])
+        for block in skrl_cfg.get("models", {}).values():
+            if isinstance(block, dict):
+                block.setdefault("angle_idx", _inject)
         self._runner = Runner(skrl_env, skrl_cfg)
         self._env = skrl_env
         self._mode = "skrl"
 
-        if anneal and algo == "ppo":
-            _patch_ppo_annealing(self._runner)
+        from contractionRL.agents.utils.RL.agent_patches import patch_terminal_observations
+        patch_terminal_observations(self._runner.agent)
 
     # ── contraction agents (C3M/LQR/SDLQR/C2RL) ───────────────────────── #
 
@@ -576,18 +515,22 @@ class ContractionRunner:
 
         agent_cfg = copy.deepcopy(cfg.get("agent", {}))
         agent_cfg.pop("class", None)
+        if algo in ("c3m", "c2rl-ppo", "c2rl-sac"):
+            agent_cfg["mode"] = cfg["mode"]
 
         # Isaac envs have no closed-form dynamics: lqr/sdlqr/cvstem-lqr (which
         # train no dynamics model of their own) need a pretrained NeuralDynamics
         # injected here, or get_f_and_B raises mid-rollout. No-op for classic
         # envs and for C3M/C2RL, which own their dynamics model directly.
         dynamics_model = _resolve_dynamics_model(
-            algo, agent_cfg, has_analytical_dynamics, skrl_env.device, dynamics_model
+            algo, agent_cfg, has_analytical_dynamics and cfg["mode"] == "analytical", skrl_env.device, dynamics_model
         )
         if dynamics_model is not None and hasattr(raw_env, "set_dynamics_model"):
             raw_env.set_dynamics_model(dynamics_model)
 
         get_f_and_B, get_rollout = _env_attrs(raw_env, "get_f_and_B", "get_rollout")
+        if dynamics_model is not None:
+            get_f_and_B = dynamics_model.get_f_and_B
         trainer_cfg = copy.deepcopy(cfg.get("trainer", {}))
         trainer_cfg.pop("class", None)
         trainer_cfg.setdefault("close_environment_at_exit", False)
@@ -602,28 +545,8 @@ class ContractionRunner:
         cmg_cfg = copy.deepcopy(cfg.get("cmg", {}))
         empirical_dynamics_cfg = copy.deepcopy(cfg.get("empirical_dynamics", {}))
 
-        # use_empirical_dynamics only means anything to the algorithms that own a
-        # dynamics model (C3M/C2RL). lqr/sdlqr/cvstem-lqr read get_f_and_B
-        # directly, so the key is dropped here rather than reaching their cfg
-        # filter — which would warn "not applied to the algorithm" on every run
-        # (train.py sets it for every contraction algorithm).
-        if algo in _ANALYTIC_CONTROLLERS:
-            agent_cfg.pop("use_empirical_dynamics", None)
-        else:
-            # Analytical dynamics (use_empirical_dynamics=False) needs the env's exact
-            # get_f_and_B, which only classic envs expose. Isaac envs must learn a
-            # NeuralDynamics (use_empirical_dynamics=True) — train.py forces this, so
-            # this guard only fires on a hand-rolled/standalone misconfiguration.
-            use_empirical_dynamics = agent_cfg.get(
-                "use_empirical_dynamics", empirical_dynamics_cfg.get("use_empirical_dynamics", False)
-            )
-            if not use_empirical_dynamics and not has_analytical_dynamics:
-                raise ValueError(
-                    "Analytical dynamics (use_empirical_dynamics=False) is only valid for "
-                    "classic envs that expose an analytical get_f_and_B. Isaac Sim envs have "
-                    "no analytical dynamics — set use_empirical_dynamics=True (pass "
-                    "--use_empirical_dynamics) and let the agent train NeuralDynamics online."
-                )
+        if cfg["mode"] == "analytical" and not has_analytical_dynamics:
+            raise ValueError("mode: analytical requires exact environment dynamics")
 
         # angle_idx: indices within an x-block that hold a raw (wrapping) angle.
         # Every network built below embeds these as (cos, sin) at its input —
@@ -642,11 +565,13 @@ class ContractionRunner:
         # contraction_metrics.log_raw_config for why this is logged separately
         # from skrl's own dataclass-based wandb config.
         raw_cfg_snapshot = copy.deepcopy({
+            "mode": cfg["mode"],
             "agent": agent_cfg, "trainer": trainer_cfg, "models": models_cfg,
             "cm": cm_cfg, "cmg": cmg_cfg, "empirical_dynamics": empirical_dynamics_cfg,
         })
 
         if algo in ("c3m",):
+            agent_cfg["memory_size"] = memory_cfg.get("memory_size", agent_cfg.get("memory_size", 131072))
             self._setup_c3m(skrl_env, device, obs_space, state_space, act_space,
                             agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B, x_dim, u_dim,
                             angle_idx=angle_idx, sym=sym, raw_cfg_snapshot=raw_cfg_snapshot)
@@ -767,7 +692,7 @@ class ContractionRunner:
         # algorithms' project-owned trainers, there's no later train()-time
         # hook to defer to, so push the raw config right here.
         trainer = SequentialTrainer(cfg=tcfg, env=env, agents=agent)
-        from contractionRL.agents.skrl.contraction_metrics import log_raw_config
+        from contractionRL.agents.utils.contraction.metrics import log_raw_config
         log_raw_config(raw_cfg_snapshot)
         self._agent = agent
         self._trainer = trainer
@@ -820,7 +745,7 @@ class ContractionRunner:
             "close_environment_at_exit": False,
         }, TrainerCfg, context="ContractionRunner trainer")))
         trainer = SequentialTrainer(cfg=tcfg, env=env, agents=agent)
-        from contractionRL.agents.skrl.contraction_metrics import log_raw_config
+        from contractionRL.agents.utils.contraction.metrics import log_raw_config
         log_raw_config(raw_cfg_snapshot)
         self._agent = agent
         self._trainer = trainer
@@ -858,13 +783,15 @@ class ContractionRunner:
         """
         angle_idx = list(angle_idx or [])
         from contractionRL.agents.skrl.c2rl import C2RLAgent, C2RLSkrlTrainer, C2RLTrainerCfg
+        from contractionRL.agents.utils.RL.config import migrate_c2rl_metric_cfg
 
         # agent_cfg last so it wins: train.py injects CLI overrides (e.g.
-        # --use_empirical_dynamics) into the `agent:` block, and merging the
+        # --mode) into the config, and merging the
         # yaml category blocks after it silently clobbered them with the yaml
         # default. No yaml declares the same key in two blocks, so for a
         # yaml-only run the merge order makes no difference.
         agent_cfg = {**(cm_cfg or {}), **(cmg_cfg or {}), **(empirical_dynamics_cfg or {}), **agent_cfg}
+        agent_cfg = migrate_c2rl_metric_cfg(agent_cfg)
 
         base_algorithm = base_algorithm.upper()
 
@@ -881,35 +808,37 @@ class ContractionRunner:
             )
         agent_cfg["memory_size"] = mem_size
 
-        w_lb = agent_cfg.get("w_lb", 0.1)
-        w_ub = agent_cfg.get("w_ub", 10.0)
+        method = agent_cfg.get("cmg_method", "cvstem")
+        w_lb = agent_cfg.get(f"{method}_w_lb", 0.1)
+        w_ub = agent_cfg.get(f"{method}_w_ub", 10.0)
         models = {}
 
         # Always build a CMG network (MetricModel), synthesized offline (Phase A
         # — see C2RLAgent.synthesize_cmg) and frozen before Phase B. Forced
         # constrain_eigenvalues=True regardless of yaml — see c2rl.py's module
         # docstring for why (C2RLAgent also guards this at construction time).
-        from contractionRL.agents.skrl.models import MetricModel
+        from contractionRL.agents.utils.RL.models import MetricModel
         cmg_net = models_cfg.get("cmg", {}).get("network", [{}])
         cmg_hd = cmg_net[0].get("layers", [256, 256]) if cmg_net else [256, 256]
         cmg_act = cmg_net[0].get("activations", "tanh") if cmg_net else "tanh"
         # Both synthesis methods use the same bounded M-emitting head.
         cmg_model = MetricModel(
             obs_space, act_space, device, hidden_dim=cmg_hd, activation=cmg_act,
-            x_dim=x_dim, angle_idx=angle_idx, sym=_cmg_symmetry(sym), constrain_eigenvalues=True, w_lb=w_lb, w_ub=w_ub,
+            x_dim=x_dim, angle_idx=angle_idx, sym=None, constrain_eigenvalues=True, w_lb=w_lb, w_ub=w_ub,
             outputs_metric=True,
         )
         models["cmg"] = cmg_model
 
-        # NeuralDynamics (learned ẋ = f(x) + B(x)·u) — feeds Phase A's CMG
-        # synthesis. Built only when learning dynamics (use_empirical_dynamics=
-        # True); Isaac envs' sole f/B source, classic envs default to analytical.
-        if "dynamics" in models_cfg and agent_cfg.get("use_empirical_dynamics", False):
-            from contractionRL.agents.skrl.nn_modules import NeuralDynamics
-            dyn_net = models_cfg["dynamics"].get("network", [{}])[0]
+        # Analytical experiments fit no dynamics or disturbance network.
+        if agent_cfg.get("mode", "analytical") == "sim_to_real":
+            from contractionRL.agents.utils.system_dynamics.dynamics import NeuralDynamics
+            dyn_net = models_cfg.get("dynamics", {}).get("network", [{}])[0]
             dyn_hd = dyn_net.get("layers", [256, 256])
             dyn_act = dyn_net.get("activations", "relu")
-            models["dynamics"] = NeuralDynamics(x_dim, u_dim, hidden_dim=dyn_hd, activation=dyn_act, device=device, angle_idx=angle_idx, sym=_cmg_symmetry(sym))
+            models["dynamics"] = NeuralDynamics(
+                x_dim, u_dim, hidden_dim=dyn_hd, activation=dyn_act, device=device,
+                angle_idx=angle_idx, sym=_dynamics_symmetry(sym),
+                nominal_dynamics=None)
 
         # Phase B deployed policy + critic — control/mlp backbone dispatch, same
         # as C3M's. Value (PPO) / twin-Q + targets (SAC) see the same
@@ -959,6 +888,14 @@ class ContractionRunner:
             u_min=u_min,
             u_max=u_max,
         )
+        if base_algorithm == "PPO" and agent._cfg.use_value_expansion:
+            from contractionRL.agents.utils.RL.value_expansion import install_value_expansion
+            install_value_expansion(agent, raw_env)
+        if base_algorithm == 'PPO' and agent._cfg.use_state_norm:
+            from contractionRL.agents.utils.RL.env import install_feature_normalization
+            install_feature_normalization(agent)
+        if hasattr(env, "set_discount_factor"):
+            env.set_discount_factor(agent._cfg.discount_factor)
         trainer_cfg.setdefault("timesteps", 300000)
         trainer = C2RLSkrlTrainer(
             cfg=C2RLTrainerCfg(**_filter_cfg_fields(trainer_cfg, C2RLTrainerCfg, context="ContractionRunner trainer")),
@@ -977,7 +914,7 @@ class ContractionRunner:
         # static [1/w_lb, 1/w_ub] only if the env doesn't wire cmg_bounds_fn up.
         if hasattr(env, "set_contraction_certificate"):
             env.set_contraction_certificate(
-                agent_cfg.get("lbd"),
+                agent._cfg.lbd,
                 discount_factor=agent_cfg.get("discount_factor", 0.99),
                 static_metric_bounds=(1.0 / w_lb, 1.0 / w_ub),
                 cmg_bounds_fn=_make_cmg_bounds_fn(cmg_model, w_lb),

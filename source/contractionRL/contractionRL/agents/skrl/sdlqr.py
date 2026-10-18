@@ -48,10 +48,10 @@ from scipy.linalg import solve_continuous_are
 from skrl.agents.torch.base import Agent, AgentCfg
 from torch.linalg import solve
 
-from .angle_utils import wrap_diff
-from .math_utils import b_jacobian, jacobian
-from .ref_window import RefWindow
-from .rl_glue import filter_cfg_fields
+from contractionRL.agents.utils.system_dynamics.state import wrap_diff
+from contractionRL.agents.utils.contraction.math_utils import b_jacobian, jacobian
+from contractionRL.agents.utils.system_dynamics.reference import RefWindow
+from contractionRL.agents.utils.RL.config import filter_cfg_fields
 
 # ─────────────────────────────────────────────────────────────────────────── #
 # Configuration

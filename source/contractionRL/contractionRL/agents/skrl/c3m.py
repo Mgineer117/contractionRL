@@ -15,12 +15,12 @@ Contraction conditions verified jointly:
 Per-``update()`` workflow (called once per ``timestep`` by C3MSkrlTrainer,
 see ``update()`` and ``_learn()`` below):
 
-  1. **Dynamics** (skipped when ``use_empirical_dynamics``) — draw a fresh
+  1. **Dynamics** (when ``mode=sim_to_real``) — draw a fresh
      ``(x, u, x_dot)`` batch via ``get_rollout(..., "dynamics")`` and take one
-     MSE gradient step on ``NeuralDynamics`` (``ẋ = f_net(x) + B_net(x)·u``).
-     Isaac envs always use this path (no closed-form dynamics available);
-     classic envs may instead set ``use_empirical_dynamics: true`` to use the
-     env's own exact ``get_f_and_B(x)``, skipping this step entirely.
+     Likelihood gradient step on ``NeuralDynamics`` (``ẋ = f_net(x) + B_net(x)·u``).
+     PhysX envs use this path (no closed-form dynamics available);
+     analytical envs may set ``mode: analytical`` to use the
+     env's exact ``get_f_and_B(x)``, skipping dynamics fitting.
   2. **``_learn()``** — one full pass over ``self._data`` (a static/periodically
      -refreshed buffer of ``(x, xref, uref)`` triples from
      ``get_rollout(..., "c3m")``) in ``batch_size`` chunks. For each chunk,
@@ -35,21 +35,16 @@ see ``update()`` and ``_learn()`` below):
      instability, and was found to be substantially more seed-sensitive than
      the reference's simultaneous update — see git history for the A/B.)
 
-Normalization: **none**. Unlike C2RL, C3M's policy/CMG are bare
-``nn.Module``s wrapped directly in skrl ``Model``s — they are never wrapped in
-a ``PPO``/``SAC`` base agent, so there is no ``observation_preprocessor``/
-``value_preprocessor`` anywhere in this file. Every network call
-(``_compute_loss``, ``_train_dynamics``) sees the same raw ``(x, xref, uref)``
-physical-unit values everywhere, at both training and eval time (``eval()``
-below, and ``C3MSkrlTrainer.eval()``) — there is no train/eval or
-loss-vs-inference input-distribution gap to worry about (contrast with
-C2RL's CMG-loss vs. policy-training normalization mismatch, documented in
-c2rl.py).
+Physical observations stay raw for dynamics, metric and controller Jacobians.
+The compact controller scales its neural inputs through the shared
+``TrackingFeatures`` map at both training and evaluation time. C3M has no
+critic or running observation/value preprocessor.
 """
 
 from __future__ import annotations
 
 import os
+import math
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -63,7 +58,7 @@ from skrl.trainers.torch.base import Trainer, TrainerCfg
 from torch import matmul, transpose
 from tqdm import tqdm
 
-from .math_utils import (
+from contractionRL.agents.utils.contraction.math_utils import (
     b_jacobian,
     bound_W,
     jacobian,
@@ -71,8 +66,8 @@ from .math_utils import (
     spd_inverse,
     weighted_gradients,
 )
-from .ref_window import RefWindow
-from .rl_glue import filter_cfg_fields
+from contractionRL.agents.utils.system_dynamics.reference import RefWindow
+from contractionRL.agents.utils.RL.config import filter_cfg_fields
 
 # ─────────────────────────────────────────────────────────────────────────── #
 # Configuration
@@ -80,6 +75,7 @@ from .rl_glue import filter_cfg_fields
 
 @dataclass
 class C3MCfg(AgentCfg):
+    memory_size: int = 131072
     batch_size: int = 1024
     W_lr: float = 3e-4
     u_lr: float = 3e-4
@@ -128,12 +124,12 @@ class C3MCfg(AgentCfg):
     # replaced, for negligible extra coverage. 128 stays comfortably above
     # every x_dim in this repo (~4-33) while costing only ~2x eigvalsh.
     pd_loss_num_samples: int = 128
-    use_empirical_dynamics: bool = False
+    mode: str = "analytical"
     # Defaults to always-on: an unbounded LR indefinitely re-visiting the same
     # static offline buffer (see module docstring) is a major driver of the
     # late-training drift/degradation this schedule is meant to damp. Configs
     # may still override to "" to opt out. Shared across all optimizers (CMG,
-    # controller, and — when use_empirical_dynamics — NeuralDynamics); there is
+    # controller, and — in sim_to_real mode — NeuralDynamics); there is
     # no separate dynamics-only scheduler knob.
     learning_rate_scheduler: str = "ExponentialLR"
     learning_rate_scheduler_kwargs: dict = field(default_factory=lambda: {"gamma": 0.9999})
@@ -191,7 +187,7 @@ class C3MAgent(Agent):
         mode="c3m"      → {"x", "xref", "uref"}
         mode="dynamics" → {"x", "u", "x_dot"}
       ``get_f_and_B``:   ``(x) -> (f, B, Bbot)`` — required when
-        ``cfg.use_empirical_dynamics=True``; Isaac envs must leave this None
+        ``cfg.mode=sim_to_real``; Isaac envs must leave this None
         (NeuralDynamics is trained online from trajectory buffer data).
     """
 
@@ -211,7 +207,11 @@ class C3MAgent(Agent):
         u_dim: int | None = None,
     ) -> None:
         if isinstance(cfg, dict):
+            from contractionRL.agents.utils.RL.config import migrate_dynamics_mode
+            cfg = migrate_dynamics_mode(cfg)
             cfg = C3MCfg(**filter_cfg_fields(cfg, C3MCfg, context="C3MAgent"))
+        if cfg.mode not in ("analytical", "sim_to_real"):
+            raise ValueError(f"Unknown mode: {cfg.mode}")
         super().__init__(
             cfg=cfg,
             models=models,
@@ -240,12 +240,12 @@ class C3MAgent(Agent):
 
 
         # ── Dynamics: analytical or learned online ──────────────────────── #
-        if not cfg.use_empirical_dynamics:
+        if cfg.mode == "analytical":
             if get_f_and_B is None:
                 raise ValueError(
-                    "C3M: analytical dynamics (use_empirical_dynamics=False) requires a "
+                    "C3M: analytical dynamics (mode=analytical) requires a "
                     "get_f_and_B callable (classic envs only). Isaac Sim envs have no "
-                    "analytical dynamics — set use_empirical_dynamics=True."
+                    "analytical dynamics — set mode=sim_to_real."
                 )
             self._get_f_and_B = get_f_and_B
             self._neural_dynamics = None
@@ -253,7 +253,7 @@ class C3MAgent(Agent):
         else:
             self._neural_dynamics = models.get("dynamics")
             if self._neural_dynamics is None:
-                raise ValueError("C3M requires 'dynamics' model in models dictionary when use_empirical_dynamics=True")
+                raise ValueError("C3M requires 'dynamics' model in models dictionary when mode=sim_to_real")
 
             self._get_f_and_B = self._neural_dynamics.get_f_and_B
             self._dynamics_optimizer = torch.optim.Adam(
@@ -289,7 +289,9 @@ class C3MAgent(Agent):
             self._dynamics_lr_scheduler = None
 
         # ── Data buffer (numpy; static for analytical, or pre-generated) ────── #
-        self._memory_size = getattr(self.memory, "memory_size", 131072) if self.memory is not None else 131072
+        self._memory_size = getattr(self.memory, "memory_size", cfg.memory_size) if self.memory is not None else cfg.memory_size
+        if self._memory_size < 1:
+            raise ValueError("C3M memory.memory_size must be positive")
         self._data = get_rollout(self._memory_size, "c3m")
         self._get_rollout = get_rollout
         self._batch_size = cfg.batch_size
@@ -332,12 +334,16 @@ class C3MAgent(Agent):
         # 1. Online NeuralDynamics training (skipped when analytical)
         dyn_loss = None
         if self._neural_dynamics is not None:
-            dyn_data = self._get_rollout(
-                self._cfg.dynamics_batch_size, "dynamics",
-                num_control_per_state=getattr(self._cfg, "num_controls_per_state", None),
-            )
+            stored = getattr(self, "_dynamics_rollout_data", None)
+            if stored is not None:
+                indices = np.random.randint(len(stored["x"]), size=self._cfg.dynamics_batch_size)
+                dyn_data = {key: stored[key][indices] for key in ("x", "u", "x_dot")}
+            else:
+                dyn_data = self._get_rollout(
+                    self._cfg.dynamics_batch_size, "dynamics",
+                    num_control_per_state=getattr(self._cfg, "num_controls_per_state", None))
             dyn_loss = self._train_dynamics(dyn_data)
-            self.track_data("Loss / C3M/dynamics/mse", dyn_loss)
+            self.track_data("Loss / C3M/dynamics/nll", dyn_loss)
 
         # 2. Full epoch update (looping entire buffer in batch_size chunks)
         loss_dict = self._learn()
@@ -535,7 +541,7 @@ class C3MAgent(Agent):
 
         # shuffle indices for the epoch; one full pass in batch_size chunks
         indices = np.random.permutation(n)
-        iters = max(1, n // batch_size)
+        iters = math.ceil(n / batch_size)
         total_pd = total_c1 = total_c2 = total_os = total_loss = 0.0
 
         pbar = tqdm(range(iters), desc="Epoch C3M Update", leave=False)
@@ -578,14 +584,15 @@ class C3MAgent(Agent):
         return metrics
 
     def _train_dynamics(self, data: dict) -> float:
-        """MSE training of NeuralDynamics on (x, u, x_dot) data."""
+        """Conditional Gaussian likelihood training on (x, u, x_dot) data."""
         dev = self._neural_dynamics.device
         x     = torch.as_tensor(data["x"], dtype=torch.float32, device=dev)
         u     = torch.as_tensor(data["u"], dtype=torch.float32, device=dev)
         x_dot = torch.as_tensor(data["x_dot"], dtype=torch.float32, device=dev)
 
-        pred = self._neural_dynamics.predict_x_dot(x, u)
-        loss = F.mse_loss(pred, x_dot)
+        loss = self._neural_dynamics.negative_log_likelihood(x, u, x_dot)
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Non-finite stochastic dynamics likelihood")
 
         self._dynamics_optimizer.zero_grad()
         loss.backward()
@@ -594,6 +601,7 @@ class C3MAgent(Agent):
         if all(torch.isfinite(p.grad).all() for p in self._neural_dynamics.parameters() if p.grad is not None):
             torch.nn.utils.clip_grad_norm_(self._neural_dynamics.parameters(), 1.0)
             self._dynamics_optimizer.step()
+            self._neural_dynamics.disturbance_fitted.fill_(True)
 
         return loss.item()
     def save_dynamics(self, path: str) -> None:
@@ -608,7 +616,7 @@ class C3MAgent(Agent):
 # ─────────────────────────────────────────────────────────────────────────── #
 
 class C3MSkrlTrainer(Trainer):
-    """skrl Trainer for C3M — no env interaction during training.
+    """skrl Trainer for C3M with optional dynamics-data collection before fitting.
 
     Calls ``agent.update()`` in a tight loop.  Evaluation runs a few env episodes.
     """
@@ -631,7 +639,7 @@ class C3MSkrlTrainer(Trainer):
         agent.write_interval = eval_interval
         agent.init(trainer_cfg=self.cfg)
 
-        from .contraction_metrics import log_raw_config
+        from contractionRL.agents.utils.contraction.metrics import log_raw_config
         log_raw_config(getattr(self, "_wandb_raw_cfg", None))
         agent.enable_training_mode(True)
 
@@ -639,7 +647,19 @@ class C3MSkrlTrainer(Trainer):
         # C2RL — see dynamics_pretrain.py; kept in one place so the two agents'
         # pretraining behavior can't drift apart). No-op for analytical
         # dynamics or dynamics_pretrain_epochs<=0.
-        from .dynamics_pretrain import pretrain_dynamics
+        from contractionRL.agents.utils.system_dynamics.dynamics import pretrain_dynamics
+        if agent._neural_dynamics is not None and not getattr(agent.cfg, "dynamics_pretrain_data_path", ""):
+            from contractionRL.agents.utils.system_dynamics.dynamics import collect_stochastic_rollouts
+            from contractionRL.runners.contraction_runner import _unwrap_env
+            from contractionRL.agents.utils.RL.logging import metric_batch
+            raw = _unwrap_env(self.env)
+            dt = getattr(raw, "dt", None) or raw.step_dt
+            with metric_batch(step=-getattr(agent.cfg, "dynamics_pretrain_epochs", 5) - 1):
+                agent._dynamics_rollout_data = collect_stochastic_rollouts(
+                    raw, agent.cfg.emp_dynamics_memory_size, low=raw.action_space.low,
+                    high=raw.action_space.high, device=agent.device, dt=dt,
+                    angle_idx=getattr(raw, "angle_idx", ()),
+                    path=os.path.join(agent.experiment_dir, "stochastic_dynamics_data.npz"))
         pretrain_dynamics(
             agent,
             epochs=getattr(agent.cfg, "dynamics_pretrain_epochs", 5),
@@ -663,7 +683,7 @@ class C3MSkrlTrainer(Trainer):
             # path_tracking_base.py emits for PPO/SAC, so every algorithm lands
             # on the same wandb tabs for the same metric.
             if eval_interval > 0 and (t + 1) % eval_interval == 0:
-                from .contraction_metrics import track_reward_summary, track_stability_summary
+                from contractionRL.agents.utils.contraction.metrics import track_reward_summary, track_stability_summary
                 ev = self.eval(timestep=t)
                 track_stability_summary(agent, ev["stability"])
                 track_reward_summary(agent, ev["reward"])
@@ -753,7 +773,7 @@ class C3MSkrlTrainer(Trainer):
         observations, infos = self.env.reset()
         states = self.env.state() if hasattr(self.env, "state") else None
 
-        from .contraction_metrics import reward_summary
+        from contractionRL.agents.utils.contraction.metrics import reward_summary
 
         num_envs = self.env.num_envs
         device = self.env.device
@@ -766,6 +786,7 @@ class C3MSkrlTrainer(Trainer):
         max_steps = int(self._env_scalar_attr("max_episode_length", "max_episode_len")) + 1
         finished = torch.zeros(num_envs, dtype=torch.bool, device=device)
         total_reward = torch.zeros((num_envs, 1), device=device)
+        reward_steps = torch.zeros((num_envs, 1), device=device)
         # Snapshot the wrapper's compute counter so we can tell whether this
         # rollout actually produced fresh metrics (see check after the loop).
         computes_before = getattr(self.env, "_compute_count", None)
@@ -780,6 +801,7 @@ class C3MSkrlTrainer(Trainer):
             observations, rewards, terminated, truncated, _ = self.env.step(actions)
             states = self.env.state() if hasattr(self.env, "state") else None
             total_reward += rewards.view(num_envs, 1) * active.unsqueeze(-1).float()
+            reward_steps += active.unsqueeze(-1)
 
             finished |= (terminated | truncated).view(num_envs)
             if finished.all():
@@ -801,15 +823,8 @@ class C3MSkrlTrainer(Trainer):
         # Only envs that finished their (first) episode carry valid reward info.
         f_mask = finished if finished.any() else torch.ones_like(finished)
 
-        # Tracking plots are not pushed from here: C3M never steps the env
-        # outside this eval() rollout (see C3MSkrlTrainer.train() docstring —
-        # "no env interaction during training"), so WandbPlotWrapper (scripts/
-        # skrl/wandb_plot_wrapper.py), which hooks every env.step() call
-        # regardless of caller, already captures this exact rollout under
-        # "train/normalized_error" / "train/path_tracking" — pushing a second,
-        # "eval"-prefixed copy from here was a redundant duplicate of the same
-        # underlying trajectory data.
+        # WandbPlotWrapper already captures these steps; avoid duplicate plots.
         return {
             "stability": self.env.stability_summary(),
-            "reward": reward_summary(total_reward, f_mask),
+            "reward": reward_summary(total_reward, f_mask, steps=reward_steps),
         }

@@ -112,6 +112,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        actions = actions.nan_to_num().clamp(-1., 1.)
         self._prev_actions = self._actions.clone()
         self._actions = actions.clone()
         default_pos = self._robot.data.default_joint_pos[:, self._joint_ids]
@@ -148,6 +149,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
                 self._robot.data.root_lin_vel_b,
                 self._robot.data.root_ang_vel_b,
                 self._robot.data.joint_vel[:, self._joint_ids],
+                self._robot.data.root_pos_w[:, 2:3],
             ],
             dim=-1,
         )
@@ -274,7 +276,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         return torch.norm(cmds[:, :2] - self._robot.data.root_lin_vel_b[:, :2], dim=-1)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
+        time_out = self.episode_length_buf >= self.max_episode_length
         # Fall = base dropped too low or body tilted past the limit. projected
         # gravity z is -1 upright and rises toward 0/+1 as the base tilts, so
         # ``> fall_grav_z_max`` (default -0.5) fires at ~>60 deg from upright —
@@ -284,6 +286,11 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
         fell = too_low | tilted
         if not getattr(self.cfg, "terminate_on_fall", True):
             fell = torch.zeros_like(time_out)
+        state = self.get_physical_state()
+        self.extras["terminal_physical_state"] = state.clone()
+        self.extras["terminal_tracking_error"] = self.get_tracking_error().clone()
+        xy = self._robot.data.root_pos_w[:, :2] - self.scene.env_origins[:, :2]
+        fell |= (xy.abs() > 80.).any(-1) | (~torch.isfinite(state)).any(-1)
         return fell, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
@@ -312,7 +319,7 @@ class QuadrupedVelTrackingEnv(DirectRLEnv):
                 # (mean)" tracker uses a different key name and can't be unified
                 # with it, so it was leaving total_reward_mean written only once
                 # (by the post-training evaluator) instead of throughout training.
-                from contractionRL.agents.skrl.contraction_metrics import reward_log_dict, reward_summary
+                from contractionRL.agents.utils.contraction.metrics import reward_log_dict, reward_summary
                 self.extras["log"].update(
                     reward_log_dict(reward_summary(undisc_returns, mask), self.device)
                 )

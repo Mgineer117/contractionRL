@@ -13,6 +13,10 @@ import argparse
 import os
 import sys
 
+# Prefer this checkout over an editable installation from another worktree.
+_checkout = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(_checkout, "source", "contractionRL"))
+
 # Local wandb run files (config/history/media, not the same as tensorboard
 # events) rack up one small file per run and are the #1 inode-quota killer on
 # the cluster's home filesystem (~72k files observed, see search sweeps).
@@ -41,13 +45,19 @@ parser.add_argument("--reference_mode", choices=["stabilizing", "contractive"], 
                          "achieved rate. Only envs declaring xref_init_fast_* accept it.")
 parser.add_argument("--classic", action="store_true", default=False,
                     help="Use classic gymnasium environment (no Isaac Sim).")
+parser.add_argument("--mode", choices=["analytical", "sim_to_real"], default=None,
+                    help="Experiment setup; classic-derived Isaac tasks use exact equations or PhysX, respectively.")
+parser.add_argument("--disable_disturbance", action="store_true", default=False,
+                    help="Disable disturbances for a classic or classic-derived Isaac analysis.")
+parser.add_argument("--policy_control_mode", choices=["structured", "factorized", "full", "residual"], default=None,
+                    help="Tracking actor: structured feedback (default), factorized full control W2(s)tanh(W1(s)), or plain full/residual MLP.")
 parser.add_argument("--headon", action="store_true", default=False,
                     help="Show the Isaac Sim GUI. Isaac Sim runs headless by default; "
                          "pass this to disable headless mode and render a window.")
 parser.add_argument("--task", type=str, default=None, help="Environment ID.")
 parser.add_argument(
     "--algorithm", "--algo", type=str, default="PPO",
-    help="Algorithm: ppo | sac | c3m | lqr | sdlqr | c2rl-ppo | c2rl-sac | AMP | DDPG | TD3 | …"
+    help="Algorithm: ppo | contraction_ppo | sac | mbpo | c3m | lqr | sdlqr | c2rl-ppo | c2rl-sac | AMP | DDPG | TD3 | …"
 )
 parser.add_argument("--cmg_method", "--cmg-method", choices=["cvstem", "ccm"], default=None,
                     help="C2RL metric synthesis: CV-STEM regression or direct CCM losses.")
@@ -55,18 +65,13 @@ parser.add_argument("--num_envs", type=int, default=None, help="Number of parall
 parser.add_argument("--seed", type=int, default=None, help="Random seed.")
 parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint path to resume from.")
 parser.add_argument("--num_timesteps", "--num-timesteps", type=int, default=None,
-                    help="Total training timesteps.")
+                    help="Total batched training steps. Isaac defaults: car 500k, cartpole/segway 1M, "
+                         "quadrotor 2M, manipulator 3M, quadruped 4M, humanoid 5M.")
 parser.add_argument("--skip_final_eval", "--skip-final-eval", action="store_true", default=False,
                     help="Skip the post-training best-model evaluation rollout. That rollout is "
                          "sequential over a single env and does NOT feed the swept "
                          "Stability/* metrics (those come from the trainer loop), so sweeps "
                          "skip it — see search/build_sweep.py.")
-parser.add_argument("--analytical", type=str, default="",
-                    help="Pass 'dynamics' to use analytical dynamics (C3M/LQR).")
-parser.add_argument("--use_empirical_dynamics", "--use-empirical-dynamics",
-                    action="store_true", default=False,
-                    help="Use a learned NeuralDynamics model instead of the env's exact analytical get_f_and_B "
-                         "(classic envs only). When NOT passed, C3M/C2RL use analytical dynamics.")
 parser.add_argument("--dynamics_checkpoint", "--dynamics-checkpoint", type=str, default=None,
                     help="Path to a dynamics.pt written by a previous C3M/C2RL run "
                          "(<log_dir>/checkpoints/dynamics.pt). REQUIRED for lqr/sdlqr/cvstem-lqr "
@@ -173,15 +178,16 @@ _ov.add_argument("--use_state_norm", "--use-state-norm", "--ppo_use_state_norm",
                  "--ppo-use-state-norm", type=str, default=None)
 _ov.add_argument("--use_value_norm", "--use-value-norm", "--ppo_use_value_norm",
                  "--ppo-use-value-norm", type=str, default=None)
+_ov.add_argument("--use_value_expansion", "--use-value-expansion", type=str, default=None)
+_ov.add_argument("--value_expansion_horizon", "--value-expansion-horizon", type=int, default=None)
+_ov.add_argument("--value_expansion_batch_size", "--value-expansion-batch-size", type=int, default=None)
+_ov.add_argument("--action_bound_penalty_beta", "--action-bound-penalty-beta", type=float, default=None)
 # Its partner knob (rl_glue installs them through different hooks:
 # value_preprocessor vs rewards_shaper), so an A/B on the reward normalizer
 # needs its own flag — without one the only way to toggle it is editing the
 # yaml, which is shared by every concurrently-running sweep worker.
 _ov.add_argument("--use_reward_norm", "--use-reward-norm", "--ppo_use_reward_norm",
                  "--ppo-use-reward-norm", type=str, default=None)
-# "false" makes PPO learn log_std through the policy loss instead of following
-# the fixed std_dev_annealing_kwargs schedule (C2RL-PPO only; see C2RLPPOCfg).
-_ov.add_argument("--std_dev_annealing", "--std-dev-annealing", type=str, default=None)
 # Train on a fixed set of num_envs reference trajectories (one minted per env
 # slot on its first reset) instead of drawing a fresh one every episode. The
 # initial error stays random — this fixes the task, not the initial condition.
@@ -243,12 +249,14 @@ parser.add_argument("--encoder_stride", "--encoder-stride", type=int, default=No
                          "1 = dense. Bounds 'mlp' input width on a long window. "
                          "Overrides the yaml; default when absent: the yaml's value, "
                          "else 1.")
+parser.add_argument('--reference_preview_steps', '--reference-preview-steps', type=int, default=None,
+                    help='Additional nominal reference steps for compact preview encoders; current reference is included too.')
 parser.add_argument("--critic_encoder", "--critic-encoder", type=str, default=None,
                     choices=["mlp", "gru", "attn"],
                     help="Override the critic's psi encoder (defaults to --encoder).")
 parser.add_argument("--critic_encoder_stride", "--critic-encoder-stride", type=int, default=None,
                     help="Stride for the critic's psi encoder (see --encoder_stride).")
-parser.add_argument("--critic_combine", "--critic-combine", type=str, default="concat",
+parser.add_argument("--critic_combine", "--critic-combine", type=str, default=None,
                     choices=["concat"],
                     help="How the critic combines phi(x, e) and psi(xrefs). Only "
                          "'concat' is active; 'bilinear'/'film' are commented out "
@@ -263,7 +271,7 @@ parser.add_argument("--critic_analytic_potential", "--critic-analytic-potential"
                     dest="critic_analytic_potential", action="store_true", default=False,
                     help="Critic V(s) = f_theta(s) + ||e||^2_M using the frozen CMG "
                          "(see models._AnalyticPotentialMixin). Use with use_value_norm=false.")
-parser.add_argument("--critic_embed_dim", "--critic-embed-dim", type=int, default=64,
+parser.add_argument("--critic_embed_dim", "--critic-embed-dim", type=int, default=None,
                     help="Embedding width for the privileged critic's phi/psi "
                          "(default 64). Bounds the bilinear form's rank.")
 
@@ -311,6 +319,9 @@ if not _is_classic:
     AppLauncher.add_app_launcher_args(parser)
 
 args_cli, hydra_args = parser.parse_known_args()
+_cli_dotted_args = [arg for arg in hydra_args if arg.startswith("--") and "=" in arg and "." in arg.split("=", 1)[0]]
+if _is_classic and len(_cli_dotted_args) != len(hydra_args):
+    parser.error("Unknown arguments: " + " ".join(arg for arg in hydra_args if arg not in _cli_dotted_args))
 if not _is_classic:
     args_cli.headless = not args_cli.headon
 if not _is_classic and args_cli.video:
@@ -351,6 +362,11 @@ from train_utils import (
     finish_wandb,
     install_wandb_scalar_hook,
     normalize_agent_cfg,
+    restore_checkpoint_model_config,
+    save_classic_config,
+    tracking_state_metadata,
+    configure_tracking_preview,
+    validate_tracking_options,
 )
 
 # No env's tensorboard event files are ever read back by anything in this repo
@@ -359,6 +375,10 @@ from train_utils import (
 disable_tensorboard_files()
 
 algorithm = args_cli.algorithm.lower()
+if algorithm in ("contractionppo", "contraction-ppo"):
+    algorithm = "contraction_ppo"
+if algorithm == "mbpo" and args_cli.ml_framework != "torch":
+    raise SystemExit("MBPO is implemented for --ml_framework torch")
 # Bare "c2rl" (no -ppo/-sac suffix) defaults to the PPO variant, since it has
 # no standalone (non-suffixed) config entry point registered.
 if algorithm in ("c2rl",):
@@ -373,7 +393,7 @@ _CONTRACTION_ALGOS = {
 # same way SAC does) need far fewer parallel envs; PPO-based algorithms are
 # on-policy and benefit from massively parallel envs. Applies to both the
 # classic gymnasium route and the Isaac Sim route.
-_SAC_LIKE_ALGOS = {"sac", "c2rl-sac", "c2rl_sac", "c3m", "lqr", "sdlqr", "cvstem-lqr", "cvstem_lqr"}
+_SAC_LIKE_ALGOS = {"sac", "mbpo", "c2rl-sac", "c2rl_sac", "c3m", "lqr", "sdlqr", "cvstem-lqr", "cvstem_lqr"}
 _DEFAULT_NUM_ENVS_SAC = 64
 _DEFAULT_NUM_ENVS_PPO_CLASSIC = 1024
 
@@ -389,6 +409,19 @@ def _apply_agent_overrides(agent_cfg, args):
     destination differs from a plain ``agent[<dest>]`` write.
     """
     a = agent_cfg["agent"]
+    policy = agent_cfg.get("models", {}).get("policy")
+    if policy is not None:
+        policy.setdefault("control_mode", "structured")
+    if args.policy_control_mode is not None:
+        if policy is None:
+            raise ValueError("--policy_control_mode requires a learned policy")
+        policy["control_mode"] = args.policy_control_mode
+    if getattr(args, 'reference_preview_steps', None) is not None:
+        if policy is None:
+            raise ValueError('--reference_preview_steps requires a learned policy')
+        policy['preview_steps'] = args.reference_preview_steps
+    if getattr(args, "mode", None) is not None:
+        agent_cfg["mode"] = args.mode
     if args.cmg_method is not None:
         a["cmg_method"] = args.cmg_method
     simple = (
@@ -396,28 +429,55 @@ def _apply_agent_overrides(agent_cfg, args):
         "mini_batches", "ratio_clip", "entropy_loss_scale", "kl_threshold",
         "value_loss_scale", "grad_norm_clip", "batch_size", "polyak",
         "gradient_steps", "initial_entropy_value",
+        "value_expansion_horizon", "value_expansion_batch_size",
+        "action_bound_penalty_beta",
     )
     for key in simple:
         val = getattr(args, key, None)
         if val is not None:
             a[key] = val
     if args.gae_lambda is not None:
-        a["lambda"] = args.gae_lambda      # skrl PPO's GAE key
         a["gae_lambda"] = args.gae_lambda  # yaml's own spelling
-    for key in ("use_state_norm", "use_value_norm", "use_reward_norm", "std_dev_annealing"):
+    for key in ("use_state_norm", "use_value_norm", "use_reward_norm", "use_value_expansion"):
         val = getattr(args, key, None)
         if val is not None:
+            if str(val).lower() not in ("true", "false"):
+                raise ValueError(f"--{key} must be true or false")
             a[key] = (str(val).lower() == "true")
-    # One switch, two places: the agent flag controls the annealing patch, while
-    # the CLActor must also be built with a learnable logstd. Setting only the
-    # former leaves self.anneal=True on the model, so CLActor.anneal_stddev()
-    # would still overwrite whatever the policy gradient learned.
-    if getattr(args, "std_dev_annealing", None) is not None:
-        _pol = agent_cfg.get("models", {}).get("policy")
-        if isinstance(_pol, dict):
-            _pol["anneal_stddev"] = a["std_dev_annealing"]
     if args.memory_size is not None:
         agent_cfg["memory"]["memory_size"] = args.memory_size
+    if getattr(args, "ppo_network_arch", None) is not None or getattr(args, "ppo_activations", None) is not None:
+        layers = None
+        if getattr(args, "ppo_network_arch", None) is not None:
+            layers = [int(value.strip()) for value in args.ppo_network_arch.strip("[]").split(",")]
+            if not layers or min(layers) < 1:
+                raise ValueError("--ppo_network_arch requires positive layer widths")
+        for name in ("policy", "value", "critic"):
+            for layer in agent_cfg.get("models", {}).get(name, {}).get("network", []):
+                if layers is not None:
+                    layer["layers"] = layers
+                if getattr(args, "ppo_activations", None) is not None:
+                    layer["activations"] = args.ppo_activations
+    if getattr(args, "max_iterations", None) is not None:
+        agent_cfg["trainer"]["timesteps"] = args.max_iterations * a["rollouts"]
+    if getattr(args, "num_timesteps", None) is not None:
+        agent_cfg["trainer"]["timesteps"] = args.num_timesteps
+    for name in ("critic", "value", "critic_1", "critic_2", "target_critic_1", "target_critic_2"):
+        block = agent_cfg.get("models", {}).get(name)
+        if not isinstance(block, dict):
+            continue
+        for key, value in {
+            "encoder": getattr(args, "critic_encoder", None) or args.encoder,
+            "encoder_stride": getattr(args, "critic_encoder_stride", None),
+            "combine": getattr(args, "critic_combine", None),
+            "embed_dim": getattr(args, "critic_embed_dim", None),
+        }.items():
+            if value is not None:
+                block[key] = value
+        if getattr(args, "critic_analytic_potential", False):
+            if str(a.get("class", "")).lower() != "c2rl-ppo":
+                raise ValueError("--critic_analytic_potential requires C2RL-PPO and use_value_norm=false")
+            block["analytic_potential"] = True
     # Encoder settings are model kwargs (models.policy.* / models.critic.*), not
     # agent-config keys — contraction_runner passes those blocks through verbatim
     # as model kwargs. setdefault, never assignment: a wandb sweep parameter under
@@ -529,10 +589,13 @@ if _is_classic:
     # Mirrors the Isaac-env branch below (search "env_cfg.seed"), which
     # already got this right.
     seed = args_cli.seed if args_cli.seed is not None else agent_cfg.get("seed", seed)
+    if seed == -1:
+        seed = random.randint(0, 10000)
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
     agent_cfg["seed"] = seed
+    args_cli.seed = seed
 
     if args_cli.num_timesteps is not None:
         agent_cfg["trainer"]["timesteps"] = args_cli.num_timesteps
@@ -540,16 +603,8 @@ if _is_classic:
     # …) — the classic branch used to apply only a couple of these, silently
     # dropping the rest, so a classic gamma sweep trained at the yaml's own value.
     _apply_agent_overrides(agent_cfg, args_cli)
-    # Classic contraction envs use the env's exact analytical get_f_and_B by
-    # default (use_empirical_dynamics=False); pass --use_empirical_dynamics to
-    # learn a NeuralDynamics instead. Classic envs only (Isaac forces empirical).
-    # _CONTRACTION_ALGOS (not a hand-written list): it carries both the hyphen
-    # and underscore spellings of the c2rl variants. The old inline list had
-    # only "c2rl_ppo"/"c2rl_sac", so the README-documented "--algorithm c2rl-ppo"
-    # silently dropped --use_empirical_dynamics and trained on analytical
-    # dynamics instead.
-    if algorithm in _CONTRACTION_ALGOS:
-        agent_cfg["agent"]["use_empirical_dynamics"] = args_cli.use_empirical_dynamics
+    from contractionRL.agents.utils.RL.config import normalize_experiment_mode
+    normalize_experiment_mode(agent_cfg)
     if args_cli.dynamics_checkpoint:
         agent_cfg["agent"]["dynamics_checkpoint"] = args_cli.dynamics_checkpoint
 
@@ -608,6 +663,7 @@ if _is_classic:
             "task": args_cli.task,
             "algorithm": algorithm,
             "seed": seed,
+            "mode": agent_cfg["mode"],
         })
 
         # A sweep must init early: its sampled hyperparameters only exist on
@@ -625,12 +681,20 @@ if _is_classic:
         # does not call wandb.init() during agent.init().
         agent_cfg["agent"].setdefault("experiment", {})["wandb"] = False
 
+    seed = int(agent_cfg["seed"])
+    if seed == -1:
+        seed = random.randint(0, 10000)
+    agent_cfg["seed"] = args_cli.seed = seed
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
     _src_dir = os.path.join(_root, "source", "contractionRL")
     if _src_dir not in sys.path:
         sys.path.insert(0, _src_dir)
     _sys.path.append(_os.path.dirname(__file__))
 
-    from contractionRL.agents.skrl.contraction_metrics import StatManagerEnvWrapper
+    from contractionRL.agents.utils.contraction.metrics import StatManagerEnvWrapper
     from train_utils import BatchedGymnasiumWrapper
     from wandb_plot_wrapper import WandbPlotWrapper
 
@@ -648,7 +712,15 @@ if _is_classic:
 
     _ref_kw = ({"reference_mode": args_cli.reference_mode}
                if getattr(args_cli, "reference_mode", None) else {})
+    if algorithm == "contraction_ppo":
+        _ref_kw["compact_reference"] = True
+    if args_cli.disable_disturbance:
+        # Classic constructors accept a per-state scale vector through ENV_CONFIG.
+        import importlib
+        _module = importlib.import_module(gym.spec(args_cli.task).entry_point.split(":")[0])
+        _ref_kw["disturbance_scales"] = [0.] * _module.ENV_CONFIG["num_dim_x"]
     raw_env = gym.make(args_cli.task, num_envs=num_envs, device=device, **_ref_kw)
+    validate_tracking_options(raw_env.unwrapped, args_cli)
     # Standalone PPO/SAC path: apply the euclidean/level reward switch straight
     # to the env — C2RL applies the equivalent through its own set_ccm() call
     # inside ContractionRunner (see c2rl.py), and normalize_agent_cfg pops these
@@ -685,8 +757,10 @@ if _is_classic:
         # _RW.effective_horizon() on both paths, and it used to be imported only
         # inside the AUTO branch -- so every pinned run died with
         # "NameError: name '_RW' is not defined" before reaching training.
-        from contractionRL.agents.skrl.ref_window import RefWindow as _RW
+        from contractionRL.agents.utils.system_dynamics.reference import RefWindow as _RW
         _len = args_cli.ref_length
+        if getattr(raw_env.unwrapped.ref_window, "compact", False):
+            _len = 1
         if _len is None:
             # Default is the FULL episode, the same length at every gamma, with
             # the tail repeating the last reference point (RefWindow clamps
@@ -732,6 +806,9 @@ if _is_classic:
             "window_over_horizon": (int(_len) * int(args_cli.ref_offset))
             / max(int(_RW.effective_horizon(_gamma, _mel)), 1),
         }
+        if getattr(raw_env.unwrapped.ref_window, "compact", False):
+            _win_cfg = {"reference_representation": "compact_generator", "ref_length": 1, "ref_offset": 1,
+                        **tracking_state_metadata(raw_env.unwrapped.ref_window), "max_episode_len": _mel}
         # Written into the pending wandb_kwargs, not onto wandb.run: wandb.init()
         # is called later, by skrl's Agent.init(), so wandb.run is still None
         # here and a live config.update() silently no-ops (measured: every window
@@ -754,28 +831,13 @@ if _is_classic:
                              f"{type(raw_env.unwrapped).__name__})")
         raw_env.unwrapped.set_fix_ref_trajectories(True)
 
-    # O6 analytic-potential critic — see --critic_analytic_potential.
-    if getattr(args_cli, "critic_analytic_potential", False):
-        _cb = agent_cfg.get("models", {}).get("critic")
-        if isinstance(_cb, dict):
-            _cb["analytic_potential"] = True
-
-    _critic_block = agent_cfg.get("models", {}).get("critic")
-    if isinstance(_critic_block, dict):
-        # Same explicit-wins rule as the policy block above: an explicitly passed
-        # flag overrides the yaml, an absent one leaves the yaml (or a
-        # sweep-sampled value) and falls back only if nothing set it.
-        _enc = args_cli.critic_encoder or args_cli.encoder
-        if _enc is not None:
-            _critic_block["encoder"] = _enc
-        else:
-            _critic_block.setdefault("encoder", "mlp")
-        if args_cli.critic_encoder_stride is not None:
-            _critic_block["encoder_stride"] = args_cli.critic_encoder_stride
-        else:
-            _critic_block.setdefault("encoder_stride", 1)
-        _critic_block.setdefault("combine", args_cli.critic_combine)
-        _critic_block.setdefault("embed_dim", args_cli.critic_embed_dim)
+    restore_checkpoint_model_config(agent_cfg, args_cli.checkpoint)
+    configure_tracking_preview(raw_env.unwrapped, agent_cfg)
+    if not args_cli.no_wandb:
+        agent_cfg['agent'].setdefault('experiment', {}).setdefault('wandb_kwargs', {}).setdefault('config', {}).update(
+            tracking_state_metadata(getattr(raw_env.unwrapped, 'ref_window', None), agent_cfg.get('models')))
+    import copy
+    _resolved_agent_cfg = copy.deepcopy(agent_cfg)
 
     # Wrapper order is load-bearing: StatManagerEnvWrapper must see the flat
     # tensor observations BatchedGymnasiumWrapper produces, and WandbPlotWrapper
@@ -785,7 +847,7 @@ if _is_classic:
         total_timesteps=agent_cfg["trainer"]["timesteps"],
     )
 
-    _annealing = normalize_agent_cfg(agent_cfg, algorithm=algorithm)
+    normalize_agent_cfg(agent_cfg, algorithm=algorithm, device=env.device)
 
     if _is_contraction:
         from contractionRL.runners import ContractionRunner
@@ -796,7 +858,7 @@ if _is_classic:
         # access), so angle_idx has to be injected into the model blocks for
         # their networks to embed it continuously — see _inject_angle_idx.
         # ContractionRunner reads it off the env itself and needs no injection.
-        from contractionRL.agents.skrl.runner import CLActorRunner
+        from contractionRL.agents.utils.RL.runner import CLActorRunner
         _inject_angle_idx(agent_cfg, list(getattr(raw_env.unwrapped, "angle_idx", []) or []),
                           _resolve_symmetry_for_env(raw_env))
         # network_architecture: sweep-friendly override applied to both the
@@ -810,10 +872,15 @@ if _is_classic:
                 _net = agent_cfg.get("models", {}).get(_blk, {}).get("network")
                 if isinstance(_net, list) and _net:
                     _net[0]["layers"] = list(_arch)
+            _resolved_agent_cfg["models"] = copy.deepcopy(agent_cfg["models"])
+            for _model in _resolved_agent_cfg["models"].values():
+                if isinstance(_model, dict):
+                    _model.pop("sym", None)
         runner = CLActorRunner(env, agent_cfg)
 
     # Contraction algorithms already namespace their own track_data() keys.
-    apply_agent_patches(runner.agent, algorithm=algorithm, annealing=_annealing, namespace=not _is_contraction)
+    save_classic_config(_resolved_agent_cfg, raw_env.unwrapped, runner.agent.experiment_dir)
+    apply_agent_patches(runner.agent, algorithm=algorithm, namespace=not _is_contraction)
 
     if args_cli.checkpoint:
         runner.load(args_cli.checkpoint) if _is_contraction else runner.agent.load(args_cli.checkpoint)
@@ -867,7 +934,7 @@ else:
         sys.exit(1)
 
     if args_cli.ml_framework.startswith("torch"):
-        from contractionRL.agents.skrl.runner import CLActorRunner as Runner
+        from contractionRL.agents.utils.RL.runner import CLActorRunner as Runner
     elif args_cli.ml_framework.startswith("jax"):
         from skrl.utils.runner.jax import Runner
 
@@ -897,6 +964,18 @@ else:
 
     @hydra_task_config(args_cli.task, agent_cfg_entry_point)
     def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict):
+        from contractionRL.agents.utils.RL.config import apply_isaac_rl_training_default
+        apply_isaac_rl_training_default(agent_cfg, args_cli.task, algorithm, overrides=hydra_args)
+        apply_cli_dotted_overrides(agent_cfg, _cli_dotted_args)
+        from contractionRL.tasks.direct.classic_isaac.backend import configure_backend, configure_backend_agent
+        if hasattr(env_cfg, "reference_mode") and args_cli.reference_mode is not None:
+            env_cfg.reference_mode = args_cli.reference_mode
+        configure_backend(env_cfg, args_cli.mode or agent_cfg.get("mode"))
+        if args_cli.disable_disturbance:
+            if not hasattr(env_cfg, "disturbance_enabled"):
+                raise ValueError("--disable_disturbance supports classic-derived Isaac tasks")
+            env_cfg.disturbance_enabled = False
+        configure_backend_agent(agent_cfg, env_cfg.mode, args_cli.task, classic_derived=hasattr(env_cfg, "classic_task"))
         # Algorithm-aware num_envs defaults: off-policy SAC-based algorithms
         # need far fewer parallel envs (large replay buffer >> many envs),
         # while on-policy PPO-based algorithms benefit from massively parallel
@@ -912,32 +991,11 @@ else:
         if args_cli.distributed:
             env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
 
-        if args_cli.max_iterations:
-            agent_cfg["trainer"]["timesteps"] = args_cli.max_iterations * agent_cfg["agent"]["rollouts"]
-        if args_cli.num_timesteps is not None:
-            agent_cfg["trainer"]["timesteps"] = args_cli.num_timesteps
         agent_cfg["trainer"]["close_environment_at_exit"] = False
 
         # Agent-config overrides (flag name == YAML key); see _apply_agent_overrides.
         _apply_agent_overrides(agent_cfg, args_cli)
-
-        if args_cli.ppo_activations is not None:
-            models_cfg = agent_cfg.get("models", {})
-            for model_type in ["policy", "value"]:
-                if model_type in models_cfg:
-                    for layer in models_cfg[model_type].get("network", []):
-                        if "activations" in layer:
-                            layer["activations"] = args_cli.ppo_activations
-
-        if args_cli.ppo_network_arch is not None:
-            arch_str = args_cli.ppo_network_arch.replace("[", "").replace("]", "")
-            layers = [int(x.strip()) for x in arch_str.split(",")]
-            models_cfg = agent_cfg.get("models", {})
-            for model_type in ["policy", "value"]:
-                if model_type in models_cfg:
-                    for layer in models_cfg[model_type].get("network", []):
-                        if "layers" in layer:
-                            layer["layers"] = layers
+        configure_backend_agent(agent_cfg, env_cfg.mode, args_cli.task, classic_derived=hasattr(env_cfg, "classic_task"))
 
         if args_cli.ml_framework.startswith("jax"):
             skrl.config.jax.backend = "jax" if args_cli.ml_framework == "jax" else "numpy"
@@ -946,12 +1004,15 @@ else:
             args_cli.seed = random.randint(0, 10000)
         agent_cfg["seed"] = args_cli.seed if args_cli.seed is not None else agent_cfg["seed"]
         env_cfg.seed = agent_cfg["seed"]
+        args_cli.seed = env_cfg.seed
 
         log_root_path = os.path.abspath(
             os.path.join("logs", "skrl", agent_cfg["agent"]["experiment"]["directory"])
         )
         print(f"[INFO] Logging experiment in directory: {log_root_path}")
         log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + f"_{algorithm}_{args_cli.ml_framework}"
+        if getattr(env_cfg, "mode", None) == "sim_to_real":
+            log_dir += "_physx"
         print(f"Exact experiment name requested from command line: {log_dir}")
         if agent_cfg["agent"]["experiment"]["experiment_name"]:
             log_dir += f"_{agent_cfg['agent']['experiment']['experiment_name']}"
@@ -973,6 +1034,7 @@ else:
             import threading as _threading
 
             import wandb as _wandb
+            from contractionRL.agents.utils.RL.logging import log_metrics
 
             agent_cfg["agent"]["experiment"]["wandb"] = ("WANDB_SWEEP_ID" not in os.environ)
             agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})["sync_tensorboard"] = False
@@ -982,25 +1044,14 @@ else:
                 _video_dir = os.path.join(log_dir, "videos", "train")
                 _uploaded_videos: set = set()
                 _wandb_stop_event = _threading.Event()
-                _video_metric_defined = [False]
 
                 def _upload_pending_videos(step: int | None = None) -> None:
                     for mp4 in sorted(_glob.glob(os.path.join(_video_dir, "*.mp4"))):
                         if mp4 not in _uploaded_videos and _wandb.run is not None:
-                            if not _video_metric_defined[0]:
-                                # The video-watcher thread uploads asynchronously (polling every
-                                # 30s) and can land after the main loop has already logged
-                                # scalars at a later step — wandb rejects any step= that isn't
-                                # monotonically increasing across all calls in the run. Give the
-                                # video its own x-axis instead of the shared step counter, so an
-                                # out-of-order upload is never rejected (https://wandb.me/define-metric).
-                                _wandb.define_metric("train/video_step")
-                                _wandb.define_metric("train/video", step_metric="train/video_step")
-                                _video_metric_defined[0] = True
                             m = _re.search(r"step-(\d+)", os.path.basename(mp4))
                             log_step = int(m.group(1)) if m else step
                             try:
-                                _wandb.log({"train/video": _wandb.Video(mp4, format="mp4"), "train/video_step": log_step})
+                                log_metrics({"train/video": _wandb.Video(mp4, format="mp4"), "train/video_step": log_step})
                                 _uploaded_videos.add(mp4)
                             except Exception as _e:
                                 logger.warning(f"wandb video upload failed: {_e}")
@@ -1013,6 +1064,8 @@ else:
 
                 _wandb_video_thread = _threading.Thread(target=_video_watcher, daemon=True)
                 _wandb_video_thread.start()
+        else:
+            agent_cfg["agent"]["experiment"]["wandb"] = False
 
         _wkw = agent_cfg["agent"]["experiment"].setdefault("wandb_kwargs", {})
         if args_cli.wandb_project is not None:
@@ -1025,19 +1078,29 @@ else:
         _wkw.setdefault("config", {}).update({
             "run_name": _wkw["name"],
             "run_batch": args_cli.wandb_batch or datetime.now().strftime("%Y-%m-%d"),
+            "mode": env_cfg.mode,
+            "task": args_cli.task, "algorithm": algorithm, "seed": env_cfg.seed,
         })
+        if not args_cli.no_wandb and "WANDB_SWEEP_ID" in os.environ:
+            if _wandb.run is None:
+                _wandb.init(project=_wkw["project"], name=_wkw.get("name"), sync_tensorboard=False)
+            apply_wandb_sweep_overrides(agent_cfg)
+            env_cfg.seed = args_cli.seed = int(agent_cfg["seed"])
 
         dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
         dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
         resume_path = retrieve_file_path(args_cli.checkpoint) if args_cli.checkpoint else None
+        restore_checkpoint_model_config(agent_cfg, resume_path)
+        dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+        if (resume_path and getattr(env_cfg, "mode", None) == "sim_to_real"
+                and hasattr(env_cfg, "physx_reference_path") and not env_cfg.physx_reference_path):
+            from contractionRL.tasks.direct.classic_isaac.backend import checkpoint_reference_bank
+            env_cfg.physx_reference_path = checkpoint_reference_bank(resume_path)
 
         if isinstance(env_cfg, ManagerBasedRLEnvCfg):
             env_cfg.export_io_descriptors = args_cli.export_io_descriptors
         env_cfg.log_dir = log_dir
-        if hasattr(env_cfg, "reference_mode") and args_cli.reference_mode is not None:
-            env_cfg.reference_mode = args_cli.reference_mode
-
         if hasattr(env_cfg, "vel_cmd"):
             vc = env_cfg.vel_cmd
             print(
@@ -1050,6 +1113,11 @@ else:
             )
 
         env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+        validate_tracking_options(env.unwrapped, args_cli)
+        if args_cli.fix_ref_trajectories:
+            if not hasattr(env.unwrapped, "set_fix_ref_trajectories"):
+                raise ValueError("--fix_ref_trajectories requires a tracking environment")
+            env.unwrapped.set_fix_ref_trajectories(True)
 
         if getattr(env.unwrapped, "has_analytical_dynamics", False):
             raw = env.unwrapped
@@ -1058,8 +1126,6 @@ else:
                 length = raw.full_ref_length(offset=args_cli.ref_offset)
             raw.configure_ref_window(length, args_cli.ref_offset,
                                      agent_cfg["agent"].get("discount_factor", 0.99))
-            if args_cli.fix_ref_trajectories:
-                raw.set_fix_ref_trajectories(True)
             if args_cli.terminate_out_of_box is not None or args_cli.terminate_as_terminal:
                 raw.set_terminate_out_of_box(
                     True if args_cli.terminate_out_of_box is None else args_cli.terminate_out_of_box,
@@ -1071,6 +1137,14 @@ else:
                 raw.plant.reward_level = args_cli.reward_level
             # Persist the actual Dict observation space after window sizing.
             dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
+
+        if getattr(env_cfg, 'mode', None) == 'sim_to_real':
+            dump_yaml(os.path.join(log_dir, 'params', 'env.yaml'), env_cfg)
+
+        configure_tracking_preview(env.unwrapped, agent_cfg)
+        if getattr(env.unwrapped, "ref_window", None) is not None:
+            _wkw.setdefault("config", {}).update(tracking_state_metadata(env.unwrapped.ref_window, agent_cfg.get('models')))
+            dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
         if isinstance(env.unwrapped, DirectMARLEnv) and algorithm in ["ppo"]:
             env = multi_agent_to_single_agent(env)
@@ -1097,7 +1171,7 @@ else:
         _isaac_env = env  # save reference for get_physical_state() during ref-traj generation
         env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)
 
-        from contractionRL.agents.skrl.contraction_metrics import StatManagerEnvWrapper
+        from contractionRL.agents.utils.contraction.metrics import StatManagerEnvWrapper
         env = StatManagerEnvWrapper(env)
         # Raw (un-plot-wrapped) reference for _evaluate_best_model/_generate_ref_trajs:
         # both toggle skrl_env._reset_once directly to force a real sim reset, which
@@ -1126,17 +1200,11 @@ else:
 
         _alg = agent_cfg["agent"].get("class", "").lower()
         _is_contraction = _alg in _CONTRACTION_ALGOS
-        _annealing = normalize_agent_cfg(agent_cfg, algorithm=_alg)
+        normalize_agent_cfg(agent_cfg, algorithm=_alg, device=env.device)
 
 
         if _is_contraction:
             from contractionRL.runners import ContractionRunner
-            # PhysX robot tasks learn their dynamics; exact classic-in-Isaac
-            # tasks expose the same analytical f/B as their classic counterparts.
-            agent_cfg["agent"]["use_empirical_dynamics"] = (
-                args_cli.use_empirical_dynamics
-                or not getattr(_isaac_env.unwrapped, "has_analytical_dynamics", False)
-            )
             # lqr/sdlqr/cvstem-lqr own no dynamics model — they need a pretrained
             # one loaded from disk here (ContractionRunner raises with the flag
             # to pass if it's missing). See --dynamics_checkpoint.
@@ -1150,16 +1218,7 @@ else:
         # .entropy_optimizer) — C2RLAgent applies them to its inner PPO/SAC
         # sub-agent itself, which is where they matter. Contraction algorithms
         # already namespace their own track_data() keys, hence namespace=False.
-        apply_agent_patches(runner.agent, algorithm=_alg, annealing=_annealing, namespace=not _is_contraction)
-
-        if _is_contraction and hasattr(runner.agent, "policy") and hasattr(runner.agent.policy, "cl_actor"):
-            _orig_post = runner.agent.post_interaction
-
-            def _annealed_post(*, timestep: int, timesteps: int) -> None:
-                runner.agent.policy.cl_actor.anneal_stddev(timestep / max(1, timesteps))
-                _orig_post(timestep=timestep, timesteps=timesteps)
-
-            runner.agent.post_interaction = _annealed_post
+        apply_agent_patches(runner.agent, algorithm=_alg, namespace=not _is_contraction)
 
         if resume_path:
             print(f"[INFO] Loading model checkpoint from: {resume_path}")

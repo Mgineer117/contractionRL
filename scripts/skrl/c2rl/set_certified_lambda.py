@@ -2,7 +2,7 @@
 
 An env's algorithms spell the same quantities differently::
 
-    skrl_c2rl_{ppo,sac}_cfg.yaml   cm.lbd  cm.w_lb    cm.w_ub    cm.cvstem_r_scaler
+    skrl_c2rl_{ppo,sac}_cfg.yaml   cm.cvstem_lbd  cm.cvstem_w_lb  cm.cvstem_w_ub  cm.cvstem_r_scaler
     skrl_c3m_cfg.yaml              cm.lbd  cm.w_lb    cm.w_ub    (no Riccati weight)
     skrl_cvstem_lqr_cfg.yaml       cm.lbd  cm.cm_w_lb cm.cm_w_ub agent.r_scaler
 
@@ -34,8 +34,8 @@ CLASSIC = os.path.join(ROOT, "source/contractionRL/contractionRL/tasks/direct/cl
 # algorithm -> {canonical name: yaml key}. A key absent here is simply not
 # written for that algorithm (c3m has no Riccati weight at all).
 SPELLINGS = {
-    "c2rl_ppo":   {"lbd": "lbd", "w_lb": "w_lb", "w_ub": "w_ub", "r": "cvstem_r_scaler"},
-    "c2rl_sac":   {"lbd": "lbd", "w_lb": "w_lb", "w_ub": "w_ub", "r": "cvstem_r_scaler"},
+    "c2rl_ppo":   {"lbd": "cvstem_lbd", "w_lb": "cvstem_w_lb", "w_ub": "cvstem_w_ub", "r": "cvstem_r_scaler"},
+    "c2rl_sac":   {"lbd": "cvstem_lbd", "w_lb": "cvstem_w_lb", "w_ub": "cvstem_w_ub", "r": "cvstem_r_scaler"},
     "c3m":        {"lbd": "lbd", "w_lb": "w_lb", "w_ub": "w_ub"},
     "cvstem_lqr": {"lbd": "lbd", "w_lb": "cm_w_lb", "w_ub": "cm_w_ub", "r": "r_scaler"},
 }

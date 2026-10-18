@@ -104,7 +104,7 @@ else
     PARALLEL=1
 fi
 
-NUM_TIMESTEPS=$(prompt_default "Override training timesteps (blank = use the config's)" "")
+NUM_TIMESTEPS=$(prompt_default "Override training timesteps (blank = task default)" "")
 EXTRA=$(prompt_default "Extra args appended verbatim to every train.py call (blank = none)" "")
 DEFAULT_TAG="run_$(date '+%Y%m%d_%H%M%S')"
 TAG=$(prompt_default "Run tag / output CSV basename" "$DEFAULT_TAG")

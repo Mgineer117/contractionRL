@@ -188,7 +188,7 @@ class AircraftEnv(BaseEnv):
         """Centre of XREF_INIT: the nominal operating point the reference holds."""
         return 0.5 * (self.XREF_INIT_MIN + self.XREF_INIT_MAX)
 
-    def sample_reference_controls(self, freqs, weights, _t, infos, add_noise=False):
+    def sample_reference_controls(self, freqs, weights, _t, infos):
         n = weights.shape[0]
         uref = torch.zeros(n, self.num_dim_control, device=self.device)
         # Trim first. An aircraft reference built from sinusoids around ZERO
@@ -242,11 +242,9 @@ class AircraftEnv(BaseEnv):
                 uref = uref + torch.clamp(hold, self.UREF_MIN, self.UREF_MAX)
         for i, freq in enumerate(freqs):
             weight = weights[:, i, :]
-            phase = math.sin(freq * _t / self.time_bound * 2 * math.pi)
+            phase = torch.sin(torch.as_tensor(freq * _t / self.time_bound * 2 * math.pi, device=self.device))
             uref[:, 0] += weight[:, 0] * phase
             uref[:, 1] += weight[:, 1] * phase
-        if add_noise:
-            uref += torch.randn_like(uref) * torch.abs(0.1 * uref)
         return torch.clamp(uref, self.UREF_MIN, self.UREF_MAX)
 
     def system_reset(self, env_ids: torch.Tensor):

@@ -1,11 +1,11 @@
-seed: 42  # Random seed for reproducibility
+mode: sim_to_real
+seed: 42
 
 models:
   separate: true
-  # The single deployed policy C2RL trains, on the Mahalanobis reward.
   policy:
     class: GaussianMixin
-    backbone: control  # PPO is unbounded; uref+feedback can exceed the declared action space
+    backbone: control
     clip_actions: false
     clip_log_std: true
     min_log_std: -20.0
@@ -16,12 +16,8 @@ models:
       layers: [256, 256]
       activations: tanh
     output: ACTIONS
-    # sigma = exp(-2) = 0.135, not exp(0) = 1.0. On the +-3 applied box that
-    # is 4.5% of the half-range instead of 33%, so the policy starts near its
-    # mean rather than being dominated by its own noise. Inside the
-    # min_log_std/max_log_std clamp above, so it is not truncated at init.
     initial_log_std: -2.0
-  critic:  # PPO value function V(obs)
+  critic:
     class: DeterministicMixin
     network:
     - name: net
@@ -29,9 +25,6 @@ models:
       layers: [256, 256]
       activations: tanh
     output: ONE
-  # NeuralDynamics (ẋ = f(x) + B(x)·u) — feeds the online contraction-metric SDP
-  # when learning dynamics. Built only when use_empirical_dynamics=true (pass
-  # --use_empirical_dynamics); classic envs default to analytical get_f_and_B.
   dynamics:
     class: NeuralDynamics
     network:
@@ -39,105 +32,82 @@ models:
       input: STATE_ACTION
       layers: [128, 128]
       activations: tanh
-  # A `cmg` (class: CMG) model is always built (see c2rl.py module docstring) —
-  # omitted here so ContractionRunner falls back to its default [256, 256]/tanh
-  # architecture; add a `cmg:` block above (like classic/car's) to customize it.
 
 memory:
   class: RandomMemory
-  memory_size: -1  # PPO: one rollout epoch, reset each epoch (== agent.rollouts)
+  memory_size: -1
 
 agent:
   class: C2RL-PPO
-  # PPO shared config (the single deployed policy's PPO sub-agent).
-  rollouts: 24   # Number of environment steps per parallel environment per update
-  learning_epochs: 5  # Number of gradient descent passes over the collected batch
-  mini_batches: 4  # Number of subsets to divide the batch into for stochastic optimization
-  gae_lambda: 0.95  # Lambda parameter for Generalized Advantage Estimation (GAE)
-  learning_rate: 1.0e-5   # Global step size, fixed — no scheduler (see below)
-  # No KL-adaptive schedule: the LR is constant at learning_rate above.
-  # (KLAdaptiveLR was steering toward kl_threshold 0.008, but with the PPO
-  # early-stop at 0.01 its decrease branch could never fire — that needs
-  # mean KL > 0.016 (kl_factor=2), above the stop — so it only ratcheted the
-  # LR upward. A fixed LR is the honest version of that behavior.)
-  learning_rate_scheduler: null
-  std_dev_annealing_kwargs:
-    schedule: exponential
-    final_log_std: -4.6
-    power: 2.0
+  rollouts: 24
+  learning_epochs: 5
+  mini_batches: 4
+  gae_lambda: 0.95
+  learning_rate: 1.0e-5
+  learning_rate_scheduler: KLAdaptiveLR
   random_timesteps: 0
   learning_starts: 0
-  grad_norm_clip: 0.5  # Maximum permitted magnitude for gradients (prevents exploding gradients)
-  ratio_clip: 0.2  # PPO trust region clipping bound for the objective ratio
-  value_clip: 0.0  # Clipping bound for the value function update
-  # 0.0: C2RL's policy is u = uref + feedback against a frozen contraction
-  # metric, so exploration is not the scarce resource -- an entropy bonus
-  # holds sigma up and injects noise into an unstable plant instead. Matches
-  # every classic c2rl-ppo config, which already pinned this at 0.0.
-  entropy_loss_scale: 0.0 # Coefficient to encourage exploration by maximizing action entropy
-  value_loss_scale: 0.5  # Weight coefficient for the value function loss term
-  kl_threshold: 0.01 # Early stopping threshold based on Kullback-Leibler divergence
-  time_limit_bootstrap: true  # Bootstrap value at episode truncation instead of treating it as terminal
+  grad_norm_clip: 0.5
+  ratio_clip: 0.2
+  value_clip: 0.0
+  entropy_loss_scale: 0.0
+  value_loss_scale: 0.5
+  kl_threshold: 0.032
+  time_limit_bootstrap: true
   rewards_shaper_scale: 1.0
-  use_state_norm: false  # Off by default — see c2rl.py module docstring / rl_glue.make_base_rl_cfg
-  # Off, measured 2026-08-08. Turning these on to tame the Mahalanobis
-  # reward was refuted by the 4-gamma x 20-seed grid: paired on gamma and
-  # seed (n=38), normalization was worse in 26/38 (median AUC +0.215), and
-  # every auc>8 outlier in the whole grid was a normalized run (4/53 vs
-  # 0/44). r/std keeps rescaling as the frozen-CMG reward drifts, and the
-  # value preprocessor's +-5 sigma clamp truncates exactly the large-error
-  # states the metric exists to weight.
-  use_value_norm: false    # Same, but for the value function's output (PPO only)
-  use_reward_norm: false   # Non-biasing running-std reward normalizer (r/std, no centering) — tames the
-                         # w_lb/w_ub-dependent Mahalanobis-reward scale/heavy-tail before GAE; see rl_glue.
+  use_state_norm: false
+  use_value_norm: true
+  use_value_expansion: false
+  value_expansion_horizon: 3
+  value_expansion_batch_size: 512
+  use_reward_norm: false
 
-  discount_factor: 0.99  # deployed policy's discount factor (single policy — no con/opt duality)
-  # w_lb, lbd, tracking_scaler, control_scaler, cm_eps, cm_solver) lives in the
-  # top-level `cm:` block below; the offline CMG synthesis (Phase A, always
-  # runs) additionally reads `cmg:`.
+  discount_factor: 0.99
   experiment:
     directory: "manipulator_c2rl_ppo"
     experiment_name: ""
-    write_interval: "auto"  # Logging frequency for tensorboard/W&B (in epochs/steps)
-    checkpoint_interval: "auto"  # Frequency of saving model weights (in epochs/steps)
-    wandb: true  # Enable Weights & Biases logging
+    write_interval: "auto"
+    checkpoint_interval: "auto"
+    wandb: true
     wandb_kwargs:
       project: contractionRL
-      name:    # auto-generated by train.py (deterministic, matches local log dir)
+      name:
 
-# ── Contraction metric + Mahalanobis reward ────────────────────────────────── #
+  learning_rate_scheduler_kwargs:
+    kl_threshold: 0.008
+    kl_factor: 2
+    lr_factor: 1.5
+    min_lr: 1.0e-6
+    max_lr: 1.0e-4
 cm:
-  # Metric source — the frozen Phase-A CMG network. "online" (per env per step
-  # CV-STEM SDP, see c2rl.py) is deliberately not used on the Isaac envs: their
-  # num_envs is in the thousands and f/B come from a learned NeuralDynamics,
-  # so a per-step solve per env is orders of magnitude too slow.
-  # Mahalanobis reward
-  w_ub: 10.0  # Upper eigenvalue bound for the metric M(x)
-  w_lb: 0.1   # Lower eigenvalue bound for the metric M(x)
-  tracking_scaler: 1.0  # Q: tracking-error weight
-  control_scaler: 0.0   # R: control-effort weight (0 = disabled)
-  cm_eps: 0.01  # Strict-definiteness margin on the contraction LMI
-  cm_solver: MOSEK  # cvxpy SDP solver: SCS (default, no license) | CLARABEL (no license, tighter/slower) | MOSEK (commercial license, tightest/fastest — see README.md Installation)
+  ccm_w_ub: 10.0
+  ccm_w_lb: 0.1
+  ccm_lbd: 0.01
+  cvstem_w_ub: 10.0
+  cvstem_w_lb: 0.1
+  cvstem_lbd: 0.01
+  tracking_scaler: 1.0
+  control_scaler: 0.0
+  cm_eps: 0.01
+  cm_solver: MOSEK
 
-# ── Dynamics — analytical env get_f_and_B by default; set use_empirical_dynamics
-#    true (classic envs only) to learn a NeuralDynamics instead. ─────────────── #
+cmg:
+  ccm_memory_size: 100000
+  ccm_batch_size: 1024
+  cvstem_memory_size: 10000
+  cvstem_batch_size: 512
+
 empirical_dynamics:
-  use_empirical_dynamics: true  # false = env analytical get_f_and_B; true = learn NeuralDynamics
-  # States×controls for online dynamics-data generation (use_empirical_dynamics=true
-  # with no dynamics_pretrain_data_path): samples ceil(memory_size / N) states and
-  # pairs each with N distinct controls → N control-aware samples per state. Only
-  # affects NeuralDynamics pretraining; ignored under analytical dynamics. Default 3.
   num_controls_per_state: 3
   dynamics_lr: 1.0e-3
   dynamics_lr_scheduler: "StepLR"
   dynamics_lr_scheduler_kwargs:
-    step_size: 1  # anneal every epoch
+    step_size: 1
     gamma: 0.99
   dynamics_batch_size: 4096
-  dynamics_pretrain_epochs: 100  # offline-data epochs, or online rollouts when no data path
-  emp_dynamics_memory_size: 8192  # fixed pretraining buffer, sampled once (no dynamics_pretrain_data_path here,
-                                   # so drawn fresh from the traj buffer — any size is feasible, no cap needed)
+  dynamics_pretrain_epochs: 100
+  emp_dynamics_memory_size: 8192
 
 trainer:
   class: C2RLSkrlTrainer
-  timesteps: 50000   # Total number of environment steps to train for
+  timesteps: 50000

@@ -175,7 +175,7 @@ class BallAndBeamEnv(BaseEnv):
         B[:, 3, 0] = 1.0 / (J_BEAM + M_BALL * r ** 2)
         return B
 
-    def sample_reference_controls(self, freqs, weights, _t, infos, add_noise=False):
+    def sample_reference_controls(self, freqs, weights, _t, infos):
         n = weights.shape[0]
         uref = torch.zeros(n, self.num_dim_control, device=self.device)
         # Trim: the torque that cancels the ball's gravity moment at the current
@@ -203,9 +203,7 @@ class BallAndBeamEnv(BaseEnv):
                 -25.0 * (theta - theta_cmd) - 8.0 * xr[:, 3])
         for i, freq in enumerate(freqs):
             weight = weights[:, i, :]
-            uref[:, 0] += weight[:, 0] * math.sin(freq * _t / self.time_bound * 2 * math.pi)
-        if add_noise:
-            uref += torch.randn_like(uref) * torch.abs(0.1 * uref)
+            uref[:, 0] += weight[:, 0] * torch.sin(torch.as_tensor(freq * _t / self.time_bound * 2 * math.pi, device=self.device))
         return torch.clamp(uref, self.UREF_MIN, self.UREF_MAX)
 
     def system_reset(self, env_ids: torch.Tensor):

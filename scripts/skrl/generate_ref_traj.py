@@ -19,7 +19,6 @@ Outputs (default --out_dir data/{robot}, matching each path-tracking env's
 default `traj_path`)
 -------
     data/{robot}/dynamics_data.npz   — x, u, x_dot (consumed by TrajectoryBuffer)
-    data/{robot}/{robot}.npz         — legacy states/actions-only archive
 """
 
 from __future__ import annotations
@@ -27,6 +26,9 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+
+_checkout = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(_checkout, "source", "contractionRL"))
 
 from isaaclab.app import AppLauncher
 
@@ -61,6 +63,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 from skrl.utils.runner.torch import Runner
+from train_utils import evaluation_act
 
 from isaaclab.envs import DirectRLEnvCfg
 
@@ -137,14 +140,14 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
 
     # Probe dims
     with torch.no_grad():
-        actions_probe, _ = runner.agent.act(obs, None, timestep=0, timesteps=0)
+        actions_probe, _ = evaluation_act(runner.agent, obs)
     state_probe = getattr(unwrapped, _STATE_METHOD)()
     state_dim  = state_probe.shape[-1]
     action_dim = actions_probe.shape[-1]
 
     # Pre-allocate (num_trajs, T, dim) on GPU
-    states_buf  = torch.zeros(num_envs, T, state_dim,  device=device)
-    actions_buf = torch.zeros(num_envs, T, action_dim, device=device)
+    states_buf  = torch.zeros(num_envs, T + 1, state_dim,  device=device)
+    actions_buf = torch.zeros(num_envs, T + 1, action_dim, device=device)
     ever_done   = torch.zeros(num_envs, dtype=torch.bool, device=device)
 
     print(f"[INFO] Collecting {num_envs} trajectories in parallel over {T} steps …")
@@ -153,12 +156,19 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
 
     for t in range(T):
         with torch.no_grad():
-            actions, _ = runner.agent.act(obs, None, timestep=0, timesteps=0)
+            actions, _ = evaluation_act(runner.agent, obs)
         states_buf[:, t]  = getattr(unwrapped, _STATE_METHOD)()
+        actions = actions.clamp(-1., 1.)
         actions_buf[:, t] = actions
-        obs_dict, _, terminated, truncated, _ = env.step(actions)
+        obs_dict, _, terminated, truncated, transition_info = env.step(actions)
         obs = _get_obs(obs_dict)
         ever_done |= terminated.squeeze(-1)  # only early falls, not natural time-limit truncation
+
+    terminal = transition_info.get("terminal_physical_state")
+    if terminal is None:
+        raise RuntimeError("Nominal reference collection requires pre-reset terminal states")
+    states_buf[:, T] = terminal
+    actions_buf[:, T] = actions_buf[:, T - 1]
 
     # Keep only envs that survived the full episode
     good = ~ever_done
@@ -202,14 +212,11 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    out_path = os.path.join(args.out_dir, f"{args.robot}.npz")
-    np.savez_compressed(out_path, states=states_arr, actions=actions_arr)
-    print(f"[INFO] Saved ref trajs → {out_path}")
-    print(f"       states  shape: {states_arr.shape}")
-    print(f"       actions shape: {actions_arr.shape}")
-
     dyn_path = os.path.join(args.out_dir, "dynamics_data.npz")
-    np.savez_compressed(dyn_path, x=states_arr, u=actions_arr, x_dot=x_dot_arr)
+    from contractionRL.tasks.direct.common.reference_domain import save_nominal_references
+    accepted = save_nominal_references(dyn_path, x=states_arr, u=actions_arr,
+                                       x_dot=x_dot_arr, dt=dt)
+    print(f"[INFO] Accepted {accepted} bounded full-length nominal references")
     print(f"[INFO] Saved dynamics  → {dyn_path}")
     print(f"       x      shape: {states_arr.shape}")
     print(f"       u      shape: {actions_arr.shape}")

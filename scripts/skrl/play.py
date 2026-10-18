@@ -38,9 +38,25 @@ import argparse
 import glob
 import os
 import sys
+from pathlib import Path
+
+# Prefer this checkout over an editable installation from another worktree.
+_checkout = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(_checkout, "source", "contractionRL"))
 
 # ── Argument parsing ─────────────────────────────────────────────────────── #
 # Parsed before any Isaac import so the classic route never touches Isaac Sim.
+
+
+def _checkpoint_agent_cfg(checkpoint, fallback):
+    """Restore the recorded architecture before constructing checkpoint models."""
+    import yaml
+    path = Path(checkpoint).parent.parent / 'params' / 'agent.yaml'
+    if path.is_file():
+        fallback = yaml.safe_load(path.read_text())
+    from train_utils import restore_checkpoint_model_config
+    restore_checkpoint_model_config(fallback, checkpoint)
+    return fallback
 
 parser = argparse.ArgumentParser(description="Multi-model Stability evaluation of skrl checkpoints.")
 parser.add_argument("--task", type=str, required=True, help="Name of the task/env.")
@@ -65,7 +81,6 @@ parser.add_argument(
     help="Stability buffer size (envs whose trajectory is scored). Default 64.",
 )
 parser.add_argument("--seed", type=int, default=None, help="Environment/agent seed.")
-parser.add_argument("--device", type=str, default=None, help="Compute device (default cuda:0 / cfg).")
 parser.add_argument("--checkpoint", type=str, default=None, help="Explicit checkpoint path (single algorithm).")
 parser.add_argument(
     "--ref_length", "--ref-length", dest="ref_length", type=int, default=None,
@@ -73,6 +88,10 @@ parser.add_argument(
          "train.py — override only if the run was trained with an explicit --ref_length.",
 )
 # Isaac-only extras (ignored on the classic route).
+parser.add_argument("--policy_control_mode", choices=["structured", "full", "residual"], default=None)
+parser.add_argument("--disable_disturbance", action="store_true", default=False)
+parser.add_argument("--mode", choices=["analytical", "sim_to_real"], default=None,
+                    help="Experiment setup; PhysX-only tasks always use sim_to_real.")
 parser.add_argument("--disable_fabric", action="store_true", default=False, help="Isaac: disable fabric.")
 parser.add_argument("--ml_framework", type=str, default="torch", choices=["torch", "jax"])
 
@@ -100,13 +119,32 @@ def _candidate_algorithms(classic: bool, algorithm_filter: str | None) -> list[s
         return []
     # Isaac: enumerate algorithms that ship a config entry point for this task
     # (best effort — the log-dir names aren't algorithm-clean like classic's).
-    return ["ppo", "sac", "c3m", "lqr", "sdlqr", "cvstem-lqr", "c2rl-ppo", "c2rl-sac"]
+    return ["ppo", "contraction_ppo", "sac", "mbpo", "c3m", "lqr", "sdlqr", "cvstem-lqr", "c2rl-ppo", "c2rl-sac"]
 
 
-def _newest_best_ckpt(patterns: list[str]) -> str | None:
+def _newest_best_ckpt(patterns: list[str], algorithm: str | None = None, task: str | None = None) -> str | None:
     hits: list[str] = []
     for p in patterns:
         hits.extend(glob.glob(p, recursive=True))
+    if algorithm is not None:
+        import yaml
+        from pathlib import Path
+        expected = algorithm.lower().replace("-", "").replace("_", "")
+        matched = []
+        for path in hits:
+            config = Path(path).parent.parent / "params" / "agent.yaml"
+            if config.exists():
+                recorded = yaml.safe_load(config.read_text())
+                saved = recorded["agent"]["class"]
+                if saved.lower().replace("-", "").replace("_", "") != expected:
+                    continue
+                saved_task = recorded.get("environment", {}).get("task") or recorded["agent"].get("experiment", {}).get("wandb_kwargs", {}).get("config", {}).get("task")
+                if task is not None and saved_task != task:
+                    continue
+            elif task is not None:
+                continue  # An unidentified legacy checkpoint needs --checkpoint.
+            matched.append(path)
+        hits = matched
     if not hits:
         return None
     return max(hits, key=os.path.getmtime)
@@ -121,8 +159,12 @@ def _discover_models(task: str, classic: bool, models_dir: str,
     a single explicit path.
     """
     env = _env_name(task)
+    if algorithm_filter is not None: algorithm_filter = algorithm_filter.lower()
+    if algorithm_filter in ("contractionppo", "contraction-ppo"):
+        algorithm_filter = "contraction_ppo"
     if checkpoint:
         alg = (algorithm_filter or "model").lower()
+        if alg in ("contractionppo", "contraction-ppo"): alg = "contraction_ppo"
         return [(alg, os.path.abspath(checkpoint))]
 
     found: list[tuple[str, str]] = []
@@ -141,7 +183,7 @@ def _discover_models(task: str, classic: bool, models_dir: str,
                 os.path.join("logs", "skrl", f"*{alg}*", "**", "best_agent.pt"),
                 os.path.join("logs", "skrl", f"*{alg.replace('-', '_')}*", "**", "best_agent.pt"),
             ]
-        ckpt = _newest_best_ckpt(patterns)
+        ckpt = _newest_best_ckpt(patterns, alg, task)
         if ckpt:
             found.append((alg, os.path.abspath(ckpt)))
     return found
@@ -174,7 +216,8 @@ def _rollout_stability(env, agent, *, max_steps: int) -> dict:
 
     for _step in range(max_steps):
         with torch.no_grad():
-            actions, outputs = agent.act(obs, states, timestep=0, timesteps=1)
+            from train_utils import evaluation_act
+            actions, outputs = evaluation_act(agent, obs, states)
             actions = outputs.get("mean_actions", actions) if isinstance(outputs, dict) else actions
         obs, _r, terminated, truncated, _ = env.step(actions)
         states = env.state() if hasattr(env, "state") else None
@@ -191,7 +234,7 @@ def _rollout_stability(env, agent, *, max_steps: int) -> dict:
 # ── Classic route ────────────────────────────────────────────────────────── #
 
 def build_classic_eval_runner(task, algorithm, agent_cfg, *, device, num_envs,
-                              num_envs_for_eval, ref_length=None):
+                              num_envs_for_eval, ref_length=None, disable_disturbance=False):
     """Env + runner for evaluating a trained CLASSIC checkpoint.
 
     Shared with scripts/policy_gap.py rather than copied into it: the
@@ -200,8 +243,8 @@ def build_classic_eval_runner(task, algorithm, agent_cfg, *, device, num_envs,
     Returns ``(env, runner)``; the caller loads the weights and closes the env.
     """
     import gymnasium as gym
-    from contractionRL.agents.skrl.contraction_metrics import StatManagerEnvWrapper
-    from contractionRL.agents.skrl.runner import CLActorRunner
+    from contractionRL.agents.utils.contraction.metrics import StatManagerEnvWrapper
+    from contractionRL.agents.utils.RL.runner import CLActorRunner
     from contractionRL.runners import ContractionRunner
     from train_utils import (
         BatchedGymnasiumWrapper,
@@ -209,6 +252,8 @@ def build_classic_eval_runner(task, algorithm, agent_cfg, *, device, num_envs,
         _disarm_termination_for_eval,
         _inject_angle_idx,
         _resolve_symmetry_for_env,
+        normalize_agent_cfg,
+        configure_tracking_preview,
     )
 
     # Eval-time config hygiene: no wandb, throwaway experiment dir, headless.
@@ -224,7 +269,15 @@ def build_classic_eval_runner(task, algorithm, agent_cfg, *, device, num_envs,
     num_envs = num_envs if num_envs is not None else _default_num_envs_classic(algorithm)
     num_envs = max(num_envs, num_envs_for_eval)
 
-    env = gym.make(task, num_envs=num_envs, device=device)
+    recorded = agent_cfg.get("environment", {})
+    env_kwargs = {key: recorded[key] for key in ("compact_reference", "reference_mode", "disturbance_scales", "time_bound", "dt") if key in recorded}
+    if algorithm in ("contraction_ppo", "contraction-ppo", "contractionppo"):
+        env_kwargs["compact_reference"] = True
+    if disable_disturbance:
+        import importlib
+        module = importlib.import_module(gym.spec(task).entry_point.split(":")[0])
+        env_kwargs["disturbance_scales"] = [0.] * module.ENV_CONFIG["num_dim_x"]
+    env = gym.make(task, num_envs=num_envs, device=device, **env_kwargs)
     # Playback is a measurement, same as train.py's evaluator — see
     # _disarm_termination_for_eval for why a truncated horizon inverts AUC.
     _disarm_termination_for_eval(env, "[play]")
@@ -236,34 +289,20 @@ def build_classic_eval_runner(task, algorithm, agent_cfg, *, device, num_envs,
     # mismatch (w2 18-wide in the checkpoint vs 9-wide here at gamma=0.01) —
     # i.e. this script could not evaluate any C2RL run at all.
     if hasattr(env.unwrapped, "configure_ref_window"):
-        from contractionRL.agents.skrl.ref_window import RefWindow as _RW
+        from contractionRL.agents.utils.system_dynamics.reference import RefWindow as _RW
         _gamma = float(agent_cfg["agent"].get("discount_factor", 0.99))
-        _offset = int(agent_cfg["agent"].get("ref_offset", 1) or 1)
-        _len = ref_length if ref_length else _RW.length_for_horizon(
-            _gamma, int(env.unwrapped.max_episode_len), _offset)
+        _offset = int(recorded.get("ref_offset", 1))
+        _len = ref_length or recorded.get("ref_length") or env.unwrapped.full_ref_length(offset=_offset)
         env.unwrapped.configure_ref_window(length=_len, offset=_offset, gamma=_gamma)
+    configure_tracking_preview(env.unwrapped, agent_cfg)
     env = BatchedGymnasiumWrapper(env)
     env = StatManagerEnvWrapper(env, num_envs_for_eval=num_envs_for_eval)
 
     if algorithm in _CONTRACTION_ALGOS:
-        if algorithm in ("c2rl-ppo", "c2rl-sac"):
-            agent_cfg["agent"]["use_empirical_dynamics"] = False
         runner = ContractionRunner(env, agent_cfg, task_id=task,
                                    num_envs=num_envs, is_classic=True)
     else:
-        # Standalone PPO/SAC: strip the norm flags train.py handles and
-        # inject angle_idx so the rebuilt models match the trained ones.
-        _a = agent_cfg["agent"]
-        _a.pop("use_state_norm", None)
-        _a.pop("use_value_norm", None)
-        for _k in ("state_preprocessor", "state_preprocessor_kwargs"):
-            _a.pop(_k, None)
-        if algorithm == "ppo":
-            _a["value_preprocessor"] = "RunningStandardScaler"
-            _a["value_preprocessor_kwargs"] = None
-        for _k in ("anneal_stddev", "anneal_log_std", "std_dev_annealing",
-                   "std_dev_annealing_kwargs"):
-            _a.pop(_k, None)
+        normalize_agent_cfg(agent_cfg, algorithm=algorithm, device=env.device)
         _angle_idx = list(getattr(env.unwrapped, "angle_idx", []) or [])
         _inject_angle_idx(agent_cfg, _angle_idx, _resolve_symmetry_for_env(env))
         runner = CLActorRunner(env, agent_cfg)
@@ -306,12 +345,17 @@ def run_classic(args) -> list[dict]:
     results: list[dict] = []
     for algorithm, ckpt in models:
         print(f"\n[play] === {algorithm} ===  ({ckpt})")
-        agent_cfg = _load_agent_cfg(algorithm)
+        agent_cfg = _checkpoint_agent_cfg(ckpt, _load_agent_cfg(algorithm))
+        if args.mode is not None:
+            agent_cfg["mode"] = args.mode
+        if args.policy_control_mode is not None:
+            agent_cfg["models"]["policy"]["control_mode"] = args.policy_control_mode
         agent_cfg["seed"] = args.seed if args.seed is not None else agent_cfg.get("seed", 42)
         env, runner = build_classic_eval_runner(
             args.task, algorithm, agent_cfg, device=device,
             num_envs=args.num_envs, num_envs_for_eval=args.num_envs_for_eval,
-            ref_length=getattr(args, "ref_length", None))
+            ref_length=getattr(args, "ref_length", None),
+            disable_disturbance=args.disable_disturbance)
         try:
             print("  loading checkpoint …")
             runner.agent.load(ckpt)
@@ -333,8 +377,8 @@ def run_classic(args) -> list[dict]:
 def run_isaac(args, simulation_app) -> list[dict]:
     import contractionRL.tasks  # noqa: F401 — registers Isaac tasks
     import gymnasium as gym
-    from contractionRL.agents.skrl.contraction_metrics import StatManagerEnvWrapper
-    from contractionRL.agents.skrl.runner import CLActorRunner
+    from contractionRL.agents.utils.contraction.metrics import StatManagerEnvWrapper
+    from contractionRL.agents.utils.RL.runner import CLActorRunner
     from contractionRL.runners import ContractionRunner
 
     from isaaclab_rl.skrl import SkrlVecEnvWrapper
@@ -353,16 +397,28 @@ def run_isaac(args, simulation_app) -> list[dict]:
         entry_key = ("skrl_cfg_entry_point" if algorithm == "ppo"
                      else f"skrl_{algorithm.replace('-', '_')}_cfg_entry_point")
         try:
-            agent_cfg = load_cfg_from_registry(args.task, entry_key)
+            agent_cfg = _checkpoint_agent_cfg(ckpt, load_cfg_from_registry(args.task, entry_key))
         except Exception as e:  # noqa: BLE001
             print(f"  [SKIP] no config entry '{entry_key}' for {args.task}: {e}")
             continue
         env_cfg = load_cfg_from_registry(args.task, "env_cfg_entry_point")
+        from contractionRL.tasks.direct.classic_isaac.backend import configure_backend, configure_backend_agent
+        configure_backend(env_cfg, args.mode or agent_cfg.get("mode"))
+        if args.policy_control_mode is not None:
+            agent_cfg["models"]["policy"]["control_mode"] = args.policy_control_mode
+        if args.disable_disturbance:
+            if not hasattr(env_cfg, "disturbance_enabled"):
+                raise ValueError("--disable_disturbance supports classic-derived Isaac tasks")
+            env_cfg.disturbance_enabled = False
+        configure_backend_agent(agent_cfg, env_cfg.mode, args.task, classic_derived=hasattr(env_cfg, "classic_task"))
         if args.num_envs is not None:
             env_cfg.scene.num_envs = args.num_envs
         if device is not None:
             env_cfg.sim.device = device
         env_cfg.seed = args.seed if args.seed is not None else agent_cfg.get("seed", 42)
+        if getattr(env_cfg, "mode", None) == "sim_to_real" and hasattr(env_cfg, "physx_reference_path"):
+            from contractionRL.tasks.direct.classic_isaac.backend import checkpoint_reference_bank
+            env_cfg.physx_reference_path = checkpoint_reference_bank(ckpt)
 
         agent_cfg.setdefault("agent", {}).setdefault("experiment", {})
         agent_cfg["agent"]["experiment"]["wandb"] = False
@@ -371,14 +427,17 @@ def run_isaac(args, simulation_app) -> list[dict]:
         agent_cfg["agent"]["experiment"]["write_interval"] = 0
 
         env = gym.make(args.task, cfg=env_cfg, render_mode=None)
+        from train_utils import configure_tracking_preview
+        configure_tracking_preview(env.unwrapped, agent_cfg)
         env = SkrlVecEnvWrapper(env, ml_framework=args.ml_framework)
         env = StatManagerEnvWrapper(env, num_envs_for_eval=args.num_envs_for_eval)
 
         try:
             _alg = algorithm.lower()
+            from train_utils import normalize_agent_cfg, _inject_angle_idx, _resolve_symmetry_for_env
+            _inject_angle_idx(agent_cfg, list(getattr(env.unwrapped, 'angle_idx', []) or []), _resolve_symmetry_for_env(env))
+            normalize_agent_cfg(agent_cfg, algorithm=_alg, device=env.device)
             if _alg in _CONTRACTION_ALGOS:
-                agent_cfg["agent"]["use_empirical_dynamics"] = not getattr(
-                    env.unwrapped, "has_analytical_dynamics", False)
                 runner = ContractionRunner(env, agent_cfg, is_classic=False)
             else:
                 runner = CLActorRunner(env, agent_cfg)
@@ -455,6 +514,8 @@ def main() -> None:
     args_cli, _ = parser.parse_known_args()
 
     if args_cli.classic:
+        parser.add_argument("--device", type=str, default=None, help="Compute device (default cuda:0 / cfg).")
+        args_cli, _ = parser.parse_known_args()
         results = run_classic(args_cli)
     else:
         # Launch Isaac Sim only for the Isaac route, and only after arg parsing.
@@ -467,8 +528,19 @@ def main() -> None:
         simulation_app = app_launcher.app
         try:
             results = run_isaac(args_cli, simulation_app)
+            if results:
+                _print_table(args_cli.task, results)
+                _save_results(args_cli.task, results)
+        except Exception:
+            # Isaac's fast shutdown may exit the process; print before cleanup.
+            import traceback
+            traceback.print_exc()
+            raise
         finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
             simulation_app.close()
+        return
 
     if results:
         _print_table(args_cli.task, results)

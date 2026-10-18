@@ -1,0 +1,82 @@
+#usda 1.0
+(
+    defaultPrim = "Robot"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+def Xform "Robot" (
+    prepend apiSchemas = ["PhysicsArticulationRootAPI", "PhysxArticulationAPI"]
+)
+{
+    bool physxArticulation:enabledSelfCollisions = false
+    int physxArticulation:solverPositionIterationCount = 8
+    int physxArticulation:solverVelocityIterationCount = 4
+    def Xform "Base" (prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"])
+    {
+        double3 xformOp:translate = (0, 0, 1.5)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        float physics:mass = 1
+        def Cube "Rail"
+        {
+            double size = 1
+            double3 xformOp:scale = (10, .05, .05)
+            uniform token[] xformOpOrder = ["xformOp:scale"]
+            color3f[] primvars:displayColor = [(.3,.3,.3)]
+        }
+    }
+    def Xform "Cart" (prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"])
+    {
+        double3 xformOp:translate = (0, 0, 1.5)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        float physics:mass = 1.0
+        float3 physics:diagonalInertia = (.1,.1,.1)
+        def Cube "Chassis"
+        {
+            double size = 1
+            double3 xformOp:scale = (.4,.3,.15)
+            uniform token[] xformOpOrder = ["xformOp:scale"]
+            color3f[] primvars:displayColor = [(.1,.5,1)]
+        }
+    }
+    def Xform "Pole" (prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"])
+    {
+        double3 xformOp:translate = (0, 0, 1.5)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        float physics:mass = 1
+        point3f physics:centerOfMass = (0,0,-1.0)
+        float3 physics:diagonalInertia = (1e-05, 1e-05, 1e-05)
+        def Cube "Body"
+        {
+            double size = 1
+            double3 xformOp:translate = (0,0,-1.0)
+            double3 xformOp:scale = (0.12, 0.12, 0.12)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            color3f[] primvars:displayColor = [(1,.5,.1)]
+        }
+        def Cube "Rod"
+        {
+            double size = 1
+            double3 xformOp:translate = (0,0,-0.5)
+            double3 xformOp:scale = (.025,.025,1)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            color3f[] primvars:displayColor = [(.8,.8,.8)]
+        }
+    }
+    def PhysicsFixedJoint "WorldFixed"
+    {
+        rel physics:body1 = </Robot/Base>
+        point3f physics:localPos0 = (0,0,1.5)
+    }
+    def PhysicsPrismaticJoint "cart_slide"
+    {
+        rel physics:body0 = </Robot/Base>
+        rel physics:body1 = </Robot/Cart>
+        uniform token physics:axis = "X"
+    }
+    def PhysicsRevoluteJoint "body_pitch"
+    {
+        rel physics:body0 = </Robot/Cart>
+        rel physics:body1 = </Robot/Pole>
+        uniform token physics:axis = "Y"
+    }
+}

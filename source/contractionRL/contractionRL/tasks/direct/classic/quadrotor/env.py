@@ -14,7 +14,7 @@ STATE_NAMES = (
     "thrust", "roll", "pitch", "yaw",
 )
 # angle_idx / pos_dimension are derived from STATE_NAMES by BaseEnv (see
-# agents/skrl/state_symmetry.py) -- the names are the single source of truth for
+# agents/utils/system_dynamics/state.py) -- the names are the single source of truth for
 # which dims wrap, which translate, and which co-rotate under a yaw rotation.
 
 G = 9.81
@@ -28,7 +28,7 @@ _X4_LIM = 1.5
 _X5_LIM = 1.5
 _X6_LIM = 1.5
 
-X_MIN = [-30.0, -30.0, -30.0, -_X4_LIM, -_X5_LIM, -_X6_LIM, _X7_LOW, -_X8_LIM, -_X9_LIM, -_X10_LIM]
+X_MIN = [-30.0, -30.0, 0.15, -_X4_LIM, -_X5_LIM, -_X6_LIM, _X7_LOW, -_X8_LIM, -_X9_LIM, -_X10_LIM]
 X_MAX = [30.0, 30.0, 30.0, _X4_LIM, _X5_LIM, _X6_LIM, _X7_HIGH, _X8_LIM, _X9_LIM, _X10_LIM]
 
 # Episode ends the first step x leaves this box (opt-in: --terminate_out_of_box).
@@ -41,8 +41,8 @@ X_TERMINATION_MAX = list(X_MAX)
 # rule.md Step 3, checked 2026-08-27: lam(x) is 1.3219 at min, median and max
 # over X -- 1.00x spread, |corr| <= 0.013 on every dim. Not state-dependent, so
 # the init boxes are arbitrary within X and XE_INIT stands.
-XREF_INIT_MIN = [-5.0, -5.0, -5.0, -1.0, -1.0, -1.0, G, 0.0, 0.0, 0.0]
-XREF_INIT_MAX = [5.0, 5.0, 5.0, 1.0, 1.0, 1.0, G, 0.0, 0.0, 0.0]
+XREF_INIT_MIN = [-5.0, -5.0, 3.0, -0.2, -0.2, -0.2, G, 0.0, 0.0, 0.0]
+XREF_INIT_MAX = [5.0, 5.0, 8.0, 0.2, 0.2, 0.2, G, 0.0, 0.0, 0.0]
 
 # Per-dimension, sized by how much of the +-6 actuator budget each dim's error
 # consumes through K = (1/r)B^T M (measured along the CV-STEM tube: horizontal
@@ -110,7 +110,8 @@ class QuadrotorEnv(BaseEnv):
         f[:, 2] = x[:, 5]
         f[:, 3] = -force * torch.sin(theta_y)
         f[:, 4] = force * torch.cos(theta_y) * torch.sin(theta_x)
-        f[:, 5] = G - force * torch.cos(theta_y) * torch.cos(theta_x)
+        # Isaac world Z is up: thrust supports altitude against gravity.
+        f[:, 5] = force * torch.cos(theta_y) * torch.cos(theta_x) - G
         return f
 
     def _B_logic(self, x):
@@ -122,18 +123,16 @@ class QuadrotorEnv(BaseEnv):
         B[:, 9, 3] = 1.0
         return B
 
-    def sample_reference_controls(self, freqs, weights, _t, infos, add_noise=False):
+    def sample_reference_controls(self, freqs, weights, _t, infos):
         n = weights.shape[0]
         uref = torch.zeros(n, self.num_dim_control, device=self.device)
         for i, freq in enumerate(freqs):
             weight = weights[:, i, :]
-            s_val = math.sin(freq * _t / self.time_bound * 2 * math.pi)
+            s_val = torch.sin(torch.as_tensor(freq * _t / self.time_bound * 2 * math.pi, device=self.device))
             uref[:, 0] += weight[:, 0] * s_val
             uref[:, 1] += weight[:, 1] * s_val
             uref[:, 2] += weight[:, 2] * s_val
             uref[:, 3] += weight[:, 3] * s_val
-        if add_noise:
-            uref += torch.randn_like(uref) * torch.abs(0.1 * uref)
         return torch.clamp(uref, self.UREF_MIN, self.UREF_MAX)
 
     def system_reset(self, env_ids: torch.Tensor):

@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/contractionppo/ContractionPPO",
+  "commit": "e63ed83516e46a2630ad203115d069d83de98f4b",
+  "paper": "https://arxiv.org/abs/2603.19632",
+  "files": {
+    "upstream_algorithm.py": "aedbc253f416e38e7f945c39646fd078e1232d072951c0e7a04d9814fe207390",
+    "upstream_handstand_cfg.py": "fd2c9e29368cfeb01b5da92c647e68945760210e6039593b858a66f87ec665a3",
+    "upstream_metric.py": "400daa9cbff72e3ed172029d3255310dfad409a950f96ff327122570880b6f5a"
+  }
+}

@@ -9,8 +9,8 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from contractionRL.agents.skrl.ref_window import RefWindow
-from contractionRL.agents.skrl.math_utils import quadratic_energy, energy_decrease
+from contractionRL.agents.utils.system_dynamics.reference import RefWindow
+from contractionRL.agents.utils.contraction.math_utils import quadratic_energy, energy_decrease, action_bound_violation
 from contractionRL.tasks.direct.common.state_guard import carry_forward_nonfinite
 from contractionRL.tasks.direct.common.termination_box import TerminationBoxMixin
 
@@ -20,6 +20,8 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         super().__init__()
         self.num_envs = num_envs
         self.device = torch.device(device)
+        self.set_action_bound_penalty(env_config.get("action_bound_penalty_beta", 0.0))
+        self._compact_requested = bool(env_config.get("compact_reference", getattr(self, "task", "") in ("car", "car_v1", "quadrotor")))
 
         self.X_MIN = torch.tensor(env_config["x_min"], device=self.device, dtype=torch.float32).flatten()
         self.X_MAX = torch.tensor(env_config["x_max"], device=self.device, dtype=torch.float32).flatten()
@@ -170,7 +172,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         self.num_dim_x = env_config["num_dim_x"]
         self.num_dim_control = env_config["num_dim_control"]
         # state_names is the single source of truth for the state layout: one
-        # name per dim (see agents/skrl/state_symmetry.py for the vocabulary).
+        # name per dim (see agents/utils/system_dynamics/state.py for the vocabulary).
         # angle_idx (which dims wrap) and pos_dimension (which dims are pure
         # translation directions) are derived from it, so they can no longer
         # disagree with each other or with the physics. The explicit keys are
@@ -181,7 +183,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
                 raise ValueError(
                     f"state_names has {len(self.state_names)} entries but "
                     f"num_dim_x={self.num_dim_x}: {self.state_names}")
-            from contractionRL.agents.skrl.state_symmetry import StateSymmetry
+            from contractionRL.agents.utils.system_dynamics.state import StateSymmetry
             sym = StateSymmetry.from_names(self.state_names)
             self.angle_idx = list(sym.angle_idx)
             self.pos_dimension = sym.pos_dimension
@@ -220,7 +222,6 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
 
         self.tracking_scaler = env_config["q"]
         self.control_scaler = env_config["r"]
-        self.use_learned_dynamics = False
         # State/control sampling distribution for get_rollout's "dynamics" mode.
         # _build_cfg() puts this in the config dict; it must be read out here or
         # get_rollout raises AttributeError on the first learned-dynamics draw.
@@ -236,7 +237,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         # ── Reference window: the observation is s = {x, xrefs, urefs} ───── #
         # xrefs[k] = xref[t + k*ref_offset], k = 0..ref_length-1 (k=0 is the
         # Current reference, i.e. the old `xref`/`uref`). Indices past the end
-        # of the episode clamp to the last one. See agents/skrl/ref_window.py.
+        # of the episode clamp to the last one. See agents/utils/system_dynamics/reference.py.
         self.ref_window = RefWindow(
             x_dim=self.num_dim_x,
             u_dim=self.num_dim_control,
@@ -246,8 +247,8 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         self.observation_space = self.ref_window.space(
             self.X_MIN, self.X_MAX, self.UREF_MIN, self.UREF_MAX)
         self.action_space = gym.spaces.Box(
-            low=self.UREF_MIN.cpu().numpy(),
-            high=self.UREF_MAX.cpu().numpy(),
+            low=self.U_MIN.cpu().numpy(),
+            high=self.U_MAX.cpu().numpy(),
             dtype=np.float32,
         )
 
@@ -306,6 +307,28 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         self._ref_pool_size = int(env_config.get("ref_pool_size", 64) or 1)
         self._ref_pool = None
 
+        from contractionRL.tasks.direct.common.disturbance import BoundedGust
+        scales = [0.0] * self.num_dim_x
+        for i, name in enumerate(self.state_names):
+            if "vel" in name or name.endswith("rate"):
+                scales[i] = 0.1
+        if getattr(self, "task", "") in ("car", "car_v1"):
+            scales = [0.0, 0.0, 0.02, 0.05]
+        elif getattr(self, "task", "") == "quadrotor":
+            scales = [0.0, 0.0, 0.0, 0.2, 0.2, 0.2, 0.0, 0.0, 0.0, 0.0]
+        if not self._compact_requested:
+            scales = [0.] * self.num_dim_x
+        configured_scales = env_config.get("disturbance_scales")
+        self.disturbance = BoundedGust(self.num_envs, scales if configured_scales is None else configured_scales, self.dt, self.device)
+        self._reference_parameters = torch.zeros(self.num_envs, self.num_dim_x + 10 * self.num_dim_control, device=self.device)
+        self._fixed_parameters = torch.zeros_like(self._reference_parameters)
+        self._group_parameters = torch.zeros(self.ref_groups, self._reference_parameters.shape[1], device=self.device)
+        self._reference_parameters_draw = None
+        self.reference_margin = float(env_config.get("reference_margin_fraction", .05)) * (self.X_MAX - self.X_MIN)
+        for i, name in enumerate(self.state_names):
+            if name == "yaw" and self.X_MAX[i] - self.X_MIN[i] >= 2 * math.pi - 1e-5:
+                self.reference_margin[i] = 0.0
+
         # The privileged critic-only `states` channel is gone: the critic now
         # reads the same {x, xrefs, urefs} observation as the actor and gets its
         # independence from its own architecture (phi/psi/combine — see
@@ -316,6 +339,18 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         self._constructing = True
         self.reset()
         self._constructing = False
+
+        if self._compact_requested:
+            from contractionRL.agents.utils.system_dynamics.reference import ReferenceState
+            self.ref_window = ReferenceState(self.num_dim_x, self.num_dim_control,
+                                             self._reference_parameters.shape[1], self._reference_control,
+                                             parameter_bounds=(torch.cat((self.X_MIN, -torch.ones(10 * self.num_dim_control, device=self.device))),
+                                                               torch.cat((self.X_MAX, torch.ones(10 * self.num_dim_control, device=self.device)))),
+                                             time_bound=self.time_bound,
+                                             state_names=self.state_names, initial_state_parameters=True)
+            self.observation_space = self.ref_window.space(self.X_MIN, self.X_MAX)
+            self.action_space = gym.spaces.Box(self.U_MIN.cpu().numpy(), self.U_MAX.cpu().numpy(), dtype=np.float32)
+            self._ref_pool = None
 
         # Markov check (see RefWindow.check_markov): the reward is Markov by
         # construction, but the value is only Markov if the window spans the
@@ -343,7 +378,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
     # Same names PathTrackingBase exposes, so ContractionRunner reads the state/
     # control dimensions identically for both env families (it looks for
     # x_dim/u_dim; without these, a classic env building a NeuralDynamics —
-    # use_empirical_dynamics=true — got None for both).
+    # learned dynamics — got None for both).
     def set_fix_ref_trajectories(self, flag: bool) -> None:
         """Freeze (or unfreeze) the per-env episodes: reference and initial state.
 
@@ -376,6 +411,8 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         (100 vs 199) -- and, had the shapes happened to agree, would have solved a
         different horizon in silence.
         """
+        if getattr(getattr(self, "ref_window", None), "compact", False):
+            return 1
         return int(self.max_episode_len) // max(int(offset), 1)
 
     def set_group_references(self, xref, uref, x0=None) -> None:
@@ -389,6 +426,8 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         trajectories as an artifact (scripts/toy/utility/precompute_vstar.py writes them next
         to V*) removes the question.
         """
+        if self._compact_requested:
+            raise ValueError("Compact reference state requires generator parameters; arbitrary reference packs need the legacy window layout")
         xref = torch.as_tensor(xref, dtype=torch.float32, device=self.device)
         uref = torch.as_tensor(uref, dtype=torch.float32, device=self.device)
         if xref.shape[1:] != self.xref.shape[1:] or uref.shape[1:] != self.uref.shape[1:]:
@@ -514,7 +553,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         return xref_0, xe_0, xref_0 + xe_0
 
     @abstractmethod
-    def sample_reference_controls(self, freqs, weights, _t, infos, add_noise=False):
+    def sample_reference_controls(self, freqs, weights, _t, infos):
         ...
 
     def drift_trim_uref(self, x: torch.Tensor) -> torch.Tensor:
@@ -723,6 +762,14 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         return out
 
     def _rollout_reference(self, xref_0: torch.Tensor, freqs, weights) -> tuple[torch.Tensor, torch.Tensor, int]:
+        encoded_weights = weights.new_zeros(len(weights), 10, self.num_dim_control)
+        for j, freq in enumerate(freqs):
+            if not 1 <= freq <= 10:
+                raise ValueError("Compact reference frequencies must be integers from 1 to 10")
+            encoded_weights[:, freq - 1] = weights[:, j]
+        self._reference_parameters_draw = torch.cat((xref_0, encoded_weights.flatten(1)), -1)
+        self._reference_valid_draw = ((xref_0 >= self.X_MIN + self.reference_margin) &
+                                      (xref_0 <= self.X_MAX - self.reference_margin)).all(-1)
         xref_list = [xref_0]
         xref_wrapped_list = [xref_0]
         uref_list = []
@@ -750,6 +797,9 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
             next_x = xref_prev + self.dt * x_dot
 
             next_x_wrapped = self.wrap_angles(next_x)
+            self._reference_valid_draw &= torch.isfinite(next_x_wrapped).all(-1)
+            self._reference_valid_draw &= ((next_x_wrapped >= self.X_MIN + self.reference_margin) &
+                                           (next_x_wrapped <= self.X_MAX - self.reference_margin)).all(-1)
             _pre = next_x_wrapped
             next_x_wrapped = torch.clamp(next_x_wrapped, self.X_MIN, self.X_MAX)
             # How often the clamp actually BITES. Checking "is xref inside X"
@@ -779,13 +829,19 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         batched SPD inverse from every env step. C3M's CMG emits W (its
         C1/C2 losses are written in W), so M = W^-1 is formed here.
         """
-        from contractionRL.agents.skrl.math_utils import bound_W, spd_inverse
+        from contractionRL.agents.utils.contraction.math_utils import bound_W, spd_inverse
         raw, _ = self.ccm_gen(x)
         out = bound_W(raw, self.w_lb, self.num_dim_x,
                       getattr(self.ccm_gen, "bounded", False))
         if getattr(self.ccm_gen, "outputs_metric", False):
             return out
         return spd_inverse(out)
+
+    def set_action_bound_penalty(self, beta):
+        beta = float(beta)
+        if not math.isfinite(beta) or beta < 0:
+            raise ValueError("action_bound_penalty_beta must be finite and nonnegative")
+        self.action_bound_penalty_beta = beta
 
     def set_ccm(self, ccm_gen, w_lb, device, tracking_scaler=None, control_scaler=None,
                 reward_euclidean=False, reward_level=False,
@@ -849,7 +905,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
     def get_rewards(self, x, u, next_x, env_ids):
         t_idx = self.time_steps[env_ids]
         xref_prev = self.xref[env_ids, torch.clamp(t_idx - 1, min=0)]
-        xref_curr = self.xref[env_ids, torch.clamp(t_idx, max=self.max_episode_len - 1)]
+        xref_curr = self.xref[env_ids, torch.clamp(t_idx, max=self.xref.shape[1] - 1)]
 
         error = self.wrap_angles(x - xref_prev)
         next_error = self.wrap_angles(next_x - xref_curr)
@@ -857,7 +913,16 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         tracking_error = torch.norm(next_error, p=2, dim=-1) ** 2
         control_effort = torch.norm(u, p=2, dim=-1) ** 2
 
-        if getattr(self, "reward_euclidean", False):
+        if getattr(self.ref_window, "compact", False):
+            if getattr(self, "ccm_gen", None) is None:
+                V, next_V = error.square().sum(-1), next_error.square().sum(-1)
+                maha_tracking_error = None
+            else:
+                V = quadratic_energy(error, self._metric_from_cmg(x))
+                next_V = quadratic_energy(next_error, self._metric_from_cmg(next_x))
+                maha_tracking_error = next_V
+            reward = energy_decrease(V, next_V)
+        elif getattr(self, "reward_euclidean", False):
             # AUC-aligned reward: the learned policy minimizes the true tracking
             # error the eval AUC measures, not the frozen-CMG Mahalanobis proxy.
             if getattr(self, "reward_level", False):
@@ -944,6 +1009,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
             reward = reward - self.residual_anchor_scale * torch.norm(u - u_base, p=2, dim=-1) ** 2
 
         infos = {
+            "tracking_error_vector": next_error.detach().clone(),
             "tracking_error": tracking_error,
             "control_effort": control_effort,
         }
@@ -952,6 +1018,10 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         return reward, infos
 
     def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        if seed is not None:
+            torch.manual_seed(seed)
+            self._ref_pool = None
         env_ids = torch.arange(self.num_envs, device=self.device)
         self.reset_idx(env_ids)
         info = {"x": self.x_t.clone(), "tracking_error": self.init_tracking_error.clone()}
@@ -1025,21 +1095,41 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         if (self._ref_pool_size <= 1
                 or self.fix_ref_trajectories
                 or getattr(self, "_held_out_weights", None) is not None):
-            return self.system_reset(env_ids)
+            return self._safe_system_reset(env_ids)
 
         pool = self._ref_pool
         if pool is None or pool["cursor"] + n > pool["x0"].shape[0]:
             batch = max(self._ref_pool_size, n)
             # Only the length is read; see the docstring.
-            x0, xref, uref, length = self.system_reset(env_ids.new_zeros(batch))
+            x0, xref, uref, length = self._safe_system_reset(env_ids.new_zeros(batch))
             pool = {"x0": x0, "xref": xref, "uref": uref,
+                    "parameters": self._reference_parameters_draw.clone(),
                     "length": length, "cursor": 0}
             self._ref_pool = pool
 
         c = pool["cursor"]
         pool["cursor"] = c + n
+        self._reference_parameters_draw = pool["parameters"][c:c + n]
         return (pool["x0"][c:c + n], pool["xref"][c:c + n],
                 pool["uref"][c:c + n], pool["length"])
+
+    def _safe_system_reset(self, env_ids):
+        result = self.system_reset(env_ids)
+        if not self._compact_requested:
+            return result
+        x0, xr, ur, length = result
+        parameters = self._reference_parameters_draw.clone()
+        valid = self._reference_valid_draw.clone()
+        for _ in range(16):
+            bad = (~valid).nonzero(as_tuple=True)[0]
+            if not len(bad):
+                self._reference_parameters_draw = parameters
+                return x0, xr, ur, length
+            xx, rr, uu, _ = self.system_reset(env_ids.new_zeros(len(bad)))
+            x0[bad], xr[bad], ur[bad] = xx, rr, uu
+            parameters[bad] = self._reference_parameters_draw
+            valid[bad] = self._reference_valid_draw
+        raise RuntimeError("Unable to generate reference trajectories inside the state box with 5% margin; refusing clipped references")
 
     def reset_idx(self, env_ids: torch.Tensor):
         if len(env_ids) == 0:
@@ -1049,6 +1139,8 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         self.episode_reward[env_ids] = 0.0
 
         x_0, xref_arr, uref_arr, _ = self._pooled_system_reset(env_ids)
+        self._reference_parameters[env_ids] = self._reference_parameters_draw
+        self.disturbance.reset(env_ids)
         xref_arr = torch.clamp(xref_arr, self.X_MIN, self.X_MAX)
         # x_0 = xref_0 + xe_0 must respect the box too. The reference is clamped on
         # the line above; the initial STATE was not, and xe_0 is drawn from XE_INIT
@@ -1100,9 +1192,11 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
                         gi = g[sel]
                         self._group_xref[gi] = xref_arr[fresh][sel]
                         self._group_uref[gi] = uref_arr[fresh][sel]
+                        self._group_parameters[gi] = self._reference_parameters[new_ids][sel]
                         self._group_minted[gi] = True
                     self._fixed_xref[new_ids] = self._group_xref[g]
                     self._fixed_uref[new_ids] = self._group_uref[g]
+                    self._reference_parameters[new_ids] = self._group_parameters[g]
                     if self.X_INIT_MIN is None:
                         # x_0 came back as xref_0 + xe_0 against this slot's OWN
                         # xref_0, which the line above just threw away for the
@@ -1123,13 +1217,18 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
                     self._fixed_xref[new_ids] = xref_arr[fresh]
                     self._fixed_uref[new_ids] = uref_arr[fresh]
                 self._fixed_x0[new_ids] = x_0[fresh]
+                self._fixed_parameters[new_ids] = self._reference_parameters[new_ids]
                 self._ref_fixed[new_ids] = True
             xref_arr = self._fixed_xref[env_ids]
             uref_arr = self._fixed_uref[env_ids]
             x_0 = self._fixed_x0[env_ids]
+            self._reference_parameters[env_ids] = self._fixed_parameters[env_ids]
         self.xref[env_ids] = xref_arr
         self.uref[env_ids] = uref_arr
         self.x_t[env_ids] = x_0
+        if getattr(self.ref_window, 'history_length', 0):
+            self._tracking_history[env_ids] = 0
+            self._tracking_history[env_ids, :, :self.num_dim_x] = x_0[:, None]
 
         self.init_tracking_error[env_ids] = torch.norm(x_0 - self.xref[env_ids, 0], p=2, dim=-1) ** 2
 
@@ -1155,11 +1254,16 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         u = torch.nan_to_num(u)
         _u_unclamped = u
         u = torch.clamp(u, self.U_MIN, self.U_MAX)
+        if getattr(self.ref_window, 'history_length', 0):
+            row = torch.cat((self.x_t, u, u.new_ones(len(u), 1)), -1)
+            self._tracking_history = torch.cat((self._tracking_history[:, 1:], row[:, None]), 1)
         self.time_steps += 1
 
         f_x, B_x, _ = self.get_f_and_B(self.x_t, need_null=False)
         x_dot = f_x + torch.bmm(B_x, u.unsqueeze(-1)).squeeze(-1)
-        next_x = self.x_t + self.dt * x_dot
+        noise = self.disturbance.advance()
+        disturbed_derivative = x_dot + noise
+        next_x = self.x_t + self.dt * disturbed_derivative
 
         # Counted BEFORE carry_forward_nonfinite: it replaces NaN/Inf with the
         # previous state, after which a diverged step compares as in-box (NaN
@@ -1171,7 +1275,18 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         # Measured on the raw integrated state, before the position freeze and
         # the X-box clamp below — both erase the excursion, so a check placed
         # after them could never fire. None when the feature is off.
+        compact = getattr(self.ref_window, "compact", False)
         left_box = self._left_termination_box(next_x)
+        failed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        if compact:
+            failed = ((next_x[:, :self.pos_dimension] < self.X_MIN[:self.pos_dimension]) |
+                      (next_x[:, :self.pos_dimension] > self.X_MAX[:self.pos_dimension])).any(-1)
+            failed |= (~torch.isfinite(x_dot)).any(-1)
+            if self.task == "quadrotor":
+                failed |= (next_x[:, 2] <= 0.15) | (next_x[:, 7:9].abs() >= math.pi / 3).any(-1)
+            elif self.task in ("cartpole", "segway"):
+                failed |= next_x[:, 1].abs() >= self.X_MAX[1]
+            left_box = None
 
         # Clamp accounting — same raw state, same reason (see _clamp_hits).
         _hit = ((next_x < self.X_MIN) | (next_x > self.X_MAX)).float()
@@ -1184,18 +1299,24 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         pos_max = self.X_MAX[:self.pos_dimension]
         out_of_bounds = (next_x[:, :self.pos_dimension] < pos_min) | (next_x[:, :self.pos_dimension] > pos_max)
         invalid_mask = out_of_bounds.any(dim=-1)
-        next_x[invalid_mask, :self.pos_dimension] = self.x_t[invalid_mask, :self.pos_dimension]
+        if not compact:
+            next_x[invalid_mask, :self.pos_dimension] = self.x_t[invalid_mask, :self.pos_dimension]
 
         next_x_wrapped = self.wrap_angles(next_x)
-        next_x_wrapped = torch.clamp(next_x_wrapped, self.X_MIN, self.X_MAX)
+        clipped = torch.clamp(next_x_wrapped, self.X_MIN, self.X_MAX)
+        if compact:
+            clipped[:, :self.pos_dimension] = next_x_wrapped[:, :self.pos_dimension]
+        next_x_wrapped = clipped
 
         reward, infos = self.get_rewards(self.x_t, u, next_x_wrapped, torch.arange(self.num_envs, device=self.device))
+        if self.action_bound_penalty_beta:
+            reward = reward - self.action_bound_penalty_beta * action_bound_violation(_u_unclamped, self.U_MIN, self.U_MAX)
         self.episode_reward += reward
 
         self.x_t = next_x_wrapped
         state = self.construct_state(self.x_t)
 
-        termination = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        termination = failed
         truncation = self.time_steps >= self.episode_len
         if left_box is not None:
             # Truncation, not termination, unless explicitly asked otherwise —
@@ -1208,11 +1329,15 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         dones = termination | truncation
 
         info_dict = {
+            "dynamics_x_dot": disturbed_derivative.detach().clone(),
+            "tracking_error_vector": infos["tracking_error_vector"],
             "x": self.x_t.clone(),
             "tracking_error": infos["tracking_error"],
             "control_effort": infos["control_effort"],
             "relative_tracking_error": infos["tracking_error"] / torch.clamp(self.init_tracking_error, min=1e-8),
         }
+        if compact:
+            info_dict["episode_ended_early"] = failed.clone()
         # Forward the Mahalanobis error (C2RL only) so StatManagerEnvWrapper's
         # _record can fill the maha buffer every step — not just at reset. Without
         # this the maha curve/Stability_maha metrics stay pinned at their step-0
@@ -1257,11 +1382,6 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         and discarded it every time (20% of that rollout's cost, and with early
         termination the rollout runs on every early reset, not once per 500
         steps). Same signature on PathTrackingBase — see tests' parity rule."""
-        if getattr(self, "use_learned_dynamics", False):
-            with torch.no_grad():
-                f_x, B_x, Bbot_x = self.learned_dynamics_model(self.wrap_angles(x))
-            return f_x, B_x, Bbot_x
-
         return (self._f_logic(x), self._B_logic(x),
                 self._B_null_logic(x) if need_null else None)
 
@@ -1324,6 +1444,32 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
             self._angle_mask = mask
         return torch.where(mask, torch.remainder(x + math.pi, 2 * math.pi) - math.pi, x)
 
+    def configure_ref_preview(self, length: int, stride: int = 1):
+        """Add a deterministic reference window without resampling the physical task."""
+        if not getattr(self.ref_window, 'compact', False):
+            raise ValueError("Reference preview requires compact (x, xref, xi) observations")
+        if length < 0 or stride < 1:
+            raise ValueError("Reference preview length must be nonnegative and stride positive")
+        self.ref_window.preview_length = int(length)
+        self.ref_window.preview_stride = int(stride)
+        self.ref_window.preview_start = 0
+        self.ref_window.history_length = 0
+        self.ref_window.temporal_context = False
+        self.observation_space = self.ref_window.space(self.X_MIN, self.X_MAX)
+
+    def configure_temporal_context(self, horizon: int, use_history: bool = True):
+        """Current-frame future references and past measured state/applied-control pairs."""
+        if not isinstance(horizon, int) or isinstance(horizon, bool) or horizon < 1:
+            raise ValueError("Temporal context requires a positive integer horizon")
+        self.configure_ref_preview(horizon)
+        self.ref_window.preview_start = 1
+        self.ref_window.temporal_context = True
+        self.ref_window.history_length = horizon if use_history else 0
+        self._tracking_history = self.x_t.new_zeros(self.num_envs, self.ref_window.history_length,
+                                                   self.num_dim_x + self.num_dim_control + 1)
+        self._tracking_history[:, :, :self.num_dim_x] = self.x_t[:, None]
+        self.observation_space = self.ref_window.space(self.X_MIN, self.X_MAX, self.U_MIN, self.U_MAX)
+
     def configure_ref_window(self, length: int, offset: int = 1,
                              gamma: float | None = None) -> None:
         """Resize the reference window and rebuild ``observation_space``.
@@ -1332,6 +1478,8 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         ``observation_space``. Used by the training entry point (``--ref_length``
         / ``--ref_offset``) and to make a fresh eval env mirror the training
         env's exact layout. Idempotent."""
+        if getattr(self.ref_window, "compact", False):
+            return
         self.ref_window = RefWindow(x_dim=self.num_dim_x, u_dim=self.num_dim_control,
                                     length=int(length), offset=int(offset))
         self.observation_space = self.ref_window.space(
@@ -1557,7 +1705,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         the horizon.
         """
         L, off = self.ref_window.length, self.ref_window.offset
-        self.ref_gen_len = int(self.max_episode_len + (L - 1) * off)
+        self.ref_gen_len = int(self.max_episode_len + (L - 1) * off + int(self._compact_requested))
         # The generation loop iterates over self.t, so it has to cover the same span.
         self.t = torch.arange(self.ref_gen_len, device=self.device,
                               dtype=torch.float32) * self.dt
@@ -1585,7 +1733,20 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         rather than by convention. ``construct_state_flat`` is the tensor form
         for callers that want what the models actually receive.
         """
-        idx = torch.clamp(self.time_steps, max=self.max_episode_len - 1)
+        idx = torch.clamp(self.time_steps, max=self.xref.shape[1] - 1)
+        if getattr(self.ref_window, "compact", False):
+            rows = torch.arange(len(x), device=self.device)
+            xi = torch.cat((self._reference_parameters,
+                            (idx * self.dt).unsqueeze(-1),
+                            x.new_zeros(len(x), self.num_dim_control)), -1)
+            observation = {"x": x, "xref": self.xref[rows, idx], "xi": xi}
+            if self.ref_window.preview_length:
+                offsets = self.ref_window.preview_start + torch.arange(self.ref_window.preview_length, device=self.device) * self.ref_window.preview_stride
+                indices = (idx[:, None] + offsets).clamp(max=self.max_episode_len)
+                observation['xrefs'] = self.xref[rows[:, None], indices]
+            if self.ref_window.history_length:
+                observation['xstates'] = self._tracking_history.clone()
+            return observation
         env_idx = torch.arange(self.num_envs, device=self.device).unsqueeze(-1)
         # ref_gen_len, not max_episode_len: the reference extends past the episode
         # end precisely so these indices are real data instead of clamped padding.
@@ -1600,7 +1761,18 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         """``construct_state`` flattened exactly as skrl flattens it — the
         tensor the models receive in ``inputs["observations"]``."""
         d = self.construct_state(x)
+        if "xi" in d:
+            return self.ref_window.flatten(d["x"], d["xref"], None, xi=d["xi"], preview=d.get('xrefs'), history=d.get('xstates'))
         return self.ref_window.flatten(d["x"], d["xrefs"], d["urefs"])
+
+    def _reference_control(self, xref, parameters, time):
+        x0 = parameters[:, :self.num_dim_x]
+        weights = parameters[:, self.num_dim_x:].reshape(-1, 10, self.num_dim_control)
+        u = self.sample_reference_controls(list(range(1, 11)), weights, time,
+                                          {"xref_0": x0, "xref_t": xref})
+        if self.reference_mode == "contractive":
+            u = (u + self._migrate_uref(xref)).clamp(self.UREF_MIN, self.UREF_MAX)
+        return u
 
     @staticmethod
     def _zeros(shape, x):

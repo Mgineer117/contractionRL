@@ -19,7 +19,6 @@ class WandbPlotWrapper:
     def __init__(self, env, total_timesteps=None, num_plots=10):
         self.env = env
         self.num_envs = getattr(env, "num_envs", 1)
-        self._total_steps = 0
         # Plot cadence is measured in `.step()` calls (== the trainer's "timesteps"/
         # "global_step" unit, i.e. Not multiplied by num_envs), so it scales with an
         # env's actual episode length instead of a fixed episode count. The previous
@@ -46,7 +45,6 @@ class WandbPlotWrapper:
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-        self._total_steps += self.num_envs
         self._step_calls += 1
 
         compute_count = getattr(self.env, "_compute_count", None)
@@ -73,7 +71,6 @@ class WandbPlotWrapper:
             mask = info["_log"]  # bool array (num_envs,)
             if isinstance(mask, np.ndarray) and mask.any():
                 import torch
-                from contractionRL.tasks.direct.common.eval_metrics import mean_confidence_interval
                 raw_log = info["log"]
                 # raw_log is a dict whose leaf values are numpy arrays and whose
                 # sub-keys starting with "_" are masks — skip those.
@@ -84,12 +81,13 @@ class WandbPlotWrapper:
                     if isinstance(v, np.ndarray):
                         valid = v[mask]
                         if valid.size > 0:
-                            v_m, v_ci = mean_confidence_interval(valid)
-                            new_log[f"{k}_mean"] = torch.tensor(v_m, dtype=torch.float32, device=device)
-                            new_log[f"{k}_ci95"] = torch.tensor(v_ci, dtype=torch.float32, device=device)
+                            if k.endswith(("_mean", "_stddev", "_ci95")):
+                                new_log[k] = torch.tensor(float(valid.mean()), dtype=torch.float32, device=device)
+                            else:
+                                new_log[f"{k}_mean"] = torch.tensor(float(valid.mean()), dtype=torch.float32, device=device)
+                                new_log[f"{k}_stddev"] = torch.tensor(float(valid.std()), dtype=torch.float32, device=device)
                     elif isinstance(v, (int, float)):
-                        new_log[f"{k}_mean"] = torch.tensor(float(v), dtype=torch.float32, device=device)
-                        new_log[f"{k}_ci95"] = torch.tensor(0.0, dtype=torch.float32, device=device)
+                        new_log[k] = torch.tensor(float(v), dtype=torch.float32, device=device)
                 if new_log:
                     info["log"] = new_log
                     lifted = True
@@ -113,12 +111,14 @@ class WandbPlotWrapper:
 
                 if logs_list:
                     import torch
-                    from contractionRL.tasks.direct.common.eval_metrics import mean_confidence_interval
                     info["log"] = {}
                     for k, v_list in logs_list.items():
-                        v_m, v_ci = mean_confidence_interval(np.array(v_list))
-                        info["log"][f"{k}_mean"] = torch.tensor(v_m, dtype=torch.float32, device=device)
-                        info["log"][f"{k}_ci95"] = torch.tensor(v_ci, dtype=torch.float32, device=device)
+                        values = np.asarray(v_list)
+                        if k.endswith(("_mean", "_stddev", "_ci95")):
+                            info["log"][k] = torch.tensor(float(values.mean()), dtype=torch.float32, device=device)
+                        else:
+                            info["log"][f"{k}_mean"] = torch.tensor(float(values.mean()), dtype=torch.float32, device=device)
+                            info["log"][f"{k}_stddev"] = torch.tensor(float(values.std()), dtype=torch.float32, device=device)
 
         return obs, reward, terminated, truncated, info
 
@@ -138,21 +138,7 @@ class WandbPlotWrapper:
         # figures (same style/keys) that C3M/C2RL emit from their eval() — a
         # single source of truth for all tracking plots, backed by
         # StatManagerEnvWrapper's buffer (already normalized by e(0)).
-        from contractionRL.agents.skrl.contraction_metrics import (
-            log_metric_distributions,
-            log_tracking_plots,
-        )
-
-        # Histograms of the per-env AUC / lambda / running lambda / peak
-        # overshoot behind the Stability scalars. Pushed before the early
-        # returns below: those guard on trajectory recording (traj_x), which is
-        # a separate buffer — the metric distributions are computed from
-        # _eval_buffer and are available whenever the StatManager has reduced,
-        # so gating them on trajectories would silently drop them.
-        log_metric_distributions(
-            self.env.distributions(), prefix="train",
-            step=self._total_steps, title="Train",
-        )
+        from contractionRL.agents.utils.contraction.metrics import log_tracking_plots
 
         traj_x, traj_xref, traj_err = self.env.trajectories()
         if not traj_err:
@@ -192,6 +178,6 @@ class WandbPlotWrapper:
             dt = getattr(unwrapped, "step_dt", None) or getattr(unwrapped, "dt", 1.0)
         log_tracking_plots(
             traj_x, traj_xref, traj_err,
-            dt=float(dt), prefix="train", step=self._total_steps, title="Train",
+            dt=float(dt), prefix="train", step=self._step_calls, title="Train",
             traj_maha_error=traj_maha,
         )

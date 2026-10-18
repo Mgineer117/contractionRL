@@ -21,6 +21,7 @@
 **/.pytest_cache/
 **/*.pyc
 **/*.pb
+test_*
 
 # Docker/Singularity
 **/*.sif
@@ -117,3 +118,7 @@ mosek.lic
 # CV-STEM synthesis artifacts are regenerable and ~11MB each. The few committed
 # under data/classic/ predate this; new ones should not be added by `git add -A`.
 data/classic/*/cm_data_*_wlb0.1_*.npz
+
+# Small authored mechanism assets required by the planar PhysX tasks.
+!source/contractionRL/contractionRL/tasks/direct/classic_isaac/assets/cartpole.usda
+!source/contractionRL/contractionRL/tasks/direct/classic_isaac/assets/segway.usda

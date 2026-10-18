@@ -17,17 +17,25 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "source/contractionRL"
 TASKS = SOURCE / "contractionRL/tasks/direct"
+# Load the stdlib-only config module directly, without importing simulator task registration.
+_config_spec = importlib.util.spec_from_file_location("training_defaults", SOURCE / "contractionRL/agents/utils/RL/config.py")
+_training_defaults = importlib.util.module_from_spec(_config_spec)
+_config_spec.loader.exec_module(_training_defaults)
 KEY_ARGS = {
+    "contraction-ppo": ("alpha", "penalty_coef", "contraction_constraint_coef", "epsilon_contraction", "contraction_metric_learning_rate", "learning_rate", "discount_factor"),
     "ppo": ("learning_rate", "discount_factor", "rollouts", "learning_epochs", "ratio_clip"),
     "sac": ("learning_rate", "discount_factor", "batch_size", "gradient_steps"),
-    "c3m": ("lbd", "w_lb", "w_ub", "W_lr", "u_lr", "use_empirical_dynamics"),
+    "mbpo": ("ensemble_size", "num_elites", "model_train_frequency", "model_rollout_batch_size", "real_data_ratio", "gradient_steps", "discount_factor"),
+    "c3m": ("lbd", "w_lb", "w_ub", "W_lr", "u_lr", "mode"),
     "lqr": ("Q_scaler", "R_scaler"),
     "sdlqr": ("Q_scaler", "R_scaler"),
     "cvstem-lqr": ("lbd", "cm_samples", "cm_solver", "cm_w_lb", "cm_w_ub"),
-    "c2rl-ppo": ("cmg_method", "lbd", "w_lb", "w_ub", "discount_factor", "learning_rate"),
-    "c2rl-sac": ("cmg_method", "lbd", "w_lb", "w_ub", "discount_factor", "learning_rate"),
+    "c2rl-ppo": ("cmg_method", "cm_eps", "ccm_lbd", "ccm_w_lb", "ccm_w_ub", "cvstem_lbd", "cvstem_w_lb", "cvstem_w_ub", "discount_factor", "learning_rate", "use_value_expansion", "value_expansion_horizon", "mode"),
+    "c2rl-sac": ("cmg_method", "cm_eps", "ccm_lbd", "ccm_w_lb", "ccm_w_ub", "cvstem_lbd", "cvstem_w_lb", "cvstem_w_ub", "discount_factor", "learning_rate", "mode"),
 }
 CFG_CLASSES = {
+    "mbpo": ("mbpo.py", "MBPOCfg"),
+    "contraction-ppo": ("contraction_ppo.py", "ContractionPPOCfg"),
     "c3m": ("c3m.py", "C3MCfg"),
     "lqr": ("sdlqr.py", "SDLQRCfg"),
     "sdlqr": ("sdlqr.py", "SDLQRCfg"),
@@ -35,7 +43,8 @@ CFG_CLASSES = {
     "c2rl-ppo": ("c2rl.py", "C2RLPPOCfg"),
     "c2rl-sac": ("c2rl.py", "C2RLSACCfg"),
 }
-METHODS = {"c3m": "C1/C2 joint metric/controller training",
+METHODS = {"mbpo": "Probabilistic ensemble + fixed one-step model rollouts + skrl SAC (no mbrl dependency)",
+           "contraction-ppo": "Released ContractionPPO: separate metric optimizer + PPO reward shaping","c3m": "C1/C2 joint metric/controller training",
            "cvstem-lqr": "CV-STEM metric + analytical feedback",
            "c2rl-ppo": "CV-STEM or CCM metric training + PPO",
            "c2rl-sac": "CV-STEM or CCM metric training + SAC"}
@@ -96,7 +105,7 @@ def environments():
                              "configs": configs}
     for task, classic_task, _ in aliases:
         records[task] = {**records[classic_task], "id": task, "family": "Isaac",
-                         "dynamics": f"exact {classic_task}"}
+                         "dynamics": f"analytical ({classic_task}) or PhysX (--mode sim_to_real)"}
     return sorted(records.values(), key=lambda item: (item["family"] != "classic", item["id"]))
 
 
@@ -117,6 +126,7 @@ def key_settings(algo, path):
                         pass
     for block in ("cm", "cmg", "empirical_dynamics", "agent"):
         merged.update(raw.get(block, {}))
+    merged["mode"] = raw.get("mode", "analytical")
     return {key: merged[key] for key in KEY_ARGS[algo] if key in merged}
 
 
@@ -142,11 +152,14 @@ def main():
             print(f"  {algo:13}  {', '.join(keys)}")
             if algo in METHODS:
                 print(f"                 {METHODS[algo]}")
-    print("\n  cmg_method: cvstem = SDP regression; ccm = full Killing + projected contraction + bounded-input feasibility.")
+    print("\n  cmg_method: cvstem = SDP regression; ccm = C3M projected C1/C2 + bounded-input feasibility (no actor contraction loss).")
     print("  Settings below come from each task's YAML and algorithm defaults; they are not CLI flags.")
     title(f"ENVIRONMENTS · {len(rows)} registered tasks")
     for row in rows:
         print(f"\n  {row['id']}  [{row['family']} · {row['dynamics']}]")
+        budget = _training_defaults.default_isaac_rl_timesteps(row["id"], "ppo")
+        if budget is not None:
+            print(f"    RL default: {budget:,} batched steps (override with --num_timesteps)")
         if not args.env and args.algorithm is None:
             print("    " + ", ".join(algo for algo in KEY_ARGS if algo in row["configs"]))
             continue

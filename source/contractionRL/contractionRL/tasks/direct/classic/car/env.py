@@ -17,7 +17,7 @@ from ..common.env_base import BaseEnv
 
 STATE_NAMES = ("pos_x", "pos_y", "yaw", "vel")
 # angle_idx / pos_dimension are derived from STATE_NAMES by BaseEnv (see
-# agents/skrl/state_symmetry.py) -- the names are the single source of truth for
+# agents/utils/system_dynamics/state.py) -- the names are the single source of truth for
 # which dims wrap, which translate, and which co-rotate under a yaw rotation.
 
 v_l, v_h = 1.0, 2.0
@@ -134,15 +134,13 @@ class CarEnv(BaseEnv):
         B[:, 3, 1] = 1.0
         return B
 
-    def sample_reference_controls(self, freqs, weights, _t, infos, add_noise=False):
+    def sample_reference_controls(self, freqs, weights, _t, infos):
         n = weights.shape[0]
         uref = torch.zeros(n, self.num_dim_control, device=self.device)
         for i, freq in enumerate(freqs):
             weight = weights[:, i, :]
-            val = weight[:, 0] * math.sin(freq * _t / self.time_bound * 2 * math.pi)
+            val = weight[:, 0] * torch.sin(torch.as_tensor(freq * _t / self.time_bound * 2 * math.pi, device=self.device))
             uref[:, 0] += val
-        if add_noise:
-            uref += torch.randn_like(uref) * torch.abs(0.1 * uref)
         return torch.clamp(uref, self.UREF_MIN, self.UREF_MAX)
 
     def set_held_out_mode(self, seed: int | None, n_trajectories: int = 64) -> None:

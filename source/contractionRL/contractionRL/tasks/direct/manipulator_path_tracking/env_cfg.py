@@ -18,11 +18,11 @@ class ManipulatorPathTrackingEnvCfg(DirectRLEnvCfg):
     decimation = 2
     episode_length_s = 15.0
 
-    # state_dim = 21, action_dim = 7
-    # obs: x(21) + x_ref(21) + u_ref(7) = 49
     action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(7,), dtype=np.float32)
-    observation_space = 49
+    observation_space = 73
     state_space = 0
+    disturbance_force_bound: float = 1.0
+    disturbance_torque_bound: float = 0.1
 
     sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation, physx=PhysxCfg(enable_external_forces_every_iteration=True, min_velocity_iteration_count=1))
     robot_cfg: ArticulationCfg = FRANKA_PANDA_HIGH_PD_CFG.replace(prim_path="/World/envs/env_.*/Robot")

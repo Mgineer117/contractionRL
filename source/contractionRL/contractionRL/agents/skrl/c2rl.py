@@ -1,19 +1,20 @@
 """C2RL: a frozen bounded metric and one PPO/SAC policy.
 
 Phase A uses cmg_method="cvstem" to regress onto offline SDP metric samples,
-or cmg_method="ccm" to train M(x) with full Killing identities, projected drift
+or cmg_method="ccm" to train M(x) with projected C3M C2 identities, projected drift
 contraction and bounded-total-input feasibility for E=e' M(x)e. CCM training
 has no learned-controller Jacobian loss. Its held-out residuals are empirical
 checks, not uniform contraction certificates.
 
-Phase B maximizes R=-(E_next-E_current), with moving-reference tracking errors
-in raw physical coordinates. Other reward forms and added penalties are
-rejected for C2RL. The metric is frozen before the policy begins learning.
+Phase B maximizes R=-(E_next-E_current), optionally penalizing the raw action's
+L2 distance from its control box. Tracking errors stay in physical coordinates.
+The metric is frozen before the policy begins learning.
 """
 
 from __future__ import annotations
 
 import copy
+import math
 import os
 import sys
 from collections.abc import Callable
@@ -27,9 +28,10 @@ from skrl.agents.torch.base import Agent, AgentCfg
 from skrl.memories.torch import RandomMemory
 from skrl.trainers.torch.base import Trainer, TrainerCfg
 
-from .math_utils import build_lr_scheduler
-from .ref_window import RefWindow
-from .rl_glue import filter_cfg_fields, make_base_rl_cfg
+from contractionRL.agents.utils.contraction.math_utils import build_lr_scheduler
+from contractionRL.agents.utils.system_dynamics.reference import RefWindow
+from contractionRL.agents.utils.RL.config import filter_cfg_fields, make_base_rl_cfg, migrate_c2rl_metric_cfg
+from contractionRL.agents.utils.RL.logging import metric_batch
 
 # ─────────────────────────────────────────────────────────────────────────── #
 # Configuration
@@ -45,7 +47,41 @@ from .rl_glue import filter_cfg_fields, make_base_rl_cfg
 # from yaml even if not declared below.
 
 @dataclass
-class C2RLPPOCfg(AgentCfg):
+class C2RLMetricCfg(AgentCfg):
+    mode: str = "analytical"
+    action_bound_penalty_beta: float = 0.0
+    ccm_w_ub: float = 10.0
+    ccm_w_lb: float = 0.1
+    ccm_lbd: float = 1e-2
+    cvstem_w_ub: float = 10.0
+    cvstem_w_lb: float = 0.1
+    cvstem_lbd: float = 1e-2
+    ccm_memory_size: int = 100000
+    cvstem_memory_size: int = 10000
+
+    @property
+    def cmg_memory_size(self):
+        return getattr(self, f"{self.cmg_method}_memory_size")
+
+    @cmg_memory_size.setter
+    def cmg_memory_size(self, value):
+        setattr(self, f"{self.cmg_method}_memory_size", value)
+
+    @property
+    def w_lb(self):
+        return getattr(self, f"{self.cmg_method}_w_lb")
+
+    @property
+    def w_ub(self):
+        return getattr(self, f"{self.cmg_method}_w_ub")
+
+    @property
+    def lbd(self):
+        return getattr(self, f"{self.cmg_method}_lbd")
+
+
+@dataclass
+class C2RLPPOCfg(C2RLMetricCfg):
     """C2RL config for base_algorithm="PPO". PPO fields mirror skrl's PPO_CFG."""
     # PPO shared config (see skrl.agents.torch.ppo.PPO_CFG) — the deployed
     # policy's own PPO sub-agent is built from this.
@@ -67,21 +103,11 @@ class C2RLPPOCfg(AgentCfg):
     time_limit_bootstrap: bool = False
     use_state_norm: bool = False  # off by default — see module docstring / rl_glue.make_base_rl_cfg
     use_value_norm: bool = True
+    use_value_expansion: bool = False
+    value_expansion_horizon: int = 3
+    value_expansion_batch_size: int = 512
     use_reward_norm: bool = False  # non-biasing running-std reward normalizer (r/std) — see rl_glue.make_base_rl_cfg
     rewards_shaper_scale: float = 1.0  # yaml convenience for PPO_CFG's rewards_shaper — see rl_glue.make_base_rl_cfg
-    std_dev_annealing_kwargs: dict | None = None  # forwarded to patch_ppo_std_annealing()
-    # True (default): log_std follows the fixed schedule in
-    # std_dev_annealing_kwargs and is not learned (CLActor builds it with
-    # requires_grad=False and the patch overwrites it every step).
-    # False: PPO learns log_std through the policy loss, as in stock PPO. The
-    # schedule then does not apply, and entropy_loss_scale is left as configured
-    # (the annealing patch zeroes it, since a bonus would fight the schedule).
-    # Off: PPO learns log_std (the False branch in __init__ flips requires_grad
-    # so it is a real parameter, not a frozen constant). Annealing drives sigma
-    # down a fixed schedule regardless of what the policy needs, which fights
-    # the exploration a swept discount factor requires -- a gamma=0.999 run and
-    # a gamma=0.01 run want very different exploration at the same step count.
-    std_dev_annealing: bool = False
     # Set by ContractionRunner from the yaml `memory:` block's memory_size, not
     # read from `agent:` directly; declared purely so filter_cfg_fields()
     # recognizes it instead of warning.
@@ -90,8 +116,6 @@ class C2RLPPOCfg(AgentCfg):
     # Mahalanobis reward, so there is no con/opt duality here.
     discount_factor: float = 0.99
     # The bounded head emits M; its eigenvalues lie in [1/w_ub, 1/w_lb].
-    w_ub: float = 10.0
-    w_lb: float = 0.1
     # "regress" (default): MSE-fit the CMG network onto the offline {x -> W*(x)}
     # dataset. "sos": skip the fit and evaluate the SOS polynomial the dataset
     # was generated FROM, exactly (toy envs only -- they are the only family
@@ -103,15 +127,14 @@ class C2RLPPOCfg(AgentCfg):
     cmg_method: str = "cvstem"  # "cvstem" regression | "ccm" direct metric training
     cmg_ccm_epochs: int = 1000
     cmg_ccm_lr: float = 1e-3
-    cmg_ccm_batch_size: int = 128
+    cmg_ccm_batch_size: int = 1024
     ccm_killing_weight: float = 1.0
     ccm_contraction_weight: float = 1.0
     ccm_feasibility_weight: float = 1.0
     tracking_scaler: float = 1.0
     control_scaler: float = 0.0
-    lbd: float = 1e-2  # contraction rate λ — used by the SDP synthesis and the reward
     # ── SDP contraction metric — see ncm_synthesis.py ────────────────────── #
-    cm_eps: float = 1e-2   # strict-definiteness margin on the contraction LMI
+    cm_eps: float = 1e-2
     cm_solver: str = "SCS"  # cvxpy SDP solver
     # CV-STEM regression (build_cm_dataset + regress_cmg): one joint SDP that
     # keeps B via a Riccati BR⁻¹Bᵀ term, then MSE-regresses the CMG onto its
@@ -187,12 +210,11 @@ class C2RLPPOCfg(AgentCfg):
     # cm_solver above), then MSE-regress the CMG network onto {x -> W*} for
     # cmg_regress_epochs (build_cm_dataset / regress_cmg). "ccm": train the CMG
     # Either way the CMG is frozen (freeze_cmg) before Phase B.
-    cmg_memory_size: int = 8192
     cmg_regress_epochs: int = 1000
     cmg_regress_lr: float = 1e-3
     cmg_regress_lr_scheduler: str = ""
     cmg_regress_lr_scheduler_kwargs: dict = field(default_factory=dict)
-    cmg_regress_batch_size: int = 1024
+    cmg_regress_batch_size: int = 512
     # Held out from cmg_memory_size as a validation split never regressed on;
     # regress_cmg stops once its MSE hasn't improved for cmg_early_stop_patience
     # consecutive epochs, restoring the best-val-epoch CMG weights instead of
@@ -208,9 +230,8 @@ class C2RLPPOCfg(AgentCfg):
     # (uniform state-space coverage). See ncm_synthesis._sample_cm_states.
     cmg_random_ratio: float = 0.0
     # Dynamics — learned NeuralDynamics (ẋ = f(x) + B(x)·u) unless
-    # use_empirical_dynamics=True (classic envs only). Feeds Phase A's CMG
+    # mode=sim_to_real (classic envs only). Feeds Phase A's CMG
     # synthesis (SDP dataset for "cvstem", C1/C2 gradient computation for "ccm").
-    use_empirical_dynamics: bool = False
     dynamics_lr: float = 1e-3
     dynamics_lr_scheduler: str = ""
     dynamics_lr_scheduler_kwargs: dict = field(default_factory=dict)
@@ -240,7 +261,7 @@ class C2RLPPOCfg(AgentCfg):
 
 
 @dataclass
-class C2RLSACCfg(AgentCfg):
+class C2RLSACCfg(C2RLMetricCfg):
     """C2RL config for base_algorithm="SAC". SAC fields mirror skrl's SAC_CFG."""
     # Not a real SAC_CFG field, and not the replay buffer size (that's
     # memory_size): it's how many env steps C2RLSkrlTrainer takes per outer
@@ -261,13 +282,10 @@ class C2RLSACCfg(AgentCfg):
     use_state_norm: bool = False  # off by default — see module docstring / rl_glue.make_base_rl_cfg
     use_reward_norm: bool = False  # non-biasing running-std reward normalizer (r/std) — see rl_glue.make_base_rl_cfg
     rewards_shaper_scale: float = 1.0  # yaml convenience for SAC_CFG's rewards_shaper — see rl_glue.make_base_rl_cfg
-    std_dev_annealing_kwargs: dict | None = None  # forwarded to patch_ppo_std_annealing()
     memory_size: int = -1
     discount_factor: float = 0.99
     # ── Metric source — "cmg" frozen CMG network (synthesized how it's
     # trained). See C2RLPPOCfg for the shared cm/cmg knobs. ─────────────────── #
-    w_ub: float = 10.0
-    w_lb: float = 0.1
     # "regress" (default): MSE-fit the CMG network onto the offline {x -> W*(x)}
     # dataset. "sos": skip the fit and evaluate the SOS polynomial the dataset
     # was generated FROM, exactly (toy envs only -- they are the only family
@@ -279,13 +297,12 @@ class C2RLSACCfg(AgentCfg):
     cmg_method: str = "cvstem"  # "cvstem" regression | "ccm" direct metric training
     cmg_ccm_epochs: int = 1000
     cmg_ccm_lr: float = 1e-3
-    cmg_ccm_batch_size: int = 128
+    cmg_ccm_batch_size: int = 1024
     ccm_killing_weight: float = 1.0
     ccm_contraction_weight: float = 1.0
     ccm_feasibility_weight: float = 1.0
     tracking_scaler: float = 1.0
     control_scaler: float = 0.0
-    lbd: float = 1e-2
     # ── SDP contraction metric ("cvstem" method only) — see ncm_synthesis.py ── #
     cm_eps: float = 1e-2
     cm_solver: str = "SCS"
@@ -305,19 +322,17 @@ class C2RLSACCfg(AgentCfg):
     sos_bisect_iters: int = 10
     sos_verify_grid: int = 101
     # ── Offline CMG synthesis (Phase A, always runs before Phase B) ─────────── #
-    cmg_memory_size: int = 8192
     cmg_regress_epochs: int = 1000
     cmg_regress_lr: float = 1e-3
     cmg_regress_lr_scheduler: str = ""
     cmg_regress_lr_scheduler_kwargs: dict = field(default_factory=dict)
-    cmg_regress_batch_size: int = 1024
+    cmg_regress_batch_size: int = 512
     cmg_val_frac: float = 0.1
     cmg_early_stop_patience: int = 10
     # Random/off-reference state fraction for the CMG dataset — see
     # C2RLPPOCfg.cmg_random_ratio above / ncm_synthesis._sample_cm_states.
     cmg_random_ratio: float = 0.0
     # Dynamics
-    use_empirical_dynamics: bool = False
     dynamics_lr: float = 1e-3
     dynamics_lr_scheduler: str = ""
     dynamics_lr_scheduler_kwargs: dict = field(default_factory=dict)
@@ -348,7 +363,7 @@ def cm_dataset_target(cfg) -> tuple[Path | None, dict]:
     Returns ``(path, cache_kwargs)``; ``path`` is None when the config names no
     dataset location at all, which the caller must treat as an error.
     """
-    from .ncm_synthesis import cm_dataset_cache_path, cm_dataset_filename
+    from contractionRL.agents.utils.contraction.ncm_synthesis import cm_dataset_cache_path, cm_dataset_filename
 
     data_path = getattr(cfg, "dynamics_pretrain_data_path", "") or None
     explicit_cache_path = getattr(cfg, "cm_data_path", "") or None
@@ -396,7 +411,7 @@ class C2RLAgent(Agent):
       ``"policy"``   — the real deployed SAC/PPO policy.
       ``"value"`` (PPO) or ``"critic_1"``/``"critic_2"``/``"target_critic_1"``/
         ``"target_critic_2"`` (SAC) — the deployed policy's own critic(s).
-      ``"dynamics"`` — optional NeuralDynamics (use_empirical_dynamics=True).
+      ``"dynamics"`` — optional NeuralDynamics (mode=sim_to_real).
       ``"cmg"``      — required. MetricModel (``BoundedCCM_Generator``, i.e.
         ``constrain_eigenvalues=True``) synthesized offline (see synthesize_cmg)
         and frozen before Phase B; read for the Mahalanobis reward.
@@ -428,11 +443,24 @@ class C2RLAgent(Agent):
         self._angle_idx = list(angle_idx or [])
         CfgCls = C2RLSACCfg if base_algorithm.upper() == "SAC" else C2RLPPOCfg
         if isinstance(cfg, dict):
+            if base_algorithm.upper() == "SAC" and cfg.get("use_value_expansion", False):
+                raise ValueError("use_value_expansion is supported only by C2RL-PPO")
+            from contractionRL.agents.utils.RL.config import migrate_dynamics_mode
+            cfg = migrate_dynamics_mode(migrate_c2rl_metric_cfg(cfg))
+            if base_algorithm.upper() == "SAC":
+                from skrl.agents.torch.sac import SAC_CFG as BaseCfg
+            else:
+                from skrl.agents.torch.ppo import PPO_CFG as BaseCfg
             self._raw_cfg = cfg.copy()
-            parsed_cfg = CfgCls(**filter_cfg_fields(cfg, CfgCls, context="C2RLAgent"))
+            parsed_cfg = CfgCls(**filter_cfg_fields(cfg, CfgCls, context="C2RLAgent",
+                                                  forwarded_fields=BaseCfg.__dataclass_fields__))
         else:
             self._raw_cfg = cfg.__dict__.copy()
             parsed_cfg = cfg
+
+        beta = float(parsed_cfg.action_bound_penalty_beta)
+        if not math.isfinite(beta) or beta < 0:
+            raise ValueError("action_bound_penalty_beta must be finite and nonnegative")
 
         super().__init__(
             cfg=parsed_cfg,
@@ -459,6 +487,8 @@ class C2RLAgent(Agent):
         self._u_dim = u_dim
         self._device = device
         self._cfg = parsed_cfg
+        if parsed_cfg.mode not in ("analytical", "sim_to_real"):
+            raise ValueError(f"Unknown mode: {parsed_cfg.mode}")
         if parsed_cfg.cmg_method not in ("cvstem", "ccm"):
             raise ValueError("C2RL cmg_method must be 'cvstem' or 'ccm'.")
         if parsed_cfg.cmg_method == "ccm" and parsed_cfg.metric_source != "regress":
@@ -545,14 +575,15 @@ class C2RLAgent(Agent):
 
         self._rl_agent = BaseRLAgent(cfg=base_cfg, models=rl_models, memory=memory, **rl_kwargs)
 
-        from contractionRL.agents.skrl.agent_patches import (
+        from contractionRL.agents.utils.RL.agent_patches import (
             patch_kl_logging,
             patch_kl_logging_post_update,
             patch_ppo_diagnostics,
-            patch_ppo_std_annealing,
             patch_sac_entropy_clamp,
+            patch_terminal_observations,
         )
         patch_kl_logging(self._rl_agent)
+        patch_terminal_observations(self._rl_agent)
         # skrl's own KL curve is the epoch MEAN, and it includes the mini-batch
         # that tripped kl_threshold. This adds the size of the step the update
         # actually ended on: current policy vs the rollout policy, full batch.
@@ -562,26 +593,10 @@ class C2RLAgent(Agent):
             disable_advantage_norm=bool(getattr(parsed_cfg, "disable_advantage_norm", False)),
         )
         patch_sac_entropy_clamp(self._rl_agent)
-        # Applied to the inner PPO/SAC sub-agent: C2RL's outer agent has no
-        # .policy/.scaler of its own for the patch to hook.
-        _std_dev_annealing_kwargs = parsed_cfg.std_dev_annealing_kwargs
-        # Anneal for PPO unless the config opts out, regardless of the policy's
-        # backbone — SAC keeps this off since it learns log_std via its own
-        # automatic entropy tuning (see SquashedCLActorModel's docstring).
-        _anneal = self._base_algorithm == "PPO" and parsed_cfg.std_dev_annealing
-        patch_ppo_std_annealing(self._rl_agent, _anneal, _std_dev_annealing_kwargs)
-        if self._base_algorithm == "PPO" and not _anneal:
-            # CLActor builds logstd with requires_grad=False (it exists to be
-            # annealed, see nn_modules.CLActor), and patch_ppo_std_annealing —
-            # the only other thing that touches it — is now a no-op. Without
-            # this flip the parameter would simply stay frozen at its initial
-            # value and "learned std" would silently mean "constant std".
+        if self._base_algorithm == "PPO":
             lsp = getattr(self._rl_agent.policy, "log_std_parameter", None)
-            if lsp is None:
-                raise RuntimeError(
-                    "std_dev_annealing=False asks PPO to LEARN log_std, but the policy "
-                    f"({type(self._rl_agent.policy).__name__}) exposes no log_std_parameter.")
-            lsp.requires_grad_(True)
+            if lsp is None or not lsp.requires_grad:
+                raise RuntimeError("PPO requires a learnable log_std_parameter for exploration")
 
         self._rl_agent.init()
 
@@ -593,6 +608,7 @@ class C2RLAgent(Agent):
             "policy": models["policy"],
             **checkpoint_extra,
         })
+        self.checkpoint_modules.update(self._rl_agent.checkpoint_modules)
         self.checkpoint_modules["cmg"] = models["cmg"]
         if self._neural_dynamics is not None:
             self.checkpoint_modules["dynamics"] = self._neural_dynamics
@@ -609,25 +625,26 @@ class C2RLAgent(Agent):
         training by the trainer's ``pretrain_dynamics``) provides it. This
         mirrors C3M's dynamics interface expected by ``dynamics_pretrain``.
         """
-        if not cfg.use_empirical_dynamics:
+        if cfg.mode == "analytical":
             if get_f_and_B is None:
                 raise ValueError(
-                    "C2RL: analytical dynamics (use_empirical_dynamics=False) requires a "
+                    "C2RL: analytical dynamics (mode=analytical) requires a "
                     "get_f_and_B callable (classic envs only). Isaac Sim envs have no "
-                    "analytical dynamics — set use_empirical_dynamics=True."
+                    "analytical dynamics — set mode=sim_to_real."
                 )
             self._get_f_and_B = get_f_and_B
             self._neural_dynamics = None
-            self._dynamics_optimizer = None
-            self._dynamics_lr_scheduler = None
         else:
             self._neural_dynamics = models.get("dynamics", None)
             if self._neural_dynamics is None:
                 raise ValueError(
                     "C2RL requires a 'dynamics' model in the models dict when "
-                    "use_empirical_dynamics=True (add a models.dynamics block to the config)."
+                    "mode=sim_to_real (add a models.dynamics block to the config)."
                 )
             self._get_f_and_B = self._neural_dynamics.get_f_and_B
+        self._dynamics_optimizer = None
+        self._dynamics_lr_scheduler = None
+        if self._neural_dynamics is not None:
             self._dynamics_optimizer = torch.optim.Adam(
                 self._neural_dynamics.parameters(), lr=cfg.dynamics_lr
             )
@@ -690,26 +707,34 @@ class C2RLAgent(Agent):
             self._rl_agent.update(timestep=timestep, timesteps=timesteps)
 
     def _train_dynamics(self, data: dict) -> float:
-        """MSE training of NeuralDynamics on (x, u, x_dot) data (same as C3M).
+        """Conditional Gaussian likelihood training on (x, u, x_dot) data.
 
         Called by the trainer's ``pretrain_dynamics`` when learning dynamics —
         Phase A's CMG synthesis needs f/B/∂f/∂x before it runs.
         """
-        import torch.nn as nn
         dev = self._neural_dynamics.device
         x     = torch.as_tensor(data["x"], dtype=torch.float32, device=dev)
         u     = torch.as_tensor(data["u"], dtype=torch.float32, device=dev)
         x_dot = torch.as_tensor(data["x_dot"], dtype=torch.float32, device=dev)
 
-        pred = self._neural_dynamics.predict_x_dot(x, u)
-        loss = nn.functional.mse_loss(pred, x_dot)
+        loss = self._neural_dynamics.negative_log_likelihood(x, u, x_dot)
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Non-finite stochastic dynamics likelihood")
 
         self._dynamics_optimizer.zero_grad()
         loss.backward()
         if all(torch.isfinite(p.grad).all() for p in self._neural_dynamics.parameters() if p.grad is not None):
             torch.nn.utils.clip_grad_norm_(self._neural_dynamics.parameters(), 1.0)
             self._dynamics_optimizer.step()
+            self._neural_dynamics.disturbance_fitted.fill_(True)
         return loss.item()
+
+    def load(self, path: str) -> None:
+        saved = torch.load(path, map_location="cpu", weights_only=False)
+        if "cmg" not in saved:
+            raise ValueError("A C2RL continuation checkpoint must contain its frozen metric ('cmg').")
+        super().load(path)
+        self._restored_cmg_checkpoint = str(path)
 
     def freeze_cmg(self) -> None:
         """Freeze the synthesized CMG before Phase B."""
@@ -730,7 +755,7 @@ class C2RLAgent(Agent):
         data_path = getattr(cfg, "dynamics_pretrain_data_path", "") or None
         if not data_path:
             return None
-        from .dynamics_pretrain import load_offline_dynamics_data
+        from contractionRL.agents.utils.system_dynamics.dynamics import load_offline_dynamics_data
         x_all = load_offline_dynamics_data(data_path, tag="[C2RL]")["x"]
         n_avail = x_all.shape[0]
         n_samples = cfg.cmg_memory_size
@@ -748,12 +773,11 @@ class C2RLAgent(Agent):
         anisotropy of the Mahalanobis reward the policy trains against; the
         w_lb/w_ub box bounds it by w_ub/w_lb. Tracks mean and 95% quantile
         (flushed by the caller's timestep=-1 write)."""
-        from .math_utils import bound_W
-        x_np = np.asarray(x_np, dtype=np.float32)[:, :self._x_dim]
-        if x_np.shape[0] > max_states:
-            idx = np.random.choice(x_np.shape[0], size=max_states, replace=False)
-            x_np = x_np[idx]
-        x = torch.as_tensor(x_np, device=self._device)
+        from contractionRL.agents.utils.contraction.math_utils import bound_W
+        x = torch.as_tensor(x_np, dtype=torch.float32, device=self._device).detach()[:, :self._x_dim]
+        if x.shape[0] > max_states:
+            idx = torch.randperm(x.shape[0], device=x.device)[:max_states]
+            x = x[idx]
         with torch.no_grad():
             raw_W, _ = self._ccm_gen(x)
             W = bound_W(raw_W, self._cfg.w_lb, self._x_dim,
@@ -766,15 +790,21 @@ class C2RLAgent(Agent):
               f"mean={cond_mean:.4g}, 95%={cond_q95:.4g} "
               f"(bound w_ub/w_lb={self._cfg.w_ub / self._cfg.w_lb:.4g})")
         self.track_data("Loss / C2RL/cmg/cond_mean", cond_mean)
+        self.track_data("Loss / C2RL/cmg/cond_stddev", cond.std(unbiased=False).item())
         self.track_data("Loss / C2RL/cmg/cond_q95", cond_q95)
 
     def synthesize_cmg(self, *, timesteps: int = 0) -> dict:
         """Train the metric with CV-STEM regression or direct CCM losses.
 
-        Both routes freeze the CMG before Phase B. The CCM route includes full
-        Killing identities, unactuated contraction and bounded-input feasibility;
+        Both routes freeze the CMG before Phase B. The CCM route includes projected
+        C1/C2 identities and bounded-input feasibility;
         it contains no policy/controller-Jacobian loss.
         """
+        restored = getattr(self, "_restored_cmg_checkpoint", None)
+        if restored:
+            self.freeze_cmg()
+            self._attach_critic_potential()
+            return {"metric_source": "restored_checkpoint", "resumed_from": restored}
         info = (self._synthesize_cmg_ccm(timesteps=timesteps) if self._cfg.cmg_method == "ccm"
                 else self._synthesize_cmg_cvstem(timesteps=timesteps))
         self._attach_critic_potential()
@@ -802,10 +832,7 @@ class C2RLAgent(Agent):
         # use_value_norm=false — check for the Module instead.
         _vp = getattr(self._rl_agent, "_value_preprocessor", None)
         if isinstance(_vp, torch.nn.Module):
-            print(f"[C2RL] WARNING: analytic-potential critic with a value preprocessor "
-                  f"ACTIVE ({type(_vp).__name__}) — the added ||e||^2_M term is in REAL "
-                  f"value units while the network output is normalized. Run this arm with "
-                  f"use_value_norm=false.", flush=True)
+            raise ValueError("An analytic-potential critic requires use_value_norm=false: its energy term is in physical value units")
         else:
             print(f"[C2RL] O6 scale check OK: value preprocessor is disabled "
                   f"({type(_vp).__name__}), so the analytic term and the network output "
@@ -931,7 +958,7 @@ class C2RLAgent(Agent):
         regression would mean the run's metric is not the one the config names
         and the offline V* solve assumes.
         """
-        from .nn_modules import AnalyticSOSMetric
+        from contractionRL.agents.utils.contraction.metric_models import AnalyticSOSMetric
 
         names, values = dataset.get("sos_coeff_names"), dataset.get("sos_coeff_values")
         if names is None or values is None:
@@ -960,29 +987,44 @@ class C2RLAgent(Agent):
                 "lambda_reduced_rate": 0.0, "metric_source": "sos"}
 
     def _synthesize_cmg_ccm(self, *, timesteps: int = 0) -> dict:
-        from .ccm_synthesis import train_cmg_ccm
+        from contractionRL.agents.utils.contraction.ccm_synthesis import sample_ccm_domain, train_cmg_ccm
         if self._u_min is None or self._u_max is None:
             raise ValueError("CCM synthesis requires the environment's applied u_min/u_max bounds.")
-        data = self._get_rollout(self._cfg.cmg_memory_size, "c3m")
+        state_box = self.observation_space["x"]
+        x_low, x_high = state_box.low, state_box.high
+        data = sample_ccm_domain(self._cfg.cmg_memory_size, x_low, x_high,
+                                 self._u_min, self._u_max, device=self._device)
         epochs = self._cfg.cmg_ccm_epochs
         log_every = max(1, epochs // 100)
 
         def report(epoch, training, validation):
-            for split, values in (("train", training), ("validation", validation)):
-                for key, value in values.items():
-                    self.track_data(f"Loss / C2RL/ccm/{split}/{key}", value)
             if epoch % log_every == 0 or epoch == epochs - 1:
+                for split, values in (("train", training), ("validation", validation)):
+                    for key, value in values.items():
+                        self.track_data(f"Loss / C2RL/ccm/{split}/{key}", value)
                 print(f"[C2RL] CCM epoch {epoch + 1}/{epochs}: loss={training['loss']:.4g}, "
                       f"validation={validation['loss']:.4g}, Killing max={validation['killing_max']:.4g}, "
                       f"contraction max={validation['contraction_max']:.4g}, "
-                      f"input residual max={validation['feasibility_max']:.4g}", flush=True)
+                      f"input residual max={validation['feasibility_max']:.4g}, "
+                      f"normalized input mean={validation['feasibility_normalized_mean']:.4g}, "
+                      f"stddev={validation['feasibility_normalized_stddev']:.4g}, "
+                      f"violations={validation['feasibility_violation_fraction']:.1%}", flush=True)
                 if getattr(self, "writer", None) is not None:
-                    self.write_tracking_data(timestep=epoch - epochs, timesteps=timesteps)
+                    with metric_batch(step=epoch - epochs):
+                        self.write_tracking_data(timestep=epoch - epochs, timesteps=timesteps)
 
         info = train_cmg_ccm(self._ccm_gen, self._get_f_and_B, data, self._u_min, self._u_max,
                              cfg=self._cfg, device=self._device, angle_idx=self._angle_idx, on_epoch=report)
+        info["sampling"] = {"distribution": "independent_uniform_full_boxes",
+                            "x_min": x_low.tolist(), "x_max": x_high.tolist(),
+                            "bounds_frame": "world",
+                            "coordinate_frame": "world"}
         self.freeze_cmg()
         self._log_cmg_condition_numbers(data["x"])
+        if getattr(self, "writer", None) is not None:
+            step = info["epochs"] - epochs - 1
+            with metric_batch(step=step):
+                self.write_tracking_data(timestep=step, timesteps=timesteps)
         # Persist the restored metric's diagnostics and the actual input box.
         import json
         os.makedirs(self.experiment_dir, exist_ok=True)
@@ -1006,7 +1048,7 @@ class C2RLAgent(Agent):
         experiment rather than a per-run artifact, so two runs cannot disagree
         about what W they were certified against.
         """
-        from .ncm_synthesis import load_cached_cm_dataset, regress_cmg
+        from contractionRL.agents.utils.contraction.ncm_synthesis import load_cached_cm_dataset, regress_cmg
         cfg = self._cfg
         cache_path, cache_kwargs = cm_dataset_target(cfg)
         if cache_path is None:
@@ -1054,7 +1096,8 @@ class C2RLAgent(Agent):
         self.track_data("Loss / C2RL/cm_synthesis/residual_max", dataset["residual_max"])
         self.track_data("Loss / C2RL/cm_synthesis/lambda_reduced_rate", dataset.get("lambda_reduced_rate", 0.0))
         if has_writer:
-            self.write_tracking_data(timestep=-epochs - 1, timesteps=timesteps)
+            with metric_batch(step=-epochs - 1):
+                self.write_tracking_data(timestep=-epochs - 1, timesteps=timesteps)
 
         # ~100 wandb points regardless of epochs, final epoch always flushed —
         # same cadence as dynamics_pretrain.pretrain_dynamics.
@@ -1066,7 +1109,8 @@ class C2RLAgent(Agent):
             if not np.isnan(val_mse):
                 self.track_data("Loss / C2RL/cmg/regress_val_mse", val_mse)
             if has_writer and ((epoch + 1) % log_every == 0 or epoch == epochs - 1):
-                self.write_tracking_data(timestep=epoch - epochs, timesteps=timesteps)
+                with metric_batch(step=epoch - epochs):
+                    self.write_tracking_data(timestep=epoch - epochs, timesteps=timesteps)
 
         bounded = getattr(self._ccm_gen, "bounded", False)
         info = regress_cmg(
@@ -1089,7 +1133,9 @@ class C2RLAgent(Agent):
             self.track_data("Loss / C2RL/cmg/regress_val_mse_best", info["final_val_loss"])
         self._log_cmg_condition_numbers(dataset["x"])
         if has_writer:
-            self.write_tracking_data(timestep=-1, timesteps=timesteps)
+            step = len(info["loss_history"]) - epochs - 1
+            with metric_batch(step=step):
+                self.write_tracking_data(timestep=step, timesteps=timesteps)
         return {
             "feasibility_rate": dataset["feasibility_rate"],
             "residual_mean": dataset["residual_mean"],
@@ -1165,6 +1211,12 @@ class C2RLSkrlTrainer(Trainer):
         injected = 0
         for e in targets:
             e = e.unwrapped if hasattr(e, "unwrapped") else e
+            beta = getattr(agent._cfg, "action_bound_penalty_beta", 0.0)
+            setter = getattr(e, "set_action_bound_penalty", None)
+            if setter is not None:
+                setter(beta)
+            elif beta:
+                raise ValueError("action_bound_penalty_beta is currently supported by classic/analytical Isaac environments")
             if hasattr(e, "set_ccm"):
                 e.set_ccm(
                     ccm,
@@ -1190,39 +1242,77 @@ class C2RLSkrlTrainer(Trainer):
         timesteps = self.cfg.timesteps
 
         agent.init(trainer_cfg=self.cfg)
-        from .contraction_metrics import log_raw_config
+        from contractionRL.agents.utils.contraction.metrics import log_raw_config
         log_raw_config(getattr(self, "_wandb_raw_cfg", None))
         agent.enable_training_mode(True)
 
-        # Pretrain learned dynamics (if any) before Phase A's CMG synthesis, so it
-        # has meaningful f/B/∂f/∂x (SDP dataset for "cvstem", C1/C2 gradient
-        # computation for "ccm"). No-op for analytical dynamics (classic envs).
-        from .dynamics_pretrain import pretrain_dynamics
+        # Fit the nominal model and noise density before metric synthesis;
+        # analytical plants retain exact f/B and fit only the noise density.
+        from contractionRL.agents.utils.system_dynamics.dynamics import pretrain_dynamics
+        dynamics_epochs = getattr(agent._cfg, "dynamics_pretrain_epochs", 5)
+        if agent._neural_dynamics is None:
+            dynamics_epochs = 0
+        metric_epochs = (agent._cfg.cmg_ccm_epochs if agent._cfg.cmg_method == "ccm"
+                         else agent._cfg.cmg_regress_epochs)
+        from contractionRL.runners.contraction_runner import _unwrap_env
+        raw = _unwrap_env(env)
+        disturbance_enabled = bool(getattr(getattr(raw, "disturbance", None), "enabled", False))
+        if getattr(agent, "_restored_cmg_checkpoint", None) and agent._neural_dynamics is not None:
+            if bool(agent._neural_dynamics.disturbance_fitted):
+                dynamics_epochs = 0
+            else:
+                # A restored metric must keep the nominal model it was fitted against.
+                for network in (agent._neural_dynamics.f_net, agent._neural_dynamics.B_net):
+                    if network is not None:
+                        for parameter in network.parameters():
+                            parameter.requires_grad_(False)
+        data_path = getattr(agent._cfg, "dynamics_pretrain_data_path", "") or None
+        if agent._cfg.mode == "sim_to_real" and dynamics_epochs > 0 and data_path and disturbance_enabled:
+            with np.load(data_path) as archive:
+                if "disturbance_enabled" in archive and not bool(archive["disturbance_enabled"]):
+                    raise ValueError("Nominal dynamics data cannot identify the disturbance density; supply disturbed rollouts or omit dynamics_pretrain_data_path to collect them")
+        if agent._cfg.mode == "sim_to_real" and dynamics_epochs > 0 and not data_path:
+            from contractionRL.agents.utils.system_dynamics.dynamics import collect_stochastic_rollouts
+            dt = getattr(raw, "dt", None) or raw.step_dt
+            with metric_batch(step=-(dynamics_epochs + metric_epochs) - 1):
+                agent._dynamics_rollout_data = collect_stochastic_rollouts(
+                    raw, agent._cfg.emp_dynamics_memory_size, low=agent._u_min, high=agent._u_max,
+                    device=agent._rl_agent.device, dt=dt, angle_idx=agent._angle_idx,
+                    path=os.path.join(agent.experiment_dir, "stochastic_dynamics_data.npz"))
+        # Reserve ordered negative ranges even when either phase stops early.
         pretrain_dynamics(
             agent,
-            epochs=getattr(agent._cfg, "dynamics_pretrain_epochs", 5),
-            data_path=getattr(agent._cfg, "dynamics_pretrain_data_path", "") or None,
+            epochs=dynamics_epochs,
+            data_path=data_path,
             timesteps=timesteps,
             memory_size=getattr(agent._cfg, "emp_dynamics_memory_size", None),
             num_controls_per_state=getattr(agent._cfg, "num_controls_per_state", None),
             tag="[C2RL]",
             val_frac=getattr(agent._cfg, "dynamics_val_frac", 0.1),
             early_stop_patience=getattr(agent._cfg, "dynamics_early_stop_patience", 10),
+            step_offset=-(dynamics_epochs + metric_epochs),
         )
+        if agent._neural_dynamics is not None:
+            agent._neural_dynamics.eval()
+            for parameter in agent._neural_dynamics.parameters():
+                parameter.requires_grad_(False)
 
-        # ── Phase A: offline CMG synthesis — "cvstem" solves one SDP per sampled
-        # state (build_cm_dataset) and MSE-regresses the CMG onto {x -> W*}
+        # ── Phase A: offline CMG synthesis — "cvstem" solves a joint sampled
+        # SDP (build_cm_dataset) and MSE-regresses the CMG onto {x -> W*}
         # (regress_cmg); "ccm" trains the CMG directly with C1/C2 losses
         # The CMG is frozen before Phase B reads its
         # static metric. synthesize_cmg logs feasibility/residual/loss/LR itself. ──
-        # Phase A always runs. There is no per-step alternative: a per-state SDP
+        # Fresh runs synthesize once; continuations retain the checkpoint metric.
+        # There is no per-step alternative: a per-state SDP
         # carries its own nu/chi and no Wdot term, so it certifies nothing about
         # contraction, and solving one every step just repeats that error.
         info = agent.synthesize_cmg(timesteps=timesteps)
         # metric_source='sos' fits nothing, so there is no regression loss to
         # report -- say which metric is in use instead of printing a 0 that
         # reads like a perfect fit.
-        if agent._cfg.cmg_method == "ccm":
+        if info.get("resumed_from"):
+            print(f"[C2RL] Phase A — restored frozen metric from {info['resumed_from']}; no refit.")
+        elif agent._cfg.cmg_method == "ccm":
             print(f"[C2RL] Phase A (ccm) — metric frozen; sampled validation {info['validation']}")
         else:
             _fit = (f"loss {info['regress_mse']:.4g}" if "regress_mse" in info
@@ -1234,6 +1324,11 @@ class C2RLSkrlTrainer(Trainer):
         # ── Phase B: rollout + train the deployed policy against the Mahalanobis
         # reward computed from the frozen CMG. ─────────────────────────────
         rl_agent = agent._rl_agent
+        # The inner agent is initialized before a trainer exists. Resolve "auto"
+        # from the same trainer budget as the outer agent, including logging off.
+        rl_agent.write_interval = agent.write_interval
+        if agent.write_interval > 0 and getattr(rl_agent, "writer", None) is None:
+            rl_agent.writer = agent.writer
         rl_agent.enable_training_mode(True)
         rollout_steps = agent._cfg.rollouts
 
@@ -1256,23 +1351,13 @@ class C2RLSkrlTrainer(Trainer):
         observations, infos = env.reset()
         states = env.state() if hasattr(env, "state") else None
         global_step = 0
-        # Coarse flush cadence for the inner rl_agent — flushing every step/chunk
-        # would collapse the 100-episode reward/timestep deques to a spiky curve.
-        flush_interval = max(1, timesteps // 100)
-        next_flush = flush_interval
-
-        # ── Outer-agent checkpointing ──────────────────────────────────────
-        # The outer agent is stepped once per rollout chunk, so skrl's
-        # `(timestep + 1) % checkpoint_interval` gate in Agent.post_interaction
-        # can never line up (stride `rollout_steps` vs. interval 2000) — it
-        # would silently write no checkpoints at all. Drive them off the real
-        # step count instead. The best-model comparison also needs episode
-        # returns, and `record_transition` runs on the inner rl_agent, so the
-        # outer agent's own tracking_data never holds them: mirror the inner
-        # agent's running mean across (captured per chunk, since
-        # write_tracking_data clears `_track_rewards`).
+        if agent.write_interval > 0:
+            optimizer = getattr(rl_agent, "optimizer", None) or rl_agent.policy_optimizer
+            rl_agent.track_data("Learning / Learning rate", optimizer.param_groups[0]["lr"])
+            with metric_batch(step=0):
+                rl_agent.write_tracking_data(timestep=0, timesteps=timesteps)
+        # skrl handles exact per-transition checkpoints, including AUC selection.
         ckpt_interval = agent.checkpoint_interval if isinstance(agent.checkpoint_interval, int) else 0
-        next_ckpt = global_step + ckpt_interval if ckpt_interval > 0 else None
         last_return: float | None = None
 
         def _write_outer_checkpoint(step: int, *, force_best: bool = False) -> None:
@@ -1314,34 +1399,19 @@ class C2RLSkrlTrainer(Trainer):
                 observations = next_obs
                 states = next_states
 
-                if agent._base_algorithm == "SAC":
-                    agent.update_policy(timestep=global_step, timesteps=timesteps)
+                # skrl owns the update schedule, including PPO rollout boundaries
+                # and learning_starts. Calling update() as well trains twice.
+                if rl_agent._track_rewards:
+                    last_return = float(np.mean(rl_agent._track_rewards))
+                if ckpt_interval > 0 and (global_step + 1) % ckpt_interval == 0 and last_return is not None:
+                    agent.track_data("Reward / Total reward (mean)", last_return)
+                # One W&B row contains both policy and environment metrics.
+                with metric_batch(step=global_step + 1):
                     rl_agent.post_interaction(timestep=global_step, timesteps=timesteps)
-                    if global_step % flush_interval == 0 and getattr(rl_agent, "writer", None) is not None:
-                        rl_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
+                    agent.post_interaction(timestep=global_step, timesteps=timesteps)
 
                 global_step += 1
                 pbar.update(1)
-
-            # Chunk-based update for PPO
-            if agent._base_algorithm == "PPO":
-                agent.update_policy(timestep=global_step, timesteps=timesteps)
-                rl_agent.post_interaction(timestep=global_step, timesteps=timesteps)
-                if global_step >= next_flush and getattr(rl_agent, "writer", None) is not None:
-                    rl_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
-                    next_flush = global_step + flush_interval
-
-            # Outer agent: drives its own checkpoint cadence (checkpoint_modules)
-            # and flushes whatever Stability/* logs _forward_env_log collected.
-            agent.post_interaction(timestep=global_step, timesteps=timesteps)
-            if getattr(agent, "writer", None) is not None:
-                agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
-
-            if getattr(rl_agent, "_track_rewards", None):
-                last_return = float(np.mean(rl_agent._track_rewards))
-            if next_ckpt is not None and global_step >= next_ckpt:
-                _write_outer_checkpoint(global_step)
-                next_ckpt = global_step + ckpt_interval
 
         # Final checkpoint — also guarantees a best_agent.pt exists for the
         # post-training eval when no interval boundary was crossed cleanly.
@@ -1349,9 +1419,6 @@ class C2RLSkrlTrainer(Trainer):
             if getattr(rl_agent, "_track_rewards", None):
                 last_return = float(np.mean(rl_agent._track_rewards))
             _write_outer_checkpoint(global_step, force_best=True)
-
-        if getattr(rl_agent, "writer", None) is not None:
-            rl_agent.write_tracking_data(timestep=global_step, timesteps=timesteps)
 
         # Persist the learned dynamics for reuse/inspection (matches C3M).
         if agent._neural_dynamics is not None:

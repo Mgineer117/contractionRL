@@ -40,8 +40,8 @@ def attach_cmg(env, name: str | None = None, *, epochs: int = 80,
     reward, ``local_lambda``, the CV-STEM-LQR gain) needs M(x) at ARBITRARY
     states, which is what the regression provides.
     """
-    from contractionRL.agents.skrl.ncm_synthesis import regress_cmg
-    from contractionRL.agents.skrl.nn_modules import BoundedCCM_Generator
+    from contractionRL.agents.utils.contraction.ncm_synthesis import regress_cmg
+    from contractionRL.agents.utils.contraction.metric_models import BoundedCCM_Generator
 
     path = find_npz(name or env.task)
     d = np.load(path, allow_pickle=True)

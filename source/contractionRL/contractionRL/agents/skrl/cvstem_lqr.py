@@ -46,10 +46,10 @@ from pathlib import Path
 import torch
 from skrl.agents.torch.base import Agent, AgentCfg
 
-from .angle_utils import wrap_diff
-from .nn_modules import CholMetric
-from .ref_window import RefWindow
-from .rl_glue import filter_cfg_fields
+from contractionRL.agents.utils.system_dynamics.state import wrap_diff
+from contractionRL.agents.utils.contraction.metric_models import CholMetric
+from contractionRL.agents.utils.system_dynamics.reference import RefWindow
+from contractionRL.agents.utils.RL.config import filter_cfg_fields
 
 # Printed verbatim on the abort path. search/sweep_runner.py greps the child's
 # output for this exact string, so the two must stay in sync — it is the signal
@@ -218,7 +218,11 @@ class CVSTEMLQRAgent(Agent):
         """
         import numpy as np
 
-        from .ncm_synthesis import M_to_cholvec, cm_dataset_filename, load_cached_cm_dataset
+        from contractionRL.agents.utils.contraction.ncm_synthesis import (
+            M_to_cholvec,
+            cm_dataset_filename,
+            load_cached_cm_dataset,
+        )
 
         cfg = self._cfg
         if not cfg.cm_data_path:
@@ -244,7 +248,7 @@ class CVSTEMLQRAgent(Agent):
 
     def _synthesize(self) -> None:
         """Uniform samples → one joint SDP → MSE-fit ``CholMetric``, then freeze."""
-        from .ncm_synthesis import (
+        from contractionRL.agents.utils.contraction.ncm_synthesis import (
             cvstem_cache_path,
             cvstem_metric_dataset,
             load_cvstem_dataset,
