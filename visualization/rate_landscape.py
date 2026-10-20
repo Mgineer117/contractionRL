@@ -46,9 +46,9 @@ import yaml  # noqa: E402
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "source", "contractionRL"))
 
-import contractionRL.tasks.direct.classic  # noqa: E402,F401
+import contractionRL.tasks.direct.common.tracking_tasks  # noqa: E402,F401
 import gymnasium as gym  # noqa: E402
-from contractionRL.agents.skrl.math_utils import jacobian  # noqa: E402
+from contractionRL.agents.utils.contraction.math_utils import jacobian  # noqa: E402
 
 
 def _short(env_name: str) -> str:
@@ -142,9 +142,10 @@ def main() -> int:
     short = _short(args.env)
     task = f"classic-{short}-v0" if short != "car_v1" else "classic-car-v1"
     with open(os.path.join(_ROOT, "source/contractionRL/contractionRL/tasks/direct/"
-                           f"classic/{short}/agents/"
+                           f"isaac_classic_{short}/agents/"
                            f"skrl_{args.algorithm.replace('-', '_')}_cfg.yaml")) as fh:
-        cm = yaml.safe_load(fh)["cm"]
+        from contractionRL.agents.utils.RL.config import load_agent_config
+        cm = load_agent_config(fh.name)["cm"]
     r = float(cm["cvstem_r_scaler"]) + 1e-5
     xs, W, npz = load_metric(short)
 

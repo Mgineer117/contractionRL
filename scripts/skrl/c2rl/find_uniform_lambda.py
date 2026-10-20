@@ -297,7 +297,7 @@ def main() -> int:
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
-    import contractionRL.tasks.direct.classic  # noqa: F401  (registers the ids)
+    import contractionRL.tasks.direct.common.tracking_tasks  # noqa: F401  (registers the ids)
     import gymnasium as gym
     env = gym.make(args.task, num_envs=args.eval_envs, device="cpu").unwrapped
 
@@ -365,7 +365,7 @@ def main() -> int:
           f"||e||2 mean {np.linalg.norm(e_pool, axis=-1).mean():.4f}, "
           f"per-dim max |e| {np.abs(e_pool).max(axis=0).round(3)}")
     # The control box is the uref box widened by --u-expansion, which is how every
-    # env defines it (env_base.py: "the applied box is 2x this"). Derived rather
+    # env defines it (analytical_env.py: "the applied box is 2x this"). Derived rather
     # than read off U_MIN/U_MAX so the check states the relationship it relies on.
     u_lo, u_hi = expand_box(uref_lo, uref_hi, args.u_expansion)
     if not (np.allclose(u_lo, _np(env.U_MIN)) and np.allclose(u_hi, _np(env.U_MAX))):

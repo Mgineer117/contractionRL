@@ -1,0 +1,329 @@
+"""Segway tracking environment (ported to batched PyTorch)."""
+
+from __future__ import annotations
+
+import math
+
+import torch
+
+from ..common.analytical_env import BaseEnv
+
+# Denote angle indices to handle smooth transition
+STATE_NAMES = ("pos_x", "pitch", "vel_x_b", "pitch_rate")
+# angle_idx / pos_dimension are derived from STATE_NAMES by BaseEnv (see
+# agents/utils/system_dynamics/state.py) -- the names are the single source of truth for
+# which dims wrap, which translate, and which co-rotate under a yaw rotation.
+
+# X bounds
+#
+# PITCH_LIM is 0.90 rad (51.6 deg), not the pi/3 (60 deg) it was, and that is a
+# statement about what is CERTIFIABLE, not about the plant.
+#
+# lambda*(x) over the old box is a smooth 0.19-0.34 across ~93% of it and
+# collapses in exactly two opposite corners: maximum tilt combined with fast
+# rotation THE OTHER WAY (pitch -1.047 with pitch_rate +2.69 gives 0.00367, and
+# the mirror +1.047 / -2.69 gives 0.00939). A uniform rate must hold everywhere,
+# so those two corners set it for the whole box -- a 93x collapse driven by ~1%
+# of the volume. At lambda = 0.00367 over a 15 s episode the certified bound is
+# C*exp(-lambda*T) = 1.15 * 0.946 = 1.088 > 1: it does not even promise the error
+# ends below where it started. The certificate was vacuous.
+#
+# Trimming pitch by one grid column removes both corners and lifts the cap 11x,
+# to 0.0407, where the bound is 0.625 -- a real 37% guaranteed decay -- while
+# keeping 87% of the (pitch, pitch_rate) area. Trimming pitch_rate instead is a
+# worse trade: 6x for 27% of the area. See scripts/minproj_plot.py's cached grid
+# and the table in the 2026-08-22 session.
+#
+# This does NOT touch the initial distribution: segway sets X_INIT, so reset()
+# draws x_0 from that box directly and never reads XE_INIT at all. What it
+# changes is the set the CM dataset certifies over, and the tilt at which an
+# episode terminates (60 deg -> 51.6 deg).
+PITCH_LIM = 0.90
+X_MIN = [-5.0, -PITCH_LIM, -1.0, -math.pi]
+X_MAX = [5.0, PITCH_LIM, 1.0, math.pi]
+
+# Episode ends the first step x leaves this box (opt-in: --terminate_out_of_box).
+# Defaults to the state box itself, i.e. it fires exactly where env_base.step's
+# clamp already silently pins a diverged env -- the same event, reported instead
+# of hidden. Tighten it here to end failing episodes sooner.
+X_TERMINATION_MIN = list(X_MIN)
+X_TERMINATION_MAX = list(X_MAX)
+
+# Initial reference state bounds.
+#
+# Stays at the origin, and NOT because the origin happens to be an equilibrium
+# (xref_init does not need to be one -- the reference is a trajectory, and
+# stabilising is the policy's job). It stays because the origin is the only place
+# a segway reference can *dwell*, and that is a hard fact about this plant.
+#
+# rule.md Step 3 says put xref_init in the low-rate region. For segway the low-rate
+# region is where |pitch| is large (corr(lam, |pitch|) = -0.226, the only dim with
+# any dependence), and a reference cannot stay there. Measured three ways:
+#
+# 1. Relative equilibria. Allowing v free and omega = 0, rows 2-3 of f + Bu = 0
+#    are LINEAR in (v, u), so steady cruise at tilt theta solves exactly:
+#    v* = -181*theta, u* = -940*theta. At theta = 0.05 rad that is v = -9.06 m/s
+#    against a +-1.0 box and u = -57 against +-24. Only theta ~ 0 fits, i.e. the
+#    equilibrium set is the v-axis sliver |theta| < 0.006 -- physically right, a
+#    lean commands acceleration, not speed.
+# 2. Dwell time. Rolling xref forward with the uref that best holds the tilt
+#    (u = -f3/B3), time until xref leaves X, out of a 60 s episode:
+#        pitch0   0.05    0.10    0.30    0.60    0.85
+#        dwell    9.93s   5.10s   1.74s   0.90s   0.66s
+#    It always exits via vel_x_b, with peak |u| only 6.5-9.7 of the 24 available:
+#    the binding constraint is the VELOCITY box, not the actuator. Holding a lean
+#    means accelerating the wheel, which is what a segway is. Widening v to +-4
+#    moves the exit to pitch and buys 34 s at pitch 0.05 -- but 0.05 rad is
+#    already lam_max, so it buys dwell exactly where there is no rate to gain,
+#    and still only 2.4 s at pitch 0.85.
+# 3. Viability, law-independent. Greedy uref over a 65-point grid with two-step
+#    lookahead and an explicit bonus for staying tilted:
+#        x0 (pitch, omega)   dwell    mean |pitch| sustained
+#        (0.00,  0.0)        60.00s   0.0000
+#        (0.45,  0.0)         1.32s   0.5381
+#        (0.70, -1.0)         1.23s   0.6914
+#    The tilt bonus changes the trajectory at no weight (B[1,0] = 0, so u cannot
+#    touch pitch within a step). The viable set for a 60 s reference is the single
+#    point pitch = v = pitch_rate = 0 -- which is lam's MAXIMUM.
+#
+# So low lam and long dwell are mutually exclusive here: lam is low exactly where
+# the plant is falling (unstable eig +2.76, e-fold 0.36 s), and a falling state is
+# not a reference. Confirmed end to end against the deployed CMG -- every tilted
+# xref_init pins to a box face and lam FALLS:
+#     xref_init                lam(0)   lam(T)    rise    ref clamp
+#     origin (this one)        0.2112   0.1468   0.695x     0.941
+#     mid tilt   (0.45)        0.2878   0.1468   0.510x     0.981
+#     max tilt   (0.85)        0.2745   0.1466   0.534x     0.994
+#     opp-sign diagonal        0.2689   0.0782   0.291x     0.969
+#     same-sign diagonal       0.3597   0.1468   0.408x     0.997
+#     fast spin only           0.3199   0.1468   0.459x     0.995
+#     cruise v = 0.9           0.3061   0.0782   0.256x     0.951
+# All seven land on one of two lam(T) values because they have all been pinned to
+# the same box face -- the reference is no longer a plant trajectory at all.
+# (note lam(0) is not even monotone in tilt -- the -0.226 correlation is far too
+# weak to make "tilt" mean "low rate" pointwise.)
+#
+# Contrast car_v1, where this DOES work: 5.63x rate spread, low-rate set dwellable,
+# and lambda_grad migrates 1.416x at a clamp rate of exactly 0.0000. segway has
+# neither property, so it keeps reference_mode="stabilizing" (the default) and this
+# box stays at the origin. Revisit only if X's velocity box is widened and
+# re-certified, and then check dwell at the tilts that actually lower lam.
+XREF_INIT_MIN = [0.0, 0, 0.0, 0]
+XREF_INIT_MAX = [0.0, 0, 0.0, 0]
+
+# Initial perturbation to the reference state.
+# pitch and pitch_rate used to span the entire state box (+-pi/3 and +-pi, i.e.
+# X_MIN/X_MAX exactly), so reset could place the segway at a 60-degree tilt
+# spinning at pi rad/s -- mid-fall, not a tracking error. Recovering 60 degrees
+# alone needs |u|=4.17 of the +-6 available, and along the CV-STEM tube
+# pitch_rate accounted for ~49% of the feedback demand and pitch ~19%, with the
+# peak demand 5.3x over budget. Tightened to a genuine perturbation.
+XE_INIT_MIN = [-1.0, -0.15, -0.15, -0.5]
+XE_INIT_MAX = [1.0, 0.15, 0.15, 0.5]
+
+# initial reference state perturbation bounds for c3m
+lim = 1.0
+XE_MIN = [-lim, -lim, -lim, -lim]
+XE_MAX = [lim, lim, lim, lim]
+
+# reference control bounds. The applied box is 2x this (analytical_env.py:37). u is a
+# normalized wheel torque with no direct hardware unit, so anchor it through its
+# effect: B[2,0] = (-1.8 cos(th) - 10.9)/(cos(th) - 24.7) ~ 0.54 maps u to the
+# body-frame acceleration v_dot, so +-12 applied is +-6.4 m/s^2 of wheel accel --
+# in range for a two-wheel balancer (peak ~5-10 m/s^2), where the old +-6 applied
+# capped it at 3.2 m/s^2. For scale, statically holding the XE_INIT pitch of
+# 0.15 rad needs only |u| = 0.65 and a 60-degree tilt needs 4.17; the box has to
+# cover the pitch_rate term too, which is what actually saturated it.
+# +-24, not +-6. find_uniform_lambda certifies lbd=0.0514 here and NOTHING at
+# +-6 (infeasible at every lambda down to 0.01, 2026-08-27). The shipped 0.0514
+# was therefore right about the rate and wrong about the actuator, which is what
+# the 95%-of-steps clamp rate and 'zero gain beats every nonzero gain' were both
+# reporting: the controller was certified for an actuator it did not have.
+# Shrinking X instead does not work -- infeasible at 0.75x and 0.5x -- because
+# the difficulty is unstable tilt (max Re eig A = +2.76, |A| = 15.3), which wants
+# gain rather than a smaller region. p99|u| was already ~10 against the old +-6.
+UREF_MIN = [-24.0]
+UREF_MAX = [24.0]
+
+# Initial state drawn directly from this box (see env_base.X_INIT_MIN),
+# placing every episode start in the plant's low-lambda region:
+# lbd*(x0) median 0.2207 -> 0.0987. The sign dims are
+# mirrored by one shared sign, because the slow set is two lobes on a
+# diagonal that no single box can cover.
+# The pitch ceiling is PITCH_LIM, not a literal: it used to be 1.0467, the old
+# pi/3 box bound, and when the box moved to 0.90 the 37.9% of this range above
+# 0.90 was clamped straight onto the box face. That is not a cosmetic artifact --
+# x_0 pinned to a boundary is not the draw this box describes, and every
+# Stability/* metric is normalised by the error at x_0. Derive it so the two
+# cannot drift apart again (scripts/check_boxes.py fails loudly if they do).
+# rule.md Step 3, redone 2026-08-27 AFTER the uniform lambda was known -- which is
+# the whole point of the ordering, and was not done for the previous box.
+#
+# The previous X_INIT had X_INIT_MAX[pitch] == X_MAX[pitch] EXACTLY (0.8999997 both).
+# Episodes therefore spawned on the wall and pitch clamped on 100% of steps, so the
+# simulated plant was not f+Bu and AUC had nothing to converge to: measured flat at
+# 79-92 over 33k steps with contraction rate 0.025 against the certified 0.0514.
+#
+# Where the hard region actually is, from the certified metric (lam(x) = largest
+# rate satisfying A_cl'M + M A_cl + 2 lam M <= 0, A_cl = A - B(1/r)B'M):
+#     lam over X: min 0.0686  median 0.2732  max 0.4319   -> 6.3x spread,
+#     so the rate IS state-dependent and Step 3's low-rate rule applies.
+#     corr(lam, |pitch|) = -0.226  <- the only dim that drives it
+#     corr(lam, |pos_x|) = +0.002, |vel_x_b| = -0.014, |pitch_rate| = +0.148
+#     hardest 5% of states sit at mean |pitch| 0.797 (vs 0.444 over all of X).
+# min lam 0.0686 >= the certified uniform 0.0514, an independent check that the
+# certificate is sound.
+#
+# So spawn at high tilt -- |pitch| in [0.65, 0.78] is inside that hardest band --
+# but stop short of the 0.90 wall, and start the body slow so the recovery
+# transient has somewhere to go. Measured with the certified controller over 400
+# steps x 128 envs: pitch clamps 0.000 of steps, clamp_any 0.027 (all of it
+# vel_x_b transient), and the error contracts to 0.64% of e(0), well past Step 5's
+# 95%. Raising the tilt further only trades error reduction for clamping.
+# pitch_rate is NEGATIVE against a positive pitch on purpose: X_INIT_SIGN_DIMS
+# mirrors dims 1-3 together, so the draw is (+pitch, -rate) or (-pitch, +rate) and
+# never the same-sign quadrant. That diagonal is where the plant is actually slow,
+# and the certified metric says so plainly -- restricted to the |pitch| > 0.6 band
+# used here, mean lam is 0.168 on the opposite-sign diagonal against 0.331 on the
+# same-sign one, and the global minimum 0.0686 lives on it. A symmetric pitch_rate
+# range would send half of every batch to the easy quadrant.
+#
+# Chosen among four diagonal candidates by measurement; this one is simultaneously
+# the hardest and the cleanest, so there is no trade to argue about:
+#     pitch_rate band     mean lam in box   clamp_any   e(T)/e(0)
+#     [-0.15, -0.05]           0.2383         0.029       0.0064
+#     [-0.60, -0.20]           0.2218         0.020       0.0053
+#     [-1.50, -0.60]           0.1938         0.016       0.0034   <- this one
+#     wider tilt               0.2148         0.026       0.0048
+X_INIT_MIN = [-2.0, 0.65, 0.0, -1.50]
+X_INIT_MAX = [2.0, 0.78, 0.05, -0.60]
+X_INIT_SIGN_DIMS = [1, 2, 3]
+
+ENV_CONFIG = {
+    "x_min": X_MIN,
+    "x_max": X_MAX,
+    "x_termination_min": X_TERMINATION_MIN,
+    "x_termination_max": X_TERMINATION_MAX,
+    "xref_init_min": XREF_INIT_MIN,
+    "xref_init_max": XREF_INIT_MAX,
+    "x_init_min": X_INIT_MIN,
+    "x_init_max": X_INIT_MAX,
+    "x_init_sign_dims": X_INIT_SIGN_DIMS,
+    "xe_init_min": XE_INIT_MIN,
+    "xe_init_max": XE_INIT_MAX,
+    "xe_min": XE_MIN,
+    "xe_max": XE_MAX,
+    "state_names": STATE_NAMES,
+    "uref_min": UREF_MIN,
+    "uref_max": UREF_MAX,
+    "num_dim_x": 4,
+    "num_dim_control": 1,
+    "dt": 0.03,
+    # 60 s, not 15. At the certified lambda = 0.0514 an exponential decay needs
+    # ln(20)/lambda = 58.3 s to bring the error to 5% of its initial value; 15 s
+    # reached only exp(-0.771) = 46%, so the episode ended while the error was
+    # still half its starting size. dt stays 0.03: at 0.12 (the value that would
+    # keep 500 steps) forward-Euler error over 2 s open-loop goes from 15% to 41%
+    # on this unstable plant, and lambda*dt from 0.096 to 0.383.
+    #
+    # The CM dataset does NOT need regenerating: its cache key is
+    # (lbd, w_lb, w_ub, eps, solver, N, r_scaler, chi/nu_weight, wdot_dt,
+    # random_ratio, wdot_trajectory, temporal_dt) -- no env dt and no time_bound --
+    # and the SDP samples the state box with continuous-time Jacobians, so lambda
+    # is a rate in 1/s that episode length never enters. Verified by preflight.
+    "time_bound": 60.0,
+    # Episodes run the full horizon rather than ending on the first excursion
+    # from the termination box. This plant is unstable and pi starts from random
+    # init (u = uref + pi, no warm-start), so with the box armed every episode
+    # ended after ~5 of 500 steps, and stability_summary() then withholds AUC /
+    # contraction rate / overshoot / score entirely -- publishing only
+    # early_end_frac -- because no episode survives to be measured. Running the
+    # full horizon lets AUC measure the divergence instead of the metric being
+    # unavailable.
+    #
+    # Safe on the reward side: the excursion was reported as TRUNCATION, not
+    # termination, and every c2rl-ppo yaml sets time_limit_bootstrap: true, so
+    # there was never a suicide bonus to lose here (see termination_box.py).
+    # The cost is the one that box existed to prevent: a diverged episode now
+    # contributes its remaining off-distribution steps to the rollout batch,
+    # which is a known source of seed-to-seed variance on these two envs.
+    "terminate_out_of_box": False,
+    "q": 1.0,
+    "r": 0.0,
+}
+
+class SegwayEnv(BaseEnv):
+    def __init__(
+        self,
+        num_envs: int = 1,
+        device: str = "cpu",
+        sample_mode: str = "uniform",
+        time_bound: float | None = None,
+        dt: float | None = None,
+        **kwargs,
+    ):
+        self.task = "segway"
+        super().__init__(
+            self._build_cfg(ENV_CONFIG, sample_mode=sample_mode, time_bound=time_bound, dt=dt, **kwargs),
+            num_envs=num_envs,
+            device=device
+        )
+
+    def _f_logic(self, x):
+        n = x.shape[0]
+        p, theta, v, omega = [x[:, i] for i in range(self.num_dim_x)]
+        f = self._zeros((n, self.num_dim_x), x)
+        f[:, 0] = v
+        f[:, 1] = omega
+        f[:, 2] = (
+            torch.cos(theta) * (9.8 * torch.sin(theta) + 11.5 * v)
+            + 68.4 * v
+            - 1.2 * (omega**2) * torch.sin(theta)
+        ) / (torch.cos(theta) - 24.7)
+        f[:, 3] = (
+            -58.8 * v * torch.cos(theta)
+            - 243.5 * v
+            - torch.sin(theta) * (208.3 + (omega**2) * torch.cos(theta))
+        ) / (torch.cos(theta) ** 2 - 24.7)
+        return f
+
+    def _B_logic(self, x):
+        n = x.shape[0]
+        theta = x[:, 1]
+        B = self._zeros((n, self.num_dim_x, self.num_dim_control), x)
+        B[:, 2, 0] = (-1.8 * torch.cos(theta) - 10.9) / (torch.cos(theta) - 24.7)
+        B[:, 3, 0] = (9.3 * torch.cos(theta) + 38.6) / (torch.cos(theta) ** 2 - 24.7)
+        return B
+
+    def _B_null_logic(self, x):
+        n = x.shape[0]
+        theta = x[:, 1]
+        Bbot = self._zeros((n, self.num_dim_x, self.num_dim_x - self.num_dim_control), x)
+        Bbot[:, 0, 0] = 1.0
+        Bbot[:, 1, 1] = 1.0
+        Bbot[:, 2, 2] = (9.3 * torch.cos(theta) + 38.6) / (torch.cos(theta) ** 2 - 24.7)
+        Bbot[:, 3, 2] = -(-1.8 * torch.cos(theta) - 10.9) / (torch.cos(theta) - 24.7)
+        return Bbot
+
+    def sample_reference_controls(self, freqs, weights, _t, infos):
+        n = weights.shape[0]
+        xref_0 = infos["xref_0"]
+        uref = torch.zeros(n, self.num_dim_control, device=self.device)
+        uref[:, 0] = 10.2 * xref_0[:, 2] / 47.9
+        for i, freq in enumerate(freqs):
+            weight = weights[:, i, :]
+            term = weight[:, 0] * torch.cos(torch.floor(torch.as_tensor(freq * _t / self.time_bound, device=self.device)) * math.pi) * torch.sin(torch.as_tensor(freq * _t / self.time_bound * 2 * math.pi, device=self.device))
+            uref[:, 0] += term
+        return torch.clamp(uref, self.UREF_MIN, self.UREF_MAX)
+
+    def system_reset(self, env_ids: torch.Tensor):
+        xref_0, xe_0, x_0 = self.define_initial_state(env_ids)
+        freqs = []
+        n = len(env_ids)
+        if len(freqs) > 0:
+            weights = torch.randn(n, len(freqs), len(UREF_MIN), device=self.device)
+            weights = 0.0 * weights / torch.sqrt((weights**2).sum(dim=1, keepdim=True))
+        else:
+            weights = torch.zeros(n, 0, len(UREF_MIN), device=self.device)
+        xref_arr, uref_arr, length = self._rollout_reference(xref_0, freqs, weights)
+        return x_0, xref_arr, uref_arr, length

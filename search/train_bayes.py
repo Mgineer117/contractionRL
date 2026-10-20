@@ -20,6 +20,10 @@ import traceback
 
 import yaml
 
+# Resolve models from this checkout before an editable installation can load them.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "source/contractionRL"))
+from car_bayes_runtime import evaluate_sweep
+
 OBJECTIVE = 'Evaluation/Stability/validation_auc_mean'
 BAD_OBJECTIVE = 1e6
 
@@ -30,24 +34,34 @@ def resolve_config(base, parameters):
     if not 0 < low < high or not all(map(math.isfinite, (low, high))):
         raise ValueError('Invalid paired CCM spectral bounds')
     cfg['cm'].update(ccm_w_lb=low, ccm_w_ub=high)
-    family = parameters['network_family']
-    if family not in ('compact_mlp', 'dual_gru'):
-        raise ValueError('Unknown network family')
-    temporal = family == 'dual_gru'
-    policy, critic = cfg['models']['policy'], cfg['models']['critic']
-    policy.update(temporal_context=temporal, use_history=temporal, preview_steps=0,
-                  encoder='gru' if temporal else 'mlp', encoder_hidden=64, encoder_stride=1)
-    critic.update(encoder='gru' if temporal else 'mlp', embed_dim=64, encoder_stride=1)
-    architecture = parameters['policy_architecture']
-    if architecture not in ('structured_residual', 'factorized'):
-        raise ValueError('Unknown policy architecture')
-    policy['control_mode'] = 'structured' if architecture == 'structured_residual' else 'factorized'
+    architecture = parameters.get('policy_architecture')
+    if architecture is not None:
+        if architecture not in ('structured_residual', 'factorized'):
+            raise ValueError('Unknown policy architecture')
+        cfg['models']['policy']['control_mode'] = 'structured' if architecture == 'structured_residual' else 'factorized'
+    pair = parameters.get('encoder_pair')
+    if pair is not None:
+        pairs = {'null:null': (None, None), 'null:gru': (None, 'gru'), 'gru:gru': ('gru', 'gru')}
+        if pair not in pairs:
+            raise ValueError('Unknown policy/critic encoder pair')
+        if any(key in parameters for key in ('models.policy.encoder', 'models.critic.encoder')):
+            raise ValueError('encoder_pair cannot be combined with individual encoder overrides')
+        cfg['models']['policy']['encoder'], cfg['models']['critic']['encoder'] = pairs[pair]
     for key, value in parameters.items():
-        if key.startswith('agent.'):
-            leaf = key.split('.', 1)[1]
-            if leaf not in cfg['agent']:
-                raise ValueError('Unknown agent parameter: ' + leaf)
-            cfg['agent'][leaf] = value
+        if key.startswith(('agent.', 'models.')):
+            *parents, leaf = key.split('.')
+            node = cfg
+            for parent in parents:
+                if parent not in node:
+                    raise ValueError('Unknown parameter: ' + key)
+                node = node[parent]
+            if leaf not in node:
+                raise ValueError('Unknown parameter: ' + key)
+            node[leaf] = value
+        elif key not in {'policy_architecture', 'ccm_bounds', 'lr_schedule', 'encoder_pair'}:
+            raise ValueError('Unknown parameter: ' + key)
+    from contractionRL.agents.utils.RL.config import validate_experiment_config
+    validate_experiment_config(cfg)
     cfg['agent']['value_expansion_horizon'] = 10
     cfg['agent']['value_expansion_batch_size'] = 512
     schedule = parameters.get('lr_schedule')
@@ -66,15 +80,27 @@ def resolve_config(base, parameters):
             raise ValueError(key + ' must be a positive integer')
     if cfg['agent']['rollouts'] % cfg['agent']['mini_batches']:
         raise ValueError('mini_batches must divide rollouts')
+    cfg['_tuned_parameters'] = [key for key in parameters if key.startswith(('agent.','models.'))]
+    if pair is not None:
+        cfg['_tuned_parameters'].extend(['models.policy.encoder', 'models.critic.encoder'])
     return cfg
 
 
 def objective(result):
     value = result.get('auc_mean')
     if (result.get('status') != 'COMPLETED' or result.get('completed_episodes') != 512
-            or value is None or not math.isfinite(value)):
-        return BAD_OBJECTIVE
-    return min(float(value), BAD_OBJECTIVE - 1)
+            or value is None or not math.isfinite(value) or value < 0):
+        raise ValueError('Validation requires 512 complete trajectories and a finite nonnegative AUC')
+    return float(value)
+
+
+def check_policy_updates(kls):
+    if not kls or not all(math.isfinite(value) and value >= 0 for value in kls):
+        raise RuntimeError('GPU check requires finite nonnegative PPO post-update KL measurements')
+    changed = sum(value > 0 for value in kls)
+    if not changed:
+        raise RuntimeError('GPU check observed no PPO policy movement; refusing to launch a sweep agent')
+    return dict(updates=len(kls), changed=changed)
 
 
 def write_json(path, data):
@@ -83,12 +109,23 @@ def write_json(path, data):
     temporary.replace(path)
 
 
+def finish_run(run, result, step):
+    succeeded = result['status'] == 'COMPLETED'
+    metrics = {'Training/Learning/Search/failed': int(not succeeded), 'global_step': step}
+    if succeeded and result['objective'] is not None:
+        metrics[OBJECTIVE] = result['objective']
+        run.summary[OBJECTIVE] = result['objective']
+    run.log(metrics)
+    run.summary['sweep_result_status'] = result['status']
+    run.finish(exit_code=0 if succeeded else 1)
+
+
 def progress(text, target):
     matches = re.findall(r'(?<!\d)([\d,]+)\s*/\s*' + f'{target:,}'.replace(',', ',?') + r'(?!\d)', text)
     return max([0] + [min(target, int(value.replace(',', ''))) for value in matches])
 
 
-def trial(root, *, smoke=None, steps=None, checkpoint=None):
+def trial(root, *, smoke=None, steps=None, checkpoint=None, smoke_evaluate=False):
     import wandb
     root = root.resolve()
     plan = json.loads((root / 'plan.json').read_text())
@@ -96,7 +133,17 @@ def trial(root, *, smoke=None, steps=None, checkpoint=None):
                      config=smoke, mode='disabled' if smoke is not None else 'online',
                      settings=wandb.Settings(console='off'))
     parameters = dict(run.config)
-    cfg = resolve_config(yaml.safe_load((root / 'base_config.yaml').read_text()), parameters)
+    from contractionRL.agents.utils.RL.config import load_agent_config
+    cfg = resolve_config(load_agent_config(root / 'base_config.yaml'), parameters)
+    metric_receipt = plan.get('pretrained_metrics', {}).get(parameters['ccm_bounds'])
+    if plan.get('require_pretrained_metric') and not metric_receipt:
+        raise ValueError('No pretrained metric for sampled CCM bounds')
+    if metric_receipt:
+        metric_path = root / metric_receipt['path']
+        if hashlib.sha256(metric_path.read_bytes()).hexdigest() != metric_receipt['sha256']:
+            raise ValueError('Pretrained metric checksum mismatch')
+        cfg['agent']['cmg_checkpoint'] = str(metric_path)
+        cfg['cmg']['ccm_epochs'] = 0
     identity = ('smoke-' + os.environ.get('CRL_SMOKE_NAME', str(os.getpid()))) if smoke is not None else run.id
     folder = root / ('preflight' if smoke is not None else 'trials') / identity
     folder.mkdir(parents=True, exist_ok=False)
@@ -104,7 +151,7 @@ def trial(root, *, smoke=None, steps=None, checkpoint=None):
     cfg['agent']['experiment'].update(directory=str(folder / 'training'), write_interval=500,
                                         checkpoint_interval=0, wandb=False)
     cfg['trainer']['timesteps'] = target
-    if smoke is not None:
+    if smoke is not None and not metric_receipt:
         cfg['cmg']['ccm_epochs'] = 2
         cfg['cmg']['ccm_memory_size'] = 128
         cfg['cmg']['ccm_batch_size'] = 64
@@ -112,6 +159,7 @@ def trial(root, *, smoke=None, steps=None, checkpoint=None):
     config.write_text(yaml.safe_dump(cfg, sort_keys=False))
     machine = os.environ.get('CRL_SWEEP_MACHINE', socket.gethostname())
     state = dict(status='STARTING', current_steps=0, target_steps=target, training_pid=os.getpid(),
+                 source_sha256=plan.get('source_sha256'),
                  machine=machine, gpu_index=os.environ.get('CUDA_VISIBLE_DEVICES'),
                  configuration=str(config), parameters=parameters, seed=plan['seed'],
                  started_at=datetime.now(timezone.utc).isoformat())
@@ -123,6 +171,7 @@ def trial(root, *, smoke=None, steps=None, checkpoint=None):
                  slurm_job_id=os.environ.get('SLURM_JOB_ID'), node=socket.gethostname(),
                  seed=plan['seed'], seeds=[plan['seed']],
                  target_steps=target, recorded_status='STARTING', dependencies=[plan['id']],
+                 source_sha256=plan.get('source_sha256'),
                  process_pattern=' '.join(sys.argv), log_path=str(folder / 'rawtrain.log'),
                  wandb_url=run.url if smoke is None else None, parameters=parameters,
                  history=[dict(at=state['started_at'], status='STARTING')])
@@ -154,21 +203,22 @@ def trial(root, *, smoke=None, steps=None, checkpoint=None):
 
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
-    result = dict(status='FAILED', objective=BAD_OBJECTIVE, parameters=parameters)
+    result = dict(status='FAILED', objective=None, parameters=parameters)
     sys.path[:0] = [str(root / 'code/source/contractionRL'), str(root / 'code/scripts/skrl'), str(root)]
     import train_utils
     original_finish = train_utils.finish_wandb
+    train_utils.install_wandb_scalar_hook()
     original_argv = sys.argv[:]
     original_directory = Path.cwd()
-    smoke_skips = []
+    smoke_kls = []
     original_track = None
     if smoke is not None:
         from skrl.agents.torch.ppo import PPO
         original_track = PPO.track_data
 
         def track_smoke(agent, tag, value):
-            if tag == 'Learning / KL guard skipped update':
-                smoke_skips.append(float(value))
+            if tag == 'Policy / KL divergence':
+                smoke_kls.append(float(value))
             return original_track(agent, tag, value)
 
         PPO.track_data = track_smoke
@@ -179,35 +229,38 @@ def trial(root, *, smoke=None, steps=None, checkpoint=None):
         state['status'] = 'TRAINING'
         os.chdir(folder)
         sys.argv = [str(root / 'code/scripts/skrl/train.py'), '--classic', '--task', 'classic-car-v0',
-                    '--cfg', str(config), '--algorithm', 'c2rl_ppo', '--mode', 'analytical',
+                    '--cfg', str(config), '--algorithm', 'c2rl_ppo',
                     '--num_envs', str(plan['num_envs']), '--seed', str(plan['seed']),
                     '--num_timesteps', str(target), '--device', 'cuda:0', '--skip_final_eval',
-                    '--wandb_project', plan['project']]
+                    '--wandb_project', plan['project'], '--no_wandb']
         if checkpoint:
             sys.argv.extend(['--checkpoint', str(checkpoint)])
         with (folder / 'rawtrain.log').open('x') as log, contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
             namespace = runpy.run_path(sys.argv[0], run_name='__main__')
             owner = namespace['runner'].agent
+            if metric_receipt:
+                import torch
+                expected = torch.load(metric_path, map_location='cpu', weights_only=False)['cmg']
+                for key, value in owner.models['cmg'].state_dict().items():
+                    if not torch.equal(value.cpu(), expected[key]):
+                        raise RuntimeError('Pretrained metric changed during policy training: ' + key)
+                result['pretrained_metric'] = dict(**metric_receipt, unchanged_after_training=True,
+                                                 loaded_from=owner._restored_cmg_checkpoint)
             if smoke is not None:
-                accepted = sum(value == 0. for value in smoke_skips)
-                result['policy_update_check'] = dict(accepted=accepted, skipped=sum(smoke_skips))
-                if not accepted:
-                    raise RuntimeError('GPU check accepted no PPO policy updates; refusing to launch a sweep agent')
+                result['policy_update_check'] = check_policy_updates(smoke_kls)
             final = Path(owner.experiment_dir) / 'checkpoints' / f'agent_{target}.pt'
             final.parent.mkdir(exist_ok=True)
             owner.save(str(final))
         state.update(status='EVALUATING', current_steps=target)
         result.update(checkpoint=str(final), checkpoint_sha256=hashlib.sha256(final.read_bytes()).hexdigest(),
                       actual_configuration=str(final.parent.parent / 'params/agent.yaml'))
-        if smoke is None:
-            import evaluate_sweep
+        if smoke is None or smoke_evaluate:
             evaluation = evaluate_sweep.evaluate(root, str(final), 'validation', folder / 'evaluation/validation',
                                                   metric_checkpoint=str(final))
             score = objective(evaluation)
-            result.update(status='COMPLETED' if score < BAD_OBJECTIVE else 'EVALUATION_FAILED',
-                          validation=evaluation, objective=score)
+            result.update(status='COMPLETED', validation=evaluation, objective=score)
         else:
-            result.update(status='COMPLETED', objective=0.)
+            result.update(status='COMPLETED')
     except Exception as error:
         result.update(error=str(error), traceback=traceback.format_exc())
         (folder / 'failure.txt').write_text(result['traceback'])
@@ -225,11 +278,8 @@ def trial(root, *, smoke=None, steps=None, checkpoint=None):
         entry.update(recorded_status=result['status'], current_steps=state['current_steps'], results=result,
                      observed_at=datetime.now(timezone.utc).isoformat())
         write_json(folder / 'manifest.json', entry)
-        run.log({OBJECTIVE: result['objective'], 'Training/Learning/Search/failed': int(result['status'] != 'COMPLETED'), 'global_step': state['current_steps']})
-        run.summary[OBJECTIVE] = result['objective']
-        run.summary['sweep_result_status'] = result['status']
-        run.finish(exit_code=0 if smoke is None or result['status'] == 'COMPLETED' else 1)
-    if smoke is not None and result['status'] != 'COMPLETED':
+        finish_run(run, result, state['current_steps'])
+    if result['status'] != 'COMPLETED':
         raise RuntimeError(result.get('error'))
     return result
 
@@ -240,6 +290,8 @@ if __name__ == '__main__':
     parser.add_argument('--smoke-config', type=Path)
     parser.add_argument('--smoke-steps', type=int, default=128)
     parser.add_argument('--checkpoint', type=Path)
+    parser.add_argument('--smoke-evaluate', action='store_true')
     args, _ = parser.parse_known_args()
     sampled = yaml.safe_load(args.smoke_config.read_text()) if args.smoke_config else None
-    trial(args.root, smoke=sampled, steps=args.smoke_steps if sampled is not None else None, checkpoint=args.checkpoint)
+    trial(args.root, smoke=sampled, steps=args.smoke_steps if sampled is not None else None,
+          checkpoint=args.checkpoint, smoke_evaluate=args.smoke_evaluate)

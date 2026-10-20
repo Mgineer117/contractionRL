@@ -1,31 +1,44 @@
-mode: sim_to_real
 seed: 42
 models:
-  separate: true
-  policy:
-    class: GaussianMixin
-    backbone: mlp
-    clip_actions: false
-    clip_log_std: true
-    min_log_std: -20.0
-    max_log_std: 2.0
-    initial_log_std: 0.0
+  encoder:
+    feature_dim: null  # null defaults to 3 * x_dim per GRU.
+    encoder_window: null  # null uses ceil(1 / (1 - discount_factor)) steps for each past/future window.
+  dynamics:
+    class: NeuralDynamics
     network:
     - name: net
-      input: OBSERVATIONS
+      input: STATE_ACTION
       layers:
       - 128
       - 128
       activations: tanh
+  separate: true
+  policy:
+    class: GaussianMixin
+    encoder: null  # No GRU; use gru to encode past and future context.
+    clip_actions: false
+    clip_log_std: true
+    min_log_std: -6.9
+    max_log_std: 2.0
+    network:
+    - name: net
+      input: OBSERVATIONS
+      layers:
+      - 256
+      - 256
+      activations: tanh
     output: ACTIONS
+    initial_log_std: -0.5
+    control_mode: structured
   value:
+    encoder: gru  # Separate GRUs encode past and future context.
     class: DeterministicMixin
     network:
     - name: net
       input: OBSERVATIONS
       layers:
-      - 128
-      - 128
+      - 256
+      - 256
       activations: tanh
     output: ONE
 memory:
@@ -33,37 +46,58 @@ memory:
   memory_size: -1
 agent:
   class: PPO
-  rollouts: 24
+  rollouts: 64
   learning_epochs: 5
   mini_batches: 4
-  discount_factor: 0.99
-  learning_rate: 1.0e-5
+  gae_lambda: 0.95
+  learning_rate: 1.0e-05
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.008
     kl_factor: 2
     lr_factor: 1.5
-    min_lr: 1.0e-6
-    max_lr: 1.0e-4
+    min_lr: 1.0e-06
+    max_lr: 0.0001
   random_timesteps: 0
   learning_starts: 0
   grad_norm_clip: 0.5
   ratio_clip: 0.2
   value_clip: 0.0
-  entropy_loss_scale: 0.001
-  value_loss_scale: 0.5
+  entropy_loss_scale: 0.0
+  value_loss_scale: 2.5
   kl_threshold: 0.032
-  rewards_shaper_scale: 1.0
   time_limit_bootstrap: true
+  rewards_shaper_scale: 1.0
+  use_state_norm: false
+  use_value_norm: false
+  discount_factor: 0.995
   experiment:
     directory: quadruped_vel_tracking
     experiment_name: ''
     write_interval: auto
     checkpoint_interval: auto
-  gae_lambda: 0.95
-  use_state_norm: false
-  use_value_norm: true
+    wandb: true
+    wandb_kwargs:
+      project: contractionRL
+      name: null
+  use_reward_norm: false
+  use_value_expansion: false
+  value_expansion_horizon: 3
+  value_expansion_batch_size: 512
+  action_bound_penalty_beta: 0.0
 trainer:
   class: SequentialTrainer
-  timesteps: 100000
+  timesteps: 500000
   environment_info: log
+empirical_dynamics:
+  dynamics_lr: 0.001
+  dynamics_lr_scheduler: StepLR
+  dynamics_lr_scheduler_kwargs:
+    step_size: 1
+    gamma: 0.999
+  dynamics_batch_size: 4096
+  dynamics_pretrain_epochs: 100
+  dynamics_pretrain_data_path: ''
+  emp_dynamics_memory_size: 8192
+  dynamics_val_frac: 0.1
+  dynamics_early_stop_patience: 10

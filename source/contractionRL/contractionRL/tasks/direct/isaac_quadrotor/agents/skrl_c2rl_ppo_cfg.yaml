@@ -1,0 +1,45 @@
+extends: skrl_ppo_cfg.yaml
+models:
+  cmg:
+    class: CMG
+    network:
+    - name: net
+      input: OBSERVATIONS
+      layers:
+      - 128
+      - 128
+      activations: tanh
+agent:
+  class: C2RL-PPO
+  use_value_expansion: true
+  action_bound_penalty_beta: 0.01
+  value_expansion_horizon: 10
+  experiment:
+    directory: quadrotor_c2rl_ppo
+cm:
+  ccm_w_ub: 1000.0
+  ccm_w_lb: 0.001
+  ccm_lbd: 1.3169
+  cvstem_w_ub: 1000.0
+  cvstem_w_lb: 0.001
+  cvstem_lbd: 1.3169
+  tracking_scaler: 1.0
+  control_scaler: 0.0
+  cm_eps: 0.01
+  cm_solver: MOSEK
+  cvstem_r_scaler: 0.1
+  cm_data_path: data/classic/quadrotor_zup_v2/cm_data.npz
+cmg:
+  ccm_memory_size: 100000
+  ccm_batch_size: 1024
+  cvstem_memory_size: 10000
+  regress_epochs: 3000
+  regress_lr: 0.001
+  regress_lr_scheduler: StepLR
+  regress_lr_scheduler_kwargs:
+    step_size: 1
+    gamma: 0.999
+  cvstem_batch_size: 512
+  early_stop_patience: 300
+trainer:
+  class: C2RLSkrlTrainer

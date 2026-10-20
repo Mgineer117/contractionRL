@@ -7,10 +7,10 @@ Run MBPO through the same PyTorch/skrl entrypoint, environment wrappers, evaluat
 python scripts/skrl/train.py --classic --task classic-car-v0 --algorithm mbpo --device cpu --num_envs 4 --num_timesteps 300000
 
 # Analytical Isaac car, parallel GPU environments.
-python scripts/skrl/train.py --task Isaac-Car-v0 --algorithm mbpo --mode analytical --num_envs 64 --headless
+python scripts/skrl/train.py --task Isaac-Classic-Car-v0 --algorithm mbpo --num_envs 64 --headless
 
 # PhysX car: the model learns from actual PhysX transitions.
-python scripts/skrl/train.py --task Isaac-Car-v0 --algorithm mbpo --mode sim_to_real --num_envs 64 --headless
+python scripts/skrl/train.py --task Isaac-Car-v0 --algorithm mbpo --num_envs 64 --headless
 
 # Add --video --video_length 150 --video_interval 20000 for W&B videos.
 python scripts/list_experiments.py --env Isaac-Car-v0 --algorithm mbpo
@@ -26,7 +26,7 @@ These are commands, not launched experiments. Use a separate policy/checkpoint f
 3. Branch one-step rollouts from real observations using the current stochastic policy. Sample an elite model and its predicted Gaussian noise for each branch. Store generated transitions in a separate bounded model replay.
 4. Use the existing skrl SAC update, including twin critics, target critics, entropy learning and Polyak averaging. For each gradient batch, choose real replay with probability `real_data_ratio` and model replay otherwise, matching the upstream buffer-selection convention. Empty model replay falls back to real replay. Model fitting always reads real replay directly.
 
-Tracking observations keep their declared layout. Synthetic endpoints copy the real branch's next reference and generator parameters/time, which evolve independently of the policy control. Only the physical state block is replaced by the model prediction. This keeps reference generation nominal and avoids learning or perturbing the reference. Wrapped physical angles stay wrapped; compact tracking clips remaining kinematics to the declared state bounds while preserving position excursions and marking them terminal. Other failure events use the learned terminal head.
+Tracking observations keep their declared layout. Synthetic endpoints copy the real branch's next reference and generator parameters/time, which evolve independently of the policy control. The physical state block is replaced by the model prediction. With GRU context, synthetic history appends the branch state and its own applied control; future references still come from the nominal bank. This keeps reference generation nominal and avoids learning or perturbing the reference. Wrapped physical angles stay wrapped; compact tracking clips remaining kinematics to the declared state bounds while preserving position excursions and marking them terminal. Other failure events use the learned terminal head.
 
 For compact tracking, both real and synthetic rewards use `r = ||x - xref||² - ||next_x - next_xref||²`, with wrapped angular errors and `M = I`. The model's reward output is used for other task layouts. Plant transitions are learned online for both analytical and PhysX backends; MBPO never calls the plant's analytical `get_f_and_B` or C2RL/C3M's offline dynamics collector.
 
@@ -57,6 +57,6 @@ Checkpoints include policy/critics, SAC optimizers, the entropy scalar, ensemble
 
 This is an independent skrl integration of [mbrl-lib's MBPO](https://github.com/facebookresearch/mbrl-lib/blob/3f93cccfc8d635f74e335a2f07aab6e9a48fc021/mbrl/algorithms/mbpo.py), inspected at commit `3f93cccfc8d635f74e335a2f07aab6e9a48fc021`. It follows the probabilistic ensemble, soft variance bounds/Gaussian likelihood, elite selection, branched rollouts, separate replay and SAC pattern. The upstream [Gaussian model](https://github.com/facebookresearch/mbrl-lib/blob/3f93cccfc8d635f74e335a2f07aab6e9a48fc021/mbrl/models/gaussian_mlp.py) and [model trainer](https://github.com/facebookresearch/mbrl-lib/blob/3f93cccfc8d635f74e335a2f07aab6e9a48fc021/mbrl/models/model_trainer.py) guided the model loss and validation path. No upstream runtime code or dependency is vendored.
 
-This baseline fixes the rollout horizon at one step, retains model data with a capacity-limited ring rather than an epoch schedule, uses skrl SAC, and learns a terminal head instead of requiring an environment-specific termination callback. It is not a bit-for-bit reproduction of the upstream MuJoCo benchmark configuration. Fixed one-step rollouts also let tracking tasks reuse exact nominal reference endpoints without an extra simulator or reference approximation. Asymmetric/privileged critic states, discrete controls, and reward shaping/normalization are rejected explicitly.
+This baseline fixes the rollout horizon at one step, retains model data with a capacity-limited ring rather than an epoch schedule, uses skrl SAC, and learns a terminal head instead of requiring an environment-specific termination callback. It is not a bit-for-bit reproduction of the upstream MuJoCo benchmark configuration. Fixed one-step rollouts also let tracking tasks reuse exact nominal reference endpoints without an extra simulator or reference approximation. Asymmetric/privileged critic states, discrete controls, and reward shaping are rejected explicitly.
 
 Model replay writes have a local aligned batch implementation: skrl 2.1.0's single-environment multi-sample insertion advances its write cursor separately for each tensor. MBPO generates multi-sample batches, so using that path directly misaligns transition columns. Tests cover column alignment across wraparound; the installed skrl package is not patched.

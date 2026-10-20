@@ -60,6 +60,7 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
         # policy, value fn, or the ref-traj collector (get_physical_state()).
         self._last_valid_state: torch.Tensor | None = None
         self._last_valid_reward: torch.Tensor | None = None
+        self._nonfinite_physics = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot_cfg)
@@ -101,6 +102,7 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
             ],
             dim=-1,
         )
+        self._nonfinite_physics |= (~torch.isfinite(state)).any(-1)
         if self._last_valid_state is None:
             self._last_valid_state = torch.nan_to_num(state)
         state = carry_forward_nonfinite(state, self._last_valid_state)
@@ -158,10 +160,19 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
         self._last_valid_reward = total_reward
         return total_reward
 
+    def get_tracking_error(self) -> torch.Tensor:
+        """EE linear-velocity and yaw-rate error norm, as used by Episode/auc."""
+        commands = self._cmd.get(self.episode_length_buf.float() * self.step_dt)
+        linear = self._robot.data.body_lin_vel_w[:, self._ee_id[0], :] - commands[:, :3]
+        yaw_rate = self._robot.data.body_ang_vel_w[:, self._ee_id[0], 2] - commands[:, 3]
+        return torch.linalg.vector_norm(torch.cat((linear, yaw_rate[:, None]), dim=-1), dim=-1)
+
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length
         terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         state = self.get_physical_state()
+        terminated |= self._nonfinite_physics
+        self.extras["nonfinite_physics"] = self._nonfinite_physics.clone()
         self.extras["terminal_physical_state"] = state.clone()
         self.extras["terminal_tracking_error"] = self.get_tracking_error().clone()
         ee = state[:, 14:17]
@@ -211,6 +222,7 @@ class ManipulatorVelTrackingEnv(DirectRLEnv):
 
         self._actions[env_ids] = 0.0
         self._prev_actions[env_ids] = 0.0
+        self._nonfinite_physics[env_ids] = False
         self._cmd.reset(env_ids)
 
         joint_pos = self._robot.data.default_joint_pos[env_ids]

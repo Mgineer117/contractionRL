@@ -5,14 +5,16 @@
 
 """Evaluate trained checkpoints and report their Stability/* metrics.
 
-Unlike a single-checkpoint viewer, this script is a multi-Model stability
-evaluator: given one ``--task``, it discovers every trained model for that env
+By default this script is a multi-model stability evaluator: given one
+``--task``, it discovers every trained model for that env
 (one per algorithm) and rolls each out for a single episode across
 ``num_envs_for_eval`` parallel envs, reading the batched contraction metrics
 (auc / contraction_rate / overshoot / contraction_score) from
 ``StatManagerEnvWrapper.stability_summary()`` — the same wrapper the training
 loop logs from. Results are printed as a per-algorithm table and saved to
 ``logs/play/<env>_stability_<ts>.json``.
+
+``--viewer`` instead continuously replays the selected Isaac policy at real time.
 
 Model discovery (per algorithm), in order:
   1. ``<models_dir>/<env>/<alg>.pt``          (default ``models_dir="models"``)
@@ -51,12 +53,20 @@ sys.path.insert(0, os.path.join(_checkout, "source", "contractionRL"))
 def _checkpoint_agent_cfg(checkpoint, fallback):
     """Restore the recorded architecture before constructing checkpoint models."""
     import yaml
+    from contractionRL.agents.utils.RL.config import load_agent_config
     path = Path(checkpoint).parent.parent / 'params' / 'agent.yaml'
     if path.is_file():
         fallback = yaml.safe_load(path.read_text())
     from train_utils import restore_checkpoint_model_config
     restore_checkpoint_model_config(fallback, checkpoint)
     return fallback
+
+def _reject_removed_flags():
+    removed = {'mode', 'encoder_stride', 'reference_preview_steps', 'critic_encoder_stride', 'critic_embed_dim', 'critic_combine'}
+    for arg in sys.argv[1:]:
+        if arg.startswith('--') and arg.split('=', 1)[0][2:].replace('-', '_') in removed:
+            parser.error(f"{arg.split('=', 1)[0]} was removed; use the recorded encoder configuration")
+
 
 parser = argparse.ArgumentParser(description="Multi-model Stability evaluation of skrl checkpoints.")
 parser.add_argument("--task", type=str, required=True, help="Name of the task/env.")
@@ -82,6 +92,18 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=None, help="Environment/agent seed.")
 parser.add_argument("--checkpoint", type=str, default=None, help="Explicit checkpoint path (single algorithm).")
+parser.add_argument("--viewer", action="store_true", help="Isaac: continuously replay the policy at real time until the viewer closes.")
+viewer_offsets = parser.add_mutually_exclusive_group()
+viewer_offsets.add_argument("--viewer_initial_offset", type=float, nargs=2, metavar=("DX", "DY"),
+                            help="Analytical car viewer: fixed initial position offset from the reference, in meters.")
+viewer_offsets.add_argument("--viewer_initial_offset_box", type=float, nargs=4,
+                            metavar=("DX_MIN", "DX_MAX", "DY_MIN", "DY_MAX"),
+                            help="Analytical car viewer: independently uniform initial position deviations, in meters.")
+viewer_offsets.add_argument("--viewer_initial_offset_signed_range", type=float, nargs=2,
+                            metavar=("MIN_MAG", "MAX_MAG"),
+                            help="Analytical car viewer: uniform magnitude and independent random sign for each position deviation.")
+parser.add_argument("--viewer_disturbance_bounds", type=float, nargs=2, metavar=("D_THETA", "D_V"),
+                    help="Analytical car viewer: heading-rate (rad/s) and acceleration (m/s^2) gust bounds.")
 parser.add_argument(
     "--ref_length", "--ref-length", dest="ref_length", type=int, default=None,
     help="Reference-window length. Default AUTO from the cfg's discount_factor, matching "
@@ -90,8 +112,6 @@ parser.add_argument(
 # Isaac-only extras (ignored on the classic route).
 parser.add_argument("--policy_control_mode", choices=["structured", "full", "residual"], default=None)
 parser.add_argument("--disable_disturbance", action="store_true", default=False)
-parser.add_argument("--mode", choices=["analytical", "sim_to_real"], default=None,
-                    help="Experiment setup; PhysX-only tasks always use sim_to_real.")
 parser.add_argument("--disable_fabric", action="store_true", default=False, help="Isaac: disable fabric.")
 parser.add_argument("--ml_framework", type=str, default="torch", choices=["torch", "jax"])
 
@@ -231,6 +251,78 @@ def _rollout_stability(env, agent, *, max_steps: int) -> dict:
     return env.stability_summary()
 
 
+def _set_viewer_initial_offset(raw, offset, upper=None, *, independent_signs=False):
+    """Change the car's reset distribution before observations and metrics reset."""
+    import torch
+
+    plant = getattr(raw, "plant", None)
+    if getattr(plant, "task", None) != "car" or plant.X_INIT_MIN is not None or plant.fix_ref_trajectories:
+        raise ValueError("--viewer_initial_offset requires an analytical car with unfixed reference episodes")
+    offset = torch.as_tensor(offset, device=plant.device, dtype=plant.XE_INIT_MIN.dtype)
+    upper = offset if upper is None else torch.as_tensor(upper, device=plant.device, dtype=offset.dtype)
+    if offset.shape != (2,) or upper.shape != (2,) or not torch.isfinite(torch.cat((offset, upper))).all():
+        raise ValueError("Initial position offset must contain two finite values")
+    if (offset > upper).any():
+        raise ValueError("Initial position offset lower bounds must not exceed upper bounds")
+    if independent_signs and (offset < 0).any():
+        raise ValueError("Signed initial position offset magnitudes must be nonnegative")
+    minimum = -upper if independent_signs else offset
+    if ((plant.XREF_INIT_MIN[:2] + minimum < plant.X_MIN[:2]).any()
+            or (plant.XREF_INIT_MAX[:2] + upper > plant.X_MAX[:2]).any()):
+        raise ValueError("Initial position offset would put reference starts outside the state domain")
+    plant.XE_INIT_MIN[:2] = offset
+    plant.XE_INIT_MAX[:2] = upper
+    plant.XE_INIT_SIGN_DIMS = [0, 1] if independent_signs else []
+    plant._ref_pool = None  # Discard starts drawn with the previous offset.
+
+
+def _view_policy(env, agent, simulation_app):
+    """Replay across automatic episode resets without performing learning updates."""
+    import time
+    import torch
+    from train_utils import evaluation_act
+
+    agent.enable_training_mode(False)
+    for model in getattr(agent, "models", {}).values():
+        if model is not None and hasattr(model, "eval"):
+            model.eval()
+    obs, _ = env.reset()
+    raw = env.unwrapped
+    dt = float(raw.step_dt)
+    display = None
+    if getattr(getattr(raw, "plant", None), "task", None) == "car":
+        from car_viewer import CarViewer
+        display = CarViewer(raw)
+
+    def focus_camera():
+        plant = getattr(raw, "plant", None)
+        if plant is not None and tuple(plant.state_names[:2]) == ("pos_x", "pos_y"):
+            px, py = plant.x_t[0, :2].tolist()
+            raw.sim.set_camera_view((px + 20., py + 20., 25.), (px + 8., py, 0.))
+
+    if display is None:
+        focus_camera()
+    print(f"[viewer] Continuous deterministic playback; dt={dt:g}s; no training.", flush=True)
+    step = 0
+    while simulation_app.is_running():
+        started = time.monotonic()
+        states = env.state() if hasattr(env, "state") else None
+        with torch.no_grad():
+            actions, _ = evaluation_act(agent, obs, states)
+        obs, _, terminated, truncated, _ = env.step(actions)
+        if display is not None:
+            display.update()
+        elif (terminated | truncated).flatten()[0]:
+            focus_camera()
+        step += 1
+        if step == 100 and os.environ.get("ISAAC_VIEWER_CAPTURE"):
+            from omni.kit.viewport.utility import capture_viewport_to_file, get_active_viewport
+            capture_viewport_to_file(get_active_viewport(), os.environ["ISAAC_VIEWER_CAPTURE"])
+        if step % 500 == 0:
+            print(f"[viewer] Simulated {step} steps ({step * dt:g}s).", flush=True)
+        time.sleep(max(0., dt - (time.monotonic() - started)))
+
+
 # ── Classic route ────────────────────────────────────────────────────────── #
 
 def build_classic_eval_runner(task, algorithm, agent_cfg, *, device, num_envs,
@@ -253,7 +345,7 @@ def build_classic_eval_runner(task, algorithm, agent_cfg, *, device, num_envs,
         _inject_angle_idx,
         _resolve_symmetry_for_env,
         normalize_agent_cfg,
-        configure_tracking_preview,
+        configure_tracking_context,
     )
 
     # Eval-time config hygiene: no wandb, throwaway experiment dir, headless.
@@ -294,8 +386,8 @@ def build_classic_eval_runner(task, algorithm, agent_cfg, *, device, num_envs,
         _offset = int(recorded.get("ref_offset", 1))
         _len = ref_length or recorded.get("ref_length") or env.unwrapped.full_ref_length(offset=_offset)
         env.unwrapped.configure_ref_window(length=_len, offset=_offset, gamma=_gamma)
-    configure_tracking_preview(env.unwrapped, agent_cfg)
-    env = BatchedGymnasiumWrapper(env)
+    configure_tracking_context(env.unwrapped, agent_cfg)
+    env = SkrlVecEnvWrapper(env, ml_framework=args.ml_framework)
     env = StatManagerEnvWrapper(env, num_envs_for_eval=num_envs_for_eval)
 
     if algorithm in _CONTRACTION_ALGOS:
@@ -319,7 +411,7 @@ def run_classic(args) -> list[dict]:
         sys.path.insert(0, _classic_dir)
     sys.path.append(os.path.dirname(__file__))
 
-    import contractionRL.tasks.direct.classic  # noqa: F401 — registers classic envs
+    import contractionRL.tasks.direct.common.tracking_tasks  # noqa: F401 — registers classic envs
     import gymnasium as gym
     import yaml
 
@@ -329,11 +421,8 @@ def run_classic(args) -> list[dict]:
         entry = (spec.kwargs or {}).get(entry_key)
         if entry is None:
             raise ValueError(f"No '{entry_key}' registered for {args.task}.")
-        pkg, fname = entry.split(":")
-        import importlib
-        pkg_obj = importlib.import_module(pkg)
-        with open(os.path.join(os.path.dirname(pkg_obj.__file__), fname)) as f:
-            return yaml.safe_load(f)
+        from contractionRL.agents.utils.RL.config import load_registered_agent_config
+        return load_registered_agent_config(args.task, entry_key)
 
     models = _discover_models(args.task, True, args.models_dir, args.algorithm, args.checkpoint)
     if not models:
@@ -346,8 +435,6 @@ def run_classic(args) -> list[dict]:
     for algorithm, ckpt in models:
         print(f"\n[play] === {algorithm} ===  ({ckpt})")
         agent_cfg = _checkpoint_agent_cfg(ckpt, _load_agent_cfg(algorithm))
-        if args.mode is not None:
-            agent_cfg["mode"] = args.mode
         if args.policy_control_mode is not None:
             agent_cfg["models"]["policy"]["control_mode"] = args.policy_control_mode
         agent_cfg["seed"] = args.seed if args.seed is not None else agent_cfg.get("seed", 42)
@@ -402,24 +489,24 @@ def run_isaac(args, simulation_app) -> list[dict]:
             print(f"  [SKIP] no config entry '{entry_key}' for {args.task}: {e}")
             continue
         env_cfg = load_cfg_from_registry(args.task, "env_cfg_entry_point")
-        from contractionRL.tasks.direct.classic_isaac.backend import configure_backend, configure_backend_agent
-        configure_backend(env_cfg, args.mode or agent_cfg.get("mode"))
+        from contractionRL.tasks.direct.common.isaac.backend import configure_backend, configure_backend_agent
+        backend = configure_backend(env_cfg, task=args.task)
         if args.policy_control_mode is not None:
             agent_cfg["models"]["policy"]["control_mode"] = args.policy_control_mode
         if args.disable_disturbance:
             if not hasattr(env_cfg, "disturbance_enabled"):
                 raise ValueError("--disable_disturbance supports classic-derived Isaac tasks")
             env_cfg.disturbance_enabled = False
-        configure_backend_agent(agent_cfg, env_cfg.mode, args.task, classic_derived=hasattr(env_cfg, "classic_task"))
+        if args.viewer_disturbance_bounds is not None:
+            if backend != "analytical" or getattr(env_cfg, "classic_task", None) != "classic-car-v0":
+                raise ValueError("--viewer_disturbance_bounds requires the analytical car viewer")
+            env_cfg.disturbance_scales = [0., 0., *args.viewer_disturbance_bounds]
+        configure_backend_agent(agent_cfg, args.task, classic_derived=hasattr(env_cfg, "classic_task"))
         if args.num_envs is not None:
             env_cfg.scene.num_envs = args.num_envs
         if device is not None:
             env_cfg.sim.device = device
         env_cfg.seed = args.seed if args.seed is not None else agent_cfg.get("seed", 42)
-        if getattr(env_cfg, "mode", None) == "sim_to_real" and hasattr(env_cfg, "physx_reference_path"):
-            from contractionRL.tasks.direct.classic_isaac.backend import checkpoint_reference_bank
-            env_cfg.physx_reference_path = checkpoint_reference_bank(ckpt)
-
         agent_cfg.setdefault("agent", {}).setdefault("experiment", {})
         agent_cfg["agent"]["experiment"]["wandb"] = False
         agent_cfg["agent"]["experiment"]["directory"] = os.path.abspath(os.path.join("logs", "play", "_scratch"))
@@ -427,8 +514,16 @@ def run_isaac(args, simulation_app) -> list[dict]:
         agent_cfg["agent"]["experiment"]["write_interval"] = 0
 
         env = gym.make(args.task, cfg=env_cfg, render_mode=None)
-        from train_utils import configure_tracking_preview
-        configure_tracking_preview(env.unwrapped, agent_cfg)
+        if args.viewer_initial_offset is not None:
+            _set_viewer_initial_offset(env.unwrapped, args.viewer_initial_offset)
+        elif args.viewer_initial_offset_box is not None:
+            dx_min, dx_max, dy_min, dy_max = args.viewer_initial_offset_box
+            _set_viewer_initial_offset(env.unwrapped, [dx_min, dy_min], [dx_max, dy_max])
+        elif args.viewer_initial_offset_signed_range is not None:
+            lo, hi = args.viewer_initial_offset_signed_range
+            _set_viewer_initial_offset(env.unwrapped, [lo, lo], [hi, hi], independent_signs=True)
+        from train_utils import configure_tracking_context
+        configure_tracking_context(env.unwrapped, agent_cfg)
         env = SkrlVecEnvWrapper(env, ml_framework=args.ml_framework)
         env = StatManagerEnvWrapper(env, num_envs_for_eval=args.num_envs_for_eval)
 
@@ -448,6 +543,9 @@ def run_isaac(args, simulation_app) -> list[dict]:
                 runner.agent.freeze_cmg()
                 C2RLSkrlTrainer._inject_ccm(env, runner.agent)
 
+            if args.viewer:
+                _view_policy(env, runner.agent, simulation_app)
+                return []
             max_steps = int(getattr(env, "max_episode_length", 1000)) + 1
             summary = _rollout_stability(env, runner.agent, max_steps=max_steps)
         finally:
@@ -511,9 +609,18 @@ def _save_results(task: str, results: list[dict]) -> None:
 # ── Entry point ──────────────────────────────────────────────────────────── #
 
 def main() -> None:
+    _reject_removed_flags()
     args_cli, _ = parser.parse_known_args()
+    if any(value is not None for value in (args_cli.viewer_initial_offset, args_cli.viewer_initial_offset_box,
+                                           args_cli.viewer_initial_offset_signed_range,
+                                           args_cli.viewer_disturbance_bounds)) and not args_cli.viewer:
+        parser.error("Viewer initial offsets and disturbance bounds require --viewer")
+    if args_cli.viewer_disturbance_bounds is not None and args_cli.disable_disturbance:
+        parser.error("--viewer_disturbance_bounds cannot be combined with --disable_disturbance")
 
     if args_cli.classic:
+        if args_cli.viewer:
+            parser.error("--viewer requires an Isaac task; remove --classic")
         parser.add_argument("--device", type=str, default=None, help="Compute device (default cuda:0 / cfg).")
         args_cli, _ = parser.parse_known_args()
         results = run_classic(args_cli)
@@ -548,4 +655,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    _reject_removed_flags()
     main()

@@ -323,7 +323,7 @@ class StatManagerEnvWrapper:
         num_envs = int(getattr(self.env, "num_envs", 1))
         self._num_envs_for_eval = min(num_envs, self._num_envs_for_eval)
         N = self._num_envs_for_eval
-        T = self._max_ep_len
+        T = self._max_ep_len + 1  # e(0) plus every physical transition endpoint.
         dev = self._device()
 
         self._eval_buffer = torch.zeros((N, T), dtype=torch.float32, device=dev)
@@ -466,7 +466,7 @@ class StatManagerEnvWrapper:
         #    that did not decrease are dropped from the average entirely (not
         #    counted as a 0) — this is a rate over contracting episodes only,
         #    not a score that also penalizes non-contracting ones.
-        lengths = tracking_steps.clamp(max=self._max_ep_len).reshape(-1, 1)
+        lengths = tracking_steps.clamp(max=self._max_ep_len + 1).reshape(-1, 1)
         end_idx = (lengths - 1).clamp(min=0)  # (N, 1), last real recorded index
         err_end = torch.gather(errs, 1, end_idx).squeeze(1)
         t_end = torch.gather(time_buffer, 1, end_idx).squeeze(1).clamp(min=1e-8)
@@ -611,7 +611,7 @@ class StatManagerEnvWrapper:
         self._recent_trajs = (res_x, res_xref, res_err)
         self._recent_maha_err = res_maha
 
-    def _record(self, obs: torch.Tensor, info: dict | None = None) -> None:
+    def _record(self, obs: torch.Tensor, info: dict | None = None, *, terminated=None, truncated=None) -> None:
         if not self._ensure_stats():
             return
 
@@ -631,7 +631,7 @@ class StatManagerEnvWrapper:
 
         unwrapped = getattr(self.env, "unwrapped", self.env)
         if isinstance(info, dict) and "tracking_error" in info:
-            # Classic BaseEnv (env_base.py): "tracking_error" is the true
+            # Classic BaseEnv (analytical_env.py): "tracking_error" is the true
             # per-env squared error computed before reset_idx() overwrites
             # x_t/xref for any env whose episode just ended — same ordering
             # fix as the reward computation. Reading it from `obs` instead
@@ -665,6 +665,14 @@ class StatManagerEnvWrapper:
             init_flags = torch.zeros(error.shape[0], dtype=torch.bool, device=self._device())
 
         early_end = self._early_end_flags(info)
+        if early_end is not None:
+            early_end = early_end.to(self._device())
+        terminal = torch.zeros(len(error), dtype=torch.bool, device=self._device()) if terminated is None else torch.as_tensor(
+            terminated, device=self._device()).reshape(-1).bool()
+        timeout = torch.zeros_like(terminal) if truncated is None else torch.as_tensor(
+            truncated, device=self._device()).reshape(-1).bool()
+        ended = terminal | timeout
+        terminal_errors = error.detach().clone()
 
         # Extract values for tracking
         err_vals = error.detach()
@@ -696,8 +704,24 @@ class StatManagerEnvWrapper:
                         init_maha_sq.reshape(-1).to(maha_err_vals), min=0.0))
                     maha_err_vals = torch.where(init_flags.reshape(-1), fresh_m, maha_err_vals)
             self._maha_seen = True
+        terminal_maha = None if not isinstance(info, dict) or "maha_tracking_error" not in info else torch.sqrt(
+            torch.clamp(info["maha_tracking_error"].reshape(-1).to(self._device()), min=0.0)).detach()
 
         obs_x = obs[:, xo:xo + pd].detach().cpu().numpy()
+        endpoint_positions = info.get("x", info.get("dynamics_x_next")) if isinstance(info, dict) else None
+        if endpoint_positions is None and isinstance(info, dict):
+            final = info.get("final_observation")
+            if isinstance(final, dict):
+                final = final.get("policy", final)
+            if isinstance(final, dict):
+                endpoint_positions = final.get("x")
+            elif torch.is_tensor(final):
+                endpoint_positions = final[:, xo:xo + pd]
+            if endpoint_positions is not None and len(endpoint_positions) != len(error):
+                mask = torch.as_tensor(info.get("_final_observation", ended), device=self._device()).reshape(-1).bool()
+                complete = torch.full((len(error), pd), float("nan"), device=self._device())
+                complete[mask] = torch.as_tensor(endpoint_positions, device=self._device())[:, :pd]
+                endpoint_positions = complete
 
         # The reference is taken as the env's whole trajectory, captured once
         # when a slot opens — not accumulated from the observation window. The
@@ -720,8 +744,8 @@ class StatManagerEnvWrapper:
             for old_slot in old_slots:
                 if not self._completed_slots[old_slot]:
                     self._completed_slots[old_slot] = True
-                    # Early termination: extend the final recorded error to the
-                    # end of the horizon so every slot has a full-length curve.
+                    # Close the old episode with its measured endpoint before
+                    # opening the autoreset episode at its own initial error.
                     # The slot keeps its env id — a completed episode must stay
                     # in the buffer until the whole buffer is reduced; freeing
                     # it here would let the very next init reuse and overwrite
@@ -730,10 +754,20 @@ class StatManagerEnvWrapper:
                     # box (not by the time limit)? Then the padding below is a
                     # fabrication, so the slot is excluded from every metric
                     # rather than padded into a plausible-looking full curve.
-                    if early_end is not None and bool(early_end[int(env_idx)]):
-                        self._invalid_slots[old_slot] = True
                     step = self._tracking_steps[old_slot]
-                    if step < self._max_ep_len:
+                    full = bool(ended[int(env_idx)]) and int(step) == self._max_ep_len
+                    failed = bool(terminal[int(env_idx)]) or (early_end is not None and bool(early_end[int(env_idx)]))
+                    self._invalid_slots[old_slot] = failed or not full
+                    if step <= self._max_ep_len:
+                        self._eval_buffer[old_slot, step] = terminal_errors[int(env_idx)] / self._e0[old_slot]
+                        if terminal_maha is not None:
+                            self._eval_buffer_maha[old_slot, step] = (terminal_maha[int(env_idx)] / self._e0_maha[old_slot]) ** 2
+                        self._time_buffer[old_slot, step] = step * self._dt
+                        self._tracking_steps[old_slot] = step + 1
+                        self._traj_x_buf[old_slot].append(
+                            np.full(pd, np.nan) if endpoint_positions is None else torch.as_tensor(endpoint_positions)[int(env_idx), :pd].detach().cpu().numpy())
+                        step = step + 1
+                    if step < self._max_ep_len + 1:
                         if self._invalid_slots[old_slot]:
                             # NaN, not the held last value: the curve simply has
                             # no data past the cut, and NaN is what makes the
@@ -745,7 +779,7 @@ class StatManagerEnvWrapper:
                             self._eval_buffer[old_slot, step:] = last_val
                             last_maha = self._eval_buffer_maha[old_slot, step-1] if step > 0 else 1.0
                             self._eval_buffer_maha[old_slot, step:] = last_maha
-                        time_steps_pad = torch.arange(step, self._max_ep_len, device=self._device(), dtype=torch.float32)
+                        time_steps_pad = torch.arange(step, self._max_ep_len + 1, device=self._device(), dtype=torch.float32)
                         self._time_buffer[old_slot, step:] = time_steps_pad * self._dt
 
             # Now assign a new slot (first come, first eval — no free slot means
@@ -784,7 +818,7 @@ class StatManagerEnvWrapper:
                 if maha_err_vals is not None:
                     self._e0_maha[fs] = maha_err_vals[fe].clamp(min=1e-8)
 
-            in_range = steps_a < self._max_ep_len
+            in_range = steps_a < self._max_ep_len + 1
             if in_range.any():
                 slot, env_id, step = (active_slots[in_range], env_ids_a[in_range],
                                       steps_a[in_range])
@@ -809,7 +843,12 @@ class StatManagerEnvWrapper:
             self._tracking_steps[active_slots] = nxt
             # Only active slots are touched, so this can never un-complete a slot
             # that finished in an earlier round.
-            self._completed_slots[active_slots] = nxt >= self._max_ep_len
+            done_here = ended[env_ids_a]
+            failed_here = terminal[env_ids_a] | (done_here & (steps_a < self._max_ep_len))
+            if early_end is not None:
+                failed_here |= early_end[env_ids_a].to(failed_here.device)
+            self._invalid_slots[active_slots] |= failed_here
+            self._completed_slots[active_slots] = (nxt >= self._max_ep_len + 1) | done_here
 
         # Check if all slots are completed
         if (self._tracking_env_ids != -1).all() and self._completed_slots.all():
@@ -818,6 +857,9 @@ class StatManagerEnvWrapper:
             self._tracking_env_ids.fill_(-1)
             self._completed_slots.fill_(False)
             self._invalid_slots.fill_(False)
+            if init_flags.any():
+                # The same transition also supplied the next episodes' e(0).
+                self._record(obs, info)
 
     @staticmethod
     def _obs_tensor(obs):
@@ -973,6 +1015,17 @@ class StatManagerEnvWrapper:
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
+        if isinstance(info, dict):
+            # Isaac tasks can reuse their extras/log dictionaries. Keep the
+            # wrapper's completed-population metrics out of that persistent
+            # dictionary, and reserve their namespace for fresh buffer rounds.
+            info = info.copy()
+            if isinstance(info.get("log"), dict):
+                info["log"] = info["log"].copy()
+                for key in tuple(info["log"]):
+                    normalized = "/".join(part.strip() for part in str(key).split("/"))
+                    if normalized.startswith(("Stability/", "Stability_maha/")):
+                        info["log"]["Diagnostics/Environment/" + normalized] = info["log"].pop(key)
         self._track_average_reward(reward, terminated, truncated)
         self._track_action_volatility(action, terminated, truncated)
         completion = self._track_episode_completion(terminated, truncated, info)
@@ -982,7 +1035,7 @@ class StatManagerEnvWrapper:
             info["log"]["Learning/episode_completion"] = completion
         o = self._obs_tensor(obs)
         if o is not None:
-            self._record(o, info if isinstance(info, dict) else None)
+            self._record(o, info if isinstance(info, dict) else None, terminated=terminated, truncated=truncated)
 
             # Inject metrics into info["log"] so skrl's trainer (cfg
             # `environment_info: log`, scalar tensors only) tracks them.
@@ -1046,18 +1099,26 @@ class StatManagerEnvWrapper:
     def stability_summary(self) -> dict[str, float]:
         if not self._initialized:
             return {}
+        population = {}
+        if self._compute_count > 0:
+            total = int(self._invalid_slots.numel())
+            population = {"completed_episodes": self._recent_valid_n,
+                          "failed_episodes": total - self._recent_valid_n,
+                          "total_episodes": total,
+                          "episode_completion": self._recent_valid_n / max(total, 1)}
         if self._compute_count > 0 and self._recent_valid_n == 0:
             # Every episode in the round was cut short, so AUC/lambda/C are
             # Unavailable, not zero and not the previous round's numbers.
             # Reporting only the fraction keeps the failure visible without
             # publishing a stale value under a fresh timestamp.
-            return {"early_end_frac": self._recent_early_end_frac}
+            return {"early_end_frac": self._recent_early_end_frac, **population}
         # Every metric carries the "{name}_mean"/"{name}_ci95" key shape that
         # track_stability_summary documents and patch_auc_checkpoint
         # (agent_patches.py) looks up. C is a single shared scalar, so its
         # ci95 is 0 by construction. peak_{mean,median,p95} have no ci95 twin
         # (they're a one-shot distribution summary, not a mean/CI pair).
         return {
+            **population,
             **getattr(self, "_recent_stddevs", {}),
             "auc_mean": self._recent_auc_mean,
             "auc_ci95": self._recent_auc_ci95,

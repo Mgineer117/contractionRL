@@ -29,10 +29,11 @@ def main(name):
   entry.update(repository=str(ROOT/'code'),configuration=str(ROOT/'plan.json'),paths=[str(folder)],code_revision=revision,recorded_status='PREFLIGHT',job_ids=[slurm or str(os.getpid())],node=os.uname().nodename,cuda_visible_devices=env.get('CUDA_VISIBLE_DEVICES'),started_at=datetime.now(timezone.utc).isoformat())
   save(folder/'manifest.json',entry)
   results={}
-  for variant in ['heavy','compact']:
+  for variant in plan.get('preflight_variants', ['heavy','compact']):
    checkenv=dict(env,WANDB_MODE='disabled',WANDB_SWEEP_ID='smoke',CRL_SMOKE_NAME=name+'-'+variant)
-   command=[profile['python'],'-u',str(ROOT/'code/search/train_bayes.py'),'--root',str(ROOT),'--smoke-config',str(ROOT/'preflight'/('proposal-'+variant+'.yaml')),'--smoke-steps','256']
-   if variant=='heavy':command+=['--checkpoint',str(ROOT/'metric/checkpoints/metric.pt')]
+   command=[profile['python'],'-u',str(ROOT/'code/search/train_bayes.py'),'--root',str(ROOT),'--smoke-config',str(ROOT/'preflight'/('proposal-'+variant+'.yaml')),'--smoke-steps',str(plan.get('preflight_steps', 256))]
+   if plan.get('preflight_checkpoint'):
+    command+=['--checkpoint',str(ROOT/plan['preflight_checkpoint'])]
    with (folder/('preflight-'+variant+'.log')).open('x') as out:
     try:result=subprocess.run(command,cwd=ROOT/'code',env=checkenv,stdout=out,stderr=subprocess.STDOUT,timeout=900)
     except subprocess.TimeoutExpired:raise RuntimeError('Finite GPU check exceeded900seconds; no automatic retry')
@@ -51,4 +52,13 @@ def main(name):
   state.update(status='COMPLETED' if code==0 else 'FAILED',exit_code=code,finished_at=datetime.now(timezone.utc).isoformat());save(folder/'state.json',state)
   entry.update(recorded_status=state['status'],results=state);save(folder/'manifest.json',entry);return code
 
-if __name__=='__main__':raise SystemExit(main(sys.argv[1]))
+if __name__=='__main__':
+ try:
+  raise SystemExit(main(sys.argv[1]))
+ except Exception as error:
+  import traceback
+  folder=ROOT/'agents'/sys.argv[1]
+  entry=json.loads((folder/'manifest.json').read_text())
+  entry.update(recorded_status='FAILED_STARTUP',error=str(error),traceback=traceback.format_exc(),finished_at=datetime.now(timezone.utc).isoformat())
+  save(folder/'manifest.json',entry)
+  raise

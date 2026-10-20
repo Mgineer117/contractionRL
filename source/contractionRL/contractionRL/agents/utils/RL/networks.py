@@ -1,11 +1,13 @@
 """Shared MLP, structured policy, and legacy sequence-network building blocks."""
 from __future__ import annotations
 
+from contractionRL.agents.utils.system_dynamics.state import embed_angles
+
 import math
 import torch
 import torch.nn as nn
 from contractionRL.agents.utils.contraction.math_utils import rescale_residual
-from contractionRL.agents.utils.system_dynamics.reference import Feats, RefWindow, TrackingFeatures, affine_observation_scaling
+from contractionRL.agents.utils.system_dynamics.reference import Feats, RefWindow, TrackingFeatures
 
 _MIN_LOG_STD = math.log(0.001)
 
@@ -142,17 +144,43 @@ class PreviewSequenceEncoder(nn.Module):
             self.rnn.train(True)
         return self
 
-    def forward(self, preview_flat: torch.Tensor) -> torch.Tensor:
+    def forward(self, preview_flat: torch.Tensor, valid: torch.Tensor | None = None) -> torch.Tensor:
         n = preview_flat.shape[0]
         points = preview_flat.reshape(n, self.num_points, self.point_dim)
+        lengths = None
+        if valid is not None:
+            if self.mode != 'gru' or self.reverse or self.stride != 1:
+                raise ValueError('Internal history padding requires an oldest-first dense GRU')
+            lengths = valid.long().sum(-1)
+            # History is left-padded. Pack only actual state/action pairs.
+            indices = (torch.arange(self.num_points, device=points.device)[None]
+                       + self.num_points - lengths[:, None]) % self.num_points
+            points = points.gather(1, indices[:, :, None].expand_as(points))
+            lengths_cpu = lengths.clamp_min(1).cpu()
         if self.stride > 1:
             points = points[:, ::self.stride, :]  # nearest-first, every stride-th point kept
         if self.mode == "mlp":
             return self.mlp(points.reshape(n, -1))
         if self.mode == "gru":
             seq = points.flip(dims=[1]) if self.reverse else points
-            _, h = self.rnn(seq)
-            return self.proj(h.squeeze(0))
+            def encode(chunk, chunk_lengths=None):
+                if chunk_lengths is not None:
+                    from torch.nn.utils.rnn import pack_padded_sequence
+                    chunk = pack_padded_sequence(chunk, chunk_lengths, batch_first=True, enforce_sorted=False)
+                return self.rnn(chunk)[1]
+            chunk_size = min(128, max(1, 25600 // seq.shape[1]))
+            if len(seq) > chunk_size:
+                from torch.utils.checkpoint import checkpoint
+                # Long gamma-derived windows need bounded cuDNN workspaces and activations.
+                chunks = seq.split(chunk_size)
+                sizes = lengths_cpu.split(chunk_size) if lengths is not None else [None] * len(chunks)
+                h = torch.cat([(checkpoint(encode, chunk, size, use_reentrant=False)
+                                if torch.is_grad_enabled() else encode(chunk, size))
+                               for chunk, size in zip(chunks, sizes)], dim=1)
+            else:
+                h = encode(seq, lengths_cpu if lengths is not None else None)
+            result = self.proj(h.squeeze(0))
+            return result if lengths is None else result.masked_fill((lengths == 0)[:, None], 0.)
         k = self.key(points)                                     # (n, P, hidden)
         v = self.value(points)                                   # (n, P, hidden)
         scores = torch.einsum("h,nph->np", self.query, k) / (k.shape[-1] ** 0.5)
@@ -160,100 +188,51 @@ class PreviewSequenceEncoder(nn.Module):
         return self.proj((w * v).sum(dim=1))
 
 
-class PreviewTrackingFeatures(TrackingFeatures):
-    """Current x/xi and a trainable encoding of a stored nominal reference preview."""
-
-    def __init__(self, window, angle_idx=(), *, encoder='gru', hidden=64, stride=1):
-        super().__init__(window, angle_idx)
-        if window.preview_length < 2:
-            raise ValueError("A compact preview encoder requires current and future reference states")
-        self.context_dim = window.x_dim + window.xi_dim
-        self.preview_encoder = PreviewSequenceEncoder(
-            window.preview_length * (window.x_dim + len(self.angle_idx)),
-            window.x_dim + len(self.angle_idx), hidden, hidden, mode=encoder, stride=stride)
-        self.output_dim = self.context_dim + 2 * len(self.position) + hidden
-
-    def forward(self, obs):
-        current = super().forward(obs)
-        x, _, xi = self.window.extract(obs)
-        if not self.position:
-            current = current.clone()
-            current[:, :self.window.x_dim] = (x - self.center[:self.window.x_dim]) / self.scale[:self.window.x_dim]
-            if self.window.initial_state_parameters:
-                n = self.window.x_dim
-                current[:, n:n+n] = (xi[:, :n] - self.center[n:n+n]) / self.scale[n:n+n]
-        preview = self.window.preview(obs)
-        points = []
-        for i in range(self.window.x_dim):
-            value = preview[:, :, i:i+1]
-            if i in self.position:
-                points.append((value - preview[:, :1, i:i+1]) / self.scale[i])
-            elif i in self.angle_idx:
-                points.extend((value.cos(), value.sin()))
-            else:
-                points.append((value - self.center[i]) / self.scale[i])
-        z = self.preview_encoder(torch.cat(points, -1).flatten(1))
-        parts = [current[:, :self.context_dim], z]
-        if self.position:
-            parts.append(current[:, -2 * len(self.position):])
-        return torch.cat(parts, -1)
-
-
 class TemporalTrackingFeatures(TrackingFeatures):
-    """Independent future/history encoders, both projected to the physical state width."""
-
-    def __init__(self, window, angle_idx=(), *, encoder='gru', hidden=64, stride=1):
-        super().__init__(window, angle_idx)
+    """Periodic current/reference, future and history features in relative position."""
+    def __init__(self, window, angle_idx=(), *, encoder='gru', hidden=64, stride=1, feature_dim=None):
+        TrackingFeatures.__init__(self, window, angle_idx)
         if encoder != 'gru' or stride != 1:
-            raise ValueError("Temporal context uses dense GRU windows")
+            raise ValueError("GRU context uses dense past and future windows")
+        if window.preview_length < 1 or window.history_length != window.preview_length:
+            raise ValueError("GRU context requires equally sized past and future windows")
         n = window.x_dim
+        self.feature_dim = 3 * n if feature_dim is None else feature_dim
+        if not isinstance(self.feature_dim, int) or isinstance(self.feature_dim, bool) or self.feature_dim < 1:
+            raise ValueError('feature_dim must be a positive integer or null for 3 * state dimension')
         point_dim = n + len(self.angle_idx)
-        self.preview_encoder = PreviewSequenceEncoder(window.preview_length * point_dim, point_dim,
-                                                      hidden, n, mode='gru')
+        self.preview_encoder = PreviewSequenceEncoder(window.preview_length * point_dim, point_dim, hidden, self.feature_dim, mode='gru')
         if window.history_length:
-            history_dim = point_dim + window.u_dim + 1
-            self.history_encoder = PreviewSequenceEncoder(window.history_length * history_dim, history_dim,
-                                                          hidden, n, mode='gru', reverse=False)
-            center, scale = affine_observation_scaling(window.control_low, window.control_high)
-            self.register_buffer('history_control_center', center)
-            self.register_buffer('history_control_scale', scale)
-        self.output_dim = window.base_dim + n * (1 + bool(window.history_length)) + 2 * len(self.position)
+            history_dim = point_dim + window.u_dim
+            self.history_encoder = PreviewSequenceEncoder(window.history_length * history_dim, history_dim, hidden, self.feature_dim, mode='gru', reverse=False)
+        self.output_dim += self.feature_dim * (1 + bool(window.history_length))
 
     def sequence_features(self, sequence, x):
         points = []
         for i in range(self.window.x_dim):
             value = sequence[:, :, i:i+1]
             if i in self.position:
-                points.append((value - x[:, None, i:i+1]) / self.scale[i])
+                points.append(value - x[:, None, i:i+1])
             elif i in self.angle_idx:
                 points.extend((value.cos(), value.sin()))
             else:
-                points.append((value - self.center[i]) / self.scale[i])
+                points.append(value)
         return torch.cat(points, -1)
 
     def forward(self, obs):
-        x, xref, xi = self.window.extract(obs)
-        n, p = self.window.x_dim, self.window.xi_dim
-        current = ((obs[:, :self.window.base_dim] - self.center) / self.scale).clone()
-        if self.position:
-            pos = list(self.position)
-            current[:, pos] = (x[:, pos] - xref[:, pos]) / self.scale[pos]
-            current[:, [n + p + i for i in pos]] = (xref[:, pos] - x[:, pos]) / self.scale[pos]
-            if self.window.initial_state_parameters:
-                current[:, [n + i for i in pos]] = (xi[:, pos] - x[:, pos]) / self.scale[[n + i for i in pos]]
+        x, _, _ = self.window.extract(obs)
         future = self.sequence_features(self.window.preview(obs), x)
-        parts = [current, self.preview_encoder(future.flatten(1))]
+        base = TrackingFeatures.forward(self, obs)
+        split = 2 * self.state_feature_dim
+        parts = [base[:, :split], self.preview_encoder(future.flatten(1))]
         if self.window.history_length:
+            n = self.window.x_dim
             history = self.window.history(obs)
             valid = history[:, :, -1:]
             states = self.sequence_features(history[:, :, :n], x)
-            controls = (history[:, :, n:n+self.window.u_dim] - self.history_control_center) / self.history_control_scale
-            encoded = torch.cat((states * valid, controls * valid, valid), -1)
-            parts.append(self.history_encoder(encoded.flatten(1)))
-        if self.position:
-            span = (self.position_high - self.position_low).clamp_min(1e-6)
-            parts.append(torch.cat(((x[:, self.position] - self.position_low) / span,
-                                    (self.position_high - x[:, self.position]) / span), -1))
+            controls = history[:, :, n:n+self.window.u_dim]
+            parts.append(self.history_encoder(torch.cat((states, controls), -1).flatten(1), valid=valid.squeeze(-1)))
+        parts.append(base[:, split:])
         return torch.cat(parts, -1)
 
 
@@ -290,6 +269,7 @@ class CLActor(nn.Module):
         encoder: str = "mlp",
         encoder_hidden: int = 64,
         encoder_stride: int = 1,
+        feature_dim: int | None = None,
     ):
         super().__init__()
         self.window = window
@@ -305,18 +285,16 @@ class CLActor(nn.Module):
 
         self.compact = bool(getattr(window, "compact", False))
         if self.compact:
-            if getattr(window, 'temporal_context', False):
+            if encoder == 'gru':
                 self.tracking_features = TemporalTrackingFeatures(window, feats.angle_idx,
-                    encoder=encoder, hidden=encoder_hidden, stride=encoder_stride)
-            elif window.preview_length:
-                self.tracking_features = PreviewTrackingFeatures(window, feats.angle_idx,
-                    encoder=encoder, hidden=encoder_hidden, stride=encoder_stride)
+                    encoder=encoder, hidden=encoder_hidden, stride=encoder_stride, feature_dim=feature_dim)
             else:
                 if encoder != "mlp" or encoder_stride != 1:
                     raise ValueError("Compact sequence encoders require an explicit reference preview")
                 self.tracking_features = TrackingFeatures(window, feats.angle_idx)
+        self.feedback_angles = self.tracking_features.angle_idx if self.compact else feats.angle_idx
         self.w1 = MLP(self.tracking_features.output_dim if self.compact else feats.single_dim,
-                      hidden, self.c * self.x_dim, activation=activation)
+                      hidden, self.c * (self.x_dim + len(self.feedback_angles)), activation=activation)
         # W2 consumes the window as a sequence of `length` points, each
         # `feats.pair_dim` wide. point_dim is what makes gru/attn see points
         # rather than one flat vector.
@@ -347,13 +325,13 @@ class CLActor(nn.Module):
         n = x.shape[0]
         if self.compact:
             features = self.feature_scaler(self.tracking_features(state))
-            e = self.tracking_features.error(x, xrefs[:, 0]).unsqueeze(-1)
-            w1 = self.w1(features).reshape(n, self.c, self.x_dim)
+            e = self.tracking_features.feedback_error(x, xrefs[:, 0]).unsqueeze(-1)
+            w1 = self.w1(features).reshape(n, self.c, self.x_dim + len(self.feedback_angles))
             w2 = self.w2(features).reshape(n, self.u_dim, self.c)
         else:
-            e = self.feats.error(x, xrefs[:, 0]).unsqueeze(-1)
+            e = (embed_angles(x, self.feats.angle_idx) - embed_angles(xrefs[:, 0], self.feats.angle_idx)).unsqueeze(-1)
             seq = self.feats.sequence(x, xrefs).reshape(n, -1)
-            w1 = self.w1(self.feats.single(x)).reshape(n, self.c, self.x_dim)
+            w1 = self.w1(self.feats.single(x)).reshape(n, self.c, self.x_dim + len(self.feedback_angles))
             w2 = self.w2(seq).reshape(n, self.u_dim, self.c)
         feedback = torch.matmul(w2, torch.tanh(torch.matmul(w1, e))).squeeze(-1)
         return feedback, urefs[:, 0]

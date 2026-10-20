@@ -35,8 +35,9 @@ import yaml
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
 sys.path.insert(0, os.path.join(_ROOT, "source", "contractionRL"))
+from contractionRL.agents.utils.RL.config import load_agent_config
 
-import contractionRL.tasks.direct.classic  # noqa: E402,F401
+import contractionRL.tasks.direct.common.tracking_tasks  # noqa: E402,F401
 import gymnasium as gym  # noqa: E402
 from contractionRL.agents.utils.contraction.math_utils import jacobian  # noqa: E402
 
@@ -48,10 +49,10 @@ def verify(short: str, task: str, algorithm: str) -> bool:
               f"(scripts/skrl/c2rl/build_cm_dataset.py --task {task})")
         return True
     cfg_path = os.path.join(
-        _ROOT, "source/contractionRL/contractionRL/tasks/direct/classic",
-        short, "agents", f"skrl_{algorithm.replace('-', '_')}_cfg.yaml")
+        _ROOT, "source/contractionRL/contractionRL/tasks/direct",
+        f"isaac_classic_{short}", "agents", f"skrl_{algorithm.replace('-', '_')}_cfg.yaml")
     with open(cfg_path) as fh:
-        cm = yaml.safe_load(fh)["cm"]
+        cm = load_agent_config(fh.name)["cm"]
     lbd, r = float(cm["cvstem_lbd"]), float(cm["cvstem_r_scaler"]) + 1e-5
     w_lb, w_ub = float(cm["cvstem_w_lb"]), float(cm["cvstem_w_ub"])
 

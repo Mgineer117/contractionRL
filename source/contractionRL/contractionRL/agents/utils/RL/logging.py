@@ -9,7 +9,8 @@ _defined_run = None
 _epoch_metrics = set()
 _pending_metrics = ContextVar("contractionrl_metrics", default=None)
 
-STABILITY_SCALARS = frozenset({'auc_mean', 'auc_stddev', 'lambda', 'lambda_stddev'})
+STABILITY_SCALARS = frozenset({'auc_mean', 'auc_stddev', 'lambda', 'lambda_stddev',
+                             'completed_episodes', 'failed_episodes', 'total_episodes', 'episode_completion'})
 _STABILITY_ALIASES = {'contraction_rate': 'lambda', 'contraction_rate_mean': 'lambda',
                       'lambda_mean': 'lambda', 'contraction_rate_stddev': 'lambda_stddev'}
 _STABILITY_MEDIA = frozenset({'path_tracking', 'normalized_error', 'normalized_maha_error',
@@ -41,8 +42,7 @@ def metric_name(name):
             tail = ["Learning rate"]  # PPO's shared optimizer is also its policy LR.
         parts = parts[:group_index + 1] + tail
     leaf = parts[-1]
-    if leaf in ("KL guard rejected KL", "KL guard retries", "KL guard skipped update",
-                "KL divergence (post-update)"):
+    if leaf == "KL divergence (post-update)":
         return None
     if leaf.lower().replace("_", " ") == "critic explained variance":
         return None
@@ -54,6 +54,8 @@ def metric_name(name):
             or leaf.endswith("_frac") or leaf == "failure_rate"):
         return None
     if leaf == "episode_completion":
+        if group.startswith("Stability"):
+            return "/".join(["Evaluation", group, leaf])
         return "Training/Learning/episode_completion"
     if re.search(r"(?:_(?:ci95|median|min|max|[pq]\d+)(?:_(?:mean|stddev))?|\s*\((?:min|max)\))$", leaf):
         return None
@@ -92,6 +94,11 @@ def metric_name(name):
     if group == "Episode":
         return "/".join(["Training", "Learning", "Diagnostics", group, *parts])
     return "/".join(["Training", "Learning", group, *parts])
+
+
+def pretraining_logging_enabled(agent):
+    """skrl creates its scalar writer during agent initialization."""
+    return getattr(agent, "writer", None) is not None
 
 
 @contextmanager

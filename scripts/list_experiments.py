@@ -26,12 +26,12 @@ KEY_ARGS = {
     "ppo": ("learning_rate", "discount_factor", "rollouts", "learning_epochs", "ratio_clip"),
     "sac": ("learning_rate", "discount_factor", "batch_size", "gradient_steps"),
     "mbpo": ("ensemble_size", "num_elites", "model_train_frequency", "model_rollout_batch_size", "real_data_ratio", "gradient_steps", "discount_factor"),
-    "c3m": ("lbd", "w_lb", "w_ub", "W_lr", "u_lr", "mode"),
+    "c3m": ("lbd", "w_lb", "w_ub", "W_lr", "u_lr"),
     "lqr": ("Q_scaler", "R_scaler"),
     "sdlqr": ("Q_scaler", "R_scaler"),
     "cvstem-lqr": ("lbd", "cm_samples", "cm_solver", "cm_w_lb", "cm_w_ub"),
-    "c2rl-ppo": ("cmg_method", "cm_eps", "ccm_lbd", "ccm_w_lb", "ccm_w_ub", "cvstem_lbd", "cvstem_w_lb", "cvstem_w_ub", "discount_factor", "learning_rate", "use_value_expansion", "value_expansion_horizon", "mode"),
-    "c2rl-sac": ("cmg_method", "cm_eps", "ccm_lbd", "ccm_w_lb", "ccm_w_ub", "cvstem_lbd", "cvstem_w_lb", "cvstem_w_ub", "discount_factor", "learning_rate", "mode"),
+    "c2rl-ppo": ("cmg_method", "cm_eps", "ccm_lbd", "ccm_w_lb", "ccm_w_ub", "cvstem_lbd", "cvstem_w_lb", "cvstem_w_ub", "discount_factor", "learning_rate", "use_value_expansion", "value_expansion_horizon"),
+    "c2rl-sac": ("cmg_method", "cm_eps", "ccm_lbd", "ccm_w_lb", "ccm_w_ub", "cvstem_lbd", "cvstem_w_lb", "cvstem_w_ub", "discount_factor", "learning_rate"),
 }
 CFG_CLASSES = {
     "mbpo": ("mbpo.py", "MBPOCfg"),
@@ -73,7 +73,6 @@ def _entry(node, package, imports):
 
 def environments():
     records = {}
-    aliases = []
     for path in sorted(TASKS.rglob("__init__.py")):
         package = ".".join(path.parent.relative_to(SOURCE).parts)
         tree = ast.parse(path.read_text())
@@ -87,8 +86,6 @@ def environments():
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            if isinstance(node.func, ast.Name) and node.func.id == "_register":
-                aliases.append(tuple(ast.literal_eval(arg) for arg in node.args))
             kwargs = {kw.arg: kw.value for kw in node.keywords}
             if not isinstance(kwargs.get("id"), ast.Constant):
                 continue
@@ -99,18 +96,17 @@ def environments():
                 if name.startswith("skrl_") and name != "skrl_cfg_entry_point":
                     module, filename = _entry(value, package, imports).split(":")
                     algo = name.removeprefix("skrl_").removesuffix("_cfg_entry_point").replace("_", "-")
+                    filename = {"ppo_cfg":"skrl_ppo_cfg.yaml", "c2rl_ppo_cfg":"skrl_c2rl_ppo_cfg.yaml",
+                                "contraction_ppo_cfg":"skrl_contraction_ppo_cfg.yaml"}.get(filename, filename)
                     configs[algo] = SOURCE.joinpath(*module.split(".")) / filename
             records[task] = {"id": task, "family": "classic" if task.startswith("classic-") else "Isaac",
-                             "dynamics": "analytical" if task.startswith("classic-") else "PhysX",
+                             "dynamics": "analytical" if task.startswith(("classic-", "Isaac-Classic-")) else "PhysX",
                              "configs": configs}
-    for task, classic_task, _ in aliases:
-        records[task] = {**records[classic_task], "id": task, "family": "Isaac",
-                         "dynamics": f"analytical ({classic_task}) or PhysX (--mode sim_to_real)"}
     return sorted(records.values(), key=lambda item: (item["family"] != "classic", item["id"]))
 
 
 def key_settings(algo, path):
-    raw = yaml.safe_load(path.read_text())
+    raw = _training_defaults.load_agent_config(path)
     # Same precedence as ContractionRunner. Defaults are read from the source
     # dataclass so omitted settings still show the deployed values.
     merged = {}
@@ -124,9 +120,10 @@ def key_settings(algo, path):
                         merged[node.target.id] = ast.literal_eval(node.value)
                     except (ValueError, TypeError):
                         pass
+    if algo == "c2rl-ppo":
+        merged["cmg_method"] = "ccm"
     for block in ("cm", "cmg", "empirical_dynamics", "agent"):
         merged.update(raw.get(block, {}))
-    merged["mode"] = raw.get("mode", "analytical")
     return {key: merged[key] for key in KEY_ARGS[algo] if key in merged}
 
 

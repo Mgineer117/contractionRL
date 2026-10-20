@@ -1,4 +1,4 @@
-"""skrl-compatible model wrappers for contractionRL actors and critics.
+"""Project-native neural modules for contractionRL actors and critics.
 
 Observation layout: ``s = {x, xrefs, urefs}`` — see ``ref_window.py``. Every
 model here recovers its own input shape from the Dict observation space via
@@ -22,10 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 
-try:
-    from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
-except ImportError:
-    raise ImportError("skrl is required. Install it or use the local developer copy.")
+from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
 
 from contractionRL.agents.utils.contraction.math_utils import rescale_residual
 from contractionRL.agents.utils.RL.networks import MLP, CLActor, PreviewSequenceEncoder, _ACT_MAP
@@ -48,7 +45,7 @@ def _layout(observation_space, x_dim=None, angle_idx=None, sym=None, ref_offset=
         raise ValueError(
             f"x_dim mismatch: caller says {int(x_dim)}, observation space declares "
             f"{window.x_dim}. The env and the model disagree about the state layout.")
-    return window, Feats(window.x_dim, angle_idx or [], sym)
+    return window, Feats(window.x_dim, sorted(set(angle_idx or []) | set(getattr(window, "angle_idx", ()))), sym)
 
 
 class _AnalyticPotentialMixin:
@@ -81,15 +78,14 @@ class _AnalyticPotentialMixin:
         obs = inputs.get("observations")
         if gen is None or obs is None:
             return None
-        from contractionRL.agents.utils.contraction.math_utils import bound_W, spd_inverse
+        from contractionRL.agents.utils.contraction.math_utils import bound_W, spd_inverse, tracking_energy
         x, xrefs, _ = self._pot_window.split(obs)
         with torch.no_grad():
-            from contractionRL.agents.utils.system_dynamics.state import wrap_diff
-            e = wrap_diff(x - xrefs[:, 0], self._pot_feats.angle_idx).unsqueeze(-1)
+            e = x - xrefs[:, 0]
             W = bound_W(gen(x)[0], self._pot_w_lb, self._pot_window.x_dim,
                         getattr(gen, "bounded", False))
             M = W if getattr(gen, "outputs_metric", False) else spd_inverse(W)
-            return torch.bmm(torch.bmm(e.transpose(1, 2), M), e).squeeze(-1)
+            return tracking_energy(e, M, self._pot_feats.angle_idx).unsqueeze(-1)
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -222,8 +218,6 @@ class FullControlActorModel(GaussianMixin, Model):
         if not preview and (kwargs.get("encoder", "mlp") != "mlp" or kwargs.get("encoder_stride", 1) != 1):
             raise ValueError("Compact sequence encoders require an explicit reference preview")
         temporal = getattr(RefWindow.from_space(observation_space), 'temporal_context', False)
-        if preview and control_mode != "structured" and not (temporal and control_mode == 'factorized'):
-            raise ValueError("Compact reference preview currently supports structured residual control")
         # PPO scores/stores the raw Gaussian sample; the plant clips applied controls.
         GaussianMixin.__init__(self, clip_actions=False, clip_log_std=clip_log_std,
                                min_log_std=min_log_std, max_log_std=max_log_std)
@@ -238,15 +232,15 @@ class FullControlActorModel(GaussianMixin, Model):
             _, feats = _layout(observation_space, angle_idx=angle_idx, sym=kwargs.get("sym"))
             self.cl_actor = CLActor(self.window, feats, hidden_dim=hidden_dim, activation=activation,
                                    encoder=kwargs.get('encoder', 'mlp'), encoder_hidden=kwargs.get('encoder_hidden', 64),
-                                   encoder_stride=kwargs.get('encoder_stride', 1))
+                                   encoder_stride=kwargs.get('encoder_stride', 1), feature_dim=kwargs.get('feature_dim'))
             self.cl_actor.logstd.requires_grad_(False)
         else:
             from contractionRL.agents.utils.system_dynamics.reference import TrackingFeatures
-            if getattr(self.window, 'temporal_context', False):
+            if kwargs.get('encoder', 'mlp') == 'gru':
                 from contractionRL.agents.utils.RL.networks import TemporalTrackingFeatures
                 self.tracking_features = TemporalTrackingFeatures(self.window, self.angle_idx,
                     encoder=kwargs.get('encoder', 'mlp'), hidden=kwargs.get('encoder_hidden', 64),
-                    stride=kwargs.get('encoder_stride', 1))
+                    stride=kwargs.get('encoder_stride', 1), feature_dim=kwargs.get('feature_dim'))
             else:
                 self.tracking_features = TrackingFeatures(self.window, self.angle_idx)
             self.register_buffer("_uses_tracking_features", torch.tensor(True))
@@ -272,15 +266,7 @@ class FullControlActorModel(GaussianMixin, Model):
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         if self.control_mode != "structured" and "_uses_tracking_features" not in state_dict:
-            state_dict = dict(state_dict)
-            uses_tracking = "tracking_features.scale" in state_dict
-            state_dict["_uses_tracking_features"] = self._uses_tracking_features.new_tensor(uses_tracking)
-            if not uses_tracking:
-                if self.tracking_features.position:
-                    raise ValueError("Load historical policies with their archived source snapshot")
-                import warnings
-                warnings.warn("Loading a legacy full/residual actor with its original absolute-state features", stacklevel=2)
-                state_dict.update({"tracking_features." + key: value for key, value in self.tracking_features.state_dict().items()})
+            raise ValueError("Checkpoint predates periodic tracking features; load it with its archived source snapshot")
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def compute(self, inputs, role="policy"):
@@ -315,16 +301,11 @@ class FullControlValueModel(_AnalyticPotentialMixin, DeterministicMixin, Model):
         self.feature_scaler = nn.Identity()
         _observation_scaling(self, observation_space, device)
         from contractionRL.agents.utils.system_dynamics.reference import TrackingFeatures
-        if getattr(self.window, 'temporal_context', False):
+        if kwargs.get('encoder', 'mlp') == 'gru':
             from contractionRL.agents.utils.RL.networks import TemporalTrackingFeatures
             self.tracking_features = TemporalTrackingFeatures(self.window, kwargs.get('angle_idx', ()),
                 encoder=kwargs.get('encoder', 'mlp'), hidden=kwargs.get('encoder_hidden', 64),
-                stride=kwargs.get('encoder_stride', 1))
-        elif preview:
-            from contractionRL.agents.utils.RL.networks import PreviewTrackingFeatures
-            self.tracking_features = PreviewTrackingFeatures(self.window, kwargs.get('angle_idx', ()),
-                encoder=kwargs.get('encoder', 'mlp'), hidden=kwargs.get('encoder_hidden', 64),
-                stride=kwargs.get('encoder_stride', 1))
+                stride=kwargs.get('encoder_stride', 1), feature_dim=kwargs.get('feature_dim'))
         else:
             self.tracking_features = TrackingFeatures(self.window, kwargs.get("angle_idx", ()))
         self.use_analytic_potential = bool(analytic_potential)
@@ -377,6 +358,9 @@ class MetricModel(Model):
         super().__init__(observation_space=observation_space, action_space=action_space, device=device)
         self.window, self.feats = _layout(observation_space, x_dim, angle_idx, sym)
         self.x_dim, self.u_dim = self.window.x_dim, self.window.u_dim
+        relative_mask = torch.zeros(self.x_dim, dtype=torch.bool, device=self.device)
+        # Retain the zero mask solely to reject incompatible historical checkpoints.
+        self.register_buffer('_relative_position_mask', relative_mask)
 
         common = dict(x_dim=self.x_dim, hidden_dim=hidden_dim or [256, 256],
                       activation=activation, mode=mode,
@@ -393,9 +377,17 @@ class MetricModel(Model):
         else:
             self.ccm_gen = CCM_Generator(**common)
 
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        key = prefix + '_relative_position_mask'
+        recorded = state_dict.get(key, torch.zeros_like(self._relative_position_mask))
+        if not torch.equal(recorded.to(self._relative_position_mask), self._relative_position_mask):
+            raise ValueError('Checkpoint metric coordinates differ; load it with its archived source snapshot')
+        state_dict.setdefault(key, torch.zeros_like(self._relative_position_mask))
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+
     def compute(self, inputs: dict, role: str = "cmg"):
         x, _, _ = self.window.split(inputs["observations"])
-        W, info = self.ccm_gen(x)
+        W, _ = self.ccm_gen(x)
         return W.reshape(W.shape[0], -1), {}
 
     def act(self, inputs: dict, role: str = "cmg"):
@@ -413,12 +405,12 @@ class MetricModel(Model):
 
 def _build_cl_actor(observation_space, action_space, x_dim, angle_idx, sym,
                     hidden_dim, activation,
-                    encoder, encoder_hidden, encoder_stride):
+                    encoder, encoder_hidden, encoder_stride, feature_dim=None):
     window, feats = _layout(observation_space, x_dim, angle_idx, sym)
     return CLActor(window=window, feats=feats,
                    hidden_dim=hidden_dim or [128, 128], activation=activation,
                    encoder=encoder, encoder_hidden=encoder_hidden,
-                   encoder_stride=encoder_stride)
+                   encoder_stride=encoder_stride, feature_dim=feature_dim)
 
 
 class CLDeterministicActorModel(DeterministicMixin, Model):
@@ -436,7 +428,7 @@ class CLDeterministicActorModel(DeterministicMixin, Model):
         DeterministicMixin.__init__(self, clip_actions=clip_actions)
         self.cl_actor = _build_cl_actor(observation_space, action_space, x_dim, angle_idx, sym,
                                         hidden_dim, activation,
-                                        encoder, encoder_hidden, encoder_stride)
+                                        encoder, encoder_hidden, encoder_stride, kwargs.get('feature_dim'))
         self.to(self.device)
 
     def compute(self, inputs: dict, role: str = "policy"):
@@ -465,7 +457,7 @@ class SquashedCLDeterministicActorModel(DeterministicMixin, Model):
         DeterministicMixin.__init__(self, clip_actions=clip_actions)
         self.cl_actor = _build_cl_actor(observation_space, action_space, x_dim, angle_idx, sym,
                                         hidden_dim, activation,
-                                        encoder, encoder_hidden, encoder_stride)
+                                        encoder, encoder_hidden, encoder_stride, kwargs.get('feature_dim'))
         self.to(self.device)
 
     def compute(self, inputs: dict, role: str = "policy"):
@@ -505,7 +497,7 @@ class CLActorModel(GaussianMixin, Model):
                                min_log_std=min_log_std, max_log_std=max_log_std)
         self.cl_actor = _build_cl_actor(observation_space, action_space, x_dim, angle_idx, sym,
                                         hidden_dim, activation,
-                                        encoder, encoder_hidden, encoder_stride)
+                                        encoder, encoder_hidden, encoder_stride, kwargs.get('feature_dim'))
         self.log_std_parameter = self.cl_actor.logstd
 
         if initial_log_std != 0.0:
@@ -892,7 +884,7 @@ class SquashedCLActorModel(_TanhSquashMixin, GaussianMixin, Model):
         self._init_tanh_squash_bounds()
         self.cl_actor = _build_cl_actor(observation_space, action_space, x_dim, angle_idx, sym,
                                         hidden_dim, activation,
-                                        encoder, encoder_hidden, encoder_stride)
+                                        encoder, encoder_hidden, encoder_stride, kwargs.get('feature_dim'))
         self.log_std_parameter = self.cl_actor.logstd
         if initial_log_std != 0.0:
             with torch.no_grad():

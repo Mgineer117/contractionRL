@@ -1,0 +1,48 @@
+name: car-c2rl-ppo-physical-cmg-encoder-pairs-bayes192
+method: bayes
+run_cap: 192
+metric:
+  name: Evaluation/Stability/validation_auc_mean
+  goal: minimize
+program: search/train_bayes.py
+command:
+- ${env}
+- ${interpreter}
+- ${program}
+- --root
+- ..
+- ${args}
+parameters:
+  agent.discount_factor:
+    values:
+    - 0.9
+    - 0.99
+    - 0.999
+  agent.gae_lambda:
+    values:
+    - 0.9
+    - 0.95
+    - 0.99
+    - 1.0
+  agent.action_bound_penalty_beta:
+    values:
+    - 0.01
+    - 1.0
+  agent.use_value_expansion:
+    values:
+    - true
+    - false
+  agent.use_value_norm:
+    values:
+    - true
+    - false
+  ccm_bounds:
+    values:
+    - 0.1:1.0
+    - 0.1:3.0
+    - 0.3:3.0
+  encoder_pair:
+    values:
+    - null:null
+    - null:gru
+    - gru:gru

@@ -24,7 +24,8 @@ from skrl.agents.torch.ppo import PPO, PPO_CFG
 from skrl.models.torch import GaussianMixin, DeterministicMixin, Model
 
 from contractionRL.agents.utils.system_dynamics.state import wrap_diff
-from contractionRL.agents.utils.system_dynamics.reference import RefWindow
+from contractionRL.agents.utils.system_dynamics.reference import RefWindow, TrackingFeatures
+from contractionRL.agents.utils.contraction.math_utils import tracking_energy
 
 UPSTREAM_COMMIT = 'e63ed83516e46a2630ad203115d069d83de98f4b'
 
@@ -76,8 +77,18 @@ class ContractionMetricNetwork(nn.Module):
         return theta @ theta.mT
 
 
-def contraction_terms(metric, error, error_dot, *, alpha, epsilon, scale):
+def contraction_terms(metric, error, error_dot, *, alpha, epsilon, scale, angle_idx=(), features=None, features_dot=None):
     """Released unnormalized hinge and shaping reward; no in-place data scaling."""
+    if features is not None:
+        with torch.enable_grad():
+            c = (error.detach() * scale).requires_grad_(True)
+            z = features.detach().requires_grad_(True)
+            V = tracking_energy(c, metric(z), angle_idx, period=2 * math.pi * scale)
+            gradient, feature_gradient = torch.autograd.grad(V.sum(), (c, z), create_graph=True)
+            V_dot = (gradient * (error_dot.detach() * scale)).sum(-1)
+            V_dot = V_dot + (feature_gradient * features_dot.detach()).sum(-1)
+            penalty = F.relu(V_dot + alpha * V + epsilon)
+        return V, V_dot, penalty
     with torch.enable_grad():
         c = (error.detach()*scale).requires_grad_(True)
         V = torch.einsum('bi,bij,bj->b', c, metric(c), c)
@@ -116,28 +127,43 @@ def _plain_mlp(space, output_dim, hidden_dims, name, device):
     return nn.Sequential(*layers).to(device)
 
 
+def _policy_features(window, angle_idx, kwargs):
+    from contractionRL.agents.utils.RL.networks import TemporalTrackingFeatures
+    if kwargs.get('encoder', 'mlp') == 'gru':
+        cls = TemporalTrackingFeatures
+    else:
+        return TrackingFeatures(window, angle_idx)
+    return cls(window, angle_idx, encoder=kwargs.get('encoder', 'mlp'),
+               hidden=kwargs.get('encoder_hidden', 64), stride=kwargs.get('encoder_stride', 1),
+               **({'feature_dim': kwargs.get('feature_dim')} if cls is TemporalTrackingFeatures else {}))
+
+
 class ContractionPPOPolicy(GaussianMixin, Model):
-    """Shared structured tracking actor; explicit full mode reloads old baselines."""
+    """Periodic structured or full-control tracking actor."""
     def __init__(self, observation_space, action_space, device, network=None,
-                 initial_log_std=0., control_mode='structured', **kwargs):
+                 initial_log_std=0., control_mode='structured', clip_actions=False, clip_log_std=False,
+                 min_log_std=-6.9, max_log_std=2., **kwargs):
         if control_mode not in {'full', 'structured'}:
             raise ValueError('ContractionPPO supports full or structured control')
         self.control_mode = control_mode
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
-        GaussianMixin.__init__(self, clip_actions=False, clip_log_std=False)
+        if clip_actions:
+            raise ValueError('PPO stores raw Gaussian samples; clip applied controls in the environment')
+        GaussianMixin.__init__(self, clip_actions=False, clip_log_std=clip_log_std,
+                               min_log_std=min_log_std, max_log_std=max_log_std)
         spec = (network or [{}])[0]
         if control_mode == 'structured':
             from contractionRL.agents.utils.RL.models import _build_cl_actor
             self.cl_actor = _build_cl_actor(observation_space, action_space, None,
                                             kwargs.get('angle_idx'), kwargs.get('sym'),
                                             spec.get('layers',[512,256,128]), spec.get('activations','elu'),
-                                            'mlp', 64, 1)
+                                            kwargs.get('encoder', 'mlp'), kwargs.get('encoder_hidden', 64), kwargs.get('encoder_stride', 1), kwargs.get('feature_dim'))
             self.cl_actor.logstd.requires_grad_(False)
         else:
             input_size = observation_space
             if hasattr(observation_space, 'reference_state'):
                 from contractionRL.agents.utils.system_dynamics.reference import TrackingFeatures
-                self.tracking_features = TrackingFeatures(observation_space.reference_state, kwargs.get('angle_idx', ()))
+                self.tracking_features = _policy_features(observation_space.reference_state, kwargs.get('angle_idx', ()), kwargs)
                 self.register_buffer('_uses_tracking_features', torch.tensor(True))
                 input_size = self.tracking_features.output_dim
             self.net = _plain_mlp(input_size, action_space.shape[0], spec.get('layers',[512,256,128]), spec.get('activations','elu'), device)
@@ -154,11 +180,7 @@ class ContractionPPOPolicy(GaussianMixin, Model):
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         if hasattr(self, 'tracking_features') and '_uses_tracking_features' not in state_dict:
-            if self.tracking_features.position:
-                raise ValueError("Load historical policies with their archived source snapshot")
-            state_dict = dict(state_dict)
-            state_dict['_uses_tracking_features'] = self._uses_tracking_features.new_tensor(False)
-            state_dict.update({'tracking_features.' + key: value for key, value in self.tracking_features.state_dict().items()})
+            raise ValueError("Checkpoint predates periodic tracking features; load it with its archived source snapshot")
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
 
@@ -170,7 +192,7 @@ class ContractionPPOValue(DeterministicMixin, Model):
         input_size = observation_space
         if hasattr(observation_space, 'reference_state'):
             from contractionRL.agents.utils.system_dynamics.reference import TrackingFeatures
-            self.tracking_features = TrackingFeatures(observation_space.reference_state, kwargs.get('angle_idx', ())).to(device)
+            self.tracking_features = _policy_features(observation_space.reference_state, kwargs.get('angle_idx', ()), kwargs).to(device)
             input_size = self.tracking_features.output_dim
         self.net = _plain_mlp(input_size,1,spec.get('layers',[512,256,128]),spec.get('activations','elu'),device)
 
@@ -216,14 +238,19 @@ class ContractionPPOAgent(PPO):
         position_dim = find('pos_dimension')
         if self.dt is None or self.dt <= 0 or position_dim is None:
             raise ValueError('ContractionPPO requires a tracking environment with dt and pos_dimension')
-        self.indices = list(range(int(position_dim)) if self.cfg.contraction_indices is None else self.cfg.contraction_indices)
+        self.indices = list(range(self.layout.x_dim) if self.cfg.contraction_indices is None else self.cfg.contraction_indices)
         if not self.indices or len(set(self.indices)) != len(self.indices) or min(self.indices)<0 or max(self.indices)>=self.layout.x_dim:
             raise ValueError('Invalid contraction_indices')
-        self.contraction_metric = ContractionMetricNetwork(len(self.indices),len(self.indices),
+        if not getattr(self.layout, 'compact', False):
+            raise ValueError('Periodic ContractionPPO requires compact tracking observations')
+        self.metric_features = TrackingFeatures(self.layout, self.angle_idx).to(self.device)
+        self.metric_angle_idx = [i for i, physical in enumerate(self.indices) if physical in self.angle_idx]
+        self.contraction_metric = ContractionMetricNetwork(self.metric_features.output_dim,len(self.indices),
             hidden_dims=self.cfg.contraction_hidden_dims,activation=self.cfg.contraction_activation,
             min_diagonal_value=self.cfg.min_diagonal_value,spectral_norm_bound=self.cfg.spectral_norm_bound).to(self.device)
         self.metric_optimizer = torch.optim.Adam(self.contraction_metric.parameters(),lr=self.cfg.contraction_metric_learning_rate)
-        self.checkpoint_modules.update(contraction_metric=self.contraction_metric,metric_optimizer=self.metric_optimizer)
+        self.checkpoint_modules.update(contraction_metric=self.contraction_metric,metric_optimizer=self.metric_optimizer,contraction_features=self.metric_features)
+
 
     def init(self, *, trainer_cfg=None):
         if self.contraction_metric is None:
@@ -232,41 +259,60 @@ class ContractionPPOAgent(PPO):
         if self.memory is not None:
             for name in ('contraction_error','contraction_error_dot'):
                 self.memory.create_tensor(name=name,size=len(self.indices),dtype=torch.float32)
+            for name in ('contraction_features', 'contraction_features_dot'):
+                self.memory.create_tensor(name=name,size=self.metric_features.output_dim,dtype=torch.float32)
             self.memory.create_tensor(name='contraction_valid',size=1,dtype=torch.bool)
         if getattr(self,'experiment_dir',None):
             Path(self.experiment_dir).mkdir(parents=True,exist_ok=True)
             Path(self.experiment_dir,'contractionppo_provenance.json').write_text(json.dumps({
-                'upstream_commit':UPSTREAM_COMMIT,'variant':'released_code_skrl_port',
+                'upstream_commit':UPSTREAM_COMMIT,'variant':'periodic_energy_skrl_port',
                 'constraint_indices':self.indices,'constraint_scale':self.cfg.contraction_constraint_coef,
                 'derivative':'measured_relative_error_forward_difference','dt':float(self.dt),
                 'policy_contraction_gradient':False,'two_phase_schedule':False,
                 'inplace_derivative_scaling':False,
-                'metric_derivative_extra_scale':self.cfg.contraction_constraint_coef},indent=2))
+                'metric_derivative_extra_scale':1.0,
+                'metric_features':'relative_position_periodic_angles','energy':'minimum_over_windings'},indent=2))
 
-    def _terms(self, error, derivative):
+    def _terms(self, error, derivative, features, features_dot):
         return contraction_terms(self.contraction_metric,error,derivative,alpha=self.cfg.alpha,
-            epsilon=self.cfg.epsilon_contraction,scale=self.cfg.contraction_constraint_coef)
+            epsilon=self.cfg.epsilon_contraction,scale=self.cfg.contraction_constraint_coef,
+            angle_idx=self.metric_angle_idx,features=features,features_dot=features_dot)
 
     def record_transition(self, *, observations, rewards, next_observations, terminated, truncated, infos, **kwargs):
         if not self.training:
             return super().record_transition(observations=observations,rewards=rewards,
                 next_observations=next_observations,terminated=terminated,truncated=truncated,infos=infos,**kwargs)
         x, refs, _ = self.layout.split(observations)
-        error = wrap_diff(x-refs[:,0],self.angle_idx)
-        endpoint = infos.get('tracking_error_vector') if isinstance(infos,dict) else None
+        error = x-refs[:,0]
+        endpoint = infos.get('physical_tracking_error_vector', infos.get('tracking_error_vector')) if isinstance(infos,dict) else None
         if endpoint is None:
             raise ValueError('ContractionPPO requires pre-autoreset tracking_error_vector in transition info')
         endpoint = torch.as_tensor(endpoint,device=self.device)
-        derivative = wrap_diff(endpoint-error,self.angle_idx)/self.dt
+        derivative = (endpoint-error)/self.dt if 'physical_tracking_error_vector' in infos else wrap_diff(endpoint-error,self.angle_idx)/self.dt
         error, derivative = error[:,self.indices].detach(), derivative[:,self.indices].detach()
-        valid = torch.isfinite(error).all(-1) & torch.isfinite(derivative).all(-1)
+        endpoint_obs = next_observations
+        final = infos.get('final_observation') if isinstance(infos, dict) else None
+        if final is not None:
+            mask = torch.as_tensor(infos.get('_final_observation', terminated | truncated), device=self.device).reshape(-1).bool()
+            if isinstance(final, dict) and 'policy' in final:
+                final = final['policy']
+            if isinstance(final, dict):
+                final = torch.cat([torch.as_tensor(final[key], device=self.device).reshape(len(final[key]), -1) for key in sorted(final)], -1)
+            final = torch.as_tensor(final, device=self.device)
+            endpoint_obs = next_observations.clone()
+            endpoint_obs[mask] = final[mask] if len(final) == len(mask) else final
+        features = self.metric_features(observations).detach()
+        features_dot = (self.metric_features(endpoint_obs).detach() - features) / self.dt
+        valid = (torch.isfinite(error).all(-1) & torch.isfinite(derivative).all(-1)
+                 & torch.isfinite(features_dot).all(-1))
         intrinsic = torch.zeros(len(error),device=self.device)
         if valid.any():
-            _, _, penalty = self._terms(error[valid],derivative[valid])
+            _, _, penalty = self._terms(error[valid],derivative[valid],features[valid],features_dot[valid])
             intrinsic[valid] = (self.cfg.epsilon_contraction-penalty.detach())*self.cfg.penalty_coef
         # Write auxiliary fields at the same slot as PPO's single add_samples call.
+        auxiliary = [('contraction_error',error),('contraction_error_dot',derivative),('contraction_valid',valid[:,None]),('contraction_features',features),('contraction_features_dot',features_dot)]
         index = self.memory.memory_index
-        for name, value in [('contraction_error',error),('contraction_error_dot',derivative),('contraction_valid',valid[:,None])]:
+        for name, value in auxiliary:
             self.memory.get_tensor_by_name(name)[index].copy_(value)
         self.latest_contraction_rewards = intrinsic.detach().clone()
         shaped = rewards + intrinsic.reshape_as(rewards)
@@ -279,15 +325,13 @@ class ContractionPPOAgent(PPO):
         # Metric and PPO objectives have disjoint parameters. Fit the metric
         # separately; PPO uses the detached shaping rewards already in its buffer.
         losses = []
-        names=['contraction_error','contraction_error_dot','contraction_valid']
+        names=['contraction_error','contraction_error_dot','contraction_valid','contraction_features','contraction_features_dot']
         for _ in range(self.cfg.learning_epochs):
-            for error, derivative, valid in self.memory.sample(names=names,batch_size=len(self.memory),mini_batches=self.cfg.mini_batches):
+            for error, derivative, valid, features, features_dot in self.memory.sample(names=names,batch_size=len(self.memory),mini_batches=self.cfg.mini_batches):
                 mask = valid.reshape(-1).bool()
                 if not mask.any(): continue
-                # Released rollout reward mutates c_dot by g before storage;
-                # metric fitting multiplies it by g again. Preserve the effective
-                # scaling explicitly, while keeping measured data immutable.
-                _, _, penalty = self._terms(error[mask],derivative[mask]*self.cfg.contraction_constraint_coef)
+                # Fit the same physical-time energy derivative used for shaping.
+                _, _, penalty = self._terms(error[mask],derivative[mask],features[mask],features_dot[mask])
                 loss = penalty.mean()
                 if not torch.isfinite(loss): raise FloatingPointError('Nonfinite ContractionPPO metric loss')
                 self.metric_optimizer.zero_grad()

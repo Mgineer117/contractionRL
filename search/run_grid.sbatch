@@ -10,7 +10,7 @@
 #   sbatch --array=0-159%14 --partition=scavenger search/run_grid.sbatch
 #
 # Index layout (160 = 2 arms x 4 gammas x 20 seeds):
-#   arm   = idx % 2          0 = normalization on, 1 = off
+#   arm   = idx % 2          0 = value normalization on, 1 = off
 #   gamma = gammas[idx/2/20]
 #   seed  = (idx/2) % 20
 # Arm alternates on consecutive indices on purpose: any contiguous slice of the
@@ -38,10 +38,10 @@ GAMMA=${GAMMAS[$(( CELL / 20 ))]}
 SEED=$(( CELL % 20 ))
 
 if [[ "$ARM" -eq 0 ]]; then
-    NORM=(--use_value_norm true  --use_reward_norm true)
+    NORM=(--use_value_norm true)
     TAG=normON
 else
-    NORM=(--use_value_norm false --use_reward_norm false)
+    NORM=(--use_value_norm false)
     TAG=normOFF
 fi
 NAME="c2rl_${TAG}_g${GAMMA}_s${SEED}"

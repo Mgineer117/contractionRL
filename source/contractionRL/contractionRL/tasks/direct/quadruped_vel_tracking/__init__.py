@@ -9,8 +9,8 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.env_cfg:QuadrupedVelTrackingEnvCfg",
         "skrl_mbpo_cfg_entry_point": "contractionRL.tasks.direct.common:skrl_mbpo_cfg.yaml",
-        "skrl_cfg_entry_point":     f"{agents.__name__}:skrl_ppo_cfg.yaml",
-        "skrl_ppo_cfg_entry_point":   f"{agents.__name__}:skrl_ppo_cfg.yaml",
+        "skrl_cfg_entry_point":     f"{agents.__name__}:ppo_cfg",
+        "skrl_ppo_cfg_entry_point":   f"{agents.__name__}:ppo_cfg",
         "skrl_sac_cfg_entry_point": f"{agents.__name__}:skrl_sac_cfg.yaml",
     },
 )

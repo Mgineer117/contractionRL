@@ -1,0 +1,22 @@
+extends: skrl_ppo_cfg.yaml
+models:
+  policy:
+    class: ContractionPPOPolicy
+  value:
+    class: ContractionPPOValue
+agent:
+  class: ContractionPPO
+  alpha: 0.1
+  penalty_coef: 0.005
+  contraction_constraint_coef: 100.0
+  contraction_metric_learning_rate: 0.001
+  contraction_hidden_dims:
+  - 128
+  - 64
+  contraction_activation: elu
+  epsilon_contraction: 0.001
+  spectral_norm_bound: 3.0
+  min_diagonal_value: 0.1
+  contraction_indices: null
+  experiment:
+    directory: contraction_ppo

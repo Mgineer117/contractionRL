@@ -13,11 +13,92 @@ import warnings
 from collections.abc import Sequence
 
 
+def load_agent_config(path):
+    """Resolve YAML inheritance before applying CLI/sweep overrides.
+
+    Shared ancestors in a diamond are applied once; later parents and the
+    child override earlier values. Lists are replaced, dictionaries merged.
+    """
+    import copy
+    from pathlib import Path
+    import yaml
+    result, applied, active = {}, set(), set()
+
+    def merge(target, values):
+        for key, value in values.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                merge(target[key], value)
+            else:
+                target[key] = copy.deepcopy(value)
+
+    def visit(filename):
+        filename = Path(filename).resolve()
+        if filename in active:
+            raise ValueError(f"Cyclic config inheritance: {filename}")
+        if filename in applied:
+            return
+        active.add(filename)
+        with filename.open() as stream:
+            values = yaml.safe_load(stream)
+        if not isinstance(values, dict):
+            raise ValueError(f"Agent config must be a mapping: {filename}")
+        parents = values.pop("extends", [])
+        parents = [parents] if isinstance(parents, str) else parents
+        if not isinstance(parents, list) or any(not isinstance(parent, str) for parent in parents):
+            raise ValueError(f"extends must be a path or list of paths: {filename}")
+        for parent in parents:
+            visit(filename.parent / parent)
+        merge(result, values)
+        active.remove(filename)
+        applied.add(filename)
+
+    visit(path)
+    if str(result.get("agent", {}).get("class", "")).upper() == "C2RL-PPO":
+        models = result.get("models", {})
+        if "value" in models:
+            inherited = models.pop("value")
+            merge(inherited, models.get("critic", {}))
+            models["critic"] = inherited
+    return result
+
+
+def config_entrypoints(source_file):
+    """Isaac Lab calls these loaders before Hydra applies trial overrides."""
+    from pathlib import Path
+    directory = Path(source_file).parent
+    def ppo_cfg():
+        return load_agent_config(directory / "skrl_ppo_cfg.yaml")
+    def c2rl_ppo_cfg():
+        return load_agent_config(directory / "skrl_c2rl_ppo_cfg.yaml")
+    def contraction_ppo_cfg():
+        return load_agent_config(directory / "skrl_contraction_ppo_cfg.yaml")
+    return ppo_cfg, c2rl_ppo_cfg, contraction_ppo_cfg
+
+
+def load_registered_agent_config(task, key):
+    import gymnasium as gym
+    import importlib
+    from pathlib import Path
+    entry = gym.spec(task.split(":")[-1]).kwargs[key]
+    if callable(entry):
+        return entry()
+    if ":" not in entry:
+        return load_agent_config(entry)
+    module, name = entry.split(":")
+    package = importlib.import_module(module)
+    return load_agent_config(Path(package.__file__).parent / name) if name.endswith(".yaml") else getattr(package, name)()
+
+
 ISAAC_RL_TIMESTEPS = {
+    "Isaac-Classic-Car-v0": 500_000,
+    "Isaac-Classic-Car-v1": 500_000,
+    "Isaac-Classic-Quadrotor-v0": 2_000_000,
     "Isaac-Car-v0": 500_000,
     "Isaac-Car-v1": 500_000,
     "Isaac-Classic-Cartpole-v0": 1_000_000,
     "Isaac-Classic-Segway-v0": 1_000_000,
+    "Isaac-Cartpole-v0": 1_000_000,
+    "Isaac-Segway-v0": 1_000_000,
     "Isaac-Quadrotor-v0": 2_000_000,
     "Manipulator-PathTracking-v0": 3_000_000,
     "Manipulator-VelTracking-v0": 3_000_000,
@@ -44,37 +125,96 @@ def apply_isaac_rl_training_default(agent_cfg, task, algorithm, *, overrides=())
         agent_cfg.setdefault("trainer", {})["timesteps"] = budget
 
 
-EXPERIMENT_MODES = ("analytical", "sim_to_real")
+CONTEXT_ROLES = ("policy", "critic", "value", "critic_1", "critic_2", "target_critic_1", "target_critic_2")
+REMOVED_CONTEXT_OPTIONS = frozenset({"backbone", "preview_steps", "temporal_context", "use_history", "encoder_stride",
+                                     "encoder_hidden", "embed_dim", "feature_dim", "encoder_window"})
 
 
-def migrate_dynamics_mode(cfg: dict, *, default="analytical") -> dict:
-    """Read historical dynamics flags once, retaining only the canonical mode."""
-    cfg = cfg.copy()
-    learned = cfg.pop("use_empirical_dynamics", None)
-    cfg.pop("use_learned_disturbance", None)
-    mode = cfg.get("mode", "sim_to_real" if learned else default)
-    if mode not in EXPERIMENT_MODES:
-        raise ValueError(f"mode must be one of {EXPERIMENT_MODES}, got {mode!r}")
-    cfg["mode"] = mode
-    return cfg
+def validate_experiment_config(cfg):
+    """Reject removed selectors rather than silently running another experiment."""
+    if 'extends' in cfg:
+        raise ValueError('Resolve config inheritance with load_agent_config before constructing an algorithm')
+    if 'gru' in cfg:
+        raise ValueError('gru settings moved to models.encoder')
+    for name, block in (("config", cfg), ("agent", cfg.get("agent", {})),
+                        ("empirical_dynamics", cfg.get("empirical_dynamics", {}))):
+        for key in ("mode", "use_empirical_dynamics", "use_learned_disturbance"):
+            if key in block:
+                raise ValueError(f"{name}.{key} was removed; the environment determines exact or learned dynamics")
+    for role in CONTEXT_ROLES:
+        block = cfg.get("models", {}).get(role, {})
+        removed = REMOVED_CONTEXT_OPTIONS.intersection(block)
+        if removed:
+            raise ValueError(f"models.{role}: removed context options {sorted(removed)}; use encoder and models.encoder")
+        if block.get("encoder") not in (None, "gru"):
+            raise ValueError(f"models.{role}.encoder must be null (no GRU) or gru")
+    if str(cfg.get("agent", {}).get("class", "")).lower() == "c3m" and any(
+            cfg.get("models", {}).get(role, {}).get("encoder") == "gru" for role in CONTEXT_ROLES):
+        raise ValueError("C3M offline state sampling has no measured history; GRU context requires a rollout-trained policy/critic")
+    critic = cfg.get("models", {}).get("critic", cfg.get("models", {}).get("value", cfg.get("models", {}).get("critic_1", {})))
+    for role in CONTEXT_ROLES[1:]:
+        block = cfg.get("models", {}).get(role)
+        if block is not None and "encoder" in block and block["encoder"] != critic.get("encoder"):
+            raise ValueError("All critic and target critic encoders must match")
+    from contractionRL.agents.utils.RL.config_usage import validate_algorithm_config
+    validate_algorithm_config(cfg)
+    shared = cfg.get("models", {}).get("encoder", {})
+    if not isinstance(shared, dict) or set(shared) - {"feature_dim", "encoder_window"}:
+        raise ValueError("models.encoder accepts only feature_dim and encoder_window")
+    for key in ("feature_dim", "encoder_window"):
+        value = shared.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+            raise ValueError(f"models.encoder.{key} must be a positive integer or null")
 
 
-def normalize_experiment_mode(cfg: dict, *, physx_only=False, default="analytical") -> str:
-    """Resolve a full config before models, logging or checkpoint setup."""
-    agent = cfg.setdefault("agent", {})
-    dynamics = cfg.get("empirical_dynamics", {})
-    merged = {**dynamics, **agent}
-    if "mode" in cfg:
-        merged["mode"] = cfg["mode"]
-    mode = migrate_dynamics_mode(merged, default=default)["mode"]
-    if physx_only:
-        mode = "sim_to_real"
-    cfg["mode"] = mode
-    for block in (agent, dynamics):
-        block.pop("use_empirical_dynamics", None)
-        block.pop("use_learned_disturbance", None)
-        block.pop("mode", None)
-    return mode
+def configure_encoder_context(env, cfg):
+    """Build one raw context bank; each network independently chooses whether to encode it."""
+    import math
+    from contractionRL.runners.contraction_runner import _unwrap_env
+    validate_experiment_config(cfg)
+    raw = _unwrap_env(env)
+    from contractionRL.agents.utils.RL.config_usage import validate_optimization_parameters
+    validate_optimization_parameters(cfg, cfg.get('_tuned_parameters', []), raw)
+    roles = cfg.get("models", {})
+    enabled = any(roles.get(role, {}).get("encoder") == "gru" for role in CONTEXT_ROLES)
+    window = getattr(raw, "ref_window", None)
+    if enabled:
+        if window is None or not getattr(window, "compact", False) or not hasattr(raw, "configure_encoder_context"):
+            raise ValueError("GRU context requires compact tracking observations s=(x, xref, xi)")
+        shared = dict(roles.get("encoder", {}))
+        count = shared.get("encoder_window")
+        if count is None:
+            gamma = float(cfg.get("agent", {}).get("discount_factor", .99))
+            if not math.isfinite(gamma) or not 0 <= gamma < 1:
+                raise ValueError("A null encoder_window requires 0 <= discount_factor < 1")
+            count = max(1, math.ceil(round(1 / (1 - gamma), 10)))
+        dim = shared.get("feature_dim")
+        dim = 3 * window.x_dim if dim is None else dim
+        roles["encoder"] = {"feature_dim": dim, "encoder_window": count}
+        if window.preview_length != count or window.history_length != count:
+            raw.configure_encoder_context(count)
+    elif window is not None and getattr(window, "compact", False) and (window.preview_length or window.history_length):
+        raw.configure_encoder_context(0)
+    return roles.get("encoder", {})
+
+
+def model_context_config(cfg):
+    """Expand shared GRU parameters only for internal model construction."""
+    import copy
+    models = copy.deepcopy(cfg.get("models", {}))
+    shared = models.pop("encoder", {})
+    critic = models.get("critic", models.get("value", models.get("critic_1", {})))
+    critic_encoder = critic.get("encoder")
+    for role in CONTEXT_ROLES:
+        block = models.get(role)
+        if isinstance(block, dict):
+            block.setdefault("encoder", None if role == "policy" else critic_encoder)
+            # Existing model constructors call the context-free path "mlp".
+            if block["encoder"] is None:
+                block["encoder"] = "mlp"
+            if block["encoder"] == "gru":
+                block["feature_dim"] = shared.get("feature_dim")
+    return models
 
 
 def filter_cfg_fields(cfg_dict: dict, dataclass_type, *, context: str, forwarded_fields=()) -> dict:
@@ -250,12 +390,11 @@ def normalize_agent_cfg(agent_cfg: dict, *, algorithm: str, device=None) -> None
     """
     a = agent_cfg.setdefault("agent", {})
     c2rl = algorithm in ("c2rl-ppo", "c2rl_ppo")
-    validate_observation_normalization(a, allow_features=c2rl)
-    if algorithm not in ("c2rl-ppo", "c2rl_ppo"):
-        if a.pop("use_value_expansion", False) or any(
-                key in a for key in ("value_expansion_horizon", "value_expansion_batch_size")):
-            raise ValueError("use_value_expansion is supported only by C2RL-PPO")
-    if not c2rl:
+    validate_observation_normalization(a, allow_features=algorithm in ("ppo", "contraction_ppo", "contraction-ppo", "contractionppo", "c2rl-ppo", "c2rl_ppo"))
+    ppo_family = algorithm in ("ppo", "contraction_ppo", "contraction-ppo", "contractionppo", "c2rl-ppo", "c2rl_ppo")
+    if not ppo_family:
+        if a.pop("use_value_expansion", False) or any(key in a for key in ("value_expansion_horizon", "value_expansion_batch_size")):
+            raise ValueError("use_value_expansion is supported only by PPO-family algorithms")
         a.pop("use_state_norm", None)
     use_value_norm = a.pop("use_value_norm", True)
     # C2RL builds its own PPO/SAC sub-agent from the raw yaml dict via

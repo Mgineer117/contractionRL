@@ -53,6 +53,13 @@ CLASSIC_ENVS = (
     "classic-quadrotor-v0",
 )
 ISAACLAB_ENVS = (
+    "Isaac-Classic-Car-v0",
+    "Isaac-Classic-Car-v1",
+    "Isaac-Classic-Quadrotor-v0",
+    "Isaac-Classic-Cartpole-v0",
+    "Isaac-Classic-Segway-v0",
+    "Isaac-Cartpole-v0",
+    "Isaac-Segway-v0",
     "Humanoid-PathTracking-v0",
     "Humanoid-VelTracking-v0",
     "Manipulator-PathTracking-v0",
@@ -76,7 +83,10 @@ def load_config(algorithm: str) -> dict:
         raise SystemExit(
             f"No search config for '{algorithm}'. Available: {', '.join(available_algorithms())}"
         )
-    cfg = yaml.safe_load(path.read_text())
+    import sys
+    sys.path.insert(0, str(_ROOT / "source/contractionRL"))
+    from contractionRL.agents.utils.RL.config import load_agent_config
+    cfg = load_agent_config(path)
     for required in ("algorithm", "num_envs", "metric", "parameters"):
         if required not in cfg:
             raise SystemExit(f"{path} is missing required key '{required}'.")
@@ -181,7 +191,7 @@ def episode_length(env: str) -> int:
     # where the generated yaml goes under `--out -`. Redirect the import's
     # output to stderr so the yaml on stdout is always parseable.
     with contextlib.redirect_stdout(sys.stderr):
-        mod = importlib.import_module(f"contractionRL.tasks.direct.classic.{name}.env")
+        mod = importlib.import_module(f"contractionRL.tasks.direct.isaac_classic_{name}.dynamics")
     cfg = mod.ENV_CONFIG
     return round(cfg["time_bound"] / cfg["dt"])
 

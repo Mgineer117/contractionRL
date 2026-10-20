@@ -1,52 +1,61 @@
 label: c2rl (rl=ppo, cm=cvstem)
 algorithm: c2rl-ppo
 num_envs: 1024
-
 method: bayes
-
 metric:
-  name: "Stability/auc_mean"
+  name: Stability/auc_mean
   goal: minimize
-
 runner:
   wrapper: true
   bad_value: 100.0
-
 extra_flags:
-  - "--ref_offset"
-  - "1"
-  - "--num_timesteps"
-  - "50000"
-
+- --ref_offset
+- '1'
+- --num_timesteps
+- '50000'
 parameters:
+  agent.value_loss_scale:
+    value: 2.5
+  agent.grad_norm_clip:
+    value: 0.5
   agent.discount_factor:
     value: 0.999
-  xref_encoder:
-    value: gru
-  xref_encoder_stride:
-    values: [1, 2, 3, 5, 10, 20]
   agent.gae_lambda:
-    values: [0.9, 0.95, 0.975, 0.99, 1.0]
+    values:
+    - 0.9
+    - 0.95
+    - 0.975
+    - 0.99
+    - 1.0
   agent.ratio_clip:
-    values: [0.1, 0.2, 0.3]
+    values:
+    - 0.1
+    - 0.2
+    - 0.3
   agent.learning_epochs:
-    values: [2, 5, 10]
+    values:
+    - 2
+    - 5
+    - 10
   agent.mini_batches:
-    values: [8, 16]
-  agent.use_reward_norm:
-    value: false
+    values:
+    - 8
+    - 16
   cm.control_scaler:
     value: 0.0
-
   agent.kl_threshold:
     value: 0.032
   models.policy.initial_log_std:
-    values: [-0.5, 0.0, 0.7, 1.4, 2.0]
-
+    values:
+    - -0.5
+    - 0.0
+    - 0.7
+    - 1.4
+    - 2.0
   agent.cmg_method:
     value: cvstem
   agent.learning_rate:
-    value: 1.0e-5
+    value: 1.0e-05
   agent.learning_rate_scheduler:
     value: KLAdaptiveLR
   agent.learning_rate_scheduler_kwargs:
@@ -54,5 +63,11 @@ parameters:
       kl_threshold: 0.008
       kl_factor: 2
       lr_factor: 1.5
-      min_lr: 1.0e-6
-      max_lr: 1.0e-4
+      min_lr: 1.0e-06
+      max_lr: 0.0001
+  models.policy.encoder:
+    value: gru
+  models.critic.encoder:
+    value: gru
+  models.encoder.encoder_window:
+    value: null

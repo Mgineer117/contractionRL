@@ -1,10 +1,20 @@
-mode: sim_to_real
 seed: 1
 models:
+  encoder:
+    feature_dim: null  # null defaults to 3 * x_dim per GRU.
+    encoder_window: null  # null uses ceil(1 / (1 - discount_factor)) steps for each past/future window.
+  dynamics:
+    class: NeuralDynamics
+    network:
+    - name: net
+      input: STATE_ACTION
+      layers: [128, 128]
+      activations: tanh
+
   separate: true
   policy:
+    encoder: null  # No GRU; use gru to encode past and future context.
     class: DeterministicMixin
-    backbone: control-squashed
     clip_actions: false
     network:
     - name: net
@@ -19,14 +29,6 @@ models:
       layers: [256, 256]
       activations: tanh
       constrain_eigenvalues: true
-  dynamics:
-    class: NeuralDynamics
-    network:
-    - name: net
-      input: STATE_ACTION
-      layers: [128, 128]
-      activations: tanh
-
 memory:
   class: RandomMemory
   memory_size: 131072

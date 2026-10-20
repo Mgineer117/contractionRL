@@ -13,10 +13,8 @@ command:
 - ..
 - ${args}
 parameters:
-  network_family:
-    values:
-    - compact_mlp
-    - dual_gru
+  agent.value_loss_scale:
+    value: 2.5
   ccm_bounds:
     values:
     - 0.1:1.0
@@ -33,12 +31,9 @@ parameters:
     - true
     - false
   agent.learning_rate:
-    value: 1.0e-5
+    value: 1.0e-05
   agent.grad_norm_clip:
-    values:
-    - 0.5
-    - 1.0
-    - 2.0
+    value: 0.5
   agent.gae_lambda:
     values:
     - 0.9
@@ -82,5 +77,11 @@ parameters:
       kl_threshold: 0.008
       kl_factor: 2
       lr_factor: 1.5
-      min_lr: 1.0e-6
-      max_lr: 1.0e-4
+      min_lr: 1.0e-06
+      max_lr: 0.0001
+  models.policy.encoder:
+    values:
+    - null
+    - gru
+  models.critic.encoder:
+    value: gru

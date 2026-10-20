@@ -42,7 +42,7 @@ Audit date: October 15, 2026. The findings below are **fixed in the working tree
    - **Fix:** Respect `outputs_metric` and evaluate the potential using the wrapped physical-coordinate error. Compact critics now honor their analytic-potential option; incompatible value normalization is rejected for C2RL.
    - **If left unfixed:** Plots or critic potentials can use a different energy from the environment reward.
 
-7. **The declared action space was smaller than the plant's applied input box** ([env_base.py](../source/contractionRL/contractionRL/tasks/direct/classic/common/env_base.py)).
+7. **The declared action space was smaller than the plant's applied input box** ([analytical_env.py](../source/contractionRL/contractionRL/tasks/direct/common/analytical_env.py)).
    - **What this is:** The action space determines bounded actors' output range and controllers' actuator limits.
    - **Problem:** Classic environments declared the nominal-reference input box instead of the actual actuator box. Bounded policies could lose half the available authority.
    - **Fix:** Declare `U_MIN/U_MAX`; keep the smaller reference-control bounds separate. Tests compare declared and applied bounds across classic plants.
@@ -96,7 +96,7 @@ Audit date: October 15, 2026. The findings below are **fixed in the working tree
     - **Fix:** Pass the effective discount and use a monotonic completion counter; clear unfinished return accumulators on external reset. Regression coverage checks successive completions after the history is full.
     - **If left unfixed:** Logged return can use the wrong objective and freeze during long runs.
 
-16. **Backend/reference switches and seeds had inconsistent contracts** ([backend.py](../source/contractionRL/contractionRL/tasks/direct/classic_isaac/backend.py); [train.py](../scripts/skrl/train.py); [env_base.py](../source/contractionRL/contractionRL/tasks/direct/classic/common/env_base.py)).
+16. **Backend/reference switches and seeds had inconsistent contracts** ([backend.py](../source/contractionRL/contractionRL/tasks/direct/common/isaac/backend.py); [train.py](../scripts/skrl/train.py); [analytical_env.py](../source/contractionRL/contractionRL/tasks/direct/common/analytical_env.py)).
     - **What this is:** Backend, trajectory layout, and seed determine dynamics/data identity.
     - **Problem:** Reapplying PhysX cache configuration nested its prefix; some compact legacy switches were accepted without effect; reference-mode validation could precede the actual override. Classic reset seeds and public custom-agent seeds were not consistently applied.
     - **Fix:** Make backend configuration idempotent, validate final reference settings, reject ignored compact reward/window/termination switches, record the actual compact layout, and seed before reference/model construction. Apply fixed-reference selection to native Isaac tracking tasks as well.
@@ -137,7 +137,7 @@ The input-box minimization uses the actual applied limits: `a + sum(min(b_i*u_lo
 
 ## Validation and performance evidence
 
-The test suite includes real finite model outputs, transitions, replay/rollout insertion, and updates for PPO, SAC, C2RL-PPO, and C2RL-SAC on all nine classic plants. The five classic plants ported to Isaac use compact layouts in this matrix; aircraft, ball-and-beam, TORA, and two-link arm use their legacy layouts. C3M buffer/batch behavior, contraction losses, ContractionPPO, backend/model metadata, reference bounds, disturbance, and logging also have dedicated tests. Three subprocess tests exercise the real classic training CLI and inspect its saved effective configuration.
+The test suite includes real finite model outputs, transitions, replay/rollout insertion, and updates for PPO, SAC, C2RL-PPO, and C2RL-SAC on the five analytical task variants backing the Isaac environments, using compact layouts. C3M buffer/batch behavior, contraction losses, ContractionPPO, backend/model metadata, reference bounds, disturbance, and logging also have dedicated tests. Three subprocess tests exercise the real classic training CLI and inspect its saved effective configuration.
 
 Native flat-observation model checks cover PPO and SAC configs from quadruped, humanoid, manipulator velocity tracking, and the retained legacy cartpole configuration. These tests execute learning updates with representative tensors; they do not simulate the robots.
 
@@ -155,4 +155,4 @@ The shipped car PPO/C2RL-PPO discount of 0.01 is a valid but nearly myopic model
 
 Verdict: Confirmed integration errors have been corrected with regression coverage. Reassess learning quality using new runs from this code before drawing conclusions from historical C2RL curves.
 
-Not checked: A new live Isaac Sim/PhysX rollout after these fixes; long training runs from the final audited snapshot; every custom YAML combination; regenerated CV-STEM datasets or uniform certificates. Physics/backend code and tensor contracts were checked without claiming a live simulator validation. Cache metadata separates backends and numeric settings but does not include an immutable fingerprint of the plant source. Generic compact ball-and-beam reference generation remains outside the validated compact task set; its legacy path is tested. Checkpoints retain more learner state but are not an exact replay/RNG/scheduler continuation format.
+Not checked: A new live Isaac Sim/PhysX rollout after these fixes; long training runs from the final audited snapshot; every custom YAML combination; regenerated CV-STEM datasets or uniform certificates. Physics/backend code and tensor contracts were checked without claiming a live simulator validation. Cache metadata separates backends and numeric settings but does not include an immutable fingerprint of the plant source. Checkpoints retain more learner state but are not an exact replay/RNG/scheduler continuation format.

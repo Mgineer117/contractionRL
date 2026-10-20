@@ -1,11 +1,9 @@
-mode: analytical
 seed: 1
 
 models:
   separate: true
   policy:
     class: DeterministicMixin
-    backbone: control-squashed
     clip_actions: false
     network:
     - name: net

@@ -410,11 +410,10 @@ def patch_auc_checkpoint(agent, metric: str = "auc") -> None:
         if value is not None:
             agent.track_data(BEST_METRIC_KEY, value)
 
-        # Mirror skrl's cadence: it updates best modules then writes them, both
-        # gated on checkpoint_interval inside the base call below.
+        # Capture the policy measured by each report; disk writes retain skrl's cadence.
         ts = timestep + 1
-        if ts > 1 and agent.checkpoint_interval > 0 and not ts % agent.checkpoint_interval:
-            if value is not None and value > best["value"]:
+        if agent.checkpoint_interval > 0:
+            if value is not None and math.isfinite(value) and value > best["value"]:
                 best["value"] = value
                 agent.checkpoint_best_modules["timestep"] = ts
                 agent.checkpoint_best_modules["saved"] = False

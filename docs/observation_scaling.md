@@ -17,7 +17,7 @@ For Car v0/v1, Cartpole, Segway, Quadrotor, Quadruped and Humanoid compact polic
 
 The simulator and replay still carry the full physical `(x, xref, xi)` for dynamics, metric/reward evaluation and model rollouts. The shared differentiable input map changes only what enters policy/critic MLPs. Analytical car therefore has 35 stored observation coordinates and 37 policy/critic input features; analytical Quadrotor has 75 and 78 respectively. Cartpole/Segway add one feature, PhysX car adds two, PhysX Quadrotor adds three, and ground robots add two. Boundary distances make the transformation information-preserving within the known box. Translating the entire scene and its box preserves the features; moving within a fixed box changes the boundary features.
 
-Ball-and-Beam, TORA, Two-link arm, Panda and Aircraft retain their previous physical tracking representation. Structured controllers multiply their gains by the physical wrapped tracking error, so controller derivatives keep physical units. Metrics continue to take physical x.
+Panda retains its previous physical tracking representation. Structured controllers multiply their gains by the physical wrapped tracking error, so controller derivatives keep physical units. Metrics continue to take physical x.
 
 
 Running normalization of physical observations is unsupported and rejected consistently in both the training entry point and direct runner/agent configuration. This prevents double normalization, changing reference-control units, or silently enabling a preprocessor that is actually an identity for compact states.

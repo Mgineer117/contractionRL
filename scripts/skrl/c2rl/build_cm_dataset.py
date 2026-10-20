@@ -30,8 +30,9 @@ import gymnasium as gym
 import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
-CLASSIC = ROOT / "source/contractionRL/contractionRL/tasks/direct/classic"
+DIRECT = ROOT / "source/contractionRL/contractionRL/tasks/direct"
 sys.path.insert(0, str(ROOT / "source" / "contractionRL"))
+from contractionRL.agents.utils.RL.config import load_agent_config
 
 
 def _short(task: str) -> str:
@@ -43,13 +44,13 @@ def _task_id(task: str) -> str:
     """Accept either the short key or the full classic gym id."""
     if task.startswith("classic-"):
         return task
-    from contractionRL.tasks.direct.classic import env_id
+    from contractionRL.tasks.direct.common.tracking_tasks import env_id
     return env_id(task)
 
 
 def _agents_dir(task: str) -> Path:
     key = "car_v1" if task == "classic-car-v1" else _short(task)
-    return CLASSIC / key / "agents"
+    return DIRECT / f"isaac_classic_{key}" / "agents"
 
 
 def _load_cfg(task: str, algorithm: str):
@@ -64,7 +65,7 @@ def _load_cfg(task: str, algorithm: str):
     if not path.exists():
         raise SystemExit(f"no config at {path}")
     with open(path) as fh:
-        raw = yaml.safe_load(fh)
+        raw = load_agent_config(fh.name)
     merged = {**raw.get("cm", {}), **raw.get("cmg", {}),
               **raw.get("empirical_dynamics", {}), **raw.get("agent", {})}
     merged.pop("class", None)
@@ -97,7 +98,7 @@ def main() -> int:
                    help="re-solve and overwrite even if a matching dataset exists")
     args = p.parse_args()
 
-    import contractionRL.tasks.direct.classic  # noqa: F401
+    import contractionRL.tasks.direct.common.tracking_tasks  # noqa: F401
     from contractionRL.agents.skrl.c2rl import cm_dataset_target
     from contractionRL.agents.utils.contraction.ncm_synthesis import (
         build_cm_dataset,

@@ -1,0 +1,85 @@
+name: analytical-car-c2rl-ppo-pretrained-ccm-revised
+method: bayes
+run_cap: 96
+metric:
+  name: Evaluation/Stability/validation_auc_mean
+  goal: minimize
+program: search/train_bayes.py
+command:
+- ${env}
+- ${interpreter}
+- ${program}
+- --root
+- ..
+- ${args}
+parameters:
+  agent.value_loss_scale:
+    value: 2.5
+  ccm_bounds:
+    values:
+    - 0.1:1.0
+    - 0.1:3.0
+    - 0.3:3.0
+  agent.use_value_norm:
+    values:
+    - true
+    - false
+  agent.use_state_norm:
+    value: false
+  agent.use_value_expansion:
+    values:
+    - true
+    - false
+  agent.learning_rate:
+    value: 1.0e-05
+  agent.grad_norm_clip:
+    value: 0.5
+  agent.gae_lambda:
+    values:
+    - 0.9
+    - 0.95
+    - 0.99
+    - 1.0
+  agent.rollouts:
+    values:
+    - 16
+    - 64
+  agent.learning_epochs:
+    values:
+    - 3
+    - 5
+    - 10
+  agent.mini_batches:
+    value: 4
+  agent.discount_factor:
+    values:
+    - 0.9
+    - 0.99
+    - 0.999
+  agent.action_bound_penalty_beta:
+    values:
+    - 0.01
+    - 1.0
+  policy_architecture:
+    values:
+    - structured_residual
+    - factorized
+  lr_schedule:
+    value: kl_adaptive
+  agent.kl_threshold:
+    value: 0.032
+  agent.learning_rate_scheduler:
+    value: KLAdaptiveLR
+  agent.learning_rate_scheduler_kwargs:
+    value:
+      kl_threshold: 0.008
+      kl_factor: 2
+      lr_factor: 1.5
+      min_lr: 1.0e-06
+      max_lr: 0.0001
+  models.policy.encoder:
+    values:
+    - null
+    - gru
+  models.critic.encoder:
+    value: gru

@@ -29,8 +29,7 @@ class HumanoidPathTrackingEnv(PathTrackingBase):
     cfg: HumanoidPathTrackingEnvCfg
     angle_idx = [2]
 
-    def __init__(self, cfg: HumanoidPathTrackingEnvCfg, render_mode=None, **kwargs):
-        super().__init__(cfg, render_mode, **kwargs)
+    def _initialize_robot_indices(self) -> None:
         self._joint_ids, _ = self._robot.find_joints([
             ".*_hip_yaw", ".*_hip_roll", ".*_hip_pitch", ".*_knee", "torso",
             ".*_ankle",
@@ -78,7 +77,7 @@ class HumanoidPathTrackingEnv(PathTrackingBase):
     def _get_physical_state(self) -> torch.Tensor:
         xy_rel = self._robot.data.root_pos_w[:, :2] - self.scene.env_origins[:, :2]
         _, _, yaw = euler_xyz_from_quat(self._robot.data.root_quat_w)
-        return torch.cat(
+        return self._unwrap_state_angles(torch.cat(
             [
                 xy_rel,
                 yaw.unsqueeze(-1),
@@ -90,7 +89,7 @@ class HumanoidPathTrackingEnv(PathTrackingBase):
                 self._robot.data.root_pos_w[:, 2:3],
             ],
             dim=-1,
-        )
+        ))
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length

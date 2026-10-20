@@ -6,14 +6,21 @@
 """Installation script for the 'contractionRL' python package."""
 
 import os
+from pathlib import Path
 
 import toml
-from setuptools import setup
+from setuptools import find_packages, setup
 
 # Obtain the extension data from the extension.toml file
 EXTENSION_PATH = os.path.dirname(os.path.realpath(__file__))
 # Read the extension.toml file
 EXTENSION_TOML_DATA = toml.load(os.path.join(EXTENSION_PATH, "config", "extension.toml"))
+PACKAGE_PATH = Path(EXTENSION_PATH) / "contractionRL"
+TASK_DATA = sorted(
+    str(path.relative_to(PACKAGE_PATH))
+    for path in (PACKAGE_PATH / "tasks").rglob("*")
+    if path.is_file() and path.suffix in {".yaml", ".yml", ".usd", ".usda", ".usdz"}
+)
 
 # Minimum dependencies required prior to installation
 INSTALL_REQUIRES = [
@@ -43,7 +50,7 @@ INSTALL_REQUIRES = [
 # Installation operation
 setup(
     name="contractionRL",
-    packages=["contractionRL"],
+    packages=find_packages(where=EXTENSION_PATH),
     author=EXTENSION_TOML_DATA["package"]["author"],
     maintainer=EXTENSION_TOML_DATA["package"]["maintainer"],
     url=EXTENSION_TOML_DATA["package"]["repository"],
@@ -53,7 +60,7 @@ setup(
     install_requires=INSTALL_REQUIRES,
     license="Apache-2.0",
     include_package_data=True,
-    package_data={"contractionRL": ["tasks/direct/classic_isaac/assets/*.usda", "tasks/direct/common/skrl_contraction_ppo_cfg.yaml"]},
+    package_data={"contractionRL": TASK_DATA},
     python_requires=">=3.10",
     classifiers=[
         "Natural Language :: English",

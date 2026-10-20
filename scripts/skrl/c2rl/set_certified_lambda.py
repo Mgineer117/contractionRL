@@ -28,8 +28,8 @@ import os
 import re
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CLASSIC = os.path.join(ROOT, "source/contractionRL/contractionRL/tasks/direct/classic")
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+DIRECT = os.path.join(ROOT, "source/contractionRL/contractionRL/tasks/direct")
 
 # algorithm -> {canonical name: yaml key}. A key absent here is simply not
 # written for that algorithm (c3m has no Riccati weight at all).
@@ -75,7 +75,7 @@ def main() -> int:
     if args.w_ub is not None:
         vals["w_ub"] = f"{args.w_ub:g}"
 
-    base = os.path.join(CLASSIC, args.env, "agents")
+    base = os.path.join(DIRECT, f"isaac_classic_{args.env}", "agents")
     if not os.path.isdir(base):
         print(f"no such env: {base}", file=sys.stderr)
         return 2

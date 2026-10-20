@@ -60,7 +60,9 @@ class TrajectoryBuffer:
         """Reject unsafe stored references; never repair them by state clipping."""
         low, high, margin = [torch.as_tensor(v, device=self.device) for v in (low, high, margin)]
         keep = torch.isfinite(self._states).all(dim=(1, 2)) & torch.isfinite(self._actions).all(dim=(1, 2))
-        keep &= ((self._states >= low + margin) & (self._states <= high - margin)).all(dim=(1, 2))
+        from contractionRL.agents.utils.system_dynamics.state import canonical_bound_state
+        checked = canonical_bound_state(self._states, low, high, getattr(self, '_angle_idx', ()))
+        keep &= ((checked >= low + margin) & (checked <= high - margin)).all(dim=(1, 2))
         keep &= ((self._actions >= torch.as_tensor(control_low, device=self.device)) &
                  (self._actions <= torch.as_tensor(control_high, device=self.device))).all(dim=(1, 2))
         keep &= self._lengths >= min_length
@@ -69,6 +71,11 @@ class TrajectoryBuffer:
         self._valid_ids = keep.nonzero(as_tuple=True)[0]
         if not len(self._valid_ids):
             raise ValueError("No full-length reference trajectory satisfies the configured state/control bounds and margins; regenerate nominal trajectories")
+
+    def unwrap_angles(self, indices):
+        from contractionRL.agents.utils.system_dynamics.state import unwrap_angle_trajectory
+        self._angle_idx = tuple(indices)
+        self._states = unwrap_angle_trajectory(self._states, indices)
 
     def wrap_angles(self, indices):
         if indices:

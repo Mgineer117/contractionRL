@@ -1,32 +1,55 @@
 label: ppo
 algorithm: ppo
 num_envs: 1024
-
-extra_flags: ["--reward_euclidean"]
-
+extra_flags:
+- --reward_euclidean
 metric:
-  name: "Reward / Total reward (mean)"
+  name: Reward / Total reward (mean)
   goal: maximize
-
 parameters:
+  agent.value_loss_scale:
+    value: 2.5
+  agent.grad_norm_clip:
+    value: 0.5
   agent.discount_factor:
-    values: [0.1, 0.3, 0.5, 0.7, 0.9, 0.99, 0.999]
+    values:
+    - 0.1
+    - 0.3
+    - 0.5
+    - 0.7
+    - 0.9
+    - 0.99
+    - 0.999
   agent.gae_lambda:
-    values: [0.9, 0.95, 0.975, 1.0]
+    values:
+    - 0.9
+    - 0.95
+    - 0.975
+    - 1.0
   agent.ratio_clip:
-    values: [0.1, 0.2, 0.3]
+    values:
+    - 0.1
+    - 0.2
+    - 0.3
   agent.entropy_loss_scale:
-    values: [0.0, 0.001, 0.01]
-  models.policy.backbone:
-    values: [mlp, control]
+    values:
+    - 0.0
+    - 0.001
+    - 0.01
   network_architecture:
     values:
-      - [64, 64]
-      - [128, 128]
-      - [512, 512]
-      - [128, 128, 128, 128]
+    - - 64
+      - 64
+    - - 128
+      - 128
+    - - 512
+      - 512
+    - - 128
+      - 128
+      - 128
+      - 128
   agent.learning_rate:
-    value: 1.0e-5
+    value: 1.0e-05
   agent.learning_rate_scheduler:
     value: KLAdaptiveLR
   agent.learning_rate_scheduler_kwargs:
@@ -34,7 +57,11 @@ parameters:
       kl_threshold: 0.008
       kl_factor: 2
       lr_factor: 1.5
-      min_lr: 1.0e-6
-      max_lr: 1.0e-4
+      min_lr: 1.0e-06
+      max_lr: 0.0001
   agent.kl_threshold:
     value: 0.032
+  models.policy.control_mode:
+    values:
+    - structured
+    - residual

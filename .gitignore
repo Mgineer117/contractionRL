@@ -71,6 +71,8 @@ _build
 nohup.out
 **/*tfevents*
 /checkpoints/
+/car_c2rl_ppo/
+value-expansion-assumptions.json
 
 # Torch checkpoints — regenerable run artifacts, never committed.
 **/*.pt
@@ -120,5 +122,11 @@ mosek.lic
 data/classic/*/cm_data_*_wlb0.1_*.npz
 
 # Small authored mechanism assets required by the planar PhysX tasks.
-!source/contractionRL/contractionRL/tasks/direct/classic_isaac/assets/cartpole.usda
-!source/contractionRL/contractionRL/tasks/direct/classic_isaac/assets/segway.usda
+!source/contractionRL/contractionRL/tasks/direct/isaac_cartpole/assets/cartpole.usda
+!source/contractionRL/contractionRL/tasks/direct/isaac_segway/assets/segway.usda
+
+tests/
+wandb/
+visualization/
+tests/
+third_party/

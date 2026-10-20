@@ -6,6 +6,7 @@ dependency.
 """
 from __future__ import annotations
 
+import math
 import torch
 from torch.autograd import grad
 
@@ -15,14 +16,83 @@ def quadratic_energy(error: torch.Tensor, metric: torch.Tensor) -> torch.Tensor:
     return torch.einsum("bi,bij,bj->b", error, metric, error)
 
 
+def minimum_metric_error(error, metric=None, angle_idx=(), *, period=2 * math.pi):
+    """Choose angle windings minimizing e' M e; physical coordinates stay unchanged.
+
+    One angle has an analytic solution. Coupled angles use an exact closest-
+    lattice search, pruned by the Cholesky energy of a feasible integer point.
+    Branch selection is discrete; derivatives of the selected energy are valid
+    away from ties. At a tie the energy is continuous but need not be C1.
+    """
+    angles = tuple(sorted(set(int(i) for i in angle_idx)))
+    if not angles:
+        return error
+    if angles[0] < 0 or angles[-1] >= error.shape[-1] or period <= 0:
+        raise ValueError("Invalid angle indices or angle period")
+    result = error.clone()
+    result[..., list(angles)] = torch.remainder(error[..., list(angles)] + period / 2, period) - period / 2
+    if metric is None:
+        return result
+    # Evaluate M only at periodic network features, so equivalent lifts share M.
+    with torch.no_grad():
+        d = result.detach().clone()
+        d[:, list(angles)] = 0
+        C = metric.detach()[:, list(angles)][:, :, list(angles)]
+        cross = (metric.detach()[:, list(angles)] @ d.unsqueeze(-1)).squeeze(-1)
+        delta = result.detach()[:, list(angles)]
+        if len(angles) == 1:
+            winding = torch.round((-cross / C[:, :, 0] - delta) / period)
+        else:
+            center = (-torch.linalg.solve(C, cross.unsqueeze(-1)).squeeze(-1) - delta) / period
+            R = torch.linalg.cholesky(C).mT
+            winding = center.round()
+            # Babai point supplies an inexpensive upper bound on the optimum.
+            for i in reversed(range(len(angles))):
+                tail = (R[:, i, i+1:] * (winding[:, i+1:] - center[:, i+1:])).sum(-1)
+                winding[:, i] = (center[:, i] - tail / R[:, i, i]).round()
+            radius = (R @ (winding - center).unsqueeze(-1)).squeeze(-1).square().sum(-1)
+            tolerance = torch.finfo(error.dtype).eps * 32 * (1 + radius)
+            ids = torch.arange(len(error), device=error.device)
+            points, partial = winding.clone(), torch.zeros_like(radius)
+            for i in reversed(range(len(angles))):
+                rows = R[ids]
+                tail = (rows[:, i, i+1:] * (points[:, i+1:] - center[ids, i+1:])).sum(-1)
+                middle = center[ids, i] - tail / rows[:, i, i]
+                width = (radius[ids] + tolerance[ids] - partial).clamp_min(0).sqrt() / rows[:, i, i]
+                low, high = (middle - width).ceil(), (middle + width).floor()
+                offsets = torch.arange(int((high - low + 1).clamp_min(0).max()), device=error.device)
+                values = low[:, None] + offsets
+                costs = partial[:, None] + (rows[:, i, i, None] * (values - middle[:, None])).square()
+                valid = (values <= high[:, None]) & (costs <= radius[ids, None] + tolerance[ids, None])
+                parent, option = valid.nonzero(as_tuple=True)
+                points = points[parent].clone()
+                points[:, i] = values[parent, option]
+                ids, partial = ids[parent], costs[parent, option]
+            best = radius.clone().scatter_reduce_(0, ids, partial, reduce="amin", include_self=True)
+            candidates = torch.arange(len(ids), device=ids.device)
+            candidates = torch.where(partial <= best[ids], candidates, len(ids))
+            selected = torch.full((len(error),), len(ids), device=ids.device, dtype=torch.long)
+            selected.scatter_reduce_(0, ids, candidates, reduce="amin", include_self=True)
+            found = selected < len(ids)
+            winding[found] = points[selected[found]]
+    result[:, list(angles)] = result[:, list(angles)] + period * winding
+    return result
+
+
+def tracking_energy(error, metric=None, angle_idx=(), *, period=2 * math.pi):
+    """Periodic tracking energy; M=None is the identity-metric PPO objective."""
+    error = minimum_metric_error(error, metric, angle_idx, period=period)
+    return error.square().sum(-1) if metric is None else quadratic_energy(error, metric)
+
+
 def energy_decrease(current_energy, next_energy):
     """R = -(E(next state) - E(current state))."""
     return -(next_energy - current_energy)
 
 
 def action_bound_violation(actions, low, high):
-    """L2 distance of raw controls from their applied box, per transition."""
-    return torch.linalg.vector_norm(actions - actions.clamp(low, high), dim=-1)
+    """Squared L2 distance of raw controls from their applied box, per transition."""
+    return (actions - actions.clamp(low, high)).square().sum(dim=-1)
 
 
 def jacobian(f: torch.Tensor, x: torch.Tensor, create_graph: bool = True) -> torch.Tensor:

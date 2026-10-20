@@ -311,7 +311,7 @@ class ReferenceState:
     compact = True
 
     def __init__(self, x_dim, u_dim, parameter_dim, control, *, parameter_bounds=None,
-                 time_bound=np.inf, state_names=(), initial_state_parameters=False):
+                 time_bound=np.inf, state_names=(), initial_state_parameters=False, angle_idx=()):
         self.x_dim, self.u_dim = int(x_dim), int(u_dim)
         self.parameter_dim = int(parameter_dim)
         # Reference parameters, time and a synthetic-control offset only.
@@ -321,6 +321,7 @@ class ReferenceState:
         self.time_bound = time_bound
         self.state_names = tuple(state_names)
         self.initial_state_parameters = initial_state_parameters
+        self.angle_idx = tuple(angle_idx)
         self.preview_length = 0
         self.preview_stride = 1
         self.preview_start = 0
@@ -339,23 +340,27 @@ class ReferenceState:
         def array(x):
             return x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x, np.float32)
         lo, hi = array(x_lo), array(x_hi)
+        obs_lo, obs_hi = lo.copy(), hi.copy()
+        for i in self.angle_idx:
+            if hi[i] - lo[i] >= 2 * np.pi - 1e-5:
+                obs_lo[i], obs_hi[i] = -np.inf, np.inf
         p_lo, p_hi = self.parameter_bounds if self.parameter_bounds is not None else (np.full(self.parameter_dim, -np.inf), np.full(self.parameter_dim, np.inf))
         xi_lo = np.concatenate((array(p_lo), [0.], np.zeros(self.u_dim))).astype(np.float32)
         xi_hi = np.concatenate((array(p_hi), [self.time_bound], np.zeros(self.u_dim))).astype(np.float32)
         result = gym.spaces.Dict({
-            "x": gym.spaces.Box(lo, hi, dtype=np.float32),
-            "xref": gym.spaces.Box(lo, hi, dtype=np.float32),
+            "x": gym.spaces.Box(obs_lo, obs_hi, dtype=np.float32),
+            "xref": gym.spaces.Box(obs_lo, obs_hi, dtype=np.float32),
             "xi": gym.spaces.Box(xi_lo, xi_hi, dtype=np.float32),
         })
         if self.preview_length:
-            result.spaces['xrefs'] = gym.spaces.Box(np.tile(lo, (self.preview_length, 1)),
-                                                   np.tile(hi, (self.preview_length, 1)), dtype=np.float32)
+            result.spaces['xrefs'] = gym.spaces.Box(np.tile(obs_lo, (self.preview_length, 1)),
+                                                   np.tile(obs_hi, (self.preview_length, 1)), dtype=np.float32)
         if self.history_length:
             if u_lo is None or u_hi is None:
                 raise ValueError("History observations require applied-control bounds")
             self.control_low, self.control_high = array(u_lo), array(u_hi)
-            history_lo = np.concatenate((lo, array(u_lo), [0.])).astype(np.float32)
-            history_hi = np.concatenate((hi, array(u_hi), [1.])).astype(np.float32)
+            history_lo = np.concatenate((obs_lo, array(u_lo), [0.])).astype(np.float32)
+            history_hi = np.concatenate((obs_hi, array(u_hi), [1.])).astype(np.float32)
             result.spaces['xstates'] = gym.spaces.Box(np.tile(history_lo, (self.history_length, 1)),
                                                      np.tile(history_hi, (self.history_length, 1)), dtype=np.float32)
         result.reference_state = self
@@ -439,81 +444,54 @@ def affine_observation_scaling(low, high):
 
 
 class TrackingFeatures(torch.nn.Module):
-    """Relative translation, physical configuration, reference motion and box distances."""
-
+    """Relative translation and periodic physical/reference configuration."""
     def __init__(self, window, angle_idx=()):
         super().__init__()
-        self.window = window
-        self.angle_idx = list(angle_idx)
-        self.names = window.state_names
-        if self.names:
-            self.angle_idx = [i for i, name in enumerate(self.names) if name in {"yaw", "roll", "pitch"}]
-            self.angle_idx = sorted(set(self.angle_idx) | set(angle_idx))
-        center, scale = affine_observation_scaling(window.feature_low, window.feature_high)
-        if window.initial_state_parameters:
-            n = window.x_dim
-            # Initial reference-state slots contain displacements, not raw parameters.
-            scale[n:n + n] = scale[:n]
-        self.register_buffer("center", center)
-        self.register_buffer("scale", scale)
-        self.register_buffer("_legacy_position_rotation", torch.tensor(False))
-        self.position = tuple(i for i, name in enumerate(self.names) if name in {"pos_x", "pos_y", "pos_z"})
+        self.window, self.names = window, window.state_names
+        named = [i for i, name in enumerate(self.names or ()) if name in {"yaw", "roll", "pitch"}]
+        self.angle_idx = sorted(set(angle_idx) | set(getattr(window, "angle_idx", ())) | set(named))
+        self.position = tuple(i for i, name in enumerate(self.names or ()) if name in {"pos_x", "pos_y", "pos_z"})
         self.reference_indices = tuple(i for i in range(window.x_dim) if i not in self.position)
-        self.output_dim = window.base_dim + len(self.position)
+        n = window.x_dim
+        self.register_buffer("_raw_tracking_features", torch.tensor(True))
+        self.register_buffer("_explicit_tracking_input_blocks", torch.tensor(True))
         self.register_buffer("_relative_position_features", torch.tensor(bool(self.position)))
-        if self.position:
-            low = torch.as_tensor(window.feature_low[:window.x_dim])
-            high = torch.as_tensor(window.feature_high[:window.x_dim])
-            if not torch.isfinite(low[list(self.position)]).all() or not torch.isfinite(high[list(self.position)]).all():
-                raise ValueError("Relative-position boundary features require finite position bounds")
-            self.register_buffer("position_low", low[list(self.position)].clone())
-            self.register_buffer("position_high", high[list(self.position)].clone())
+        self.register_buffer("_periodic_tracking_features", torch.tensor(True))
+        self.register_buffer("_legacy_position_rotation", torch.tensor(False))
+        self.state_feature_dim = n + len(self.angle_idx)
+        self.context_feature_dim = window.xi_dim + (len(self.angle_idx) if window.initial_state_parameters else 0)
+        self.output_dim = 2 * self.state_feature_dim + self.context_feature_dim
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         if bool(state_dict.pop(prefix + "_episode_local_coordinates", False)):
-            raise ValueError("This checkpoint uses a removed coordinate system; load it with its archived source snapshot")
-        representation = prefix + "_relative_position_features"
-        recorded = bool(state_dict.get(representation, False))
-        if recorded != bool(self.position):
-            raise ValueError("Checkpoint tracking features differ; load historical policies with their archived source snapshot")
-        state_dict.setdefault(representation, self._relative_position_features.new_tensor(False))
-        key = prefix + "_legacy_position_rotation"
-        if key not in state_dict:
-            import warnings
-            warnings.warn("Restoring a historical checkpoint's rotated position features; new training uses world-coordinate errors", stacklevel=2)
-            state_dict[key] = self._legacy_position_rotation.new_tensor(True)
+            raise ValueError("Checkpoint uses removed coordinates; load it with its archived source snapshot")
+        state_dict.setdefault(prefix + "_legacy_position_rotation", self._legacy_position_rotation.new_tensor(False))
+        if not bool(state_dict.get(prefix + "_periodic_tracking_features", False)):
+            raise ValueError("Checkpoint predates periodic tracking features; load it with its archived source snapshot")
+        if not bool(state_dict.get(prefix + "_raw_tracking_features", False)):
+            raise ValueError("Checkpoint uses fixed feature scaling; load it with its archived source snapshot")
+        if not bool(state_dict.get(prefix + "_explicit_tracking_input_blocks", False)):
+            raise ValueError("Checkpoint uses the previous tracking input layout; load it with its archived source snapshot")
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
     def error(self, x, xref):
-        error = wrap_diff(x - xref, self.angle_idx)
-        # Only historical checkpoints retain the feature encoding they trained on.
-        if bool(self._legacy_position_rotation) and all(name in self.names for name in ("pos_x", "pos_y", "yaw")):
-            ix, iy, yaw = [self.names.index(name) for name in ("pos_x", "pos_y", "yaw")]
-            cos, sin = xref[:, yaw].cos(), xref[:, yaw].sin()
-            ex, ey = error[:, ix].clone(), error[:, iy].clone()
-            error = error.clone()
-            error[:, ix], error[:, iy] = cos * ex + sin * ey, -sin * ex + cos * ey
-        return error
+        return wrap_diff(x - xref, self.angle_idx)
+
+    def feedback_error(self, x, xref):
+        return embed_angles(x, self.angle_idx) - embed_angles(xref, self.angle_idx)
 
     def forward(self, obs):
         x, xref, xi = self.window.extract(obs)
         n = self.window.x_dim
-        features = (obs[:, :self.window.base_dim] - self.center) / self.scale
-        features = features.clone()
+        state, reference = x.clone(), xref.clone()
         if self.position:
             pos = list(self.position)
-            # Keep physical non-position states; only translation coordinates become errors.
-            features[:, pos] = (x[:, pos] - xref[:, pos]) / self.scale[pos]
-            if self.window.initial_state_parameters:
-                features[:, [n + i for i in pos]] = (xi[:, pos] - xref[:, pos]) / self.scale[[n + i for i in pos]]
-            span = (self.position_high - self.position_low).clamp_min(1e-6)
-            boundaries = torch.cat(((x[:, pos] - self.position_low) / span,
-                                    (self.position_high - x[:, pos]) / span), -1)
-            return torch.cat((features[:, :n + self.window.xi_dim],
-                              features[:, [n + self.window.xi_dim + i for i in self.reference_indices]],
-                              boundaries), -1)
-        features[:, :n] = self.error(x, xref) / self.scale[:n]
+            state[:, pos] = x[:, pos] - xref[:, pos]
+            reference[:, pos] = 0.
+        # Other reference generators may require a persistent target in their context.
         if self.window.initial_state_parameters:
-            features[:, n:n + n] = self.error(xi[:, :n], xref) / self.scale[n:n + n]
-        # xref remains in physical world coordinates: it locates the box faces.
-        return features
+            initial = xi[:, :n].clone()
+            if self.position:
+                initial[:, list(self.position)] -= xref[:, list(self.position)]
+            xi = torch.cat((embed_angles(initial, self.angle_idx), xi[:, n:]), -1)
+        return torch.cat((embed_angles(state, self.angle_idx), embed_angles(reference, self.angle_idx), xi), -1)

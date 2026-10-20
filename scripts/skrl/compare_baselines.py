@@ -12,7 +12,8 @@ import gymnasium as gym
 import numpy as np
 import torch
 import yaml
-import contractionRL.tasks.direct.classic
+from contractionRL.agents.utils.RL.config import load_agent_config
+import contractionRL.tasks.direct.common.tracking_tasks
 from contractionRL.agents.skrl.contraction_ppo import ContractionPPOPolicy
 from contractionRL.agents.utils.RL.models import FullControlActorModel
 from compare_residual import summarize
@@ -20,21 +21,21 @@ from compare_residual import summarize
 
 def load_actor(env, path):
     path = Path(path)
-    cfg = yaml.safe_load((path.parent.parent/'params/agent.yaml').read_text())
+    cfg = load_agent_config(path.parent.parent/'params/agent.yaml')
     spec = cfg['models']['policy']
-    from train_utils import configure_tracking_preview
-    configure_tracking_preview(env, cfg)
+    from train_utils import configure_tracking_context
+    configure_tracking_context(env, cfg)
     if spec['class'] == 'ContractionPPOPolicy':
         actor = ContractionPPOPolicy(env.observation_space, env.action_space, 'cpu', network=spec['network'],
-                                     control_mode=spec.get('control_mode', 'full'))
+                                     control_mode=spec.get('control_mode', 'structured'), encoder=spec.get('encoder') or 'mlp',
+                                     feature_dim=cfg.get('models', {}).get('encoder', {}).get('feature_dim'))
     else:
-        assert spec['class'] == 'GaussianMixin' and spec.get('backbone') == 'control'
+        assert spec['class'] == 'GaussianMixin'
         network = spec['network'][0]
         actor = FullControlActorModel(env.observation_space, env.action_space, 'cpu',
                                      hidden_dim=network['layers'], activation=network['activations'],
-                                     control_mode=spec.get('control_mode', 'full'),
-                                     encoder=spec.get('encoder', 'mlp'), encoder_hidden=spec.get('encoder_hidden', 64),
-                                     encoder_stride=spec.get('encoder_stride', 1))
+                                     control_mode=spec.get('control_mode', 'structured'),
+                                     encoder=spec.get('encoder') or 'mlp', feature_dim=cfg.get('models', {}).get('encoder', {}).get('feature_dim'))
     state = torch.load(path, map_location='cpu', weights_only=False)
     if cfg['agent'].get('use_state_norm', False):
         from contractionRL.agents.utils.RL.env import RunningFeatureScaler
@@ -118,7 +119,7 @@ def compare(manifest, checkpoint, output):
         common = masks[name] & masks['contraction_ppo']
         paired[name] = {**summarize(curves['contraction_ppo'][common]-curves[name][common]),
                         'common_complete_episodes': int(common.sum())}
-    result = {'task': 'Isaac-Car-v0', 'backend': 'analytical', 'evaluation_seed': int(bank['seed']),
+    result = {'task': 'Isaac-Classic-Car-v0', 'backend': 'analytical', 'evaluation_seed': int(bank['seed']),
               'evaluation_bank': str(bank_path), 'evaluation_bank_sha256': hashlib.sha256(bank_path.read_bytes()).hexdigest(),
               'disturbance_enabled': False, 'auc_definition': previous['auc_definition'],
               'failure_handling': previous['failure_handling'], 'variants': rows,

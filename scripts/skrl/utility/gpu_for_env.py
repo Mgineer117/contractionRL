@@ -1,26 +1,7 @@
-"""Pick a GPU big enough for the worst trial the sweep can sample.
+"""Estimate sweep memory from two GRU windows and the PPO minibatch size.
 
-The footprint is driven by the GRU/attn encoder over the reference window, and it
-is set by two things the sweep samples INDEPENDENTLY:
-
-    seq = ceil(episode_len / stride)                  the window it unrolls
-    B   = rollouts * num_envs / mini_batches          the PPO mini-batch it sees
-
-and the cost is ~linear in their PRODUCT. An earlier version of this file priced
-memory per retained point and ignored B entirely; it predicted 28.8 GiB for
-segway at stride 1 and the real allocation was 53.58 GiB, so segway OOM'd again
-on a 44 GiB L40S. B is not a detail, it is half the product.
-
-GIB_PER_BSEQ is calibrated from that failure -- 53.58 GiB at B=6144, seq=2000 --
-rather than derived from tensor shapes, so it already contains the gate count,
-the cuDNN workspace and the autograd tape.
-
-The WORST case is what has to fit, not the average: bayes will eventually sample
-the densest stride together with the smallest mini_batches, and that trial has to
-run rather than take its GPU-mates down with it.
-
-    python scripts/skrl/utility/gpu_for_env.py --all
-    python scripts/skrl/utility/gpu_for_env.py --env classic-segway-v0 --shell
+Uses a historical empirical memory coefficient with headroom; placement remains
+an estimate, not a simulator allocation guarantee.
 """
 from __future__ import annotations
 
@@ -34,7 +15,7 @@ import yaml
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
 sys.path.insert(0, os.path.join(_ROOT, "source", "contractionRL"))
 
-import contractionRL.tasks.direct.classic  # noqa: E402,F401
+import contractionRL.tasks.direct.common.tracking_tasks  # noqa: E402,F401
 import gymnasium as gym  # noqa: E402
 
 # Calibrated: a GRU trial at B=6144, seq=2000 tried to allocate 53.58 GiB.
@@ -51,12 +32,13 @@ FLEET = [
 ]
 
 
-def need_gib(task: str, min_stride: int, num_envs: int, rollouts: int,
+def need_gib(task: str, encoder_window: int, num_envs: int, rollouts: int,
              min_mini_batches: int) -> tuple[float, int, int, int]:
-    """Worst-case GiB for one trial: densest stride x smallest mini_batches."""
+    """Estimate a context-enabled trial with both past and future windows."""
     env = gym.make(task, num_envs=1, device="cpu").unwrapped
     ep = int(env.episode_len)
-    seq = math.ceil(ep / max(1, min_stride))
+    env.close()
+    seq = 2 * encoder_window
     B = max(1, int(rollouts * num_envs / max(1, min_mini_batches)))
     return B * seq * GIB_PER_BSEQ * HEADROOM, ep, seq, B
 
@@ -84,9 +66,13 @@ def main() -> int:
 
     with open(os.path.join(_ROOT, "search/configs", f"{args.algorithm}.yaml")) as fh:
         cfg = yaml.safe_load(fh)
-    strides = cfg["parameters"]["xref_encoder_stride"].get(
-        "values", [cfg["parameters"]["xref_encoder_stride"].get("value", 1)])
-    min_stride = min(strides)
+    params = cfg['parameters']
+    windows = params.get('models.encoder.encoder_window', {'value': None})
+    windows = windows.get('values', [windows.get('value')])
+    gammas = params.get('agent.discount_factor', {'value': .99})
+    gammas = gammas.get('values', [gammas.get('value', .99)])
+    encoder_window = max(math.ceil(round(1/(1-gamma), 10)) if value is None else value
+                         for value in windows for gamma in gammas)
     mbs = cfg["parameters"].get("agent.mini_batches", {})
     min_mb = min(mbs.get("values", [mbs.get("value", 4)]))
     num_envs = int(cfg.get("num_envs", 1024))
@@ -94,13 +80,13 @@ def main() -> int:
     tasks = ([args.env] if args.env else
              [k for k in gym.registry if k.startswith("classic-")])
     if not args.shell:
-        print(f"worst case = densest stride {min_stride} x smallest mini_batches "
+        print(f"worst case = two windows of {encoder_window} x smallest mini_batches "
               f"{min_mb}, num_envs {num_envs}, rollouts {args.rollouts}, "
               f"{HEADROOM:g}x headroom")
         print(f"{'env':<24} {'episode':>8} {'seq':>6} {'B':>7} {'GiB/trial':>10}  placement")
     rc = 0
     for t in tasks:
-        gib, ep, seq, B = need_gib(t, min_stride, num_envs, args.rollouts, min_mb)
+        gib, ep, seq, B = need_gib(t, encoder_window, num_envs, args.rollouts, min_mb)
         hit = place(gib, args.agents)
         if args.shell:
             if not args.env:

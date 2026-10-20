@@ -55,7 +55,7 @@ class WandbPlotWrapper:
                 self._last_plot_call = self._step_calls
             self._last_compute_count = compute_count
 
-        # Lift "log" dicts so SKRL's trainer can log them natively.
+        # Lift "log" dicts so Skrl's trainer can log them natively.
         # SyncVectorEnv structures info differently depending on autoreset mode:
         #   NEXT_STEP (default): no "final_info"; per-env "log" dicts are flattened
         #       by _add_info into info["log"] = {metric_key: np.array(num_envs)}

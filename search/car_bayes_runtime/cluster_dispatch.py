@@ -5,6 +5,7 @@ import json,os,re,subprocess,sys,time
 ROOT=Path(__file__).resolve().parent
 
 def save(path,value):
+ path.parent.mkdir(parents=True,exist_ok=True)
  temp=path.with_suffix('.tmp');temp.write_text(json.dumps(value,indent=2)+'\n');temp.replace(path)
 
 def main(host):
@@ -12,13 +13,9 @@ def main(host):
  for p in plan['agents']:
   if p['machine']!=host or not p.get('slurm'):continue
   name=p['name'];node=p['node'];folder=ROOT/'agents'/name
-  if host=='uiuc-cc':
-   part='IllinoisComputes-GPU' if node=='ccc0465' else 'eng-research-gpu'
-   account='huytran1-ic' if node=='ccc0465' else 'huytran1-ae-eng'
-   gres='gpu:H200:1' if node=='ccc0465' else 'gpu:A10:1'
-  else:
-   part='gpuA100x4' if node.startswith('gpua') else 'gpuA40x4';account='bhqw-delta-gpu';gres='gpu:1'
-  cmd=['srun','--immediate=90','--job-name=crl-low-lr','--account='+account,'--partition='+part,'--nodelist='+node,'--gres='+gres,'--nodes=1','--ntasks=1','--cpus-per-task=2','--mem=8G','--time=2-00:00:00','--output='+str(folder/'slurm-%j.log'),p['python'],'-u',str(ROOT/'worker.py'),name]
+  if json.loads((folder/'manifest.json').read_text())['recorded_status']!='PLANNED':continue
+  part,account,gres=p['partition'],p['account'],p['gres']
+  cmd=['srun','--immediate=30','--job-name=crl-bayes192','--account='+account,'--partition='+part,'--nodelist='+node,'--gres='+gres,'--nodes=1','--ntasks=1','--cpus-per-task=2','--mem=8G','--time='+p['walltime'],'--output='+str(folder/'slurm-%j.log'),p['python'],'-u',str(ROOT/'worker.py'),name]
   entry=json.loads((folder/'manifest.json').read_text());entry.update(recorded_status='REQUESTING_IMMEDIATE_ALLOCATION',submission_command=cmd,account=account,partition=part)
   save(folder/'manifest.json',entry)
   log=(folder/'srun-client.log').open('x');proc=subprocess.Popen(cmd,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT)

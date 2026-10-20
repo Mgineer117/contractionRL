@@ -1,4 +1,4 @@
-"""Finite-horizon MVE and TD-k critic fitting for C2RL's stock skrl PPO.
+"""Finite-horizon MVE and TD-k critic fitting for the shared skrl PPO path.
 
 Feinberg et al. (2018), https://arxiv.org/abs/1803.00101, Eq. 2 and Alg. 1.
 The PPO adaptation retains real-data GAE/actor updates, replaces real-state
@@ -10,8 +10,8 @@ import math
 import torch
 from torch.nn import functional as F
 
-from contractionRL.agents.utils.contraction.math_utils import bound_W, quadratic_energy, spd_inverse, action_bound_violation
-from contractionRL.agents.utils.system_dynamics.state import wrap_diff
+from contractionRL.agents.utils.contraction.math_utils import bound_W, quadratic_energy, spd_inverse, action_bound_violation, tracking_energy
+from contractionRL.agents.utils.system_dynamics.state import wrap_diff, clamp_physical_state, canonical_bound_state
 
 
 class TrackingExpansionModel:
@@ -25,9 +25,10 @@ class TrackingExpansionModel:
             raise ValueError("Value expansion requires compact (x, xref, xi) observations")
         self.device = owner._rl_agent.device
         self.angles = owner._angle_idx
+        analytical = getattr(env, "has_analytical_dynamics", hasattr(env, "_f_logic"))
         if hasattr(env, "_f_logic"):
             self.kind = "classic"
-            self.dynamics = (lambda x: env.get_f_and_B(x, need_null=False)) if getattr(owner._cfg, "mode", "analytical") == "analytical" else owner._get_f_and_B
+            self.dynamics = (lambda x: env.get_f_and_B(x, need_null=False)) if analytical else owner._get_f_and_B
         elif hasattr(env, "_refs"):
             self.kind = "physx"
             self.dynamics = owner._get_f_and_B
@@ -36,8 +37,21 @@ class TrackingExpansionModel:
             self.dynamics = owner._get_f_and_B
         else:
             raise ValueError("Value expansion requires a supported tracking environment and reference generator")
-        self.dynamics_source = "analytical" if self.kind == "classic" and getattr(owner._cfg, "mode", "analytical") == "analytical" else "learned"
+        self.dynamics_source = "analytical" if self.kind == "classic" and analytical else "learned"
         self.dt = float(env.step_dt if self.kind == "robot" else env.dt)
+        disturbance = getattr(env, 'disturbance', None)
+        disturbed = bool(getattr(disturbance, 'enabled', False))
+        fresh_gust = self.dynamics_source == 'analytical' and disturbed
+        persistent = disturbed and getattr(disturbance, 'max_hold', self.dt) > self.dt
+        self.model_assumptions = {
+            'nominal_dynamics': self.dynamics_source,
+            'history_length': int(getattr(self.window, 'history_length', 0)),
+            'disturbance_enabled': disturbed,
+            'persistent_disturbance': persistent,
+            'root_disturbance_conditioning': 'fresh_unconditional_gust' if fresh_gust else 'learned_state_action_noise' if disturbed else 'disabled',
+            'conditional_history_bias_possible': fresh_gust and persistent,
+            'latent_simulator_gust_or_dwell_used': False,
+        }
         self.time_bound = float(self.window.time_bound)
         if (not math.isfinite(self.dt) or self.dt <= 0
                 or not math.isfinite(self.time_bound) or self.time_bound <= 0):
@@ -63,7 +77,8 @@ class TrackingExpansionModel:
             self._gust.reset(torch.arange(len(roots), device=roots.device))
 
     def _advance(self, x, control, *, stochastic=False):
-        dynamics = (lambda x: self.env.get_f_and_B(x, need_null=False)) if self.kind == "classic" and not stochastic else self.dynamics
+        exact_reference = self.kind == "classic" and getattr(self.env, "has_analytical_dynamics", True) and not stochastic
+        dynamics = (lambda x: self.env.get_f_and_B(x, need_null=False)) if exact_reference else self.dynamics
         f, B, _ = dynamics(x)
         derivative = f + torch.bmm(B, control.unsqueeze(-1)).squeeze(-1)
         if (stochastic and self.dynamics_source == 'analytical'
@@ -71,18 +86,20 @@ class TrackingExpansionModel:
             if self._gust is None or len(self._gust.value) != len(x):
                 self.begin_rollout(x)
             derivative = derivative + self._gust.advance()
-        if (stochastic and getattr(self.owner._cfg, "mode", "analytical") == "sim_to_real"
+        if (stochastic and self.dynamics_source == "learned"
                 and getattr(getattr(self.env, "disturbance", None), "enabled", False)):
             derivative = derivative + self.owner._neural_dynamics.sample_disturbance(x, control)
         return x + self.dt * derivative
 
     def _energy(self, x, reference):
         metric = self.owner._ccm_gen
+        if metric is None:
+            return wrap_diff(x - reference, self.angles).square().sum(-1)
         raw, _ = metric(x)
         M = bound_W(raw, self.owner._cfg.w_lb, self.window.x_dim, getattr(metric, "bounded", False))
         if not getattr(metric, "outputs_metric", False):
             M = spd_inverse(M)
-        return quadratic_energy(wrap_diff(x - reference, self.angles), M)
+        return tracking_energy(x - reference, M, self.angles)
 
     def step(self, observations, actions):
         x, xr, xi = self.window.extract(observations)
@@ -91,8 +108,8 @@ class TrackingExpansionModel:
         raw = self._advance(x, actions, stochastic=True)
         nonfinite = ~torch.isfinite(raw).all(-1)
         raw = torch.where(torch.isfinite(raw), raw, x)
-        canonical = wrap_diff(raw, self.angles)
-        outside = (raw < self.low) | (raw > self.high)
+        canonical = canonical_bound_state(raw, self.low, self.high, self.angles)
+        outside = (canonical < self.low) | (canonical > self.high)
         failed = nonfinite | outside[:, self.position].any(-1)
         task = getattr(self.env, "task", "")
         if self.kind == "classic":
@@ -110,15 +127,15 @@ class TrackingExpansionModel:
                 failed |= raw[:, -1] > 3.
                 if getattr(self.env.cfg, "terminate_on_fall", True):
                     failed |= (raw[:, -1] < self.env.cfg.base_height_min) | (raw[:, 5] > -.71)
-        next_x = canonical.clamp(self.low, self.high)
+        next_x = clamp_physical_state(raw, self.low, self.high, self.angles)
         next_x[:, self.position] = canonical[:, self.position]
         next_xi = xi.clone()
         p = self.window.parameter_dim
         next_xi[:, p] = (xi[:, p] + self.dt).clamp(max=self.time_bound)
         if self.kind == "classic":
             ur = self.window.current_control(xr, xi)
-            next_xr = wrap_diff(self._advance(xr, ur), self.angles)
-            next_xr = next_xr.clamp(self.low, self.high)
+            next_xr = self._advance(xr, ur)
+            next_xr = clamp_physical_state(next_xr, self.low, self.high, self.angles)
         elif self.kind == "physx":
             ids = xi[:, 0].long().clamp(0, len(self.env._refs) - 1)
             steps = (next_xi[:, p] / self.dt).round().long().clamp(0, self.env.max_episode_length)
@@ -131,28 +148,43 @@ class TrackingExpansionModel:
         if beta:
             reward = reward - beta * action_bound_violation(raw_actions, self.control_low, self.control_high).unsqueeze(-1)
         # PhysX observations also clip terminal positions; its reward keeps the excursion.
-        observed_x = next_x.clamp(self.low, self.high) if self.kind == "physx" else next_x
+        observed_x = clamp_physical_state(next_x, self.low, self.high, self.angles) if self.kind == "physx" else next_x
         preview = None
         if self.window.preview_length:
-            if self.kind != 'classic':
-                raise ValueError('Value expansion with a reference preview currently requires an analytical tracking plant')
-            reference, parameters = next_xr, next_xi.clone()
-            points = []
-            for index in range(self.window.preview_length):
-                advances = self.window.preview_start if index == 0 else self.window.preview_stride
-                for _ in range(advances):
-                    ur = self.window.current_control(reference, parameters)
-                    candidate = wrap_diff(self._advance(reference, ur), self.angles).clamp(self.low, self.high)
-                    reference = torch.where((parameters[:, p] < self.time_bound - self.dt * 1e-4)[:, None],
-                                            candidate, reference)
-                    parameters[:, p] = (parameters[:, p] + self.dt).clamp(max=self.time_bound)
-                points.append(reference)
+            if self.kind == 'classic':
+                reference, parameters = next_xr, next_xi.clone()
+                points = []
+                for index in range(self.window.preview_length):
+                    advances = self.window.preview_start if index == 0 else self.window.preview_stride
+                    for _ in range(advances):
+                        ur = self.window.current_control(reference, parameters)
+                        candidate = clamp_physical_state(self._advance(reference, ur), self.low, self.high, self.angles)
+                        reference = torch.where((parameters[:, p] < self.time_bound - self.dt * 1e-4)[:, None],
+                                                candidate, reference)
+                        parameters[:, p] = (parameters[:, p] + self.dt).clamp(max=self.time_bound)
+                    points.append(reference)
+            else:
+                ids = next_xi[:, 0].long()
+                step = (next_xi[:, p] / self.dt).round().long()
+                points = []
+                for offset in range(1, self.window.preview_length + 1):
+                    index = (step + offset).clamp(max=round(self.time_bound / self.dt))
+                    points.append(self.env._refs[ids, index] if self.kind == 'physx'
+                                  else self.env._traj_buf.get(ids, index)[0])
             preview = torch.stack(points, 1)
         history = None
         if self.window.history_length:
             row = torch.cat((x, actions, x.new_ones(len(x), 1)), -1)
             history = torch.cat((self.window.history(observations)[:, 1:], row[:, None]), 1)
         next_obs = self.window.flatten(observed_x, next_xr, None, xi=next_xi, preview=preview, history=history)
+        agent = self.owner._rl_agent
+        if getattr(agent, "contraction_metric", None) is not None:
+            error, endpoint = x - xr, next_x - next_xr
+            derivative = (endpoint - error) / self.dt
+            features = agent.metric_features(observations)
+            features_dot = (agent.metric_features(next_obs) - features) / self.dt
+            _, _, penalty = agent._terms(error[:, agent.indices], derivative[:, agent.indices], features, features_dot)
+            reward = reward + ((agent.cfg.epsilon_contraction - penalty.detach()) * agent.cfg.penalty_coef)[:, None]
         timeout = next_xi[:, p] >= self.time_bound - self.dt * 1e-4
         return next_obs, reward, failed[:, None], timeout[:, None]
 
@@ -238,7 +270,8 @@ class ValueExpansion:
     def prepare(self):
         observations = self.agent.memory.get_tensor_by_name("observations")
         roots = observations.reshape(-1, observations.shape[-1])
-        modules = [self.agent.policy, self.agent.value, self.owner._ccm_gen]
+        modules = [module for module in (self.agent.policy, self.agent.value, self.owner._ccm_gen,
+                   getattr(self.agent, "contraction_metric", None)) if module is not None]
         if self.owner._neural_dynamics is not None:
             modules.append(self.owner._neural_dynamics)
         modes = [module.training for module in modules]

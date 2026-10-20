@@ -25,8 +25,14 @@ def _default_num_envs_classic(algo: str) -> int:
 
 def evaluation_act(agent, observations, states=None):
     """Use the policy mean and bypass random warmup for evaluation/references."""
+    deterministic = getattr(agent, 'act_deterministic', None)
+    if callable(deterministic):
+        return deterministic(observations, states)
     timestep = max(0, int(getattr(agent.cfg, "random_timesteps", 0)))
-    actions, outputs = agent.act(observations, states, timestep=timestep, timesteps=max(timestep + 1, 1))
+    device = torch.device(getattr(agent, "device", "cpu"))
+    devices = [device.index] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
+        actions, outputs = agent.act(observations, states, timestep=timestep, timesteps=max(timestep + 1, 1))
     return outputs.get("mean_actions", actions), outputs
 
 
@@ -48,73 +54,36 @@ def restore_checkpoint_model_config(agent_cfg, checkpoint):
     if not checkpoint or not os.path.isfile(checkpoint):
         return
     from pathlib import Path
-    from contractionRL.agents.utils.RL.config import normalize_experiment_mode
-    if "mode" not in agent_cfg:
-        env_path = Path(checkpoint).parent.parent / "params" / "env.yaml"
-        if env_path.is_file():
-            import yaml
-            recorded = yaml.load(env_path.read_text(), Loader=yaml.BaseLoader) or {}
-            if recorded.get("mode") in ("analytical", "sim_to_real"):
-                agent_cfg["mode"] = recorded["mode"]
-            elif recorded.get("dynamics_backend") in ("analytical", "physx"):
-                agent_cfg["mode"] = "sim_to_real" if recorded["dynamics_backend"] == "physx" else "analytical"
-    normalize_experiment_mode(agent_cfg)
     saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
     critic = saved.get("value", saved.get("critic_1", {}))
     if any(key.startswith("phi.") for key in critic):
         agent_cfg.setdefault("models", {}).setdefault("critic", {})["legacy_reference_critic"] = True
 
 
-def configure_tracking_preview(raw_env, agent_cfg):
-    """Configure an optional nominal preview before creating models or rollout memory."""
-    policy = agent_cfg.get('models', {}).get('policy', {})
-    temporal = policy.get('temporal_context', False)
-    if not isinstance(temporal, bool) or not isinstance(policy.get('use_history', True), bool):
-        raise ValueError('temporal_context and use_history must be booleans')
-    if temporal:
-        import math
-        gamma = float(agent_cfg['agent']['discount_factor'])
-        if not 0. <= gamma < 1.:
-            raise ValueError('Temporal context requires 0 <= discount_factor < 1')
-        if policy.get('preview_steps', 0):
-            raise ValueError('temporal_context derives its horizon from gamma; remove preview_steps')
-        if not hasattr(raw_env, 'configure_temporal_context'):
-            raise ValueError('Temporal context requires a supported analytical tracking environment')
-        # Avoid ceil(10.000000000000002) turning gamma=0.9 into eleven points.
-        horizon = max(1, math.ceil(round(1. / (1. - gamma), 10)))
-        raw_env.configure_temporal_context(horizon, policy.get('use_history', True))
-        return
-    steps = policy.get('preview_steps', 0)
-    if not isinstance(steps, int) or isinstance(steps, bool) or steps < 0:
-        raise ValueError('models.policy.preview_steps must be a nonnegative integer')
-    if steps:
-        if not hasattr(raw_env, 'configure_ref_preview'):
-            raise ValueError('Reference preview requires a supported analytical tracking environment')
-        raw_env.configure_ref_preview(steps + 1)
-    elif getattr(getattr(raw_env, 'ref_window', None), 'preview_length', 0):
-        raw_env.configure_ref_preview(0)
+def configure_tracking_context(raw_env, agent_cfg):
+    from contractionRL.agents.utils.RL.config import configure_encoder_context
+    return configure_encoder_context(raw_env, agent_cfg)
 
 
 def tracking_state_metadata(window, models_cfg=None):
     if not getattr(window, "compact", False):
         return {}
     from contractionRL.agents.utils.system_dynamics.reference import TrackingFeatures
+    models = models_cfg or {}
+    shared = models.get('encoder', {})
     features = TrackingFeatures(window)
-    preview = getattr(window, 'preview_length', 0)
-    temporal = getattr(window, 'temporal_context', False)
-    width = features.output_dim
-    if temporal:
-        width = window.base_dim + window.x_dim * (1 + bool(window.history_length)) + 2 * len(features.position)
-    elif preview:
-        width = (window.x_dim + window.xi_dim + 2 * len(features.position)
-                 + models_cfg.get('policy', {}).get('encoder_hidden', 64)) if models_cfg is not None else None
-    return {"observation_width": window.flat_dim, "policy_input_width": width,
-            "reference_preview_points": preview, "reference_preview_stride": getattr(window, 'preview_stride', 1),
-            "reference_preview_start": getattr(window, 'preview_start', 0),
-            "temporal_context": temporal, "history_points": getattr(window, 'history_length', 0),
-            "embedding_dim": window.x_dim if temporal else None,
-            "tracking_state_representation": "relative_position_with_boundaries" if features.position else "physical_tracking",
-            "relative_position_axes": [window.state_names[i] for i in features.position]}
+    policy = models.get('policy', {}).get('encoder')
+    critic = models.get('critic', models.get('value', models.get('critic_1', {}))).get('encoder')
+    dim = shared.get('feature_dim') or 3 * window.x_dim
+    return {"observation_width": window.flat_dim,
+            "policy_input_width": features.output_dim + (2 * dim if policy == 'gru' else 0),
+            "critic_input_width": features.output_dim + (2 * dim if critic == 'gru' else 0),
+            "policy_encoder": policy, "critic_encoder": critic,
+            "encoder_window": window.history_length,
+            "gru_feature_dim": dim if 'gru' in (policy, critic) else None,
+            "tracking_state_representation": "relative_position_periodic_angles",
+            "relative_position_axes": [window.state_names[i] for i in features.position],
+            "physical_angle_coordinates": "continuous_lift", "tracking_energy": "minimum_over_windings"}
 
 
 def save_classic_config(agent_cfg, raw_env, directory):
@@ -123,6 +92,8 @@ def save_classic_config(agent_cfg, raw_env, directory):
     from pathlib import Path
     import yaml
     cfg = copy.deepcopy(agent_cfg)
+    from contractionRL.agents.utils.RL.config_usage import config_parameter_usage
+    cfg.pop('_tuned_parameters', None)
     cfg.get("agent", {}).get("experiment", {}).get("wandb_kwargs", {}).pop("settings", None)
     cfg["environment"] = {
         "task": raw_env.spec.id if raw_env.spec else None,
@@ -133,6 +104,7 @@ def save_classic_config(agent_cfg, raw_env, directory):
         "disturbance_scales": raw_env.disturbance.scales.cpu().tolist(),
         **tracking_state_metadata(raw_env.ref_window, cfg.get('models')),
     }
+    cfg["parameter_usage"] = config_parameter_usage(cfg, raw_env)
     target = Path(directory)/"params"
     target.mkdir(parents=True, exist_ok=True)
     (target/"agent.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
@@ -197,8 +169,8 @@ def _inject_angle_idx(agent_cfg: dict, angle_idx: list, sym=None) -> None:
     """
     if not angle_idx and sym is None:
         return
-    for block in agent_cfg.get("models", {}).values():
-        if isinstance(block, dict):
+    for role, block in agent_cfg.get("models", {}).items():
+        if isinstance(block, dict) and role not in ("dynamics", "cmg", "encoder"):
             if angle_idx:
                 block.setdefault("angle_idx", angle_idx)
             if sym is not None:
@@ -279,43 +251,13 @@ def install_wandb_scalar_hook() -> None:
     Agent.write_tracking_data = _write_tracking_data
 
 
-def apply_wandb_sweep_overrides(agent_cfg: dict) -> None:
-    """Fold ``wandb.config`` (dotted keys) into ``agent_cfg`` for a sweep run.
-
-    A sweep parameter whose value is itself a dict (wandb's nested-parameter
-    form for jointly-sampled pairs, e.g. ``{w_lb, w_ub}`` — see
-    ``search/configs/``) is merged into the existing sub-dict rather than
-    assigned: assigning would wipe sibling keys already at that path
-    (``agent.class``, ``agent.lbd``, …) that the sweep isn't sampling.
-
-    Two synthetic, non-dotted keys fan a single sampled value out to both the
-    actor's and the critic's reference-trajectory encoder, so one bayes trial
-    always uses the same encoder (and stride) on both sides rather than
-    sampling them independently — wandb's nested-dict form only joins keys
-    that share a parent path (e.g. ``cm.w_lb``/``cm.w_ub``), which
-    ``models.policy.encoder``/``models.critic.encoder`` don't:
-      ``xref_encoder``        -> models.policy.encoder and models.critic.encoder
-      ``xref_encoder_stride`` -> models.policy.encoder_stride and
-                                  models.critic.encoder_stride
-    See search/configs/c2rl-ppo-cvstem.yaml.
-    """
+def apply_wandb_sweep_overrides(agent_cfg):
+    """Apply explicit dotted config paths without coupling policy and critic encoders."""
     import wandb
-
-    _FANOUT = {
-        "xref_encoder": (("models", "policy", "encoder"),
-                          ("models", "critic", "encoder")),
-        "xref_encoder_stride": (("models", "policy", "encoder_stride"),
-                                 ("models", "critic", "encoder_stride")),
-    }
-
+    tuned = agent_cfg.setdefault('_tuned_parameters', [])
     for dotted, value in wandb.config.items():
-        if dotted in _FANOUT:
-            for *parents, leaf in _FANOUT[dotted]:
-                node = agent_cfg
-                for key in parents:
-                    node = node.setdefault(key, {})
-                node[leaf] = value
-            continue
+        if dotted not in tuned:
+            tuned.append(dotted)
         *parents, leaf = dotted.split(".")
         node = agent_cfg
         for key in parents:
@@ -392,6 +334,7 @@ def apply_cli_dotted_overrides(agent_cfg: dict, extra_args: list[str]) -> list[s
                 f"{', '.join(sorted(node)[:12])}...). Refusing to set a key the "
                 "config does not declare — it would be dropped without a word.")
         node[leaf] = value
+        agent_cfg.setdefault('_tuned_parameters', []).append(dotted)
         applied.append(f"{dotted}={value!r}")
     if applied:
         print("[train] CLI overrides: " + "  ".join(applied))
@@ -468,7 +411,8 @@ def _max_step_reward(robot: str, env_cfg) -> float:
 
 
 
-def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli):
+def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli,
+                        out_dir=None, checkpoint_path=None):
     import numpy as np
     import torch
 
@@ -477,14 +421,28 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
         print(f"[RefTraj] No robot mapping for task '{task}'; skipping.")
         return
 
-    out_dir = os.path.join(_DATA_ROOT, robot)
+    out_dir = out_dir or getattr(args_cli, 'ref_out_dir', None) or os.path.join(_DATA_ROOT, robot)
     out_path = os.path.join(out_dir, "dynamics_data.npz")
-    T = int(env_cfg.episode_length_s / (env_cfg.sim.dt * env_cfg.decimation))
+    import math
+    dt = float(env_cfg.sim.dt * env_cfg.decimation)
+    duration = float(env_cfg.episode_length_s)
+    if not math.isfinite(dt) or dt <= 0 or not math.isfinite(duration) or duration <= 0:
+        raise ValueError("Reference episode duration and timestep must be finite and positive")
+    T = int(duration / dt)
+    if T < 4 or args_cli.ref_num_trajs < 1 or skrl_env.num_envs < 1:
+        raise ValueError("Reference export requires positive environment/trajectory counts and at least four steps")
+    oversample = float(args_cli.ref_oversample_factor)
+    if not math.isfinite(oversample) or oversample < 1:
+        raise ValueError("Reference oversampling factor must be finite and at least 1")
     # Quality threshold = half of the theoretical best-case total episode reward
     # (best-case per-step reward × T), rather than a hand-picked constant — this
     # tracks whatever the reward scales in env_cfg actually are per task.
-    min_reward = args_cli.min_ref_quality if args_cli.min_ref_quality is not None \
+    explicit_quality = args_cli.min_ref_quality
+    min_reward = float(explicit_quality) if explicit_quality is not None \
         else 0.5 * _max_step_reward(robot, env_cfg) * T
+    if not math.isfinite(min_reward):
+        raise ValueError("Reference quality threshold must be finite")
+    quality_enabled = min_reward != 0 if explicit_quality is not None else min_reward > 0
 
     # Load best checkpoint
     import logging as _logging
@@ -493,12 +451,15 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
     _skrl_log.setLevel(_logging.ERROR)
     agent = runner.agent
     best_ckpt = os.path.join(agent.experiment_dir, "checkpoints", "best_agent.pt")
-    if os.path.exists(best_ckpt):
-        print(f"[RefTraj] Loading best checkpoint: {best_ckpt}")
-        agent.load(best_ckpt)
-    else:
-        print("[RefTraj] WARNING: best_agent.pt not found; using final weights.")
-    _skrl_log.setLevel(_prev_level)
+    selected_checkpoint = checkpoint_path or (best_ckpt if os.path.exists(best_ckpt) else None)
+    try:
+        if selected_checkpoint:
+            print(f"[RefTraj] Loading checkpoint: {selected_checkpoint}")
+            agent.load(selected_checkpoint)
+        else:
+            print("[RefTraj] WARNING: best_agent.pt not found; using final weights.")
+    finally:
+        _skrl_log.setLevel(_prev_level)
     for model in agent.models.values():
         if model is not None:
             model.eval()
@@ -511,14 +472,15 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
     _act_high = torch.as_tensor(skrl_env.action_space.high, dtype=torch.float32, device=skrl_env.device)
 
     # Quality gate: 1 full episode across all parallel environments
-    if min_reward > 0:
+    if quality_enabled:
         print(f"\n[RefTraj] Evaluating quality (threshold: mean total reward >= {min_reward}) …")
 
         # Deliberately measures the same quantity as training's "Reward / Total
         # reward (mean)": min_reward is calibrated as 0.5 * best-case-per-step *
         # T, i.e. on a full training episode's scale. So this rollout must
         # reproduce training's episode structure — fall termination at its cfg
-        # default (True) and the policy's own stochastic actions.
+        # default (True). Evaluate the same deterministic policy mean used for
+        # reference collection; this is not the stochastic training distribution.
         #
         # It must not disable terminate_on_fall the way _evaluate_best_model
         # does: with it off a fallen robot flails for the full T steps,
@@ -566,6 +528,8 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
             return
         mean_r = sum(ep_rewards) / len(ep_rewards)
         print(f"[RefTraj] Mean total reward: {mean_r:.1f}")
+        if not math.isfinite(mean_r):
+            raise RuntimeError("Reference quality evaluation produced a nonfinite return")
         if mean_r < min_reward:
             print(
                 f"[RefTraj] SKIPPED — policy quality too low "
@@ -774,12 +738,15 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli)
     from contractionRL.tasks.direct.common.reference_domain import save_nominal_references
     accepted = save_nominal_references(dyn_path, x=states_arr, u=actions_arr,
                                        x_dot=x_dot_arr, lengths=lengths_arr, dt=dt)
+    if accepted < 1:
+        raise RuntimeError("Reference export produced no accepted nominal trajectories")
     print(f"[RefTraj] Accepted {accepted} full-length references inside the domain margins")
     print(f"[RefTraj] Saved dynamics  → {dyn_path}")
     print(f"       x       shape: {states_arr.shape}")
     print(f"       u       shape: {actions_arr.shape}   (clipped to action-space bounds)")
     print(f"       x_dot   shape: {x_dot_arr.shape}")
     print(f"       lengths shape: {lengths_arr.shape}  (min {lengths_arr.min()}, max {lengths_arr.max()})")
+    return dyn_path
 
 
 
@@ -877,8 +844,8 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
     _w = getattr(_train_env, "ref_window", None)
     if _w is not None and hasattr(env.unwrapped, "configure_ref_window"):
         env.unwrapped.configure_ref_window(length=_w.length, offset=_w.offset)
-        if getattr(_w, 'temporal_context', False):
-            env.unwrapped.configure_temporal_context(_w.preview_length, bool(_w.history_length))
+        if _w.history_length:
+            env.unwrapped.configure_encoder_context(_w.history_length)
         elif getattr(_w, 'preview_length', 0):
             env.unwrapped.configure_ref_preview(_w.preview_length, _w.preview_stride)
         print(f"[Eval] reference window mirrored: length={_w.length} offset={_w.offset}")

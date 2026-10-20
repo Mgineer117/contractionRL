@@ -1,10 +1,12 @@
-mode: analytical
 seed: 42
 models:
+  encoder:
+    feature_dim: null  # null defaults to 3 * x_dim per GRU.
+    encoder_window: null  # null uses ceil(1 / (1 - discount_factor)) steps for each past/future window.
   separate: true
   policy:
+    encoder: null  # No GRU; use gru to encode past and future context.
     class: GaussianMixin
-    backbone: mlp-squashed
     clip_actions: false
     clip_log_std: true
     min_log_std: -20.0
@@ -19,6 +21,7 @@ models:
     output: ACTIONS
     control_mode: structured
   critic_1:
+    encoder: gru  # Separate GRUs encode past and future context.
     class: DeterministicMixin
     network:
     - name: net
@@ -72,7 +75,7 @@ agent:
   initial_entropy_value: 0.2
   random_timesteps: 100
   learning_starts: 100
-  grad_norm_clip: 1.0
+  grad_norm_clip: 0.5
   experiment:
     directory: mbpo
     experiment_name: ''

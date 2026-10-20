@@ -297,6 +297,12 @@ class MBPOAgent(SAC):
                 outside = ((physical[:, :p] < low[:p]) | (physical[:, :p] > high[:p])).any(-1)
                 terminated = terminated | outside[:, None]
                 physical[:, p:] = physical[:, p:].clamp(low[p:], high[p:])
+            if getattr(self.window, "history_length", 0):
+                history = self.window.history(obs)
+                applied = actions.clamp(torch.as_tensor(self.action_space.low, device=self.device),
+                                        torch.as_tensor(self.action_space.high, device=self.device))
+                row = torch.cat((obs[:, self.physical_slice], applied, obs.new_ones(len(obs), 1)), -1)
+                self.window.history(next_obs).copy_(torch.cat((history[:, 1:], row[:, None]), 1))
             rewards = predicted[:, -1:]
             if getattr(self.window, "compact", False):
                 x, xr, _ = self.window.extract(obs)

@@ -7,6 +7,8 @@ metric:
   goal: maximize
 
 parameters:
+  agent.grad_norm_clip:
+    value: 0.5
   agent.learning_rate:
     value: 1.0e-5
   agent.discount_factor:

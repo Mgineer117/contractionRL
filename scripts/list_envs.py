@@ -23,26 +23,27 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import sys
 import textwrap
 from pathlib import Path
 
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-CLASSIC_DIR = ROOT / "source/contractionRL/contractionRL/tasks/direct/classic"
+sys.path.insert(0, str(ROOT / "source/contractionRL"))
 DIRECT_DIR = ROOT / "source/contractionRL/contractionRL/tasks/direct"
 N_PROBE = 300
 
 
 
 def _env_id(name: str) -> str:
-    """Short name -> gym id, via the one map the classic package owns."""
-    from contractionRL.tasks.direct.classic import env_id
+    """Short name -> gym id, via the shared task resolver."""
+    from contractionRL.tasks.direct.common.tracking_tasks import env_id
     return env_id(name)
 
 def classic_names() -> list[str]:
-    return sorted(p.name for p in CLASSIC_DIR.iterdir()
-                  if p.is_dir() and (p / "env.py").exists())
+    return sorted(p.name.removeprefix("isaac_classic_") for p in DIRECT_DIR.glob("isaac_classic_*")
+                  if (p / "dynamics.py").is_file())
 
 
 def isaac_names() -> list[str]:
@@ -110,7 +111,7 @@ def main() -> int:
                     help="also print the f(x) and B(x) source for each classic env")
     args = ap.parse_args()
 
-    import contractionRL.tasks.direct.classic  # noqa: F401  registers classic envs
+    import contractionRL.tasks.direct.common.tracking_tasks  # noqa: F401  registers classic envs
 
     kw = (args.keyword or "").lower()
     classic = [t for t in classic_names() if kw in t.lower() or kw in "classic"]

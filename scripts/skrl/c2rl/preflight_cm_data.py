@@ -35,26 +35,24 @@ BATCH = ["classic-cartpole-v0", "classic-segway-v0", "classic-car-v0", "classic-
 
 def cfg_for(task: str, algorithm: str):
     """Build the algorithm Cfg exactly as train.py does: yaml -> filtered dataclass."""
-    import yaml
     from contractionRL.agents.skrl.c2rl import C2RLPPOCfg, C2RLSACCfg
     from contractionRL.agents.utils.RL.config import filter_cfg_fields, migrate_c2rl_metric_cfg
 
-    import importlib
-    import gymnasium as gym
-    import contractionRL.tasks.direct.classic_isaac  # noqa: F401
+    import contractionRL.tasks.direct.common.tracking_tasks  # noqa: F401
     algorithm = algorithm.replace("-", "_")
-    entry = gym.spec(task).kwargs[f"skrl_{algorithm}_cfg_entry_point"]
-    package, filename = entry.split(":")
-    y = Path(importlib.import_module(package).__file__).parent / filename
-    raw = yaml.safe_load(y.read_text())
+    from contractionRL.agents.utils.RL.config import load_registered_agent_config
+    y = Path(f"skrl_{algorithm}_cfg.yaml")
+    raw = load_registered_agent_config(task, f"skrl_{algorithm}_cfg_entry_point")
     # Section merge order is ContractionRunner._setup_c2rl's, agent last so it
     # wins (its line 870). Reversing it would read a `cm:` value the agent does
     # not use, and the whole point of this check is to agree with the agent.
     merged = {**(raw.get("cm") or {}), **(raw.get("cmg") or {}),
               **(raw.get("empirical_dynamics") or {}), **(raw.get("agent") or {})}
     merged.pop("class", None)
+    merged = migrate_c2rl_metric_cfg(merged)
+    merged.setdefault("cmg_method", "ccm" if algorithm == "c2rl_ppo" else "cvstem")
     Cfg = C2RLSACCfg if algorithm == "c2rl_sac" else C2RLPPOCfg
-    return Cfg(**filter_cfg_fields(migrate_c2rl_metric_cfg(merged), Cfg, context="preflight")), y
+    return Cfg(**filter_cfg_fields(merged, Cfg, context="preflight")), y
 
 
 def check(task: str, algorithm: str = "c2rl_ppo", cmg_method: str | None = None) -> tuple[bool, str]:

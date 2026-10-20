@@ -5,6 +5,7 @@ Reward: r = E_current - E_next, with identity or an installed contraction metric
 Failures terminate; the horizon truncates. Kinematic observations are clipped.
 
 Subclasses must implement:
+    _initialize_robot_indices(),
     _setup_scene(), _apply_action(),
     _get_physical_state() -> (N, state_dim),
     _get_dones() -> (terminated, time_out),
@@ -19,9 +20,9 @@ import torch
 
 from isaaclab.envs import DirectRLEnv
 
-from contractionRL.agents.utils.system_dynamics.state import wrap_diff
+from contractionRL.agents.utils.system_dynamics.state import wrap_diff, unwrap_state_angles, clamp_physical_state
 from contractionRL.agents.utils.system_dynamics.reference import RefWindow
-from contractionRL.agents.utils.contraction.math_utils import quadratic_energy, energy_decrease
+from contractionRL.agents.utils.contraction.math_utils import tracking_energy, energy_decrease
 from contractionRL.agents.utils.RL.logging import log_metrics
 
 from .eval_metrics import fit_exponential_envelope
@@ -65,7 +66,6 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
             would spike the error by ~2*pi.
     """
     has_analytical_dynamics = False
-    mode = "sim_to_real"
     angle_idx: Sequence[int] = ()
 
     # One name per physical state dim (see agents/utils/system_dynamics/state.py for the
@@ -98,6 +98,11 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
     # Keep terminal observations finite; the raw state still triggers failure.
     _ERROR_CLAMP = 1.0e3              # cap on ||error|| feeding reward/AUC/metrics
 
+    def _unwrap_state_angles(self, x):
+        state = unwrap_state_angles(x, getattr(self, '_continuous_state', None), self.angle_idx)
+        self._continuous_state = state.detach().clone()
+        return state
+
     def _sanitize_state(self, x: torch.Tensor) -> torch.Tensor:
         """Replace non-finite elements of the physical state with the same
         element from the last known-finite state (carry-forward), so a
@@ -107,7 +112,6 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         call sites sanitize) whenever it actually has to scrub a non-finite
         state — this should be rare, so a silent guard would hide a real problem.
         """
-        x = wrap_diff(x, self.angle_idx)
         nonfinite = ~torch.isfinite(x)
         if nonfinite.any():
             step = int(getattr(self, "common_step_counter", 0))
@@ -125,7 +129,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         sanitized = carry_forward_nonfinite(x, self._last_valid_state)
         if hasattr(self, "ref_window"):
             lo, hi = self._state_bounds()
-            clipped = sanitized.clamp(torch.as_tensor(lo, device=x.device), torch.as_tensor(hi, device=x.device))
+            clipped = clamp_physical_state(sanitized, lo, hi, self.angle_idx)
             if self.ref_window.u_dim == 7:
                 clipped[:, 14:17] = sanitized[:, 14:17]
             else:
@@ -136,10 +140,11 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
 
     def __init__(self, cfg, render_mode=None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
+        self._initialize_robot_indices()
 
         self._traj_buf = TrajectoryBuffer(cfg.traj_path, self.device)
         self._traj_buf.require_nominal(self.step_dt)
-        self._traj_buf.wrap_angles(self.angle_idx)
+        self._traj_buf.unwrap_angles(self.angle_idx)
 
         # Compact reference generator state; no future reference sequence.
         from contractionRL.agents.utils.system_dynamics.reference import ReferenceState
@@ -154,7 +159,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
                                          self._reference_control,
                                          parameter_bounds=([0.], [self._traj_buf.num_trajs - 1.]),
                                          time_bound=self.cfg.episode_length_s,
-                                         state_names=self.state_names)
+                                         state_names=self.state_names, angle_idx=self.angle_idx)
         self._rebuild_observation_space()
         low, high = self._state_bounds()
         margin = 0.05 * (high - low)
@@ -162,7 +167,8 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
             margin[2:6] = 0  # periodic heading and unit projected-gravity vector
             margin[-1] = 0.03  # clearance above the robot's failure height [m]
         self.reference_margin = margin
-        self._traj_buf.validate(low, high, margin, self.action_space.low, self.action_space.high,
+        control_low, control_high = self._control_bounds()
+        self._traj_buf.validate(low, high, margin, control_low, control_high,
                                 self.max_episode_length + 1, upright_index=None if self._traj_buf.action_dim == 7 else 5)
 
         n = self.num_envs
@@ -252,11 +258,15 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
     # Contraction algorithm interface (C3M / LQR / SD-LQR / C2RL)
     # ------------------------------------------------------------------ #
 
+    def _initialize_robot_indices(self) -> None:
+        """Resolve articulation indices before building reference state names."""
+        raise NotImplementedError
+
     def set_dynamics_model(self, model) -> None:
         """Inject a NeuralDynamics model for get_f_and_B (required for Isaac envs)."""
         self._dynamics_model = model
 
-    def _metric_from_cmg(self, x):
+    def _metric_from_cmg(self, x, xref=None):
         """M(x) from the CMG, inverting only when the head emits W.
 
         Mirrors classic env_base._metric_from_cmg exactly — see
@@ -279,7 +289,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
                 residual_anchor_scale=0.0, cvstem_r_scaler=1.0) -> None:
         """Inject the frozen CMG for C2RL's Phase B Mahalanobis reward.
 
-        Mirrors classic/common/env_base.py's BaseEnv.set_ccm exactly (same
+        Mirrors common/analytical_env.py's BaseEnv.set_ccm exactly (same
         signature) so C2RLSkrlTrainer.train() can call it identically for
         both env families — see _get_rewards for the reward this enables.
 
@@ -379,8 +389,8 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
                no gamma, just the tightest C*exp(-lambda*t) that bounds them.
             2. theoretical bound — sqrt(m_bar/m_underbar) * [1/(1-gamma)] *
                e(0) * exp(-lbd*t), where m_bar/m_underbar come from the CMG's
-               configured hard limits (w_lb/w_ub) — the worst-case guarantee
-               by construction, regardless of what the network currently does.
+               configured hard limits (w_lb/w_ub). These bound the spectral
+               factor; decay still requires a separately verified controller.
             3. empirical bound — same shape, but m_bar/m_underbar are
                measured (max/min eigenvalues of the current CMG evaluated on
                the actually-visited states) — reflects the real network today.
@@ -441,7 +451,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
                 C_theory = cond * gamma_factor * e0_mean
                 ax_err.plot(
                     t_axis, (C_theory * np.exp(-self.target_lambda * t_axis)) ** 2, "g:", linewidth=2,
-                    label=f"theoretical bound (C={C_theory:.2g}, λ={self.target_lambda:.2g})",
+                    label=f"configured-rate reference (C={C_theory:.2g}, λ={self.target_lambda:.2g})",
                 )
 
             # 3. empirical — current CMG's eigenvalues, measured on visited states.
@@ -456,7 +466,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
                 C_emp = cond * gamma_factor * e0_mean
                 ax_err.plot(
                     t_axis, (C_emp * np.exp(-self.target_lambda * t_axis)) ** 2, "m-.", linewidth=2,
-                    label=f"empirical bound (C={C_emp:.2g}, λ={self.target_lambda:.2g})",
+                    label=f"sampled-spectrum reference (C={C_emp:.2g}, λ={self.target_lambda:.2g})",
                 )
 
         ax_err.set_xlabel("time [s]")
@@ -493,8 +503,8 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
     def get_rollout(self, buffer_size: int, mode: str, num_control_per_state: int | None = None) -> dict:
         """Sample random (x, xref, uref) triples for C3M-style contraction synthesis.
 
-        Samples reference states from the trajectory buffer, adding bounded
-        Gaussian noise to produce actual states that deviate from the reference.
+        Samples independent states, references and controls over the full boxes,
+        using the same distribution as C2RL's CCM synthesis.
         Returns numpy float32 arrays (required by mjrl's to_tensor()).
 
         ``num_control_per_state`` is a classic-env-only knob (see
@@ -508,22 +518,11 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         if mode != "c3m":
             raise ValueError(f"PathTrackingBase.get_rollout: unsupported mode '{mode}'")
 
-        buf = self._traj_buf
-        # Random trajectories and random timesteps within them
-        traj_ids = buf.sample_traj_ids(buffer_size)
-        steps = torch.randint(0, buf.traj_len, (buffer_size,), device=self.device)
-        xref, uref = buf.get(traj_ids, steps)  # (N, state_dim), (N, action_dim)
-
-        # Small Gaussian noise to create x ≠ xref (contraction error)
-        noise = torch.randn_like(xref) * 0.05
+        from contractionRL.agents.utils.contraction.ccm_synthesis import sample_ccm_domain
         low, high = self._state_bounds()
-        x = (xref + noise).clamp(torch.as_tensor(low, device=self.device), torch.as_tensor(high, device=self.device))
-
-        return {
-            "x":    x.cpu().numpy().astype(np.float32),
-            "xref": xref.cpu().numpy().astype(np.float32),
-            "uref": uref.cpu().numpy().astype(np.float32),
-        }
+        u_low, u_high = self._control_bounds()
+        data = sample_ccm_domain(buffer_size, low, high, u_low, u_high, device=self.device)
+        return {key: value.cpu().numpy().astype(np.float32) for key, value in data.items()}
 
     def _get_dynamics_rollout(self, buffer_size: int) -> dict:
         """Sample (x, u, x_dot) pairs for NeuralDynamics training.
@@ -538,7 +537,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         steps = (torch.rand(buffer_size, device=self.device) * (buf._lengths[traj_ids] - 1)).long()
         x_t, u_t = buf.get(traj_ids, steps)
         x_next, _ = buf.get(traj_ids, steps + 1)
-        x_dot = wrap_diff(x_next - x_t, self.angle_idx) / self.step_dt
+        x_dot = (x_next - x_t) / self.step_dt
         return {
             "x":     x_t.cpu().numpy().astype(np.float32),
             "u":     u_t.cpu().numpy().astype(np.float32),
@@ -622,6 +621,11 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         self.observation_space = self.ref_window.space(lo, hi, u_lo, u_hi)
         self.cfg.observation_space = self.ref_window.flat_dim
         self.num_observations = self.ref_window.flat_dim
+        declared = getattr(self, "single_observation_space", None)
+        if hasattr(declared, "spaces"):
+            declared.spaces["policy"] = self.observation_space
+        elif isinstance(declared, dict):
+            declared["policy"] = self.observation_space
 
     def _with_termination_box(self, get_dones):
         """Wrap a subclass ``_get_dones`` so the box folds into its result.
@@ -667,6 +671,10 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         low, high = self._control_bounds()
         action = torch.as_tensor(action, device=self.device).nan_to_num().clamp(
             torch.as_tensor(low, device=self.device), torch.as_tensor(high, device=self.device))
+        if getattr(self.ref_window, "history_length", 0):
+            current = self._sanitize_state(self._get_physical_state())
+            row = torch.cat((current, action, current.new_ones(self.num_envs, 1)), -1)
+            self._tracking_history = torch.cat((self._tracking_history[:, 1:], row[:, None]), 1)
         gust = self.disturbance.advance()
         body = self._ee_id[:1] if self.ref_window.u_dim == 7 else [0]
         self._robot.set_external_force_and_torque(gust[:, None, :3], gust[:, None, 3:],
@@ -683,9 +691,21 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         return low, high
 
     def _control_bounds(self):
-        lo = np.asarray(self.action_space.low, dtype=np.float32).reshape(-1)
-        hi = np.asarray(self.action_space.high, dtype=np.float32).reshape(-1)
+        space = getattr(self, "single_action_space", self.action_space)
+        lo = np.asarray(space.low, dtype=np.float32).reshape(-1)
+        hi = np.asarray(space.high, dtype=np.float32).reshape(-1)
         return lo, hi
+
+    def configure_encoder_context(self, horizon: int):
+        """Expose nominal bank futures and measured history without changing the task."""
+        if not isinstance(horizon, int) or isinstance(horizon, bool) or horizon < 0:
+            raise ValueError("Encoder context requires a nonnegative integer window")
+        self.ref_window.preview_length = self.ref_window.history_length = horizon
+        self.ref_window.preview_start = self.ref_window.preview_stride = 1
+        self.ref_window.temporal_context = bool(horizon)
+        self._tracking_history = torch.zeros(self.num_envs, horizon,
+            self.ref_window.x_dim + self.ref_window.u_dim + 1, device=self.device)
+        self._rebuild_observation_space()
 
     def configure_ref_window(self, length: int, offset: int = 1,
                              gamma: float | None = None) -> None:
@@ -714,7 +734,15 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
             xi = torch.cat((self._traj_ids.float().unsqueeze(-1),
                             (step * self.step_dt).unsqueeze(-1),
                             x.new_zeros(self.num_envs, self.ref_window.u_dim)), -1)
-            return {"policy": self.ref_window.flatten(x, self._x_ref, None, xi=xi)}
+            future = None
+            if self.ref_window.preview_length:
+                points = [self._traj_buf.get(self._traj_ids,
+                          (step + offset).clamp(max=self.max_episode_length))[0]
+                          for offset in range(1, self.ref_window.preview_length + 1)]
+                future = torch.stack(points, 1)
+            history = self._tracking_history if self.ref_window.history_length else None
+            return {"policy": self.ref_window.flatten(x, self._x_ref, None, xi=xi,
+                                                       preview=future, history=history)}
         x_refs, u_refs = self._traj_buf.get_window(self._traj_ids, step, self.ref_window)
         # Slot 0 is the current reference — what the reward and every metric use.
         self._x_ref, self._u_ref = x_refs[:, 0], u_refs[:, 0]
@@ -750,6 +778,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         error_norm = torch.norm(error, dim=-1).clamp(max=self._ERROR_CLAMP)   # (N,)
         self.extras["terminal_tracking_error"] = error_norm.clone()
         self.extras["tracking_error_vector"] = error.detach().clone()
+        self.extras["physical_tracking_error_vector"] = (x - self._x_ref).detach().clone()
         self.extras["tracking_error"] = error.square().sum(-1).detach()
 
         # accumulate streaming metric state: running error sum (AUC integrand),
@@ -782,17 +811,17 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
             # C2RL Phase B: Lyapunov-decrease reward tracking_scaler*(V - next_V)
             # - control_scaler*||u||^2, V = error^T M error, M = the frozen
             # CMG's metric at the corresponding state — mirrors classic
-            # env_base.py's get_rewards exactly. _get_rewards only ever sees
+            # analytical_env.py's get_rewards exactly. _get_rewards only ever sees
             # the post-transition state (no separate "prev x" lookup buffer
             # like the reference trajectory has), so the previous step's
             # error vector + metric are cached explicitly in
             # _prev_error/_prev_M (seeded at _reset_idx) rather than
             # recomputed from a stored trajectory.
             with torch.no_grad():
-                next_M = self._metric_from_cmg(x)
+                next_M = self._metric_from_cmg(x, self._x_ref)
 
-                V = quadratic_energy(self._prev_error, self._prev_M)
-                next_V = quadratic_energy(error, next_M)
+                V = tracking_energy(self._prev_error, self._prev_M, self.angle_idx)
+                next_V = tracking_energy(error, next_M, self.angle_idx)
 
                 control_effort = torch.norm(self._actions, p=2, dim=-1) ** 2
                 reward = energy_decrease(V, next_V)
@@ -802,7 +831,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         else:
             # -||error||_I^2, using the sanitized+clamped norm so a diverged step
             # can't emit a huge/NaN reward that wrecks the value fn / normalizers.
-            next_energy = error.square().sum(-1)
+            next_energy = tracking_energy(error, angle_idx=self.angle_idx)
             reward = energy_decrease(self._prev_energy, next_energy)
             self._prev_energy = next_energy
         self._episode_reward += reward
@@ -912,6 +941,8 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         # initialise robot to match x_ref at step 0
         x_ref_init = self._traj_buf.initial_state(self._traj_ids[env_ids])  # (n, state_dim)
         self._set_robot_state_from_ref(env_ids, x_ref_init)
+        if hasattr(self, '_continuous_state'):
+            self._continuous_state[env_ids] = x_ref_init
         self.disturbance.reset(env_ids)
         initial_error = wrap_diff(self._get_physical_state()[env_ids] - x_ref_init, self.angle_idx)
         self._prev_energy[env_ids] = initial_error.square().sum(-1)
@@ -925,7 +956,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         # seed the CCM Lyapunov cache (_get_rewards) from the freshly-reset
         # state, so the first step of the new episode compares against a
         # meaningful V rather than a stale value from the env's previous
-        # episode — mirrors classic env_base.py's reset_idx M-seeding.
+        # episode — mirrors classic analytical_env.py's reset_idx M-seeding.
         if self.ccm_gen is not None:
             if not hasattr(self, "_prev_M"):
                 state_dim = self._traj_buf.state_dim
@@ -935,4 +966,6 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
                 x0 = self._get_physical_state()[env_ids]
                 error0 = wrap_diff(x0 - x_ref_init, self.angle_idx)
                 self._prev_error[env_ids] = error0
-                self._prev_M[env_ids] = self._metric_from_cmg(x0)
+                self._prev_M[env_ids] = self._metric_from_cmg(x0, x_ref_init)
+        if getattr(self.ref_window, "history_length", 0):
+            self._tracking_history[env_ids] = 0

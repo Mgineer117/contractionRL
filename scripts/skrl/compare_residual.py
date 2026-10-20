@@ -1,6 +1,6 @@
 """Paired final-checkpoint AUC evaluation for the analytical Isaac car ablation.
 
-Training uses Isaac-Car-v0. Evaluation uses its identical analytical plant without
+Training uses Isaac-Classic-Car-v0. Evaluation uses its identical analytical plant without
 rendering, on one persisted fixed bank. Failed episodes are excluded from AUC
 and counted explicitly; paired differences use only common complete episodes.
 """
@@ -17,7 +17,8 @@ import gymnasium as gym
 import numpy as np
 import torch
 import yaml
-import contractionRL.tasks.direct.classic  # register analytical plant
+from contractionRL.agents.utils.RL.config import load_agent_config
+import contractionRL.tasks.direct.common.tracking_tasks  # register analytical plant
 from contractionRL.agents.utils.RL.models import FullControlActorModel
 
 
@@ -47,7 +48,7 @@ def compare(checkpoints, output, *, seed=20261015, episodes=512, wandb_project=N
     initial_observation = None
     for mode in ('full', 'residual'):
         path = Path(checkpoints[mode]).resolve()
-        cfg = yaml.safe_load((path.parent.parent/'params/agent.yaml').read_text())
+        cfg = load_agent_config(path.parent.parent/'params/agent.yaml')
         spec = cfg['models']['policy']
         assert spec.get('control_mode', 'full') == mode
         assert not cfg['agent'].get('use_state_norm', False), 'Apply the saved state scaler before evaluating normalized runs'
@@ -96,7 +97,7 @@ def compare(checkpoints, output, *, seed=20261015, episodes=512, wandb_project=N
         torch.testing.assert_close(metric_states[0][key], metric_states[1][key], rtol=1e-5, atol=1e-6)
     common = masks['full'] & masks['residual']
     difference = curves['residual'][common]-curves['full'][common]
-    result = {'task': 'Isaac-Car-v0', 'backend': 'analytical', 'evaluation_seed': seed,
+    result = {'task': 'Isaac-Classic-Car-v0', 'backend': 'analytical', 'evaluation_seed': seed,
               'disturbance_enabled': False, 'matched_metric': True,
               'auc_definition': 'integral_0^15 ||wrapped_error(t)|| / ||wrapped_error(0)|| dt',
               'failure_handling': 'AUC only for complete first episodes; failures reported; paired difference uses common complete episodes',

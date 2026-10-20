@@ -1,123 +1,7 @@
-"""CLActorRunner — backbone-aware GaussianMixin factory.
-
-YAML policy config:
-
-    policy:
-      class: GaussianMixin
-      backbone: control           # CLActor (W2 @ tanh(W1 @ (x-x_ref))); alias: contraction
-      clip_log_std: True
-      min_log_std: -4.605
-      max_log_std: 2.0
-      network:                    # layers used for w1 and w2 MLPs
-        - name: net
-          input: OBSERVATIONS
-          layers: [128, 128]
-          activations: tanh
-      output: ACTIONS
-
-    policy:
-      class: GaussianMixin
-      backbone: mlp               # standard skrl MLP (default)
-      network:
-        - name: net
-          input: OBSERVATIONS
-          layers: [128, 128]
-          activations: tanh
-      output: ACTIONS
-
-    policy:
-      class: GaussianMixin
-      backbone: control-squashed  # tanh-squashed CLActor (SquashedCLActorModel) — same
-                                   # bilinear feedback architecture as "control", but bounded
-                                   # + log_prob-corrected; requires the same [x, xref, uref]
-                                   # layout as "control". See models.py's SquashedCLActorModel /
-                                   # _TanhSquashMixin docstrings for why this is required for
-                                   # SAC (skrl's stock GaussianMixin + clip_actions is not
-                                   # equivalent — clip never reaches log_prob).
-      clip_log_std: True
-      min_log_std: -20.0
-      max_log_std: 2.0
-      network:
-        - name: net
-          input: OBSERVATIONS
-          layers: [128, 128]
-          activations: tanh
-      output: ACTIONS
-
-    policy:
-      class: GaussianMixin
-      backbone: mlp-squashed      # tanh-squashed plain-MLP actor (SquashedMLPActorModel).
-                                   # Adds uref like "mlp" does if the observation layout has one
-                                   # ([x, xref, uref]); otherwise (e.g. velocity-tracking) it's a
-                                   # plain squashed MLP over the full observation. State-dependent
-                                   # log_std, so no initial_log_std/clip_actions (silently
-                                   # ignored — squashing already bounds every sampled action).
-      clip_log_std: True
-      min_log_std: -20.0
-      max_log_std: 2.0
-      network:
-        - name: net
-          input: OBSERVATIONS
-          layers: [256, 256]
-          activations: relu
-      output: ACTIONS
-
-When backbone is ``contraction``/``control``, ``layers`` is extracted from the
-first network entry and passed as ``hidden_dim`` to CLActorModel. ``output`` is
-dropped. ``initial_log_std`` is NOT dropped -- CLActorModel honours it, and this
-docstring previously said otherwise while the code agreed with the docstring.
-"""
+"""Tracking-aware skrl models with independent policy and critic context encoders."""
 from __future__ import annotations
 
 from skrl.utils.runner.torch import Runner
-
-# Backbone → action-distribution family. Unbounded backbones sample from a raw
-# Normal (valid only for PPO-family trust-region methods); squashed backbones
-# tanh-bound the action + correct log_prob (valid only for SAC-family off-policy
-# entropy tuning). Mixing them across families silently mistrains — see
-# _assert_backbone_algo_compatible.
-_UNBOUNDED_BACKBONES = frozenset({"mlp", "control", "contraction"})
-_SQUASHED_BACKBONES = frozenset({"mlp-squashed", "control-squashed"})
-
-def _assert_backbone_algo_compatible(backbone: str, agent_class: str | None) -> None:
-    """Raise on (algorithm, backbone) pairings that would silently mistrain.
-
-    - SAC / C2RL-SAC need a bounded (tanh-squashed) action distribution: an
-      unbounded Gaussian's log_prob is unbounded below, so SAC's automatic
-      entropy-coefficient tuning has no fixed point and diverges. Unbounded
-      backbones (mlp / control / contraction) are rejected for SAC.
-    - PPO / C2RL-PPO need a closed-form entropy (entropy bonus) and clean
-      trust-region log_prob ratios; the squashed backbones deliberately raise
-      from get_entropy() and have zero-gradient action boundaries, so they are
-      rejected for PPO.
-
-    Other agents (C3M, LQR, SD-LQR) are unconstrained — they don't build their
-    policy through this factory with a squashed backbone and don't do SAC-style
-    entropy tuning. ``agent_class=None`` also skips the check (nothing to
-    validate against).
-    """
-    if not agent_class:
-        return
-    algo = agent_class.upper()
-    is_sac = "SAC" in algo or algo == "MBPO"
-    is_ppo = "PPO" in algo
-    if is_sac and backbone in _UNBOUNDED_BACKBONES:
-        suggested = "mlp-squashed" if backbone == "mlp" else "control-squashed"
-        raise ValueError(
-            f"backbone: {backbone!r} is an UNBOUNDED Gaussian and is not valid for "
-            f"agent class {agent_class!r} (SAC family): SAC's automatic entropy tuning "
-            f"has no fixed point with an unbounded log_prob and will diverge. Use "
-            f"backbone: {suggested!r} (tanh-squashed, bounded) for SAC."
-        )
-    if is_ppo and backbone in _SQUASHED_BACKBONES:
-        suggested = "mlp" if backbone == "mlp-squashed" else "control"
-        raise ValueError(
-            f"backbone: {backbone!r} is tanh-squashed and has no closed-form entropy "
-            f"(get_entropy raises), so it is not valid for agent class {agent_class!r} "
-            f"(PPO family), whose entropy bonus / analytic entropy require it. Use "
-            f"backbone: {suggested!r} (unbounded Gaussian) for PPO."
-        )
-
 
 def _is_window_space(space) -> bool:
     """True for a ``{x, xrefs, urefs}`` path-tracking observation. Velocity-
@@ -126,116 +10,45 @@ def _is_window_space(space) -> bool:
     return isinstance(space, gym.spaces.Dict) and {"x", "xrefs", "urefs"} <= set(space.spaces)
 
 
-def _gaussian_factory(observation_space, state_space, action_space, device,
-                       backbone: str = "mlp", agent_class: str | None = None, **kwargs):
+def _gaussian_factory(observation_space, state_space, action_space, device, agent_class=None, **kwargs):
+    """Select the controller by control_mode and the action distribution by algorithm."""
+    is_sac = "SAC" in str(agent_class).upper() or str(agent_class).upper() == "MBPO"
+    control_mode = kwargs.pop("control_mode", "structured")
+    network = kwargs.pop("network", [{}]) or [{}]
+    kwargs.pop("output", None)
+    spec = network[0]
+    hidden, activation = spec.get("layers", [128, 128]), spec.get("activations", "tanh")
     if hasattr(observation_space, "reference_state"):
         from contractionRL.agents.utils.RL.models import FullControlActorModel, FullControlSquashedActorModel
-        spec = (kwargs.pop("network", None) or [{}])[0]
-        is_sac = "SAC" in str(agent_class).upper() or str(agent_class).upper() == "MBPO"
         model = FullControlSquashedActorModel if is_sac else FullControlActorModel
-        return model(observation_space, action_space, device,
-                     hidden_dim=spec.get("layers", [128, 128]),
-                     activation=spec.get("activations", "tanh"), **kwargs)
-
-    # Hard guard: reject algorithm/backbone pairs that silently mistrain
-    # (unbounded + SAC → divergence; squashed + PPO → no analytic entropy).
-    _assert_backbone_algo_compatible(backbone, agent_class)
-
-    # x_dim is now only a cross-Check against what the observation space
-    # declares (models raise on a mismatch) — never the source of the layout.
-    x_dim = kwargs.pop("x_dim", None)
-    is_window = _is_window_space(observation_space)
-    control_mode = kwargs.pop("control_mode", None)
-    if control_mode == "factorized":
-        raise ValueError("Factorized full control requires a compact tracking observation")
-    if not is_window and control_mode == "residual":
+        return model(observation_space, action_space, device, hidden_dim=hidden,
+                     activation=activation, control_mode=control_mode, **kwargs)
+    if _is_window_space(observation_space):
+        from contractionRL.agents.utils.RL.models import CLActorModel, SquashedCLActorModel, MLPResidualActorModel, SquashedMLPActorModel
+        if control_mode == "structured":
+            model = SquashedCLActorModel if is_sac else CLActorModel
+        elif control_mode == "residual":
+            model = SquashedMLPActorModel if is_sac else MLPResidualActorModel
+        else:
+            raise ValueError("full/factorized control requires compact tracking observations")
+        return model(observation_space, action_space, device, hidden_dim=hidden, activation=activation, **kwargs)
+    if control_mode == "residual":
         raise ValueError("Residual control requires a tracking reference")
-
-    def _hidden(default):
-        network = kwargs.pop("network", [{}])
-        hd = network[0].get("layers", default) if network else default
-        act = network[0].get("activations", None) if network else None
-        kwargs.pop("output", None)
-        return hd, act
-
-    # "control" is the preferred spelling for the CLActor backbone;
-    # "contraction" is kept as a backward-compatible alias.
-    if backbone in ("control", "contraction", "control-squashed"):
-        if not is_window:
-            raise ValueError(
-                f"backbone: {backbone} requires a {{x, xrefs, urefs}} observation "
-                f"(a path-tracking env), got {type(observation_space).__name__}. "
-                f"Use backbone: mlp / mlp-squashed for velocity-tracking envs.")
-        from contractionRL.agents.utils.RL.models import CLActorModel, SquashedCLActorModel
-        hidden_dim, activation = _hidden([128, 128])
-        if backbone == "control-squashed":
-            return SquashedCLActorModel(
-                observation_space=observation_space, action_space=action_space,
-                device=device, hidden_dim=hidden_dim, activation=activation or "tanh", x_dim=x_dim, **kwargs)
-        # initial_log_std is FORWARDED, not dropped. It used to be popped here,
-        # which silently pinned every backbone: control run to log_std 0.0, i.e.
-        # sigma = 1.0, whatever the yaml asked for. CLActorModel declares the
-        # argument and applies it (`if initial_log_std != 0.0: fill_`), so the pop
-        # was discarding a value the model was ready to honour -- and discarding
-        # it invisibly, since a Gaussian policy with sigma = 1.0 looks healthy.
-        #
-        # The consequence was not subtle: at sigma = 1.0 instead of the configured
-        # exp(-2) = 0.135, the sampled action carried ~7.4x the intended noise,
-        # the state left the termination box in ~4 of 500 steps, and because EVERY
-        # episode ended early stability_summary() published only early_end_frac --
-        # so AUC, contraction rate, overshoot, score and the whole
-        # Stability_maha/* family were missing from every run.
-        return CLActorModel(
-            observation_space=observation_space, action_space=action_space,
-            device=device, hidden_dim=hidden_dim, activation=activation or "tanh", x_dim=x_dim, **kwargs)
-
-    if backbone == "mlp-squashed":
+    if is_sac:
         from contractionRL.agents.utils.RL.models import SquashedMLPActorModel
-        hidden_dim, activation = _hidden([256, 256])
-        # log_std is state-dependent (network head) for this backbone, and
-        # squashing already bounds every sampled action — these two yaml keys
-        # (meaningful for the other backbones) don't apply here.
         kwargs.pop("initial_log_std", None)
         kwargs.pop("clip_actions", None)
-        return SquashedMLPActorModel(
-            observation_space=observation_space, action_space=action_space, device=device,
-            hidden_dim=hidden_dim, activation=activation or "relu", x_dim=x_dim, **kwargs)
-
-    if backbone == "mlp" and is_window:
-        # "mlp" still adds urefs[0] to its output (mu = uref + MLP(...)), just via
-        # a generic MLP over the encoded observation instead of CLActor's bilinear
-        # W1/W2 structure. Vel-tracking envs (flat Box obs) fall through below.
-        from contractionRL.agents.utils.RL.models import MLPResidualActorModel
-        hidden_dim, activation = _hidden([128, 128])
-        initial_log_std = kwargs.pop("initial_log_std", 0.0)
-        return MLPResidualActorModel(
-            observation_space=observation_space, action_space=action_space, device=device,
-            hidden_dim=hidden_dim, activation=activation or "tanh", initial_log_std=initial_log_std, x_dim=x_dim, **kwargs)
-
+        return SquashedMLPActorModel(observation_space=observation_space, action_space=action_space,
+                                    device=device, hidden_dim=hidden, activation=activation, **kwargs)
     from skrl.utils.model_instantiators.torch import gaussian_model
-    for _k in ("angle_idx", "sym", "encoder", "encoder_hidden", "encoder_stride"):
-        kwargs.pop(_k, None)
-    return gaussian_model(
-        observation_space=observation_space,
-        state_space=state_space,
-        action_space=action_space,
-        device=device,
-        **kwargs,
-    )
+    for key in ("angle_idx", "sym", "x_dim", "encoder", "feature_dim"):
+        kwargs.pop(key, None)
+    return gaussian_model(observation_space=observation_space, state_space=state_space,
+                          action_space=action_space, device=device, network=network, output="ACTIONS", **kwargs)
 
 
 def _deterministic_factory(observation_space, state_space, action_space, device, **kwargs):
-    """DeterministicMixin (value/critic) factory — the RefWindowValueModel
-    counterpart to ``_gaussian_factory`` above.
-
-    On a ``{x, xrefs, urefs}`` observation this builds the structured critic
-    ``V = MLP([phi(x, e) || psi(xrefs)])`` — the mirror of the actor's
-    ``W1(x)`` / ``W2(xrefs)`` split, with the reference window going through the
-    same ``--encoder`` (mlp | gru | attn) and the same relative-position /
-    wrapped-angle feature map. Velocity-tracking envs (flat Box obs) fall
-    through to skrl's stock ``deterministic_model``, which is what they used
-    before — it has no notion of an angle-bearing state, but they have none.
-    """
+    """Build an independent V/Q network with optional tracking context."""
     network = kwargs.pop("network", [{}])
     kwargs.pop("output", None)
     net_spec = network[0] if network else {}
@@ -261,8 +74,6 @@ def _deterministic_factory(observation_space, state_space, action_space, device,
 
     from contractionRL.agents.utils.RL.models import RefWindowValueModel
 
-    # yaml spells psi's width "embed_dim" (matching --critic_embed_dim); the
-    # model calls it encoder_hidden, shared with the actor's encoder.
     if "embed_dim" in kwargs:
         kwargs.setdefault("encoder_hidden", int(kwargs.pop("embed_dim")))
 
@@ -278,15 +89,25 @@ def _deterministic_factory(observation_space, state_space, action_space, device,
 
 
 class CLActorRunner(Runner):
+    @staticmethod
+    def load_cfg_from_yaml(path):
+        from contractionRL.agents.utils.RL.config import load_agent_config
+        return load_agent_config(path)
+
     def __init__(self, env, cfg):
-        from contractionRL.agents.utils.RL.config import validate_observation_normalization
-        validate_observation_normalization(cfg.get("agent", {}))
+        from contractionRL.agents.utils.RL.config import configure_encoder_context, validate_observation_normalization
+        import copy
+        cfg = copy.deepcopy(cfg)
+        if any(key in cfg.get('agent', {}) for key in ('use_value_norm','use_reward_norm')):
+            from contractionRL.agents.utils.RL.config import normalize_agent_cfg
+            normalize_agent_cfg(cfg, algorithm=str(cfg['agent']['class']).lower(), device=getattr(env, 'device', None))
+        configure_encoder_context(env, cfg)
+        validate_observation_normalization(cfg.get("agent", {}), allow_features="PPO" in str(cfg.get("agent", {}).get("class", "")).upper())
         if hasattr(env, "set_discount_factor"):
             env.set_discount_factor(cfg.get("agent", {}).get("discount_factor", .99))
-        # Capture the agent class up front so the gaussian factory can reject
-        # (algorithm, backbone) combinations that silently mistrain (see
-        # _assert_backbone_algo_compatible). Set before super().__init__ because
-        # that's what triggers model construction via _component below.
+        # Select the policy distribution before model construction.
+        import copy
+        self._feature_cfg = copy.deepcopy(cfg)
         self._agent_class = str((cfg.get("agent") or {}).get("class", "")).strip()
         self._mbpo = self._agent_class.lower() == "mbpo"
         self._contractionppo = self._agent_class.lower().replace("_", "").replace("-", "") == "contractionppo"
@@ -305,12 +126,32 @@ class CLActorRunner(Runner):
             cfg["agent"]["class"] = "PPO"  # Use skrl's PPO construction path with our subclass.
         super().__init__(env, cfg)
 
+    def _generate_models(self, env, cfg):
+        from contractionRL.agents.utils.RL.config import model_context_config
+        cfg["models"] = model_context_config(cfg)
+        cfg["models"].pop("dynamics", None)
+        return super()._generate_models(env, cfg)
+
     def _generate_agent(self, env, cfg, models):
+        for key in ('use_value_expansion','value_expansion_horizon','value_expansion_batch_size','use_state_norm','action_bound_penalty_beta'):
+            cfg['agent'].pop(key, None)
         agent = super()._generate_agent(env, cfg, models)
         from contractionRL.agents.utils.RL.agent_patches import patch_kl_logging
         patch_kl_logging(agent)
         if self._contractionppo or self._mbpo:
             agent.bind_env(env)
+        if 'action_bound_penalty_beta' in self._feature_cfg.get('agent', {}):
+            from contractionRL.runners.contraction_runner import _unwrap_env
+            raw = _unwrap_env(env)
+            beta = self._feature_cfg['agent']['action_bound_penalty_beta']
+            if hasattr(raw, 'set_action_bound_penalty'):
+                raw.set_action_bound_penalty(beta)
+            elif beta:
+                raise ValueError('Environment does not implement action_bound_penalty_beta')
+        if 'PPO' in self._agent_class.upper() and any(self._feature_cfg.get('agent', {}).get(key, False)
+                for key in ('use_value_expansion','use_state_norm')):
+            from contractionRL.agents.utils.RL.ppo_features import PPOFeatures
+            agent._ppo_features = PPOFeatures(agent, env, self._feature_cfg)
         return agent
 
     def _process_cfg(self, cfg):

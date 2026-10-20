@@ -72,6 +72,48 @@ def embed_angles(block: torch.Tensor, angle_idx: Sequence[int]) -> torch.Tensor:
     return torch.cat(pieces, dim=-1)
 
 
+def unwrap_state_angles(x, previous, angle_idx=()):
+    """Lift measured orientation to the continuous branch nearest the last sample."""
+    if previous is None or not angle_idx:
+        return x.clone()
+    result = x.clone()
+    angles = list(angle_idx)
+    delta = x[..., angles] - previous[..., angles]
+    lifted = previous[..., angles] + torch.remainder(delta + math.pi, 2 * math.pi) - math.pi
+    result[..., angles] = torch.where(torch.isfinite(previous[..., angles]), lifted, x[..., angles])
+    return result
+
+
+def unwrap_angle_trajectory(states, angle_idx=()):
+    """Continuous angular lifts along the penultimate (time) dimension."""
+    if not angle_idx:
+        return states
+    result = states.clone()
+    angles = list(angle_idx)
+    values = states[..., angles]
+    increments = torch.remainder(values[..., 1:, :] - values[..., :-1, :] + math.pi, 2 * math.pi) - math.pi
+    result[..., angles] = torch.cat((values[..., :1, :], values[..., :1, :] + increments.cumsum(-2)), -2)
+    return result
+
+
+def clamp_physical_state(x, low, high, angle_idx=()):
+    """Clamp bounded coordinates while retaining continuous full-turn angles."""
+    low, high = torch.as_tensor(low, device=x.device), torch.as_tensor(high, device=x.device)
+    mask = torch.zeros(x.shape[-1], dtype=torch.bool, device=x.device)
+    mask[list(angle_idx)] = True
+    full_turn = mask & (high - low >= 2 * math.pi - 1e-5)
+    return torch.where(full_turn, x, x.clamp(low, high))
+
+
+def canonical_bound_state(x, low, high, angle_idx=()):
+    """A coordinate copy for box checks; never changes the simulator state."""
+    low, high = torch.as_tensor(low, device=x.device), torch.as_tensor(high, device=x.device)
+    mask = torch.zeros(x.shape[-1], dtype=torch.bool, device=x.device)
+    mask[list(angle_idx)] = True
+    full_turn = mask & (high - low >= 2 * math.pi - 1e-5)
+    return torch.where(full_turn, torch.remainder(x - low, 2 * math.pi) + low, x)
+
+
 def wrap_diff(diff: torch.Tensor, angle_idx: Sequence[int]) -> torch.Tensor:
     """Wrap the ``angle_idx`` columns of a raw difference into (-pi, pi].
 

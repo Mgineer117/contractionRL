@@ -13,7 +13,13 @@ def write_json(path, value):
 def setup(root):
     sys.path[:0] = [str(root / 'code/source/contractionRL'), str(root / 'code/scripts/skrl')]
     import torch
-    import contractionRL.tasks.direct.classic  # noqa: F401
+    try:
+        import contractionRL.tasks.direct.common.tracking_tasks  # noqa: F401
+    except ModuleNotFoundError as error:
+        if error.name != 'contractionRL.tasks.direct.common.tracking_tasks':
+            raise
+        # Historical checkpoint analysis loads the original source snapshot.
+        import contractionRL.tasks.direct.classic  # noqa: F401
     torch.set_num_threads(2)
 
 

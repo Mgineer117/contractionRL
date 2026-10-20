@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 import yaml
+from contractionRL.agents.utils.RL.config import load_agent_config
 
 # ── repo imports (read-only) ───────────────────────────────────────────────── #
 _VIZ_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -58,17 +59,17 @@ _SRC = os.path.join(_REPO_ROOT, "source", "contractionRL")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-import contractionRL.tasks.direct.classic  # noqa: F401,E402  registers classic-*-v0
+import contractionRL.tasks.direct.common.tracking_tasks  # noqa: F401,E402  registers classic-*-v0
 import gymnasium as gym  # noqa: E402
-from contractionRL.agents.skrl.angle_utils import wrap_diff  # noqa: E402
-from contractionRL.agents.skrl.math_utils import (  # noqa: E402
+from contractionRL.agents.utils.system_dynamics.state import wrap_diff  # noqa: E402
+from contractionRL.agents.utils.contraction.math_utils import (  # noqa: E402
     b_jacobian,
     bound_W,
     jacobian,
     spd_inverse,
 )
-from contractionRL.agents.skrl.ncm_synthesis import cvstem_joint  # noqa: E402
-from contractionRL.agents.skrl.nn_modules import BoundedCCM_Generator, CCM_Generator  # noqa: E402
+from contractionRL.agents.utils.contraction.ncm_synthesis import cvstem_joint  # noqa: E402
+from contractionRL.agents.utils.contraction.metric_models import BoundedCCM_Generator, CCM_Generator  # noqa: E402
 
 # Only envs with u_dim <= 2 — the full control space is plottable without any
 # projection (see the module docstring). quadrotor (u_dim=4) is deliberately out.
@@ -129,7 +130,7 @@ METRIC_KINDS = ("ccm", "cvstem_pretrained", "cvstem_online", "random")
 
 def _env_id(name: str) -> str:
     """Short name -> gym id, via the one map the classic package owns."""
-    from contractionRL.tasks.direct.classic import env_id
+    from contractionRL.tasks.direct.common.tracking_tasks import env_id
     return env_id(name)
 
 def make_env(env_name: str, seed: int, time_bound: float | None = None):
@@ -380,7 +381,7 @@ class CVSTEMPretrainedMetric:
                  cache_path: str, solver: str | None = None, device: str = "cpu"):
         from pathlib import Path
 
-        from contractionRL.agents.skrl.ncm_synthesis import (
+        from contractionRL.agents.utils.contraction.ncm_synthesis import (
             build_cm_dataset,
             load_cached_cm_dataset,
             regress_cmg,
@@ -488,7 +489,7 @@ class CCMTrainedMetric:
         import json
         from pathlib import Path
 
-        from contractionRL.agents.skrl.ncm_synthesis import train_cmg_ccm
+        from contractionRL.agents.utils.contraction.ncm_synthesis import train_cmg_ccm
 
         cm = cfg.get("cm", {})
         from contractionRL.agents.utils.RL.config import migrate_c2rl_metric_cfg
@@ -673,7 +674,7 @@ def load_algo_cfg(env_name: str, algo: str) -> dict:
     local = os.path.join(POLICIES_DIR, env_name, f"{algo}.yaml")
     if os.path.exists(local):
         with open(local) as f:
-            return yaml.safe_load(f)
+            return load_agent_config(f.name)
     task_yaml = os.path.join(
         _SRC, "contractionRL", "tasks", "direct", "classic", env_name, "agents",
         _CFG_FILENAMES[algo],
@@ -686,7 +687,7 @@ def load_algo_cfg(env_name: str, algo: str) -> dict:
               f"c2rl_ppo config's cm: block for the CV-STEM knobs")
         return load_algo_cfg(env_name, "c2rl_ppo")
     with open(task_yaml) as f:
-        return yaml.safe_load(f)
+        return load_agent_config(f.name)
 
 
 def find_checkpoint(env_name: str, algo: str) -> str | None:
@@ -702,7 +703,7 @@ def _build_actor_from_cfg(cfg: dict, env, scen: Scenario):
     """Instantiate the actor class the training run used — same backbone→class
     dispatch as the runners, reusing models.py classes so checkpoint keys match
     exactly. Returns (model, deterministic_action_fn)."""
-    from contractionRL.agents.skrl.models import (
+    from contractionRL.agents.utils.RL.models import (
         CLActorModel,
         CLDeterministicActorModel,
         MLPResidualActorModel,

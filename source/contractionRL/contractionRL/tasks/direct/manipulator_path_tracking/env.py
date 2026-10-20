@@ -23,8 +23,7 @@ class ManipulatorPathTrackingEnv(PathTrackingBase):
 
     cfg: ManipulatorPathTrackingEnvCfg
 
-    def __init__(self, cfg: ManipulatorPathTrackingEnvCfg, render_mode=None, **kwargs):
-        super().__init__(cfg, render_mode, **kwargs)
+    def _initialize_robot_indices(self) -> None:
         self._arm_ids, _ = self._robot.find_joints(self.cfg.arm_joint_names)
         self._ee_id, _ = self._robot.find_bodies(self.cfg.ee_body_name)
 
@@ -70,7 +69,7 @@ class ManipulatorPathTrackingEnv(PathTrackingBase):
         ee_pos = self._robot.data.body_pos_w[:, self._ee_id[0], :] - self.scene.env_origins
         ee_lin_vel = self._robot.data.body_lin_vel_w[:, self._ee_id[0], :]
         ee_yaw_vel = self._robot.data.body_ang_vel_w[:, self._ee_id[0], 2:3]
-        return torch.cat(
+        return self._unwrap_state_angles(torch.cat(
             [
                 self._robot.data.joint_pos[:, self._arm_ids],
                 self._robot.data.joint_vel[:, self._arm_ids],
@@ -79,7 +78,7 @@ class ManipulatorPathTrackingEnv(PathTrackingBase):
                 ee_yaw_vel,
             ],
             dim=-1,
-        )
+        ))
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length
@@ -98,4 +97,4 @@ class ManipulatorPathTrackingEnv(PathTrackingBase):
         root[:, :3] += self.scene.env_origins[env_ids]
         self._robot.write_root_pose_to_sim(root[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(root[:, 7:], env_ids)
-        self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+        self._robot.write_joint_state_to_sim(joint_pos, joint_vel, joint_ids=self._arm_ids, env_ids=env_ids)

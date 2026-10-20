@@ -9,6 +9,8 @@ from torch.distributions import Normal
 from contractionRL.agents.utils.RL.networks import MLP, _ACT_MAP
 from contractionRL.agents.utils.system_dynamics.state import StateSymmetry, embed_angles, embedded_dim
 
+
+
 class CCM_Generator(nn.Module):
     """Contraction-metric generator W(x) = VᵀV (symmetric PSD by construction).
 

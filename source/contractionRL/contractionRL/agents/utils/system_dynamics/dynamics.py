@@ -19,6 +19,41 @@ from contractionRL.agents.utils.system_dynamics.state import StateSymmetry, embe
 from contractionRL.agents.utils.system_dynamics.state import wrap_diff
 
 
+def dynamics_environment_metadata(env) -> dict:
+    """Physical derivative rows and applied-control coordinates used by a model."""
+    if not hasattr(env, "x_dim") and getattr(env, "envs", None):
+        env = env.envs[0].unwrapped
+    dt = getattr(env, "dt", None) or getattr(env, "step_dt", None)
+    coordinates = getattr(env, "action_coordinates", None)
+    if coordinates is None:
+        coordinates = getattr(getattr(env, "_traj_buf", None), "action_coordinates", None)
+    cfg = getattr(env, "cfg", None)
+    scales = {name: torch.as_tensor(getattr(cfg, name)).tolist()
+              for name in sorted(dir(cfg)) if name.startswith("action_scale") and getattr(cfg, name) is not None}
+    return {"x_dim": int(env.x_dim), "u_dim": int(env.u_dim),
+            "state_names": list(getattr(env, "state_names", ())),
+            "angle_idx": list(getattr(env, "angle_idx", ())),
+            "dt": None if dt is None else float(dt), "action_coordinates": coordinates,
+            "action_scales": scales or None}
+
+
+def validate_dynamics_metadata(saved: dict, expected: dict) -> None:
+    missing = []
+    for name, value in expected.items():
+        if value is None or (name == "state_names" and not value):
+            continue
+        actual = saved.get(name)
+        if actual is None or (name == "state_names" and not actual):
+            missing.append(name)
+        elif not (math.isclose(float(actual), float(value), rel_tol=1e-6, abs_tol=1e-9)
+                  if name == "dt" else actual == value):
+            raise ValueError(f"Dynamics checkpoint {name} does not match the environment")
+    if missing:
+        warnings.warn("Legacy dynamics checkpoint lacks " + ", ".join(missing)
+                      + "; physical state/control compatibility is unverified. Use its original environment and source.",
+                      RuntimeWarning, stacklevel=2)
+
+
 @torch.no_grad()
 def collect_stochastic_rollouts(env, count, *, low, high, device, dt, angle_idx=(), path=None):
     """Collect executed exploratory controls and disturbed plant derivatives.
@@ -52,7 +87,7 @@ def collect_stochastic_rollouts(env, count, *, low, high, device, dt, angle_idx=
             endpoint = infos.get("dynamics_x_next", infos.get("terminal_physical_state"))
             if endpoint is None:
                 raise RuntimeError("Simulator must expose raw pre-autoreset endpoints for stochastic dynamics learning")
-            derivative = wrap_diff(endpoint - x, angle_idx) / dt
+            derivative = (endpoint - x) / dt
         valid = torch.isfinite(x).all(-1) & torch.isfinite(derivative).all(-1)
         for key, value in (("x", x), ("u", u), ("x_dot", derivative), ("trajectory_id", groups)):
             records[key].append(value[valid].clone())
@@ -77,7 +112,7 @@ def collect_stochastic_rollouts(env, count, *, low, high, device, dt, angle_idx=
     return data
 
 
-def load_offline_dynamics_data(data_path: str, tag: str = "") -> dict:
+def load_offline_dynamics_data(data_path: str, tag: str = "", *, require_disturbed: bool = False) -> dict:
     """Load + flatten an offline ``dynamics_data.npz`` (keys ``x``, ``u``,
     ``x_dot``, optional ``lengths``) into flat ``(n, dim)`` arrays.
 
@@ -90,6 +125,15 @@ def load_offline_dynamics_data(data_path: str, tag: str = "") -> dict:
     """
     print(f"{tag} Loading dynamics pretrain data from {data_path}")
     npz = np.load(data_path)
+    if require_disturbed and (
+        str(npz.get("reference_source", "")) == "physx_nominal_rollout"
+        or ("disturbance_enabled" in npz and not bool(npz["disturbance_enabled"]))
+    ):
+        npz.close()
+        raise ValueError("Nominal dynamics data cannot identify the disturbance density; supply disturbed rollouts or omit dynamics_pretrain_data_path to collect them")
+    if require_disturbed and "disturbance_enabled" not in npz:
+        npz.close()
+        raise ValueError("Disturbed dynamics fitting requires explicit disturbance_enabled=True provenance; regenerate actual disturbed rollouts or omit dynamics_pretrain_data_path to collect them")
     if str(npz.get("coordinate_frame", "world")) != "world":
         npz.close()
         raise ValueError("Dynamics training requires world-coordinate data; use the archive's original source for other frames")
@@ -136,6 +180,7 @@ def load_offline_dynamics_data(data_path: str, tag: str = "") -> dict:
     }
     if groups is not None:
         result["trajectory_id"] = groups.reshape(-1).copy()
+    npz.close()
     return result
 
 
@@ -186,7 +231,8 @@ def pretrain_dynamics(agent, *, epochs: int, data_path: str | None,
                       tag: str = "",
                       val_frac: float = 0.1,
                       early_stop_patience: int = 10,
-                      step_offset: int | None = None) -> None:
+                      step_offset: int | None = None,
+                      require_disturbed: bool = False) -> None:
     """Pretrain ``agent._neural_dynamics`` for ``epochs`` epochs over a fixed
     ``memory_size``-sized buffer of ``(x, u, x_dot)`` samples, drawn once before
     the epoch loop — the same "sample a fixed dataset, then multi-epoch it"
@@ -230,7 +276,8 @@ def pretrain_dynamics(agent, *, epochs: int, data_path: str | None,
     log_every = max(1, epochs // 100)
     if log_interval and log_interval > 0:
         log_every = min(log_every, log_interval)
-    has_writer = getattr(agent, "writer", None) is not None
+    from contractionRL.agents.utils.RL.logging import pretraining_logging_enabled
+    has_writer = pretraining_logging_enabled(agent)
 
     dev = agent._neural_dynamics.device
 
@@ -240,7 +287,7 @@ def pretrain_dynamics(agent, *, epochs: int, data_path: str | None,
         x_np, u_np, xdot_np = (supplied[key] for key in ("x", "u", "x_dot"))
         data_groups = supplied.get("trajectory_id")
     elif data_path:
-        offline = load_offline_dynamics_data(data_path, tag=tag)
+        offline = load_offline_dynamics_data(data_path, tag=tag, require_disturbed=require_disturbed)
         x_all, u_all, xdot_all = offline["x"], offline["u"], offline["x_dot"]
         n_avail = x_all.shape[0]
         n_samples = memory_size if memory_size is not None else n_avail
@@ -252,6 +299,8 @@ def pretrain_dynamics(agent, *, epochs: int, data_path: str | None,
         x_np, u_np, xdot_np = x_all[idx], u_all[idx], xdot_all[idx]
         if "trajectory_id" in offline:
             data_groups = offline["trajectory_id"][idx]
+        # C3M's later dynamics updates must keep using the accepted dataset.
+        agent._dynamics_rollout_data = {key: value[idx] for key, value in offline.items()}
     else:
         n_samples = memory_size if memory_size is not None else agent._cfg.dynamics_batch_size
         data = agent._get_rollout(n_samples, "dynamics", num_control_per_state=num_controls_per_state)
@@ -383,6 +432,7 @@ class NeuralDynamics(nn.Module):
         self.device = torch.device(device or "cpu")
         self.angle_idx = list(angle_idx)
         self.nominal_dynamics = nominal_dynamics
+        self.transition_metadata = {}
 
         act = _ACT_MAP[activation.lower()]()
         # Nets see the continuous embedding of x's angle dims; f/B are still
@@ -477,6 +527,7 @@ class NeuralDynamics(nn.Module):
                 "symmetry_mode": getattr(self.sym, "mode", None),
                 "nominal_source": "analytical" if self.nominal_dynamics is not None else "learned",
                 "disturbance_density": "zero_mean_diagonal_gaussian",
+                "transition_metadata": self.checkpoint_metadata(),
                 "state_dict": self.state_dict(),
             },
             path,
@@ -484,8 +535,18 @@ class NeuralDynamics(nn.Module):
         print(f"[NeuralDynamics] saved → {path}")
 
     @classmethod
-    def load(cls, path: str, device: str | None = None, *, nominal_dynamics=None) -> NeuralDynamics:
+    def load(cls, path: str, device: str | None = None, *, nominal_dynamics=None,
+             expected_metadata: dict | None = None) -> NeuralDynamics:
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        metadata = ckpt.get("transition_metadata", {key: ckpt.get(key) for key in
+            ("x_dim", "u_dim", "state_names", "angle_idx", "dt", "action_coordinates", "action_scales")})
+        validate_dynamics_metadata(metadata, {key: ckpt.get(key) for key in
+            ("x_dim", "u_dim", "state_names", "angle_idx")})
+        if expected_metadata is not None:
+            validate_dynamics_metadata(metadata, expected_metadata)
+        elif "transition_metadata" not in ckpt:
+            warnings.warn("Legacy dynamics checkpoint has no transition_metadata; physical state/control compatibility is unverified.",
+                          RuntimeWarning, stacklevel=2)
         if ckpt.get("nominal_source") == "analytical" and nominal_dynamics is None:
             raise ValueError("Analytical dynamics checkpoint requires its exact nominal_dynamics callable")
         symmetry = _sym_from_names(ckpt.get("state_names"), ckpt.get("symmetry_mode"))
@@ -505,9 +566,15 @@ class NeuralDynamics(nn.Module):
             nominal_dynamics=nominal_dynamics,
         )
         model.load_state_dict(ckpt["state_dict"])
+        model.transition_metadata = metadata.copy()
         model.eval()
         print(f"[NeuralDynamics] loaded ← {path}  (x_dim={ckpt['x_dim']}, u_dim={ckpt['u_dim']})")
         return model
+
+    def checkpoint_metadata(self) -> dict:
+        return {"x_dim": self.x_dim, "u_dim": self.u_dim,
+                "state_names": list(getattr(self.sym, "names", ()) or ()),
+                "angle_idx": list(self.angle_idx), **self.transition_metadata}
 
     def to(self, *args, **kwargs):
         result = super().to(*args, **kwargs)

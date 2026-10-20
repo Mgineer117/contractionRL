@@ -30,6 +30,7 @@ from skrl.trainers.torch.base import Trainer, TrainerCfg
 
 from contractionRL.agents.utils.contraction.math_utils import build_lr_scheduler
 from contractionRL.agents.utils.system_dynamics.reference import RefWindow
+from contractionRL.agents.utils.RL.logging import pretraining_logging_enabled
 from contractionRL.agents.utils.RL.config import filter_cfg_fields, make_base_rl_cfg, migrate_c2rl_metric_cfg
 from contractionRL.agents.utils.RL.logging import metric_batch
 
@@ -48,8 +49,8 @@ from contractionRL.agents.utils.RL.logging import metric_batch
 
 @dataclass
 class C2RLMetricCfg(AgentCfg):
-    mode: str = "analytical"
     action_bound_penalty_beta: float = 0.0
+    cmg_checkpoint: str = ""
     ccm_w_ub: float = 10.0
     ccm_w_lb: float = 0.1
     ccm_lbd: float = 1e-2
@@ -229,8 +230,8 @@ class C2RLPPOCfg(C2RLMetricCfg):
     # offline dynamics-pretrain pool if configured, else get_rollout("dynamics")
     # (uniform state-space coverage). See ncm_synthesis._sample_cm_states.
     cmg_random_ratio: float = 0.0
-    # Dynamics — learned NeuralDynamics (ẋ = f(x) + B(x)·u) unless
-    # mode=sim_to_real (classic envs only). Feeds Phase A's CMG
+    # PhysX dynamics — learned NeuralDynamics (ẋ = f(x) + B(x)·u).
+    # Feeds Phase A's CMG
     # synthesis (SDP dataset for "cvstem", C1/C2 gradient computation for "ccm").
     dynamics_lr: float = 1e-3
     dynamics_lr_scheduler: str = ""
@@ -411,7 +412,7 @@ class C2RLAgent(Agent):
       ``"policy"``   — the real deployed SAC/PPO policy.
       ``"value"`` (PPO) or ``"critic_1"``/``"critic_2"``/``"target_critic_1"``/
         ``"target_critic_2"`` (SAC) — the deployed policy's own critic(s).
-      ``"dynamics"`` — optional NeuralDynamics (mode=sim_to_real).
+      ``"dynamics"`` — optional NeuralDynamics for PhysX tasks.
       ``"cmg"``      — required. MetricModel (``BoundedCCM_Generator``, i.e.
         ``constrain_eigenvalues=True``) synthesized offline (see synthesize_cmg)
         and frozen before Phase B; read for the Mahalanobis reward.
@@ -445,8 +446,7 @@ class C2RLAgent(Agent):
         if isinstance(cfg, dict):
             if base_algorithm.upper() == "SAC" and cfg.get("use_value_expansion", False):
                 raise ValueError("use_value_expansion is supported only by C2RL-PPO")
-            from contractionRL.agents.utils.RL.config import migrate_dynamics_mode
-            cfg = migrate_dynamics_mode(migrate_c2rl_metric_cfg(cfg))
+            cfg = migrate_c2rl_metric_cfg(cfg)
             if base_algorithm.upper() == "SAC":
                 from skrl.agents.torch.sac import SAC_CFG as BaseCfg
             else:
@@ -487,8 +487,6 @@ class C2RLAgent(Agent):
         self._u_dim = u_dim
         self._device = device
         self._cfg = parsed_cfg
-        if parsed_cfg.mode not in ("analytical", "sim_to_real"):
-            raise ValueError(f"Unknown mode: {parsed_cfg.mode}")
         if parsed_cfg.cmg_method not in ("cvstem", "ccm"):
             raise ValueError("C2RL cmg_method must be 'cvstem' or 'ccm'.")
         if parsed_cfg.cmg_method == "ccm" and parsed_cfg.metric_source != "regress":
@@ -625,13 +623,7 @@ class C2RLAgent(Agent):
         training by the trainer's ``pretrain_dynamics``) provides it. This
         mirrors C3M's dynamics interface expected by ``dynamics_pretrain``.
         """
-        if cfg.mode == "analytical":
-            if get_f_and_B is None:
-                raise ValueError(
-                    "C2RL: analytical dynamics (mode=analytical) requires a "
-                    "get_f_and_B callable (classic envs only). Isaac Sim envs have no "
-                    "analytical dynamics — set mode=sim_to_real."
-                )
+        if get_f_and_B is not None:
             self._get_f_and_B = get_f_and_B
             self._neural_dynamics = None
         else:
@@ -639,7 +631,7 @@ class C2RLAgent(Agent):
             if self._neural_dynamics is None:
                 raise ValueError(
                     "C2RL requires a 'dynamics' model in the models dict when "
-                    "mode=sim_to_real (add a models.dynamics block to the config)."
+                    "exact equations are unavailable (add a models.dynamics block)."
                 )
             self._get_f_and_B = self._neural_dynamics.get_f_and_B
         self._dynamics_optimizer = None
@@ -801,6 +793,15 @@ class C2RLAgent(Agent):
         it contains no policy/controller-Jacobian loss.
         """
         restored = getattr(self, "_restored_cmg_checkpoint", None)
+        if self._cfg.cmg_checkpoint and not restored:
+            saved = torch.load(self._cfg.cmg_checkpoint, map_location="cpu", weights_only=False)
+            expected = {"w_lb": self._cfg.w_lb, "w_ub": self._cfg.w_ub,
+                        "lbd": self._cfg.lbd, "angle_idx": list(self._angle_idx),
+                        "state_names": list(getattr(self._window, "state_names", ()))}
+            if saved.get("metric_config") != expected:
+                raise ValueError("Pretrained metric coordinates/bounds/rate do not match the configuration")
+            self.models["cmg"].load_state_dict(saved["cmg"], strict=True)
+            restored = self._restored_cmg_checkpoint = str(self._cfg.cmg_checkpoint)
         if restored:
             self.freeze_cmg()
             self._attach_critic_potential()
@@ -824,7 +825,8 @@ class C2RLAgent(Agent):
         value = getattr(self._rl_agent, "value", None)
         if value is None or not getattr(value, "use_analytic_potential", False):
             return
-        value._pot_ccm_gen = self._ccm_gen
+        # The outer agent checkpoints the metric; avoid duplicate critic keys that cannot reload before attachment.
+        object.__setattr__(value, '_pot_ccm_gen', self._ccm_gen)
         # A disabled preprocessor is skrl's ``_empty_preprocessor`` bound method;
         # an enabled one is a RunningStandardScaler, i.e. an nn.Module. Testing
         # the callable's type name is not enough (a bound method's type is
@@ -992,6 +994,9 @@ class C2RLAgent(Agent):
             raise ValueError("CCM synthesis requires the environment's applied u_min/u_max bounds.")
         state_box = self.observation_space["x"]
         x_low, x_high = state_box.low, state_box.high
+        if getattr(self._window, 'compact', False):
+            x_low = self._window.feature_low[:self._x_dim]
+            x_high = self._window.feature_high[:self._x_dim]
         data = sample_ccm_domain(self._cfg.cmg_memory_size, x_low, x_high,
                                  self._u_min, self._u_max, device=self._device)
         epochs = self._cfg.cmg_ccm_epochs
@@ -1009,7 +1014,7 @@ class C2RLAgent(Agent):
                       f"normalized input mean={validation['feasibility_normalized_mean']:.4g}, "
                       f"stddev={validation['feasibility_normalized_stddev']:.4g}, "
                       f"violations={validation['feasibility_violation_fraction']:.1%}", flush=True)
-                if getattr(self, "writer", None) is not None:
+                if pretraining_logging_enabled(self):
                     with metric_batch(step=epoch - epochs):
                         self.write_tracking_data(timestep=epoch - epochs, timesteps=timesteps)
 
@@ -1021,7 +1026,7 @@ class C2RLAgent(Agent):
                             "coordinate_frame": "world"}
         self.freeze_cmg()
         self._log_cmg_condition_numbers(data["x"])
-        if getattr(self, "writer", None) is not None:
+        if pretraining_logging_enabled(self):
             step = info["epochs"] - epochs - 1
             with metric_batch(step=step):
                 self.write_tracking_data(timestep=step, timesteps=timesteps)
@@ -1267,11 +1272,11 @@ class C2RLSkrlTrainer(Trainer):
                         for parameter in network.parameters():
                             parameter.requires_grad_(False)
         data_path = getattr(agent._cfg, "dynamics_pretrain_data_path", "") or None
-        if agent._cfg.mode == "sim_to_real" and dynamics_epochs > 0 and data_path and disturbance_enabled:
+        if agent._neural_dynamics is not None and dynamics_epochs > 0 and data_path and disturbance_enabled:
             with np.load(data_path) as archive:
                 if "disturbance_enabled" in archive and not bool(archive["disturbance_enabled"]):
                     raise ValueError("Nominal dynamics data cannot identify the disturbance density; supply disturbed rollouts or omit dynamics_pretrain_data_path to collect them")
-        if agent._cfg.mode == "sim_to_real" and dynamics_epochs > 0 and not data_path:
+        if agent._neural_dynamics is not None and dynamics_epochs > 0 and not data_path:
             from contractionRL.agents.utils.system_dynamics.dynamics import collect_stochastic_rollouts
             dt = getattr(raw, "dt", None) or raw.step_dt
             with metric_batch(step=-(dynamics_epochs + metric_epochs) - 1):

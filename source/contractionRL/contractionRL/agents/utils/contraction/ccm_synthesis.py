@@ -1,13 +1,14 @@
 """CCM metric training: projected C1/C2 and bounded-input feasibility.
 
 E(x, xref) = wrap(x-xref)' M(x) wrap(x-xref), matching the C2RL reward.
+The metric depends on physical x; reference motion enters the error derivative.
 All three conditions are sampled losses, not uniform certificates. There is
 no learned controller or controller-Jacobian contraction loss in this module.
 """
 
 import torch
 
-from contractionRL.agents.utils.system_dynamics.state import wrap_diff
+from contractionRL.agents.utils.contraction.math_utils import minimum_metric_error
 from contractionRL.agents.utils.contraction.math_utils import (
     EarlyStopper,
     Jacobian_Matrix,
@@ -86,7 +87,7 @@ def ccm_residuals(metric, get_f_and_B, x, xref, uref, low, high, *, lbd, angle_i
         projected = M[:, :0, :0]
         killing = full_killing[:, :, :0, :0]
 
-    error = wrap_diff(x - xref, angle_idx)
+    error = minimum_metric_error(x - xref, M, angle_idx)
     E = quadratic_energy(error, M)
     # Exact derivative of this quadratic tracking energy, including the moving
     # reference. The box constrains TOTAL input u, not the residual u-uref.

@@ -1,65 +1,22 @@
-mode: analytical
-seed: 42
+extends: skrl_ppo_cfg.yaml
 models:
-  separate: true
   policy:
     class: ContractionPPOPolicy
-    initial_log_std: 0.0
-    network:
-      - layers: [512, 256, 128]
-        activations: elu
   value:
     class: ContractionPPOValue
-    network:
-      - layers: [512, 256, 128]
-        activations: elu
-memory:
-  class: RandomMemory
-  memory_size: -1
 agent:
   class: ContractionPPO
-  rollouts: 24
-  learning_epochs: 5
-  mini_batches: 4
-  learning_rate: 1.0e-5
-  learning_rate_scheduler: KLAdaptiveLR
-  learning_rate_scheduler_kwargs:
-    kl_threshold: 0.008
-    kl_factor: 2
-    lr_factor: 1.5
-    min_lr: 1.0e-6
-    max_lr: 1.0e-4
-  discount_factor: 0.99
-  gae_lambda: 0.95
-  ratio_clip: 0.2
-  value_clip: 0.2
-  value_loss_scale: 1.0
-  entropy_loss_scale: 0.01
-  grad_norm_clip: 1.0
-  kl_threshold: 0.032
-  use_state_norm: false
-  use_value_norm: true
   alpha: 0.1
   penalty_coef: 0.005
   contraction_constraint_coef: 100.0
-  contraction_metric_learning_rate: 1.0e-3
-  contraction_hidden_dims: [128, 64]
+  contraction_metric_learning_rate: 0.001
+  contraction_hidden_dims:
+  - 128
+  - 64
   contraction_activation: elu
-  epsilon_contraction: 1.0e-3
+  epsilon_contraction: 0.001
   spectral_norm_bound: 3.0
   min_diagonal_value: 0.1
   contraction_indices: null
-  random_timesteps: 0
-  learning_starts: 0
-  time_limit_bootstrap: true
   experiment:
     directory: contraction_ppo
-    experiment_name: ''
-    write_interval: 100
-    checkpoint_interval: 10000
-    wandb: false
-trainer:
-  class: SequentialTrainer
-  timesteps: 100000
-  environment_info: log
-  close_environment_at_exit: false
