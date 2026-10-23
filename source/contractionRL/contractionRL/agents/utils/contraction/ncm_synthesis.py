@@ -88,9 +88,7 @@ from contractionRL.agents.utils.contraction.math_utils import (
     train_val_split,
 )
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # Solver setup (cvxpy / MOSEK license)
-# ─────────────────────────────────────────────────────────────────────────── #
 
 def _require_cvxpy():
     try:
@@ -136,9 +134,7 @@ def _ensure_mosek_license() -> None:
 _ensure_mosek_license()
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # One-time warnings (each fires at most once per process — see docstrings)
-# ─────────────────────────────────────────────────────────────────────────── #
 
 _LICENSE_ERROR_WARNED = False
 
@@ -163,9 +159,7 @@ def _warn_once_if_license_error(solver: str, exc: Exception) -> None:
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # Core pointwise SDP solve
-# ─────────────────────────────────────────────────────────────────────────── #
 
 def _sym(M):
     """Symmetrise a cvxpy/numpy matrix expression (0.5·(M + Mᵀ)).
@@ -175,54 +169,6 @@ def _sym(M):
     deduce it, so we symmetrise explicitly.
     """
     return 0.5 * (M + M.T)
-
-
-def _add_wdot_term(S, Wbar, I, *, wdot_dt: float, W_prev_bar: np.ndarray | None, dt: float):
-    """Fold the ``-Ẇ`` material-derivative term into the (normalized) LMI operand ``S``.
-
-    Two mutually-exclusive proxies for ``Ẇ``, both acting on the normalized ``W̄``
-    (so they stay convex/linear in the decision variable and don't drag in the
-    variable scale ``ν``):
-
-    * **temporal** (``W_prev_bar`` given, ``dt>0``): the true material derivative
-      along a trajectory, ``Ẇ ≈ (W̄ - W̄_prev)/dt``, so ``-Ẇ = (W̄_prev - W̄)/dt``.
-      ``W̄_prev`` is the previous step's normalized metric at the same state
-      sequence; at a trajectory start / just after a reset it is ``None`` and the
-      term is dropped (``Ẇ≈0`` there). This is Tsukamoto's ``(W̄-I)/dt``
-      generalized from ``I`` to the actual predecessor — a strictly better
-      estimate, since consecutive states of the same trajectory are differenced
-      rather than differencing from an arbitrary identity. Driven by
-      ``build_cm_dataset``'s ``traj_x``/``traj_lengths``/``temporal_dt`` (C2RL's
-      ``cm_wdot_trajectory`` config) — also retained as a general library
-      capability via ``cvstem_joint``'s own ``pairs``/``dt``/
-      ``return_wbar`` kwargs.
-    * **static proxy** (``wdot_dt>0``, ``W_prev_bar`` None): Tsukamoto's literal
-      ``(W̄-I)/dt``. Off by default (infeasible at the envs' small dt — see module
-      docstring). Superseded by the temporal term whenever both are supplied.
-
-    Returns ``S`` unchanged when neither is active.
-    """
-    if W_prev_bar is not None and dt > 0:
-        return S + (np.asarray(W_prev_bar, dtype=np.float64) - Wbar) / dt
-    if wdot_dt > 0:
-        return S + (Wbar - I) / wdot_dt
-    return S
-
-
-def _lmi_residual(A_f: np.ndarray, B: np.ndarray, W: np.ndarray, lbd: float, *, r_scaler: float = 1.0) -> float:
-    """Max eigenvalue of the contraction LMI at a solved ``W`` — post-hoc numpy
-    re-evaluation of what ``cvstem_joint`` constrains.
-
-    Evaluated on the deployed ``W = W̄/ν`` while the SDP constrains the
-    normalized ``W̄``, so the bound to clear is ``-eps/ν``, not ``-eps``. Should
-    stay comfortably negative; >= 0 flags a solver reporting "optimal" that is
-    numerically borderline (useful for comparing cm_solver choices).
-    """
-    A_f = np.asarray(A_f, dtype=np.float64)
-    r = r_scaler + 1e-5
-    riccati = (2.0 / r) * (B @ B.T)
-    S = _sym(A_f @ W + W @ A_f.T - riccati + 2.0 * lbd * W)
-    return float(np.max(np.linalg.eigvalsh(S)))
 
 
 _LAMBDA_BACKOFF_FACTOR = 0.5  # each retry halves λ — not exposed as a config knob, only the retry count is
@@ -396,7 +342,7 @@ def build_cm_dataset(
     DfDx = jacobian(f, x, create_graph=False).detach().cpu().numpy()  # (n, x, x)
     B_np = B.detach().cpu().numpy()  # (n, x, u)
 
-    # ── one joint SDP over all n samples, not one per state ─────────────── #
+    # one joint SDP over all n samples, not one per state
     # The pointwise program below solves an independent SDP per state with its own
     # ν/χ and no Ẇ term, so its "feasibility" is a per-state statement, not a
     # contraction certificate: it can report 100% at a λ the joint program cannot
@@ -655,9 +601,7 @@ def save_cm_dataset(
     print(f"{tag} Cached CM dataset ({dataset['x'].shape[0]} states) → {cache_path}")
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # CMG regression (for CV-STEM)
-# ─────────────────────────────────────────────────────────────────────────── #
 
 def _metric_space_error(ccm_gen, dataset, w_lb, x_dim, device):
     """Median relative error of the DEPLOYED metric against the SDP's own.
@@ -853,9 +797,7 @@ def regress_cmg(
 # Full implementation: `git log -S solve_cm_metric_bounded -- <this file>`.
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # CCM neural-network synthesis (C1 + C2 losses — no per-state SDP)
-# ─────────────────────────────────────────────────────────────────────────── #
 
 # Removed 2026-08-31: train_cmg_ccm — trained the CMG directly on the C1/C2
 # contraction losses with no SDP (cmg_method="ccm"). Never used in practice,
@@ -865,9 +807,7 @@ def regress_cmg(
 # Recover with `git log -S train_cmg_ccm -- <this file>`.
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # Online CV-STEM metric (no offline synthesis)
-# ─────────────────────────────────────────────────────────────────────────── #
 
 def cvstem_joint(
     A: np.ndarray,

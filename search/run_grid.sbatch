@@ -69,7 +69,7 @@ wait_for_vram() {
 for attempt in 1 2 3; do
     wait_for_vram || exit 75
     echo "[$(date '+%F %T')] $NAME: attempt $attempt"
-    python scripts/skrl/train.py --classic --task classic-cartpole-v0 --algorithm c2rl-ppo \
+    python scripts/skrl/train.py --task Isaac-Classic-Cartpole-v0 --algorithm c2rl-ppo \
         --num_envs 1024 --ref_offset 1 --num_timesteps 200000 \
         --discount_factor "$GAMMA" --seed "$SEED" "${NORM[@]}" \
         --wandb_project contractionRL --wandb_run_name "$NAME" --wandb_batch grid_plain

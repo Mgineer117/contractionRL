@@ -1,14 +1,7 @@
-"""Locate and attach a shipped ``cm_data_*.npz`` contraction metric.
-
-Three call sites used to glob for these files themselves, each with its own
-family/path logic, and each free to disagree about which of several builds
-counts as "the" dataset. They now share this, so a figure, a taxonomy row and a
-value-iteration cost are all reading the SAME metric.
-"""
+"""Locate and attach shipped contraction-metric datasets."""
 
 from __future__ import annotations
 
-import glob
 import pathlib
 
 import numpy as np
@@ -17,13 +10,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[3] / "data"
 
 
 def find_npz(name: str) -> pathlib.Path:
-    """Newest ``cm_data_*.npz`` for env short name ``name``, in the classic family.
-
-    Newest, not first-alphabetically: the sorted-glob the call sites used picks
-    by lbd string, so a re-derived rate silently loses to a stale higher one.
-    """
-    hits = [pathlib.Path(p) for fam in ("classic",)
-            for p in glob.glob(str(ROOT / fam / name / "cm_data_*.npz"))]
+    """Return the most recently modified metric dataset for a classic task."""
+    hits = list((ROOT / "classic" / name).glob("cm_data_*.npz"))
     if not hits:
         raise FileNotFoundError(
             f"no CM dataset for '{name}'. Expected data/classic/{name}/"
@@ -34,12 +22,7 @@ def find_npz(name: str) -> pathlib.Path:
 
 def attach_cmg(env, name: str | None = None, *, epochs: int = 80,
                device: str = "cpu", tag: str = "[cm_data]", **set_ccm_kw) -> dict:
-    """Regress the shipped ``W(x)`` into the CMG C2RL deploys and set it on ``env``.
-
-    The npz holds W at sampled states; everything downstream (the Mahalanobis
-    reward, ``local_lambda``, the CV-STEM-LQR gain) needs M(x) at ARBITRARY
-    states, which is what the regression provides.
-    """
+    """Regress a sampled metric dataset into the CMG and attach it to the environment."""
     from contractionRL.agents.utils.contraction.ncm_synthesis import regress_cmg
     from contractionRL.agents.utils.contraction.metric_models import BoundedCCM_Generator
 
@@ -75,14 +58,3 @@ def attach_metric(env, name: str | None = None, *, device: str = "cpu",
     result = attach_cmg(env, name, device=device, tag=tag, **reward_kw)
     return {"metric_source": "regress", "lbd": result["lbd"],
             **{k: getattr(env, k, None) for k in REWARD_KEYS}}
-
-
-def reward_signature(env) -> dict:
-    """What ``get_rewards`` will actually compute, as comparable scalars."""
-    return {
-        "uses_metric": bool(getattr(env, "ccm_gen", None) is not None),
-        "tracking_scaler": float(getattr(env, "tracking_scaler", 1.0)),
-        "control_scaler": float(getattr(env, "control_scaler", 0.0)),
-        "reward_euclidean": bool(getattr(env, "reward_euclidean", False)),
-        "reward_level": bool(getattr(env, "reward_level", False)),
-    }

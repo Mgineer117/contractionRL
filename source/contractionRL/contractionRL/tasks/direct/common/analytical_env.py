@@ -25,7 +25,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         self._transition_backend = env_config.get("transition_backend")
         self.has_analytical_dynamics = self._transition_backend is None
         self.reference_feedback_gain = env_config.get("reference_feedback_gain")
-        self.set_action_bound_penalty(env_config.get("action_bound_penalty_beta", 0.0))
+        self.set_action_bound_penalty(env_config.get("action_bound_penalty", 0.0))
         self._compact_requested = bool(env_config.get("compact_reference", getattr(self, "task", "") in ("car", "car_v1", "quadrotor")))
 
         self.X_MIN = torch.tensor(env_config["x_min"], device=self.device, dtype=torch.float32).flatten()
@@ -35,37 +35,10 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         self.XE_INIT_MIN = torch.tensor(env_config["xe_init_min"], device=self.device, dtype=torch.float32).flatten()
         self.XE_INIT_MAX = torch.tensor(env_config["xe_init_max"], device=self.device, dtype=torch.float32).flatten()
         self.XE_INIT_SIGN_DIMS = list(env_config.get("xe_init_sign_dims", []))
-        # Dims on which xref_0 is drawn bimodally: the [min,max] box is sampled
-        # as usual, then one global sign per env flips all of them together, so
-        # the distribution is the box plus its exact mirror image.
-        #
-        # Needed because a low-lbd region is generally not a box. lbd is slow
-        # where |pitch| is large -- two lobes straddling zero -- and any single
-        # box covering both contains the fast center between them. Worse, the
-        # lobes lie on a diagonal (segway is slow only when pitch and pitch_rate
-        # have opposite signs), so flipping each dim independently would land
-        # half the mass on the fast diagonal. One shared sign maps the box to
-        # the correct opposite lobe and keeps the distribution symmetric, which
-        # a one-sided box would not be.
-        #
-        # Empty (the default) reproduces the previous behavior exactly.
+        # Mirror selected dimensions with one shared sign to preserve correlated lobes.
         self.XREF_INIT_SIGN_DIMS = list(env_config.get("xref_init_sign_dims", []) or [])
-        # ── Direct initial-state box (optional) ──────────────────────────── #
-        # When set, x_0 is drawn from [X_INIT_MIN, X_INIT_MAX] directly and the
-        # perturbation is back-solved as xe_0 = x_0 - xref_0, instead of x_0
-        # being composed as xref_0 + xe_0. Saying "start in region R" is then
-        # one box, rather than an XE_INIT box that has to be eroded by
-        # XREF_INIT and re-checked against X_MIN/X_MAX to land where you meant.
-        #
-        # xe_0 is still derived (not dropped) because e(0) = x_0 - xref_0
-        # anchors every normalized metric -- AUC = sum(e)/e0 divides by it.
-        #
-        # X_INIT_SIGN_DIMS applies the same shared-sign mirroring as
-        # XREF_INIT_SIGN_DIMS, for the same reason: a low-lbd region is two
-        # lobes on a diagonal, which no single box can cover without also
-        # covering the fast center between them.
-        #
-        # None (the default) keeps the xref_0 + xe_0 composition exactly.
+        # An explicit initial-state box overrides xref + error sampling.
+        # Still derive the error from x0 so normalized metrics use the actual start.
         _xi_lo = env_config.get("x_init_min")
         _xi_hi = env_config.get("x_init_max")
         self.X_INIT_MIN = (None if _xi_lo is None else torch.tensor(
@@ -79,32 +52,8 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
             )
         self.X_INIT_SIGN_DIMS = list(env_config.get("x_init_sign_dims", []) or [])
 
-        # reference_mode: WHERE the reference is asked to operate.
-        #
-        #   "stabilizing"   (default) the shipped XREF_INIT band. For a plant with a
-        #                 state-dependent rate this is deliberately the LOW-rate
-        #                 region (rule.md Step 3), so the number reported is the
-        #                 hard case.
-        #   "contractive" starts in the SAME low-rate region and then migrates the
-        #                 reference toward XREF_INIT_FAST -- the high-rate band --
-        #                 over the episode. The hard initial condition is kept;
-        #                 what changes is whether the task lets the plant move to
-        #                 where it is controllable.
-        #
-        # The distinction exists because contraction is a property of the
-        # operating point while the operating point is dictated by the task, and
-        # nothing in the current setup lets those be varied separately. Measured
-        # on car_v1, whose rate rises with speed (corr(lam,|vel|) = +0.804), the
-        # SAME certified controller gives
-        #     xref v in [0.3, 0.6]  (shipped, slow)  achieved rate 0.281
-        #     xref v in [1.0, 1.4]  (fast)           achieved rate 0.463
-        # against a local lam_max of 0.461 -- i.e. it reaches the local rate when
-        # the task lets it. Both are honest numbers about different questions, and
-        # neither is reachable from the other without this switch.
-        #
-        # An env with no XREF_INIT_FAST declares that it has no meaningfully
-        # faster region, and asking for "contractive" there is an error rather
-        # than a silent fallback to the same band.
+        # Contractive references migrate from the initial band toward XREF_INIT_FAST.
+        # Reject this mode when the task defines no fast band.
         _xf_lo = env_config.get("xref_init_fast_min")
         _xf_hi = env_config.get("xref_init_fast_max")
         self.XREF_INIT_FAST_MIN = (None if _xf_lo is None else torch.tensor(
@@ -135,25 +84,8 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
                 "env. Absent means the rate is not state-dependent here (or the "
                 "fast band has not been measured), and silently reusing the normal "
                 "band would report a 'contractive' number that is the arbitrary one.")
-        # ── Early-termination box (on by default) ────────────────────────── #
-        # The episode ends the first step x leaves [X_TERMINATION_MIN,
-        # X_TERMINATION_MAX]. Without it a diverged env is silently pinned at the
-        # state box by the clamp in step() and keeps emitting off-distribution
-        # transitions for the rest of the episode — on segway, 500 steps of
-        # already-fallen data per failure, which is what makes the rollout batch
-        # (and hence the seed) decide what PPO fits.
-        #
-        # The box defaults to the state box itself in every env module, i.e. it
-        # fires exactly where the clamp already silently activates — the same
-        # event, reported instead of hidden. Tighten it per env to end episodes
-        # sooner.
-        #
-        # On by default. Note this shortens episodes, so numbers are not directly
-        # comparable with runs made before this default flipped; pass
-        # --no_terminate_out_of_box to reproduce those.
-        # angle_idx is resolved further down, but _left_termination_box only
-        # reads it per step — set the default now so the mixin never sees a
-        # missing attribute if that ordering ever changes.
+        # Detect excursions before numerical clipping; default to the state box.
+        # Resolve angle_idx before the termination mixin can use it.
         self.angle_idx = getattr(self, "angle_idx", [])
 
         self._init_termination_box(
@@ -197,19 +129,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
             self.pos_dimension = env_config["pos_dimension"]
             self.angle_idx = env_config.get("angle_idx", [])
 
-        # ── Clamp-rate accounting (Clamp/* in wandb) ──────────────────────── #
-        # The out-of-box clamp is a NUMERICAL BACKSTOP, not a model: wherever it
-        # fires, the realized transition is not xdot = f(x) + B(x)u, so no
-        # CV-STEM/C3M certificate applies to that step. Measured on segway it
-        # fired on 95% of steps, which silently made the clamp the dynamics and
-        # invalidated every Stability/* number reported alongside it. It has to be
-        # observable, so accumulate here and publish next to those metrics.
-        #
-        # Counted on the RAW integrated state, before the freeze/clamp erase the
-        # excursion — the same reason _left_termination_box is measured there.
-        #
-        # Placed after num_dim_x and state_names are resolved: both are read here
-        # and neither exists at the top of __init__.
+        # Count raw excursions before clipping, which changes the modeled dynamics.
         self._clamp_hits = torch.zeros(self.num_dim_x, device=self.device, dtype=torch.float32)
         self._clamp_any = 0.0
         self._clamp_usat = 0.0
@@ -240,7 +160,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         self.STATE_MIN = torch.cat([self.X_MIN, ref_unit_min])
         self.STATE_MAX = torch.cat([self.X_MAX, ref_unit_max])
 
-        # ── Reference window: the observation is s = {x, xrefs, urefs} ───── #
+        # Reference window: the observation is s = {x, xrefs, urefs}
         # xrefs[k] = xref[t + k*ref_offset], k = 0..ref_length-1 (k=0 is the
         # Current reference, i.e. the old `xref`/`uref`). Indices past the end
         # of the episode clamp to the last one. See agents/utils/system_dynamics/reference.py.
@@ -277,13 +197,8 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         self._fixed_uref = torch.zeros_like(self.uref)
         self._fixed_x0 = torch.zeros_like(self.x_t)
 
-        # ref_groups: how many DISTINCT references the fixed set contains. With
-        # fix_ref_trajectories alone every slot gets its own, so num_envs=625
-        # means 625 references. Grouping lets num_envs/ref_groups slots share one
-        # reference while each keeps its own x_0, which is what makes the global
-        # optimum computable: the optimum is solved per (reference, x_0) pair
-        # (scripts/toy/utility/precompute_global.py), so 25 references is 25 task groups and
-        # 625 would be 625. 0 = one reference per slot, the old behaviour.
+        # Group slots by reference while keeping their initial states independent.
+        # Zero assigns one reference per slot.
         self.ref_groups = int(env_config.get("ref_groups", 0) or 0)
         if self.ref_groups:
             if not self.fix_ref_trajectories:
@@ -459,13 +374,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         self._ref_pool = None
         self.reset()
         if x0 is not None:
-            # The global optimum is solved per (reference, INITIAL STATE) pair --
-            # unlike the V* grid, which covered every x at once, a trajectory
-            # optimum is a statement about one start. Installing the reference
-            # and re-drawing x_0 would compare the policy against the optimum of
-            # a task it was never given. One start per ENV SLOT, not per group:
-            # the toy benchmark is one reference shared by num_envs distinct
-            # initial conditions, so the slot -- not the group -- is the task.
+            # Preserve each slot's initial state: a trajectory optimum applies to that start.
             x0 = torch.as_tensor(x0, dtype=torch.float32, device=self.device)
             if x0.shape != (self.num_envs, self.num_dim_x):
                 raise ValueError(
@@ -606,23 +515,8 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         """
         target = 0.5 * (self.XREF_INIT_FAST_MIN + self.XREF_INIT_FAST_MAX)
         start_c = 0.5 * (self.XREF_INIT_MIN + self.XREF_INIT_MAX)
-        # Which dims the migration is responsible for.
-        #
-        # "the dims the fast band MOVES" alone is not enough. Righting an inverted
-        # pendulum means driving its base, so pitch cannot migrate without pos_x
-        # and vel_x_b moving too -- and with those two unregulated they never come
-        # back: measured on segway, pitch arrived at +0.006 (98.7% of the way) while
-        # pos_x ran to +5.000, the box edge exactly, and 90.7% of reference steps
-        # were rewritten by the X-box clamp. The pitch migration was correct and
-        # the trajectory was still not a trajectory.
-        #
-        # The band itself says which dims are targets: a dim whose fast band is a
-        # single POINT is being pinned to that value, whereas a WIDE band is a
-        # region the reference is free to roam. So regulate every pinned dim, and
-        # migrate the ones that are also pinned somewhere new. No threshold needed
-        # and no new config key: car_v1's position/yaw bands are wide (inherited
-        # from the car's own xref_init), so its path stays free and only velocity
-        # migrates, exactly as before.
+        # Regulate every pinned fast-band dimension, including coupled position/velocity
+        # states; unregulated coupled states can drive the reference out of bounds.
         pinned = (self.XREF_INIT_FAST_MAX - self.XREF_INIT_FAST_MIN).abs() <= 1e-9
         active = ((target - start_c).abs() > 1e-9) | pinned
         err = torch.where(active, target - xref_t, torch.zeros_like(xref_t))
@@ -637,21 +531,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
                 # while pos_x sat on the +5.000 wall with 98.0% of steps clamped.
                 # One full-state gain resolves the coupling by construction.
                 return self._lqr_migrate(xref_t, target, active)
-            # every active dim is in range(B) here — the branch above took the rest
-            # -f cancels the drift, so the command is "hold where you are, THEN
-            # move toward the target" rather than "add a nudge to whatever the
-            # plant was already doing". Without it a tilted reference simply
-            # free-falls and the migration is indistinguishable from gravity:
-            # measured on segway, the reference ran from pitch 0.452 to 0.900,
-            # which is X_MAX exactly, with 99.1% of steps modified by the X-box
-            # clamp -- and on cartpole it fell THROUGH upright (0.404 -> -0.046,
-            # "111% of the required travel") which reads as success and is not.
-            # With the drift cancelled, u = pinv(B)(k*e - f) makes the reference
-            # HOLD its tilt when e = 0, which is the only way "start slow, end
-            # fast" is a trajectory rather than a fall.
-            #
-            # For car/car_v1, f has no component in range(B), so the drift
-            # cancellation term is zero.
+            # Cancel drift in the actuated subspace before adding the migration command.
             u = torch.bmm(torch.linalg.pinv(B),
                           (self.migrate_gain * err - f).unsqueeze(-1)).squeeze(-1)
         return torch.clamp(u, self.UREF_MIN, self.UREF_MAX)
@@ -853,8 +733,8 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
     def set_action_bound_penalty(self, beta):
         beta = float(beta)
         if not math.isfinite(beta) or beta < 0:
-            raise ValueError("action_bound_penalty_beta must be finite and nonnegative")
-        self.action_bound_penalty_beta = beta
+            raise ValueError("action_bound_penalty must be finite and nonnegative")
+        self.action_bound_penalty = beta
 
     def set_ccm(self, ccm_gen, w_lb, device, tracking_scaler=None, control_scaler=None,
                 reward_euclidean=False, reward_level=False,
@@ -958,18 +838,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
                 Kb = (1.0 / r) * torch.bmm(B.transpose(1, 2).to(torch.float32), Mb)
                 e_b = self.wrap_angles(x - xref_curr).unsqueeze(-1)
                 u_base = uref_curr - torch.bmm(Kb, e_b).squeeze(-1)
-                # ``u`` reaching get_rewards has already been clamped to
-                # [U_MIN, U_MAX] by step(), so u_base must be too or the two
-                # sides of this penalty live in different spaces. It is not a
-                # small discrepancy: at cvstem_r_scaler=0.01 the analytic gain
-                # is ‖K‖₂ ≈ 53, putting ~86% of u_base's components outside the
-                # box (measured on the cached car CM dataset). Unclamped, the
-                # anchor charges a large, irreducible penalty no matter what the
-                # policy does, and the only gradient it supplies pushes the
-                # action hard against the saturation boundary — the opposite of
-                # the intended "stay near the certified base unless deviating
-                # strictly helps" trust region. Clamping makes both sides the
-                # control the plant actually applies.
+                # Clamp the anchor too: compare the controls actually applied by the plant.
                 u_base = torch.clamp(u_base, self.U_MIN, self.U_MAX)
             reward = reward - self.residual_anchor_scale * torch.norm(u - u_base, p=2, dim=-1) ** 2
 
@@ -1037,25 +906,10 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         return out
 
     def _pooled_system_reset(self, env_ids: torch.Tensor):
-        """``system_reset`` draws that share one reference integration.
+        """Amortize reference integration by pooling independent reset samples.
 
-        ``system_reset``'s cost is dominated by ``_rollout_reference``, a loop
-        over the episode's ``max_episode_len`` timesteps that is vectorized over
-        the batch — so drawing 64 references costs about what drawing 1 costs.
-        Measured on car: one reset is 100.8 ms against 0.204 ms for a step, i.e.
-        493 steps' worth. That is affordable once per 500-step episode, but
-        ``terminate_out_of_box`` ends episodes long before ``max_episode_len``,
-        so the whole integration was being paid every few steps — training ran
-        53x slower with the box armed (0.27 it/s vs 14.4 it/s on car).
-
-        The draw is unchanged, only batched: ``define_initial_state`` and the
-        reference-weight draw read ``len(env_ids)`` and nothing else, so pooled
-        samples are the same iid samples. No classic env's ``system_reset``
-        indexes by ``env_ids``.
-
-        Two paths do depend on draw position and fall through to a direct call:
-        held-out evaluation advances its persistent reference-bank cursor, and
-        ``fix_ref_trajectories`` pins one episode per slot on its first reset.
+        Fixed-reference slots and held-out banks bypass pooling because their slot
+        assignment or bank cursor depends on draw order.
         """
         n = len(env_ids)
         if (self._ref_pool_size <= 1
@@ -1109,18 +963,7 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
         self.disturbance.reset(env_ids)
         xref_arr = unwrap_angle_trajectory(xref_arr, self.angle_idx)
         xref_arr = clamp_physical_state(xref_arr, self.X_MIN, self.X_MAX, self.angle_idx)
-        # x_0 = xref_0 + xe_0 must respect the box too. The reference is clamped on
-        # the line above; the initial STATE was not, and xe_0 is drawn from XE_INIT
-        # independently of where xref sits, so the sum routinely left the box.
-        # Measured on car: xref's velocity is pinned at 1.5 while xe_0 draws
-        # U[-1,1], giving x_0 velocities across [0.5, 2.5] against a [1.0, 2.0]
-        # box — 44% of episodes began outside it.
-        #
-        # Not a cosmetic bound. The CMG is regressed over the box only, so outside
-        # it M(x) is an extrapolation and the Mahalanobis reward is computed from a
-        # metric that certifies nothing there. Every Stability/* metric is also
-        # normalized by the error at x_0, so out-of-box starts move the very
-        # denominator the runs are compared on.
+        # Keep initial states inside the metric's training domain.
         x_0 = clamp_physical_state(x_0, self.X_MIN, self.X_MAX, self.angle_idx)
         if self.fix_ref_trajectories:
             # First reset of a slot mints its permanent episode — reference and
@@ -1138,18 +981,8 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
                     g = self._group_of[new_ids]
                     unminted = ~self._group_minted[g]
                     if bool(unminted.any()):
-                        # ONE source slot per group, chosen deterministically.
-                        # `g[unminted]` repeats each group num_envs/ref_groups
-                        # times, and assigning through a repeated index is
-                        # last-write-wins with no guaranteed winner -- so the
-                        # xref scatter and the uref scatter could resolve to
-                        # DIFFERENT slots and the group kept one trajectory's
-                        # states beside another's controls. That pair is not a
-                        # trajectory of the plant, so u = uref + feedback chases
-                        # a motion no control can produce and every slot in the
-                        # group settles at the same nonzero error. Measured on
-                        # toy-mg: the stored pair missed its own dynamics by up
-                        # to 1.05 per step on 24 of 25 references.
+                        # Choose one source slot per group so state/control scatters stay paired.
+                        # Repeated indices otherwise have nondeterministic last-write winners.
                         cand = unminted.nonzero().flatten()
                         pick = torch.full((self.ref_groups,), cand.numel(),
                                           dtype=torch.long, device=self.device)
@@ -1165,18 +998,8 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
                     self._fixed_uref[new_ids] = self._group_uref[g]
                     self._reference_parameters[new_ids] = self._group_parameters[g]
                     if self.X_INIT_MIN is None:
-                        # x_0 came back as xref_0 + xe_0 against this slot's OWN
-                        # xref_0, which the line above just threw away for the
-                        # group's. Carry the ERROR across, not the state, or
-                        # e(0) becomes the difference of two independent
-                        # XREF_INIT draws plus xe_0. Measured on toy-mg: 67% of
-                        # the 625 slots started outside the XE_INIT box, |e(0)|
-                        # up to 1.080 against a design max of 0.354 -- those are
-                        # the episodes that looked like the policy failing.
-                        # Skipped when X_INIT_MIN is set: there x_0 is the
-                        # primary object drawn from a certified spawn box and
-                        # e(0) is the consequence, so re-anchoring would move
-                        # the start out of the box the box exists to pin.
+                        # Carry the tracking error onto the group reference. Explicit initial-state
+                        # boxes keep their sampled state instead.
                         xe = x_0[fresh] - xref_arr[fresh][:, 0]
                         x_0[fresh] = torch.clamp(self._group_xref[g][:, 0] + xe,
                                                  self.X_MIN, self.X_MAX)
@@ -1283,8 +1106,8 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
             self._transition_backend.sync_state(torch.arange(self.num_envs, device=self.device), next_x_wrapped)
 
         reward, infos = self.get_rewards(self.x_t, u, next_x_wrapped, torch.arange(self.num_envs, device=self.device))
-        if self.action_bound_penalty_beta:
-            reward = reward - self.action_bound_penalty_beta * action_bound_violation(_u_unclamped, self.U_MIN, self.U_MAX)
+        if self.action_bound_penalty:
+            reward = reward - self.action_bound_penalty * action_bound_violation(_u_unclamped, self.U_MIN, self.U_MAX)
         self.episode_reward += reward
 
         self.x_t = next_x_wrapped
@@ -1491,191 +1314,11 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
             if warn:
                 print(warn)
 
-    # ── Superseded by the {x, xrefs, urefs} reference window above ───────── #
-    # The old flat layout was [x, xref, uref] plus an optional "preview" tail of
-    # future rows, whose width/content was inferred by every consumer rather than
-    # declared. Kept here (commented) for reference while the new window beds in.
-    #
-    # def _preview_offsets(self, num_points: int, gamma: float) -> list[int]:
-    #     """Geometrically-spaced future-step offsets spanning the effective horizon.
-#
-    #     The window extent is the discount's effective horizon ``H = 1/(1-gamma)``
-    #     (in steps) — how far the value function actually looks — clamped to the
-    #     episode. Within ``[1, H]`` it places ``num_points`` unique offsets on a
-    #     Geometric ladder: near-term references (where the error is being crushed
-    #     now) get dense coverage, the far horizon a few anchors, matching how the
-    #     discount weights them. At a low gamma ``H`` collapses to ~1, so preview
-    #     is ~just the next uref — exactly when look-ahead is not needed anyway.
-    #     """
-    #     if not num_points or gamma is None or not (0.0 < gamma < 1.0):
-    #         return []
-    #     H = min(self.max_episode_len - 1, max(1, int(round(1.0 / (1.0 - gamma)))))
-    #     if num_points >= H:
-    #         return list(range(1, H + 1))
-    #     geom = torch.logspace(0.0, math.log10(float(H)), num_points)
-    #     offs = sorted({int(round(v)) for v in geom.tolist() if 1 <= round(v) <= H})
-    #     return offs
-#
-    # def set_preview_offsets(self, offsets: Sequence[int], include_xref: bool = False,
-    #                         include_uref: bool = True) -> None:
-    #     """Set the preview window to an explicit list of step offsets and widen
-    #     the observation space to match. Used to make a fresh eval env mirror the
-    #     training env's exact layout (copy its ``preview_offsets``).
-#
-    #     ``include_xref=False`` (default) reproduces the historic uref-only
-    #     preview exactly. ``include_xref=True`` additionally appends, for each
-    #     offset, the future reference position relative to the current state
-    #     (``wrap_angles(xref_future - x)`` — see ``construct_state``): a
-    #     translation-invariant "where is the path heading from here" signal,
-    #     one ``x_dim``-wide block per offset, ordered nearest-offset-first like
-    #     the uref block it follows. Not full SE(2)-invariant (no rotation into
-    #     the current heading frame) — a deliberate simplification.
-#
-    #     ``include_uref=False`` drops the future-uref block from the preview
-    #     tail entirely (the tail becomes xref-only) — needs ``include_xref=True``
-    #     or the preview would carry nothing. Default True reproduces the
-    #     historic layout exactly.
-    #     """
-    #     self.preview_offsets = [int(o) for o in offsets]
-    #     self._preview_include_xref = bool(include_xref) and bool(self.preview_offsets)
-    #     self._preview_include_uref = bool(include_uref) and bool(self.preview_offsets)
-    #     if not self.preview_offsets:
-    #         self._preview_offsets_t = None
-    #         self.observation_space = gym.spaces.Box(
-    #             low=self.STATE_MIN.cpu().numpy(), high=self.STATE_MAX.cpu().numpy(),
-    #             dtype=np.float32)
-    #         return
-    #     self._preview_offsets_t = torch.tensor(
-    #         self.preview_offsets, device=self.device, dtype=torch.long)
-    #     p = len(self.preview_offsets)
-    #     lo, hi = self.STATE_MIN, self.STATE_MAX
-    #     if self._preview_include_uref:
-    #         lo = torch.cat([lo] + [self.UREF_MIN] * p)
-    #         hi = torch.cat([hi] + [self.UREF_MAX] * p)
-    #     if self._preview_include_xref:
-    #         # Symmetric superset bound for a relative-position difference —
-    #         # X_MIN/X_MAX are x_dim-wide (STATE_MIN/max are the full [x,xref,
-    #         # uref] base width; using those here would over-widen by (u_dim +
-    #         # x_dim) per point instead of x_dim).
-    #         rel_lo = self.X_MIN - self.X_MAX
-    #         rel_hi = self.X_MAX - self.X_MIN
-    #         lo = torch.cat([lo] + [rel_lo] * p)
-    #         hi = torch.cat([hi] + [rel_hi] * p)
-    #     self.observation_space = gym.spaces.Box(
-    #         low=lo.cpu().numpy(), high=hi.cpu().numpy(), dtype=np.float32)
-#
-    # def _full_trajectory_offsets(self) -> list[int]:
-    #     """every future step offset from the current time to episode end
-    #     (dense, not the geometric ladder — see ``_preview_offsets``). Meant to
-    #     pair with a sequence gate encoder (``film_gate_encoder in ("gru",
-    #     "attn")``): rather than hand-picking a small window sized off the
-    #     discount's effective horizon, hand the encoder the whole remaining
-    #     reference and let it learn what to attend to / how much to forget.
-    #     Cost warning: construct_state recomputes this every step, so the
-    #     gate encoder's forward pass is O(max_episode_len) per step instead of
-    #     O(num_preview) — an O(max_episode_len^2) cost per episode overall.
-    #     Intended for GPU (cluster) runs, not the CPU-only local sweeps."""
-    #     return list(range(1, self.max_episode_len))
-#
-    # def configure_preview(self, num_points: int, gamma: float, include_xref: bool = False,
-    #                       full_trajectory: bool = False, include_uref: bool = True) -> None:
-    #     """Enable/resize reference preview and widen the observation space to
-    #     match. Must be called before the agent/memory are built off
-    #     ``observation_space``. Idempotent; ``num_points<=0`` disables preview.
-    #     ``include_xref`` — see ``set_preview_offsets`` — defaults to False,
-    #     reproducing the historic uref-only preview exactly. ``full_trajectory``
-    #     (see ``_full_trajectory_offsets``) replaces the geometric ``num_points``/
-    #     ``gamma`` ladder with every future offset up to episode end; ``gamma``
-    #     is unused in that case (kept in the signature so callers don't branch).
-    #     ``include_uref=False`` drops the future-uref block, testing an
-    #     xref-only preview (needs ``include_xref=True`` or there is nothing
-    #     left in the tail)."""
-    #     offsets = self._full_trajectory_offsets() if full_trajectory else self._preview_offsets(int(num_points), gamma)
-    #     self.set_preview_offsets(offsets, include_xref=include_xref, include_uref=include_uref)
-    #     if self.preview_offsets:
-    #         if self._preview_include_uref and self._preview_include_xref:
-    #             _what = "future-uref + relative-future-xref"
-    #         elif self._preview_include_xref:
-    #             _what = "relative-future-xref (uref excluded)"
-    #         else:
-    #             _what = "future-uref"
-    #         print(f"[BaseEnv] reference preview: {len(self.preview_offsets)} {_what} "
-    #               f"points at step offsets {self.preview_offsets} (gamma={gamma}) -> "
-    #               f"obs_dim {self.observation_space.shape[0]}")
-#
-    # def configure_value_state(self, num_points: int, gamma: float = 0.99,
-    #                           full_trajectory: bool = False) -> None:
-    #     """Enable the privileged critic-only state channel: ``[x, future-xref
-    #     relative to x]`` at ``num_points`` offsets (or every remaining step if
-    #     ``full_trajectory``), completely independent of whatever preview the
-    #     Actor's own observation carries (see the ``_value_state_offsets_t``
-    #     docstring in ``__init__``). Must be called before the agent/memory are
-    #     built off ``state_space``, mirroring ``configure_preview``. Idempotent;
-    #     ``num_points<=0`` (and not full_trajectory) disables it (``state()``
-    #     then returns ``None``, ``state_space`` stays ``None``)."""
-    #     offsets = self._full_trajectory_offsets() if full_trajectory else self._preview_offsets(int(num_points), gamma)
-    #     if not offsets:
-    #         self._value_state_offsets_t = None
-    #         self.state_space = None
-    #         return
-    #     self._value_state_offsets_t = torch.tensor(offsets, device=self.device, dtype=torch.long)
-    #     p = len(offsets)
-    #     # Same symmetric superset bound construct_state uses for its own
-    #     # relative-xref preview block (see set_preview_offsets).
-    #     rel_lo = self.X_MIN - self.X_MAX
-    #     rel_hi = self.X_MAX - self.X_MIN
-    #     lo = torch.cat([self.X_MIN] + [rel_lo] * p)
-    #     hi = torch.cat([self.X_MAX] + [rel_hi] * p)
-    #     self.state_space = gym.spaces.Box(low=lo.cpu().numpy(), high=hi.cpu().numpy(), dtype=np.float32)
-    #     print(f"[BaseEnv] privileged critic state: {p} relative-future-xref points "
-    #           f"at step offsets {offsets} (gamma={gamma}) -> state_dim {self.state_space.shape[0]}")
-#
-    # def state(self) -> torch.Tensor | None:
-    #     """The privileged critic-only state ``[x, future-xref relative to x]``
-    #     — see ``configure_value_state``. ``None`` when not configured (skrl's
-    #     ``GymnasiumWrapper.state()`` catches the resulting exception from
-    #     indexing a ``None`` offsets tensor and returns ``None`` itself, but we
-    #     short-circuit explicitly here for clarity)."""
-    #     if self._value_state_offsets_t is None:
-    #         return None
-    #     idx = torch.clamp(self.time_steps, max=self.max_episode_len - 1)
-    #     env_idx = torch.arange(self.num_envs, device=self.device)
-    #     pidx = torch.clamp(idx.unsqueeze(-1) + self._value_state_offsets_t.unsqueeze(0),
-    #                        max=self.max_episode_len - 1)                    # (N, P)
-    #     xref_fut = self.xref[env_idx.unsqueeze(-1), pidx]                   # (N, P, x_dim)
-    #     p = xref_fut.shape[1]
-    #     raw_rel = (xref_fut - self.x_t.unsqueeze(1)).reshape(self.num_envs * p, -1)
-    #     xref_rel = self.wrap_angles(raw_rel).reshape(self.num_envs, p, -1)  # relative to current x
-    #     return torch.cat([self.x_t, xref_rel.reshape(self.num_envs, -1)], dim=-1)
-#
     def _size_reference_buffers(self) -> None:
-        """Allocate ``xref``/``uref`` long enough that the window never clamps.
+        """Generate enough reference points to fill the final observation window.
 
-        The episode runs ``max_episode_len`` steps, but the window at the last of
-        them still reaches ``max_episode_len - 1 + (length-1)*offset``. Generating
-        only ``max_episode_len`` points forces every index past the end to clamp
-        onto ``xref[-1]``, which pads the observation with a synthetic constant
-        tail whose length grows as the episode advances. Generating to
-        ``ref_gen_len`` instead makes every window entry real reference data.
-
-        Why that matters beyond tidiness: the padded tail is not reference the
-        plant ever tracks, so the actor's window encoder spends capacity on a
-        signal that carries no information about the task, and its content
-        changes with ``t`` even when the underlying reference does not.
-
-        What it does NOT change is the Markov requirement. The episodic return
-        from ``t`` touches ``xref[t .. max_episode_len-1]``, so the window still
-        has to be at least ``max_episode_len`` long for the value to be a
-        function of the observation -- generating further ahead removes the
-        padding, it does not license a shorter window. ``check_markov`` is still
-        asked about ``max_episode_len`` for exactly that reason.
-
-        Strictly, the observation process is no longer closed under the shift:
-        ``xrefs_{t+1}`` needs ``xref[t + length*offset]``, which is not in
-        ``s_t``. That index is beyond the episode end, so it never enters any
-        reward -- it is reward-irrelevant nuisance rather than hidden state the
-        value depends on, which is the opposite of truncating the window inside
-        the horizon.
+        Extra points avoid endpoint padding; they do not make a shortened window
+        Markov. check_markov still uses the full episode horizon.
         """
         L, off = self.ref_window.length, self.ref_window.offset
         self.ref_gen_len = int(self.max_episode_len + (L - 1) * off + int(self._compact_requested))
@@ -1688,23 +1331,11 @@ class BaseEnv(TerminationBoxMixin, gym.Env):
                                 dtype=torch.float32, device=self.device)
 
     def construct_state(self, x: torch.Tensor):
-        """The observation ``s = {x, xrefs, urefs}``, flattened in skrl's
-        sorted-key order (see ``RefWindow.split`` — the one place that layout
-        is encoded).
+        """Build raw world-frame observations in the declared Dict layout.
 
-        ``xrefs``/``urefs`` are the reference at steps ``t + k*offset``,
-        ``k = 0..length-1``, clamped at the episode end so the reference holds
-        its terminal setpoint rather than running off the buffer. Both are raw
-        world-frame reference points: the relative-position / wrapped-angle
-        transform is a network-input concern and lives in ``ref_window.Feats``,
-        so every consumer (actor, critic, the analytic controllers) applies the
-        identical map instead of each re-deriving it from a pre-baked tail.
-
-        Returns the dict, not a flat tensor: skrl's wrapper tensorizes and
-        flattens it against ``observation_space`` on the way in, which is what
-        makes ``RefWindow.split``'s sorted-key ordering correct by construction
-        rather than by convention. ``construct_state_flat`` is the tensor form
-        for callers that want what the models actually receive.
+        Compact observations contain (x, xref, xi) and optional future/history windows.
+        Legacy observations contain (x, xrefs, urefs). Networks apply relative-position
+        and periodic-angle features; construct_state_flat matches skrl's key order.
         """
         idx = torch.clamp(self.time_steps, max=self.xref.shape[1] - 1)
         if getattr(self.ref_window, "compact", False):

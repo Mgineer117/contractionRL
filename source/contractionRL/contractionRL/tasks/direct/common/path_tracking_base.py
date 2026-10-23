@@ -29,6 +29,7 @@ from .eval_metrics import fit_exponential_envelope
 from .state_guard import carry_forward_nonfinite
 from .termination_box import TerminationBoxMixin
 from .traj_buffer import TrajectoryBuffer
+from .transfer_dynamics import TransferDynamicsMixin
 
 # wandb is optional; only used when a run is active
 try:
@@ -48,7 +49,7 @@ _WANDB_PLOT_INTERVAL = 20   # log trajectory plot every N completed episodes (en
 _VIZ_MAX_ENVS = 1         # cap on how many envs' trajectories go into the plot
 
 
-class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
+class PathTrackingBase(TransferDynamicsMixin, TerminationBoxMixin, DirectRLEnv):
     """Abstract base for path-tracking environments.
 
     Subclass must define:
@@ -254,9 +255,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         self._static_metric_bounds: tuple[float, float] | None = None
         self._cmg_bounds_fn: Callable[[torch.Tensor], tuple[float, float]] | None = None
 
-    # ------------------------------------------------------------------ #
     # Contraction algorithm interface (C3M / LQR / SD-LQR / C2RL)
-    # ------------------------------------------------------------------ #
 
     def _initialize_robot_indices(self) -> None:
         """Resolve articulation indices before building reference state names."""
@@ -507,11 +506,8 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         using the same distribution as C2RL's CCM synthesis.
         Returns numpy float32 arrays (required by mjrl's to_tensor()).
 
-        ``num_control_per_state`` is a classic-env-only knob (see
-        ``env_base.get_rollout``) accepted here purely so callers can pass it
-        uniformly across both env families — Isaac's dynamics rollout draws
-        real consecutive-step transitions from the trajectory buffer, so there
-        is no "controls per state" tiling to configure; the argument is ignored.
+        Dynamics sampling uses the dataset collected by empirical_dynamics;
+        controls-per-state is configured when that dataset is collected.
         """
         if mode == "dynamics":
             return self._get_dynamics_rollout(buffer_size)
@@ -525,24 +521,11 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         return {key: value.cpu().numpy().astype(np.float32) for key, value in data.items()}
 
     def _get_dynamics_rollout(self, buffer_size: int) -> dict:
-        """Sample (x, u, x_dot) pairs for NeuralDynamics training.
-
-        Uses consecutive (t, t+1) pairs from the reference trajectory buffer
-        and approximates x_dot via finite differences: (x_{t+1} - x_t) / step_dt.
-        This avoids requiring additional env interaction beyond what's in the buffer.
-        """
-        buf = self._traj_buf
-        traj_ids = buf.sample_traj_ids(buffer_size)
-        # Avoid last step so t+1 is always valid
-        steps = (torch.rand(buffer_size, device=self.device) * (buf._lengths[traj_ids] - 1)).long()
-        x_t, u_t = buf.get(traj_ids, steps)
-        x_next, _ = buf.get(traj_ids, steps + 1)
-        x_dot = (x_next - x_t) / self.step_dt
-        return {
-            "x":     x_t.cpu().numpy().astype(np.float32),
-            "u":     u_t.cpu().numpy().astype(np.float32),
-            "x_dot": x_dot.cpu().numpy().astype(np.float32),
-        }
+        data = getattr(self, '_transfer_dataset', None)
+        if data is None:
+            raise RuntimeError('Collect/configure transfer dynamics data before requesting dynamics samples')
+        indices = np.random.choice(len(data['x']), buffer_size, replace=buffer_size > len(data['x']))
+        return {key: value[indices] for key, value in data.items()}
 
     def get_tracking_error(self) -> torch.Tensor:
         """Current ||x - x_ref|| per env, (N,).
@@ -591,9 +574,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
     def u_dim(self) -> int:
         return self._traj_buf.action_dim
 
-    # ------------------------------------------------------------------ #
     # Interface to implement in subclasses
-    # ------------------------------------------------------------------ #
 
     def _get_physical_state(self) -> torch.Tensor:
         """Returns (N, state_dim) current robot physical state."""
@@ -605,9 +586,7 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         """Set robot state (joints + base vel) to match x_ref_init."""
         raise NotImplementedError
 
-    # ------------------------------------------------------------------ #
     # PathTracking logic (shared)
-    # ------------------------------------------------------------------ #
 
     def _rebuild_observation_space(self) -> None:
         """Declare ``{x, xrefs, urefs}`` as the observation space.
@@ -675,6 +654,8 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
             current = self._sanitize_state(self._get_physical_state())
             row = torch.cat((current, action, current.new_ones(self.num_envs, 1)), -1)
             self._tracking_history = torch.cat((self._tracking_history[:, 1:], row[:, None]), 1)
+        if self.transition_backend == 'learned':
+            return self._step_learned(action)
         gust = self.disturbance.advance()
         body = self._ee_id[:1] if self.ref_window.u_dim == 7 else [0]
         self._robot.set_external_force_and_torque(gust[:, None, :3], gust[:, None, 3:],
@@ -834,6 +815,14 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
             next_energy = tracking_energy(error, angle_idx=self.angle_idx)
             reward = energy_decrease(self._prev_energy, next_energy)
             self._prev_energy = next_energy
+        if self.transition_backend == 'learned':
+            penalty = getattr(self, '_ood_reward_penalty', torch.zeros_like(reward))
+            self.extras['task_reward'] = reward.detach().clone()
+            self.extras['ood_penalty'] = penalty.detach().clone()
+            reward = reward - penalty
+        else:
+            self.extras.pop('task_reward', None)
+            self.extras.pop('ood_penalty', None)
         self._episode_reward += reward
         return reward
 
@@ -941,6 +930,8 @@ class PathTrackingBase(TerminationBoxMixin, DirectRLEnv):
         # initialise robot to match x_ref at step 0
         x_ref_init = self._traj_buf.initial_state(self._traj_ids[env_ids])  # (n, state_dim)
         self._set_robot_state_from_ref(env_ids, x_ref_init)
+        if self.transition_backend == 'learned':
+            self._capture_reset_state(env_ids)
         if hasattr(self, '_continuous_state'):
             self._continuous_state[env_ids] = x_ref_init
         self.disturbance.reset(env_ids)

@@ -35,7 +35,8 @@ FLEET = [
 def need_gib(task: str, encoder_window: int, num_envs: int, rollouts: int,
              min_mini_batches: int) -> tuple[float, int, int, int]:
     """Estimate a context-enabled trial with both past and future windows."""
-    env = gym.make(task, num_envs=1, device="cpu").unwrapped
+    from contractionRL.tasks.direct.common.tracking_tasks import make_analytical_plant
+    env = make_analytical_plant(task, num_envs=1, device="cpu").unwrapped
     ep = int(env.episode_len)
     env.close()
     seq = 2 * encoder_window

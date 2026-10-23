@@ -33,10 +33,7 @@ class MLP(nn.Module):
         super().__init__()
         dims = [input_dim] + list(hidden_dims)
         layers: list[nn.Module] = []
-        try:
-            gain = nn.init.calculate_gain("tanh")
-        except Exception:
-            gain = 1.0
+        gain = nn.init.calculate_gain("tanh")
         for in_d, out_d in zip(dims[:-1], dims[1:]):
             lin = nn.Linear(in_d, out_d)
             nn.init.xavier_uniform_(lin.weight, gain=gain)
@@ -67,37 +64,11 @@ def _zero_last_linear(mlp: MLP) -> None:
 
 
 class PreviewSequenceEncoder(nn.Module):
-    """Encodes the preview tail as a sequence of ``num_points`` future
-    reference rows (each ``point_dim`` wide), instead of flattening it into
-    one vector for a plain MLP. Drop-in replacement for
-    ``MLP(preview_dim, hidden, out_dim)`` — same ``(n, preview_dim) -> (n,
-    out_dim)`` signature — so it can be swapped in for any FiLMResidual γ-gate
-    that reads "preview" without touching FiLMResidual.forward at all.
+    """Encode flattened reference rows with an MLP, GRU or attention layer.
 
-    "gru": fed farthest point first (the tail is stored nearest-first, so this
-    reverses it). The final hidden state is then dominated by the near-term
-    point, the far future having already been squashed by the forget gates —
-    which is what makes "an RNN's forgetting resembles discounting" literally
-    true here. Fed nearest-first the final state would be dominated by the
-    farthest point, the opposite of what discounting wants. The encoder is never
-    told gamma, unlike env_base's explicit geometric ladder, so any horizon-like
-    behavior is purely learned.
-
-    "attn": one learned query attends over all points via softmax
-    (order-independent) — lets training discover which offsets matter, with no
-    recency prior, as a deliberate contrast to "gru".
-
-    "mlp": flattens the (possibly strided) points into one vector through a
-    plain MLP — no order/recency structure at all, a deliberate contrast to
-    "gru"/"attn".
-
-    ``stride`` applies uniformly to all three modes (keep every stride-th
-    point, nearest-first — offset 0 is never skipped): "mlp" sees fewer,
-    wider-spaced points to flatten (bounds its input width, which otherwise
-    scales with ``num_points`` and gets wasteful once the tail is a full
-    episode trajectory — see ``env_base.BaseEnv._full_trajectory_offsets``);
-    "gru"/"attn" see a shorter, cheaper sequence. ``stride=1`` (default)
-    keeps every point — the original dense behavior for any mode.
+    GRU previews reverse the nearest-first storage so the final hidden state
+    sees the nearest reference last. History uses chronological order.
+    Stride subsamples rows before encoding; compact GRU context requires stride 1.
     """
 
     MODES = ("mlp", "gru", "attn")
@@ -128,17 +99,10 @@ class PreviewSequenceEncoder(nn.Module):
 
 
     def train(self, mode: bool = True) -> PreviewSequenceEncoder:
-        """Keep the GRU submodule permanently in train mode, regardless of
-        what the surrounding policy is set to. cuDNN's RNN kernel refuses to
-        run backward at all when its own training flag is False (either a
-        flat "called in eval mode" error, or — if a caller upstream needs
-        create_graph=True — a hard "double backwards not supported"
-        NotImplementedError) — and skrl's own act()/update() cycle toggles
-        eval()/train() on the whole policy in ways this module has no control
-        over (including inside vendored skrl/ code, off-limits to edit). This
-        GRU has no dropout, so train vs eval never changes its output — only
-        whether cuDNN allows differentiating through it — so forcing it to
-        stay in train mode is free."""
+        """Keep dropout-free GRUs in training mode so cuDNN permits backward.
+
+        The training flag does not change their outputs because dropout is disabled.
+        """
         super().train(mode)
         if self.mode == "gru":
             self.rnn.train(True)
@@ -202,10 +166,9 @@ class TemporalTrackingFeatures(TrackingFeatures):
             raise ValueError('feature_dim must be a positive integer or null for 3 * state dimension')
         point_dim = n + len(self.angle_idx)
         self.preview_encoder = PreviewSequenceEncoder(window.preview_length * point_dim, point_dim, hidden, self.feature_dim, mode='gru')
-        if window.history_length:
-            history_dim = point_dim + window.u_dim
-            self.history_encoder = PreviewSequenceEncoder(window.history_length * history_dim, history_dim, hidden, self.feature_dim, mode='gru', reverse=False)
-        self.output_dim += self.feature_dim * (1 + bool(window.history_length))
+        history_dim = point_dim + window.u_dim
+        self.history_encoder = PreviewSequenceEncoder(window.history_length * history_dim, history_dim, hidden, self.feature_dim, mode='gru', reverse=False)
+        self.output_dim += 2 * self.feature_dim
 
     def sequence_features(self, sequence, x):
         points = []
@@ -225,39 +188,22 @@ class TemporalTrackingFeatures(TrackingFeatures):
         base = TrackingFeatures.forward(self, obs)
         split = 2 * self.state_feature_dim
         parts = [base[:, :split], self.preview_encoder(future.flatten(1))]
-        if self.window.history_length:
-            n = self.window.x_dim
-            history = self.window.history(obs)
-            valid = history[:, :, -1:]
-            states = self.sequence_features(history[:, :, :n], x)
-            controls = history[:, :, n:n+self.window.u_dim]
-            parts.append(self.history_encoder(torch.cat((states, controls), -1).flatten(1), valid=valid.squeeze(-1)))
+        n = self.window.x_dim
+        history = self.window.history(obs)
+        valid = history[:, :, -1]
+        states = self.sequence_features(history[:, :, :n], x)
+        controls = history[:, :, n:n+self.window.u_dim]
+        parts.append(self.history_encoder(torch.cat((states, controls), -1).flatten(1), valid=valid))
         parts.append(base[:, split:])
         return torch.cat(parts, -1)
 
 
 class CLActor(nn.Module):
-    """The contracting controller, over a ``{x, xrefs, urefs}`` observation:
+    """Structured controller with u = uref + W2(context) @ tanh(W1(context) @ error).
 
-        u = urefs[0] + W2(xrefs) @ tanh( W1(x) @ e ),   e = error(x, xrefs[0])
-
-    Roles are disjoint by construction, which is the whole point of the split:
-
-    ``W1(x)``      reads the current configuration only (``Feats.single`` — the
-                   symmetry directions dropped). It shapes how the tracking error
-                   is weighted according to the present physics.
-    ``W2(xrefs)``  reads the reference PATH only, as a sequence of ``length``
-                   points each expressed relative to the current ``x``
-                   (``Feats.sequence`` — relative position, wrapped angles). It
-                   allocates control effort for the geometry that is coming. The
-                   sequence goes through ``PreviewSequenceEncoder``, so mlp/gru/
-                   attn is a searchable architectural choice.
-    ``e``          the canonical-frame tracking error, the only thing the
-                   feedback multiplies — so ``e == 0 => u == urefs[0]`` exactly,
-                   which is what the contraction certificate requires.
-
-    Differentiable in x, so ``K = du/dx`` feeds the contraction condition
-    without a separate Jacobian network.
+    Zero tracking error preserves reference feedforward. Compact tracking uses
+    periodic relative-position features and optional past/future GRUs; legacy
+    reference windows remain supported. Autograd supplies du/dx for contraction.
     """
 
     def __init__(
@@ -281,7 +227,6 @@ class CLActor(nn.Module):
             activation = _ACT_MAP[activation.lower()]()
         hidden = list(hidden_dim) if hidden_dim else [128, 128]
         self.c = 3 * self.x_dim          # bilinear latent width
-        self.feature_scaler = nn.Identity()
 
         self.compact = bool(getattr(window, "compact", False))
         if self.compact:
@@ -324,7 +269,7 @@ class CLActor(nn.Module):
         x, xrefs, urefs = self.window.split(state)
         n = x.shape[0]
         if self.compact:
-            features = self.feature_scaler(self.tracking_features(state))
+            features = self.tracking_features(state)
             e = self.tracking_features.feedback_error(x, xrefs[:, 0]).unsqueeze(-1)
             w1 = self.w1(features).reshape(n, self.c, self.x_dim + len(self.feedback_angles))
             w2 = self.w2(features).reshape(n, self.u_dim, self.c)

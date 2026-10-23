@@ -53,9 +53,7 @@ from contractionRL.agents.utils.contraction.math_utils import b_jacobian, jacobi
 from contractionRL.agents.utils.system_dynamics.reference import RefWindow
 from contractionRL.agents.utils.RL.config import filter_cfg_fields
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # Configuration
-# ─────────────────────────────────────────────────────────────────────────── #
 
 @dataclass
 class SDLQRCfg(AgentCfg):
@@ -68,9 +66,7 @@ class SDLQRCfg(AgentCfg):
 LQRCfg = SDLQRCfg
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # Shared care solver
-# ─────────────────────────────────────────────────────────────────────────── #
 
 def _care_gain(A: torch.Tensor, B_mat: torch.Tensor,
                Q_scaler: float, R_scaler: float, x_dim: int, u_dim: int) -> torch.Tensor:
@@ -94,9 +90,7 @@ def _care_gain(A: torch.Tensor, B_mat: torch.Tensor,
     return solve(R, B_mat.T @ P)  # (u_dim, x_dim)
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # SD-LQR Agent
-# ─────────────────────────────────────────────────────────────────────────── #
 
 class SDLQRAgent(Agent):
     """State-Dependent LQR wrapped as a native skrl Agent.
@@ -220,9 +214,7 @@ class SDLQRAgent(Agent):
         pass  # analytical — no gradient updates
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # LQR Agent (linearises at xref, not x)
-# ─────────────────────────────────────────────────────────────────────────── #
 
 class LQRAgent(Agent):
     """LQR wrapped as a native skrl Agent — linearises at reference trajectory.

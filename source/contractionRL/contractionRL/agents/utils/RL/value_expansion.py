@@ -10,7 +10,7 @@ import math
 import torch
 from torch.nn import functional as F
 
-from contractionRL.agents.utils.contraction.math_utils import bound_W, quadratic_energy, spd_inverse, action_bound_violation, tracking_energy
+from contractionRL.agents.utils.contraction.math_utils import bound_W, spd_inverse, action_bound_violation, tracking_energy
 from contractionRL.agents.utils.system_dynamics.state import wrap_diff, clamp_physical_state, canonical_bound_state
 
 
@@ -65,10 +65,19 @@ class TrackingExpansionModel:
         else:
             self.position = slice(0, env.pos_dimension)
         self._gust = None
+        self._member_ids = None
 
-    def begin_rollout(self, roots):
+    def begin_rollout(self, roots, *, member_ids=None):
         """Sample a private gust path for each imagined branch; never read plant gust state."""
         self._gust = None
+        self._member_ids = None
+        if (getattr(self.env, 'transition_backend', None) == 'learned'
+                and hasattr(self.env._dynamics_model, 'member_parameters')):
+            if member_ids is None:
+                member_ids = getattr(self.env, '_dynamics_member_ids', None)
+            if member_ids is None or len(member_ids) != len(roots):
+                raise ValueError('Transfer value expansion requires the dynamics member for each root environment')
+            self._member_ids = member_ids.clone()
         disturbance = getattr(self.env, 'disturbance', None)
         if self.dynamics_source == 'analytical' and getattr(disturbance, 'enabled', False):
             from contractionRL.tasks.direct.common.disturbance import BoundedGust
@@ -77,6 +86,12 @@ class TrackingExpansionModel:
             self._gust.reset(torch.arange(len(roots), device=roots.device))
 
     def _advance(self, x, control, *, stochastic=False):
+        if getattr(self.env, 'transition_backend', None) == 'learned':
+            from contractionRL.tasks.direct.common.transfer_dynamics import integrate_learned
+            if self._member_ids is None and hasattr(self.env._dynamics_model, 'member_parameters'):
+                self.begin_rollout(x)
+            return integrate_learned(self.env._dynamics_model, x, control, self.env.cfg.sim.dt,
+                                     self.env.cfg.decimation, stochastic=stochastic, member_ids=self._member_ids)
         exact_reference = self.kind == "classic" and getattr(self.env, "has_analytical_dynamics", True) and not stochastic
         dynamics = (lambda x: self.env.get_f_and_B(x, need_null=False)) if exact_reference else self.dynamics
         f, B, _ = dynamics(x)
@@ -144,7 +159,9 @@ class TrackingExpansionModel:
             ids = xi[:, 0].long().clamp(0, self.env._traj_buf.num_trajs - 1)
             next_xr, _ = self.env._traj_buf.get(ids, (next_xi[:, p] / self.dt).round().long())
         reward = (self._energy(x, xr) - self._energy(next_x, next_xr)).unsqueeze(-1)
-        beta = getattr(self.owner._cfg, "action_bound_penalty_beta", 0.0)
+        from contractionRL.tasks.direct.common.transfer_dynamics import ood_reward_penalty
+        reward = reward - ood_reward_penalty(self.env, x, actions).unsqueeze(-1)
+        beta = getattr(self.owner._cfg, "action_bound_penalty", 0.0)
         if beta:
             reward = reward - beta * action_bound_violation(raw_actions, self.control_low, self.control_high).unsqueeze(-1)
         # PhysX observations also clip terminal positions; its reward keeps the excursion.
@@ -211,7 +228,8 @@ class ValueExpansion:
         self.owner, self.model = owner, model
         self.agent = owner._rl_agent
         self.horizon = owner._cfg.value_expansion_horizon
-        self.batch_size = owner._cfg.value_expansion_batch_size
+        configured_batch_size = getattr(owner._cfg, 'value_expansion_batch_size', None)
+        self.batch_size = self.agent.cfg.rollouts if configured_batch_size is None else configured_batch_size
         for name, value in (("value_expansion_horizon", self.horizon),
                             ("value_expansion_batch_size", self.batch_size)):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -221,28 +239,24 @@ class ValueExpansion:
         if {id(p) for p in self.agent.policy.parameters()} & {id(p) for p in self.agent.value.parameters()}:
             raise ValueError("Value expansion requires separate actor and critic parameters")
         if owner._raw_cfg.get("rewards_shaper") is not None:
-            raise ValueError("Value expansion supports rewards_shaper_scale/use_reward_norm, not custom reward shapers")
+            raise ValueError("Value expansion supports rewards_shaper_scale, not custom reward shapers")
 
     def _value(self, observations):
         values, _ = self.agent.value.act(
             {"observations": self.agent._observation_preprocessor(observations), "states": None}, role="value")
         return self.agent._value_preprocessor(values, inverse=True)
 
-    def _reward_scale(self):
-        from contractionRL.agents.utils.RL.env import RunningRewardScaler
-        shaper = self.agent.cfg.rewards_shaper
-        if isinstance(shaper, RunningRewardScaler):
-            return shaper.scale / (shaper._scaler.running_variance.float().sqrt() + shaper.epsilon)
-        return self.owner._cfg.rewards_shaper_scale
-
     @torch.no_grad()
-    def imagine(self, roots):
+    def imagine(self, roots, *, member_ids=None):
         """Return fixed targets at every depth, in physical (unnormalized) value units."""
         if hasattr(self.model, 'begin_rollout'):
-            self.model.begin_rollout(roots)
+            if member_ids is None:
+                self.model.begin_rollout(roots)
+            else:
+                self.model.begin_rollout(roots, member_ids=member_ids)
         obs, path, rewards, continues, valid = roots, [], [], [], []
         alive = torch.ones(len(roots), 1, device=roots.device, dtype=torch.bool)
-        gamma, scale = self.agent.cfg.discount_factor, self._reward_scale()
+        gamma, scale = self.agent.cfg.discount_factor, self.owner._cfg.rewards_shaper_scale
         for _ in range(self.horizon):
             path.append(obs)
             valid.append(alive)
@@ -270,6 +284,14 @@ class ValueExpansion:
     def prepare(self):
         observations = self.agent.memory.get_tensor_by_name("observations")
         roots = observations.reshape(-1, observations.shape[-1])
+        env = getattr(self.model, 'env', None)
+        members = None
+        if (getattr(env, 'transition_backend', None) == 'learned'
+                and hasattr(env._dynamics_model, 'member_parameters')):
+            assigned = getattr(env, '_dynamics_member_ids', None)
+            if observations.ndim != 3 or assigned is None or len(assigned) != observations.shape[1]:
+                raise ValueError('Transfer value expansion requires rollout memory ordered as time, environment, features')
+            members = assigned.repeat(observations.shape[0])
         modules = [module for module in (self.agent.policy, self.agent.value, self.owner._ccm_gen,
                    getattr(self.agent, "contraction_metric", None)) if module is not None]
         if self.owner._neural_dynamics is not None:
@@ -283,7 +305,8 @@ class ValueExpansion:
             # Imagination must not advance real-policy exploration or retry RNG streams.
             with torch.random.fork_rng(devices=devices), torch.no_grad():
                 for start in range(0, len(roots), self.batch_size):
-                    path, targets, valid = self.imagine(roots[start:start + self.batch_size])
+                    chunk_members = None if members is None else members[start:start + self.batch_size]
+                    path, targets, valid = self.imagine(roots[start:start + self.batch_size], member_ids=chunk_members)
                     real_targets.append(targets[0])
                     mask = valid[1:].squeeze(-1)
                     imagined_obs.append(path[1:][mask])

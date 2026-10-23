@@ -38,11 +38,11 @@ N_PROBE = 300
 
 def _env_id(name: str) -> str:
     """Short name -> gym id, via the shared task resolver."""
-    from contractionRL.tasks.direct.common.tracking_tasks import env_id
-    return env_id(name)
+
+    return name
 
 def classic_names() -> list[str]:
-    return sorted(p.name.removeprefix("isaac_classic_") for p in DIRECT_DIR.glob("isaac_classic_*")
+    return sorted(p.name.removeprefix("isaac_classic_") for p in (DIRECT_DIR / "Classic").glob("isaac_classic_*")
                   if (p / "dynamics.py").is_file())
 
 
@@ -53,10 +53,11 @@ def isaac_names() -> list[str]:
 
 def probe(task: str) -> dict:
     """Instantiate a classic env and measure what it actually does."""
+    from contractionRL.tasks.direct.common.tracking_tasks import make_analytical_plant
     import gymnasium as gym
     import torch
 
-    env = gym.make(_env_id(task), num_envs=1, device="cpu").unwrapped
+    env = make_analytical_plant(_env_id(task), num_envs=1, device="cpu").unwrapped
     n, m = int(env.num_dim_x), int(env.num_dim_control)
     lo, hi = env.X_MIN.numpy().astype(float), env.X_MAX.numpy().astype(float)
     xs = np.random.default_rng(0).uniform(lo, hi, size=(N_PROBE, n))
@@ -114,7 +115,7 @@ def main() -> int:
     import contractionRL.tasks.direct.common.tracking_tasks  # noqa: F401  registers classic envs
 
     kw = (args.keyword or "").lower()
-    classic = [t for t in classic_names() if kw in t.lower() or kw in "classic"]
+    classic = []
     isaac = [t for t in isaac_names() if kw in t.lower() or kw in "isaac"]
 
     hdr = (f"{'env':22s} {'x_dim':>5s} {'u_dim':>5s} {'sv(B) spread':>12s} "

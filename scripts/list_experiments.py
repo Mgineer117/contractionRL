@@ -12,7 +12,6 @@ import importlib.util
 from pathlib import Path
 import sys
 
-import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "source/contractionRL"
@@ -96,11 +95,12 @@ def environments():
                 if name.startswith("skrl_") and name != "skrl_cfg_entry_point":
                     module, filename = _entry(value, package, imports).split(":")
                     algo = name.removeprefix("skrl_").removesuffix("_cfg_entry_point").replace("_", "-")
-                    filename = {"ppo_cfg":"skrl_ppo_cfg.yaml", "c2rl_ppo_cfg":"skrl_c2rl_ppo_cfg.yaml",
-                                "contraction_ppo_cfg":"skrl_contraction_ppo_cfg.yaml"}.get(filename, filename)
+                    if filename.endswith('_cfg'):
+                        filename = f'skrl_{filename}.yaml'
                     configs[algo] = SOURCE.joinpath(*module.split(".")) / filename
-            records[task] = {"id": task, "family": "classic" if task.startswith("classic-") else "Isaac",
-                             "dynamics": "analytical" if task.startswith(("classic-", "Isaac-Classic-")) else "PhysX",
+            records[task] = {"id": task, "family": "Isaac",
+                             "dynamics": ("learned stochastic (PhysX evaluation)" if task.startswith('Isaac-Transfer-path-')
+                                          else "analytical" if task.startswith("Isaac-Classic-") else "PhysX"),
                              "configs": configs}
     return sorted(records.values(), key=lambda item: (item["family"] != "classic", item["id"]))
 

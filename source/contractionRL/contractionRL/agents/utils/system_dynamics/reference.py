@@ -70,7 +70,7 @@ class RefWindow:
         if self.offset < 1:
             raise ValueError(f"RefWindow: offset must be >= 1, got {self.offset}")
 
-    # ── layout ──────────────────────────────────────────────────────────── #
+    # layout
     @property
     def flat_dim(self) -> int:
         return self.x_dim + self.length * (self.x_dim + self.u_dim)
@@ -173,7 +173,7 @@ class RefWindow:
         k = torch.arange(self.length, device=t.device, dtype=torch.long)
         return torch.clamp(t.unsqueeze(-1) + k.unsqueeze(0) * self.offset, max=horizon - 1)
 
-    # ── sizing ──────────────────────────────────────────────────────────── #
+    # sizing
     @staticmethod
     def effective_horizon(gamma: float, max_episode_len: int) -> int:
         """``H = 1/(1-gamma)`` in steps, clamped to the episode — how far the
@@ -195,7 +195,7 @@ class RefWindow:
         H = cls.effective_horizon(gamma, max_episode_len)
         return int(math.ceil(H / max(1, int(offset)))) + 1
 
-    # ── Markov check ────────────────────────────────────────────────────── #
+    # Markov check
     def check_markov(self, gamma: float, max_episode_len: int, *,
                      strict: bool = False) -> str | None:
         """Verify ``{x, xrefs, urefs}`` is a sufficient statistic for the value

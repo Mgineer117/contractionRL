@@ -31,7 +31,6 @@ import sys
 
 import numpy as np
 import torch
-import yaml
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
 sys.path.insert(0, os.path.join(_ROOT, "source", "contractionRL"))
@@ -43,6 +42,7 @@ from contractionRL.agents.utils.contraction.math_utils import jacobian  # noqa: 
 
 
 def verify(short: str, task: str, algorithm: str) -> bool:
+    from contractionRL.tasks.direct.common.tracking_tasks import make_analytical_plant
     paths = sorted(glob.glob(os.path.join(_ROOT, f"data/classic/{short}/*.npz")))
     if not paths:
         print(f"{short:10s} no dataset — nothing to verify "
@@ -50,7 +50,7 @@ def verify(short: str, task: str, algorithm: str) -> bool:
         return True
     cfg_path = os.path.join(
         _ROOT, "source/contractionRL/contractionRL/tasks/direct",
-        f"isaac_classic_{short}", "agents", f"skrl_{algorithm.replace('-', '_')}_cfg.yaml")
+        "Classic", f"isaac_classic_{short}", "agents", f"skrl_{algorithm.replace('-', '_')}_cfg.yaml")
     with open(cfg_path) as fh:
         cm = load_agent_config(fh.name)["cm"]
     lbd, r = float(cm["cvstem_lbd"]), float(cm["cvstem_r_scaler"]) + 1e-5
@@ -62,7 +62,7 @@ def verify(short: str, task: str, algorithm: str) -> bool:
     # W̄ = νW with W̄ ⪰ I tight somewhere, so ν = max_k 1/λ_min(W_k).
     nu = 1.0 / np.linalg.eigvalsh(W).min(axis=1).max()
 
-    env = gym.make(task, num_envs=1, device="cpu").unwrapped
+    env = make_analytical_plant(task, num_envs=1, device="cpu").unwrapped
     x = torch.as_tensor(x_np, dtype=torch.float32).requires_grad_()
     with torch.enable_grad():
         f, B, _ = env.get_f_and_B(x)

@@ -5,27 +5,29 @@ from pxr import Gf, UsdGeom, UsdLux, UsdShade, Vt
 
 
 class CarViewer:
-    def __init__(self, env):
+    def __init__(self, env, *, name="CarViewer", trace_color=(1., .4, .06), frame_camera=True):
         self.env = env
         self.stage = env.sim.stage
+        self.path = "/World/" + name
+        self.frame_camera = frame_camera
         self.origin = env.scene.env_origins[0].cpu().numpy()
         self.previous_step = -1
         self.trace = []
         light = UsdLux.DomeLight.Get(self.stage, "/World/Light")
         light.GetColorAttr().Set(Gf.Vec3f(.22, .27, .35))
         light.GetIntensityAttr().Set(900.)
-        self.ground = UsdGeom.Cube.Define(self.stage, "/World/CarViewer/Ground")
+        self.ground = UsdGeom.Cube.Define(self.stage, self.path + "/Ground")
         self.ground.CreateSizeAttr(1.)
         self.ground_position = self.ground.AddTranslateOp()
         self.ground_size = self.ground.AddScaleOp()
         self._material(self.ground, "Ground", (.14, .17, .22), (.035, .045, .06))
         self.grid = self._curve("Grid", (.28, .34, .42), .025)
         self.reference = self._curve("ReferencePath", (.15, 1., .3), .12)
-        self.traveled = self._curve("CarTrace", (1., .4, .06), .09)
+        self.traveled = self._curve("CarTrace", trace_color, .09)
         self.update()
 
     def _material(self, geometry, name, color, emission):
-        path = "/World/CarViewer/Materials/" + name
+        path = self.path + "/Materials/" + name
         material = UsdShade.Material.Define(self.stage, path)
         shader = UsdShade.Shader.Define(self.stage, path + "/Shader")
         shader.CreateIdAttr("UsdPreviewSurface")
@@ -37,7 +39,7 @@ class CarViewer:
         UsdShade.MaterialBindingAPI.Apply(geometry.GetPrim()).Bind(material)
 
     def _curve(self, name, color, width):
-        curve = UsdGeom.BasisCurves.Define(self.stage, "/World/CarViewer/" + name)
+        curve = UsdGeom.BasisCurves.Define(self.stage, self.path + "/" + name)
         curve.CreateTypeAttr("linear")
         curve.CreateWrapAttr("nonperiodic")
         curve.CreateWidthsAttr([width])
@@ -80,10 +82,11 @@ class CarViewer:
                 lines.extend(((low[0], y, .005), (high[0], y, .005)))
             self._points(self.grid, lines, [2] * (len(lines) // 2))
             span = max(float(np.ptp(bounds, axis=0).max()) + 8., 16.)
-            self.env.sim.set_camera_view(
-                (float(center[0]), float(center[1] - .55 * span), .95 * span),
-                (float(center[0]), float(center[1]), 0.),
-            )
+            if self.frame_camera:
+                self.env.sim.set_camera_view(
+                    (float(center[0]), float(center[1] - .55 * span), .95 * span),
+                    (float(center[0]), float(center[1]), 0.),
+                )
         self.trace.append((float(current[0]), float(current[1]), .07))
         self._points(self.traveled, self.trace if len(self.trace) > 1 else self.trace * 2)
         self.previous_step = step

@@ -67,9 +67,8 @@ agent:
   value_loss_scale: 2.5
   kl_threshold: 0.032
   time_limit_bootstrap: true
-  rewards_shaper_scale: 1.0
-  use_state_norm: false
-  use_value_norm: false
+  rewards_shaper_scale: 0.1
+  use_value_norm: true
   discount_factor: 0.995
   experiment:
     directory: ppo
@@ -80,11 +79,10 @@ agent:
     wandb_kwargs:
       project: contractionRL
       name: null
-  use_reward_norm: false
-  use_value_expansion: false
-  value_expansion_horizon: 3
-  value_expansion_batch_size: 512
-  action_bound_penalty_beta: 0.0
+  use_value_expansion: true
+  value_expansion_horizon: 10
+  value_expansion_batch_size: null  # Defaults to agent.rollouts.
+  action_bound_penalty: 1.0
 trainer:
   class: SequentialTrainer
   timesteps: 500000

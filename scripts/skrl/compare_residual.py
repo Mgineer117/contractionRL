@@ -16,7 +16,6 @@ sys.path.insert(0, str(ROOT / 'source/contractionRL'))
 import gymnasium as gym
 import numpy as np
 import torch
-import yaml
 from contractionRL.agents.utils.RL.config import load_agent_config
 import contractionRL.tasks.direct.common.tracking_tasks  # register analytical plant
 from contractionRL.agents.utils.RL.models import FullControlActorModel
@@ -30,13 +29,14 @@ def summarize(values):
 
 @torch.no_grad()
 def compare(checkpoints, output, *, seed=20261015, episodes=512, wandb_project=None):
+    from contractionRL.tasks.direct.common.tracking_tasks import make_analytical_plant
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     bank_path = output/'evaluation_bank.npz'
     if bank_path.exists():
         raise FileExistsError(f'Refusing to overwrite comparison evidence: {bank_path}')
     torch.manual_seed(seed)
-    env = gym.make('classic-car-v0', num_envs=episodes, device='cpu',
+    env = make_analytical_plant('classic-car-v0', num_envs=episodes, device='cpu',
                    disturbance_scales=[0.]*4).unwrapped
     env.set_fix_ref_trajectories(True)
     env.reset()
@@ -51,7 +51,6 @@ def compare(checkpoints, output, *, seed=20261015, episodes=512, wandb_project=N
         cfg = load_agent_config(path.parent.parent/'params/agent.yaml')
         spec = cfg['models']['policy']
         assert spec.get('control_mode', 'full') == mode
-        assert not cfg['agent'].get('use_state_norm', False), 'Apply the saved state scaler before evaluating normalized runs'
         checkpoint = torch.load(path, map_location='cpu', weights_only=False)
         metric_states.append(checkpoint['cmg'])
         network = spec['network'][0]

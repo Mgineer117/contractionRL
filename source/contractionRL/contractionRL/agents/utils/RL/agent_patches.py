@@ -305,26 +305,6 @@ def patch_sac_entropy_clamp(agent, min_log_alpha: float = -5.0, max_log_alpha: f
     entropy_optimizer.step = _step
 
 
-def _resolve_x_dim(policy) -> int | None:
-    """Length of the leading ``x`` block of a ``[x, xref, uref]`` observation,
-    or ``None`` for a flat observation with no such split.
-
-    Every backbone knows this number but spells it differently: residual/
-    squashed MLPs use ``_x_dim``; CLActorModel/SquashedCLActorModel keep it only
-    on their ``cl_actor`` submodule. Missing that last case silently returned
-    None for exactly the two backbones where the x-only restriction is
-    load-bearing for the uref pass-through.
-    """
-    for owner, attr in ((policy, "x_dim"), (policy, "_x_dim"),
-                        (getattr(policy, "cl_actor", None), "x_dim")):
-        x_dim = getattr(owner, attr, None) if owner is not None else None
-        if x_dim:
-            return int(x_dim)
-    return None
-
-
-
-
 def patch_algo_namespace(agent, algo_name: str) -> None:
     """Rewrite track_data keys "{cat} / {name}" -> "{cat} / {algo_name}/{name}".
 

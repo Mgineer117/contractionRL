@@ -2,6 +2,8 @@
 
 The `Isaac-Classic-*` tasks use analytical transitions; the matching `Isaac-*` tasks use PhysX. Each pair shares one task implementation: state/observation layout, reset distribution, nominal reference generator, reward, bounds, disturbances, termination and horizon. The task sections below describe those shared definitions and the analytical transition; see [PhysX transition details](isaac_backends.md) for the alternative dynamics. Reference candidates use the same generator but are rolled out with their own backend.
 
+The three `Isaac-Transfer-path-*` robot tasks train in learned stochastic dynamics and evaluate in both that simulator and PhysX. Their robot sections describe the state/control contract and physical data/evaluation plant. See [transfer dynamics](transfer_dynamics.md) for collection modes, finite differences, probabilistic fitting, decimation, checkpoints and evaluation tabs.
+
 Implemented in the `dev` worktree. The **trajectory tracking** tasks below use compact observations and feedforward MLP policies. The three **velocity tracking** tasks remain nominal-controller training tasks for generating PhysX references; their original command rewards are listed separately. RNN and legacy reference-window implementations remain available in the source.
 
 The robot pipeline trains `*-VelTracking-v0`, exports its genuine full-horizon PhysX rollouts to `data/<robot>/dynamics_data.npz`, then loads that archive in `*-PathTracking-v0`. Velocity training triggers export automatically; `scripts/skrl/generate_ref_traj.py` can repeat export from a saved velocity checkpoint. Use `--ref_out_dir` on training, or `--out_dir` on standalone export, to keep validation banks separate. A missing archive is an unfinished upstream generation stage. Export preserves episode failures and rejects unsafe or incomplete references. A zero quality threshold disables the reward gate; full-horizon safety checks still apply, so a safe bank from a short-run controller alone does not establish good velocity tracking.
@@ -42,6 +44,12 @@ References must remain in a 5% interior margin (5% of the full interval width on
 This verifies finite-horizon sampled reference bounds. A fixed 5% margin **does not establish forward invariance for every learned policy**, nor does it certify between-sample reference safety. A rigorous invariant tracking tube requires a validated metric/controller, bounded-disturbance error radius, tube containment in the domain and a sampled-control argument; arbitrary RL controls may fail and terminate. Kinematic clipping is a numerical boundary rule and is part of the implemented transition.
 
 Failures terminate; the horizon truncates. Autoresets start a new episode. Evaluation must not join a reset episode onto the original error curve; failure rates and full-horizon stability measurements have different populations.
+
+### Control deadlines in transfer-path evaluation
+
+Playback, checkpoint evaluation and C3M evaluation for `Isaac-Transfer-path-*` run policy inference in a worker. At each wall-clock sampling deadline (`step_dt`), simulation applies the latest completed control, or holds the last applied input if none is ready. A late control computed from an older observation is used at a subsequent boundary. Only one inference batch is in flight; the next request uses the latest available observation. An episode reset clears that environment's held input to zero and invalidates its pending result. Simulation and rendering stay on the main thread. CUDA inference uses a separate stream; a pending inference is never synchronized by the main thread. Physics or rendering can still run slower than real time.
+
+Evaluation reports `control_delay_steps` (steps without a ready control computed from that step's observation), `control_hold_steps` (steps with no newly completed valid control), `control_steps` (evaluated environment transitions), `control_delay_steps_mean` (delayed steps per evaluated environment) and `control_delay_fraction`. A newly applied stale control counts as delayed but not held. Counts include the terminal transition and exclude subsequent reset episodes during a one-episode evaluation. Final evaluation saves these beside AUC in `eval_results.json` and logs them under `Evaluation/Control/`; playback saves them with its evaluation summary and prints cumulative counts in viewer mode. Counts sum over parallel environments, and therefore depend on the evaluated batch size and machine. Robot task settings are unchanged. Training rollouts retain their existing synchronous action/transition pairing.
 
 ## Isaac-Classic-Car-v0
 
@@ -121,7 +129,7 @@ Euler integration, dt=0.025 s. \(\dot p=v\); \(\dot v=(-F\sin\theta,F\cos\theta\
 
 Position outside the box, ground contact at z<=0.15, |roll| or |pitch|>=pi/3, or nonfinite dynamics terminates. Horizon: 10 s, 400 transitions. Old metrics fitted to the previous vertical sign/domain must be refitted; default metric cache paths now use `data/classic/quadrotor_zup_v2/`.
 
-## Quadruped-PathTracking-v0 (Unitree Go2)
+## Isaac-Transfer-path-Quadruped-v0 (Unitree Go2)
 
 ### State and bounds
 
@@ -147,7 +155,7 @@ PhysX articulated robot, flat ground and PD actuators; physics dt=0.005 s, four 
 
 Position-box exit, nonfinite state, any other raw finite-domain excursion, height below 0.2 m or projected gravity z>-0.71 terminates. Kinematic observations clip, while raw excursions still trigger termination. Horizon: 40 s, 2000 transitions.
 
-## Humanoid-PathTracking-v0 (Unitree H1)
+## Isaac-Transfer-path-Humanoid-v0 (Unitree H1)
 
 ### State and bounds
 
@@ -173,7 +181,7 @@ PhysX, physics dt=0.005 s, decimation four, action dt=0.02 s. Held base force sc
 
 Domain excursion, nonfinite state, height below 0.5 m or projected gravity z>-0.71 terminates. Horizon: 40 s, 2000 transitions.
 
-## Manipulator-PathTracking-v0 (Franka Panda)
+## Isaac-Transfer-path-Manipulator-v0 (Franka Panda)
 
 ### State and bounds
 
@@ -199,7 +207,7 @@ Fixed-base PhysX Panda with position PD actuators, physics dt=1/120 s, two physi
 
 EE position outside its workspace, nonfinite state or any other raw finite-domain excursion terminates. Kinematic observations clip. Horizon: 15 s, 900 transitions.
 
-## Quadruped-VelTracking-v0 (nominal reference generator)
+## Isaac-Transfer-vel-Quadruped-v0 (nominal reference generator)
 
 ### State and bounds
 
@@ -225,7 +233,7 @@ Nominal PhysX Go2, action dt=0.02 s, no added gust during nominal reference gene
 
 Height<0.2 m, projected gravity z>-0.71, local xy outside ±80 m, or nonfinite exported state terminates. Horizon: 40 s. Reference collection accepts only full-length nonfailed episodes and preserves the true terminal endpoint before autoreset.
 
-## Humanoid-VelTracking-v0 (nominal reference generator)
+## Isaac-Transfer-vel-Humanoid-v0 (nominal reference generator)
 
 ### State and bounds
 
@@ -251,7 +259,7 @@ Nominal H1 PhysX and PD control, action dt=0.02 s; no added gust for nominal ref
 
 Height<0.5 m, projected gravity z>-0.71, xy outside ±80 m or nonfinite state terminates. Horizon: 40 s. Only full-length nonfailed recordings can become path references.
 
-## Manipulator-VelTracking-v0 (nominal reference generator)
+## Isaac-Transfer-vel-Manipulator-v0 (nominal reference generator)
 
 ### State and bounds
 

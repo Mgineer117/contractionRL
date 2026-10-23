@@ -13,6 +13,19 @@ import warnings
 from collections.abc import Sequence
 
 
+def migrate_action_bound_penalty(cfg):
+    """Read the former spelling in saved configs without changing its value."""
+    old, new = "action_bound_penalty_beta", "action_bound_penalty"
+    agent = cfg.get("agent", {})
+    if old in agent:
+        if new in agent and agent[new] != agent[old]:
+            raise ValueError(f"Conflicting agent.{old} and agent.{new}")
+        agent[new] = agent.pop(old)
+    if "_tuned_parameters" in cfg:
+        cfg["_tuned_parameters"] = ["agent." + new if key == "agent." + old else key
+                                    for key in cfg["_tuned_parameters"]]
+
+
 def load_agent_config(path):
     """Resolve YAML inheritance before applying CLI/sweep overrides.
 
@@ -42,6 +55,7 @@ def load_agent_config(path):
             values = yaml.safe_load(stream)
         if not isinstance(values, dict):
             raise ValueError(f"Agent config must be a mapping: {filename}")
+        migrate_action_bound_penalty(values)
         parents = values.pop("extends", [])
         parents = [parents] if isinstance(parents, str) else parents
         if not isinstance(parents, list) or any(not isinstance(parent, str) for parent in parents):
@@ -62,17 +76,11 @@ def load_agent_config(path):
     return result
 
 
-def config_entrypoints(source_file):
+def config_entrypoints(source_file, names=("ppo", "c2rl_ppo", "contraction_ppo")):
     """Isaac Lab calls these loaders before Hydra applies trial overrides."""
     from pathlib import Path
     directory = Path(source_file).parent
-    def ppo_cfg():
-        return load_agent_config(directory / "skrl_ppo_cfg.yaml")
-    def c2rl_ppo_cfg():
-        return load_agent_config(directory / "skrl_c2rl_ppo_cfg.yaml")
-    def contraction_ppo_cfg():
-        return load_agent_config(directory / "skrl_contraction_ppo_cfg.yaml")
-    return ppo_cfg, c2rl_ppo_cfg, contraction_ppo_cfg
+    return tuple((lambda name=name: load_agent_config(directory / f"skrl_{name}_cfg.yaml")) for name in names)
 
 
 def load_registered_agent_config(task, key):
@@ -99,13 +107,13 @@ ISAAC_RL_TIMESTEPS = {
     "Isaac-Classic-Segway-v0": 1_000_000,
     "Isaac-Cartpole-v0": 1_000_000,
     "Isaac-Segway-v0": 1_000_000,
-    "Isaac-Quadrotor-v0": 2_000_000,
-    "Manipulator-PathTracking-v0": 3_000_000,
-    "Manipulator-VelTracking-v0": 3_000_000,
-    "Quadruped-PathTracking-v0": 4_000_000,
-    "Quadruped-VelTracking-v0": 4_000_000,
-    "Humanoid-PathTracking-v0": 5_000_000,
-    "Humanoid-VelTracking-v0": 5_000_000,
+    "Isaac-Quadrotor-v0": 1_000_000,
+    "Isaac-Transfer-path-Manipulator-v0": 3_000_000,
+    "Isaac-Transfer-vel-Manipulator-v0": 3_000_000,
+    "Isaac-Transfer-path-Quadruped-v0": 4_000_000,
+    "Isaac-Transfer-vel-Quadruped-v0": 4_000_000,
+    "Isaac-Transfer-path-Humanoid-v0": 5_000_000,
+    "Isaac-Transfer-vel-Humanoid-v0": 5_000_000,
 }
 
 
@@ -132,6 +140,7 @@ REMOVED_CONTEXT_OPTIONS = frozenset({"backbone", "preview_steps", "temporal_cont
 
 def validate_experiment_config(cfg):
     """Reject removed selectors rather than silently running another experiment."""
+    migrate_action_bound_penalty(cfg)
     if 'extends' in cfg:
         raise ValueError('Resolve config inheritance with load_agent_config before constructing an algorithm')
     if 'gru' in cfg:
@@ -273,11 +282,10 @@ def migrate_c2rl_metric_cfg(cfg: dict) -> dict:
 
 
 
-def validate_observation_normalization(cfg, *, allow_features=False):
+def validate_observation_normalization(cfg):
     """Keep physical observations intact; models scale only their neural inputs."""
-    if (cfg.get("use_state_norm", False) and not allow_features) or any(cfg.get(key) is not None for key in
-            ("observation_preprocessor", "state_preprocessor")):
-        raise ValueError("use_state_norm and external observation/state preprocessors are unsupported for physical-coordinate tracking; use the model's tracking features instead")
+    if any(cfg.get(key) is not None for key in ("observation_preprocessor", "state_preprocessor")):
+        raise ValueError("External observation/state preprocessors are unsupported for physical-coordinate tracking")
 
 
 def make_base_rl_cfg(
@@ -301,7 +309,7 @@ def make_base_rl_cfg(
     as a plain dict (the raw value may be an ExperimentCfg object, which is not
     subscriptable).
     """
-    validate_observation_normalization(raw_cfg, allow_features=base_algorithm.upper() == 'PPO')
+    validate_observation_normalization(raw_cfg)
     if base_algorithm.upper() == "SAC":
         from skrl.agents.torch.sac import SAC_CFG as _BaseCfg
     else:
@@ -346,19 +354,7 @@ def make_base_rl_cfg(
     # "rewards_shaper", a Callable — translate it here since C2RL's inner
     # PPO/SAC sub-agent bypasses Runner entirely. 1.0 (or unset) is a no-op.
     rewards_shaper_scale = raw_cfg.get("rewards_shaper_scale")
-    # use_reward_norm: non-biasing running-std reward normalization (r/std, no
-    # mean subtraction — preserves the optimal policy). Installed through the
-    # Same rewards_shaper hook and, when both are set, absorbs rewards_shaper_scale
-    # as its post-normalization scale (giving reward variance scale²). See
-    # preprocessors.RunningRewardScaler for why value_norm alone leaves the
-    # metric-bound-dependent (w_lb/w_ub) reward-scale instability unaddressed.
-    if raw_cfg.get("use_reward_norm", False):
-        from contractionRL.agents.utils.RL.env import RunningRewardScaler
-        d["rewards_shaper"] = RunningRewardScaler(
-            scale=(rewards_shaper_scale if rewards_shaper_scale is not None else 1.0),
-            device=device,
-        )
-    elif rewards_shaper_scale is not None and rewards_shaper_scale != 1.0:
+    if rewards_shaper_scale is not None and rewards_shaper_scale != 1.0:
         d["rewards_shaper"] = lambda rewards, *a, scale=rewards_shaper_scale, **kw: rewards * scale
 
     if base_algorithm.upper() == "PPO" and raw_cfg.get("use_value_norm", True):
@@ -385,17 +381,16 @@ def normalize_agent_cfg(agent_cfg: dict, *, algorithm: str, device=None) -> None
     each. Policy exploration standard deviations are learned by the algorithm.
 
     External observation/state preprocessors are rejected to preserve physical
-    coordinates. C2RL-PPO can normalize neural features internally; value
-    normalization independently rescales the critic target.
+    coordinates. Value normalization independently rescales the critic target.
     """
+    migrate_action_bound_penalty(agent_cfg)
     a = agent_cfg.setdefault("agent", {})
     c2rl = algorithm in ("c2rl-ppo", "c2rl_ppo")
-    validate_observation_normalization(a, allow_features=algorithm in ("ppo", "contraction_ppo", "contraction-ppo", "contractionppo", "c2rl-ppo", "c2rl_ppo"))
+    validate_observation_normalization(a)
     ppo_family = algorithm in ("ppo", "contraction_ppo", "contraction-ppo", "contractionppo", "c2rl-ppo", "c2rl_ppo")
     if not ppo_family:
         if a.pop("use_value_expansion", False) or any(key in a for key in ("value_expansion_horizon", "value_expansion_batch_size")):
             raise ValueError("use_value_expansion is supported only by PPO-family algorithms")
-        a.pop("use_state_norm", None)
     use_value_norm = a.pop("use_value_norm", True)
     # C2RL builds its own PPO/SAC sub-agent from the raw yaml dict via
     # rl_glue.make_base_rl_cfg, which reads ``use_value_norm`` itself (defaulting
@@ -419,11 +414,7 @@ def normalize_agent_cfg(agent_cfg: dict, *, algorithm: str, device=None) -> None
         a.pop("value_preprocessor", None)
         a.pop("value_preprocessor_kwargs", None)
 
-    # Reward switches are consumed here only for skrl-native algorithms.
+    # C2RL consumes these reward switches directly.
     if algorithm in ("ppo", "sac", "mbpo", "contraction_ppo", "contraction-ppo", "contractionppo"):
-        if a.pop("use_reward_norm", False):
-            from contractionRL.agents.utils.RL.env import RunningRewardScaler
-            a["rewards_shaper"] = RunningRewardScaler(
-                scale=float(a.pop("rewards_shaper_scale", 1.0)), device=device or "cpu")
         a.pop("reward_euclidean", None)
         a.pop("reward_level", None)

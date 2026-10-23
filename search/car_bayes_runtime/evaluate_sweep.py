@@ -109,8 +109,8 @@ def evaluate(root, checkpoint, name, output, metric_checkpoint=None, mean=False)
     env = gym.make('classic-car-v0', num_envs=n, device='cpu', disturbance_scales=[0.] * 4).unwrapped
     actor = None
     try:
-        import yaml
-        beta = (float(yaml.safe_load((Path(checkpoint).parent.parent / 'params/agent.yaml').read_text())['agent'].get('action_bound_penalty_beta', 0.))
+        from contractionRL.agents.utils.RL.config import load_agent_config
+        beta = (float(load_agent_config(Path(checkpoint).parent.parent / 'params/agent.yaml')['agent'].get('action_bound_penalty', 0.))
                 if checkpoint != 'lqr' else 0.)
         env.set_action_bound_penalty(beta)
         if metric_checkpoint:
@@ -170,7 +170,7 @@ def evaluate(root, checkpoint, name, output, metric_checkpoint=None, mean=False)
                       final_worse_than_start=int(((normalized[:, -1] > 1).numpy() & complete).sum()),
                       action_clip_fraction=float((clipped / counts.clamp_min(1)).mean()),
                       action_overflow_l2_mean=float((overflow / counts.clamp_min(1)).mean()),
-                      action_bound_penalty_beta=beta, reward_metric='CCM' if metric_checkpoint else 'identity (reward unused in ranking)',
+                      action_bound_penalty=beta, reward_metric='CCM' if metric_checkpoint else 'identity (reward unused in ranking)',
                       reference_seed=int(data['seed']), gust_seed=int(data['gust_seed']), action_seed=int(data['action_seed']),
                       auc_definition='integral_0^15 ||e(t)||_2/||e(0)||_2 dt; lower is better')
         np.savez_compressed(output / 'episodes.npz', auc=auc, completed=complete, normalized_error=normalized.numpy(),

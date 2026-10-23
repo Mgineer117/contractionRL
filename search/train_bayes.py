@@ -34,11 +34,6 @@ def resolve_config(base, parameters):
     if not 0 < low < high or not all(map(math.isfinite, (low, high))):
         raise ValueError('Invalid paired CCM spectral bounds')
     cfg['cm'].update(ccm_w_lb=low, ccm_w_ub=high)
-    architecture = parameters.get('policy_architecture')
-    if architecture is not None:
-        if architecture not in ('structured_residual', 'factorized'):
-            raise ValueError('Unknown policy architecture')
-        cfg['models']['policy']['control_mode'] = 'structured' if architecture == 'structured_residual' else 'factorized'
     pair = parameters.get('encoder_pair')
     if pair is not None:
         pairs = {'null:null': (None, None), 'null:gru': (None, 'gru'), 'gru:gru': ('gru', 'gru')}
@@ -58,21 +53,12 @@ def resolve_config(base, parameters):
             if leaf not in node:
                 raise ValueError('Unknown parameter: ' + key)
             node[leaf] = value
-        elif key not in {'policy_architecture', 'ccm_bounds', 'lr_schedule', 'encoder_pair'}:
+        elif key not in {'ccm_bounds', 'encoder_pair'}:
             raise ValueError('Unknown parameter: ' + key)
     from contractionRL.agents.utils.RL.config import validate_experiment_config
     validate_experiment_config(cfg)
     cfg['agent']['value_expansion_horizon'] = 10
-    cfg['agent']['value_expansion_batch_size'] = 512
-    schedule = parameters.get('lr_schedule')
-    if schedule is not None:
-        if schedule not in ('constant', 'kl_adaptive'):
-            raise ValueError('Unknown learning-rate schedule')
-        cfg['agent']['learning_rate_scheduler'] = 'KLAdaptiveLR' if schedule == 'kl_adaptive' else None
-        cfg['agent']['learning_rate_scheduler_kwargs'] = (dict(
-            kl_threshold=.008, kl_factor=2, lr_factor=1.5, min_lr=1e-6, max_lr=1e-4)
-            if schedule == 'kl_adaptive' else {})
-    for key in ('use_value_norm', 'use_state_norm', 'use_value_expansion', 'use_reward_norm'):
+    for key in ('use_value_norm', 'use_value_expansion'):
         if not isinstance(cfg['agent'][key], bool):
             raise ValueError(key + ' must be boolean')
     for key in ('rollouts', 'mini_batches', 'learning_epochs'):

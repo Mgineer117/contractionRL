@@ -30,9 +30,7 @@ from contractionRL.agents.utils.RL.logging import log_metrics
 METRIC_NAMES = ("auc", "contraction_rate", "overshoot", "contraction_score")
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # Streaming metric math
-# ─────────────────────────────────────────────────────────────────────────── #
 
 def per_env_metrics(
     *,
@@ -93,46 +91,6 @@ def summarize(
         out[f"{name}_stddev"] = float(np.std(arr, dtype=np.float64)) if arr.size else 0.0
         out[f"{name}_ci95"] = float(ci)
     return out
-
-
-class StreamingErrorStats:
-    """Per-env streaming accumulators for the four contraction metrics.
-
-    Feed one env step at a time via :meth:`update`, then call :meth:`summary`
-    (mean/ci95 dict) or :meth:`metrics` (per-env tensors).  ``active`` freezes
-    the accumulators of envs that already finished their (first) episode, so a
-    non-terminating eval loop over ``max_episode_length`` steps measures exactly
-    one episode per env.
-    """
-
-    def __init__(self, num_envs: int, device) -> None:
-        self._device = device
-        z = lambda: torch.zeros((num_envs, 1), device=device)
-        self.e0 = z()
-        self.e_last = z()
-        self.e_max = z()
-        self.err_sum = z()
-        self.steps = z()
-
-    def update(self, error: torch.Tensor, active: torch.Tensor | None = None) -> None:
-        error = error.reshape(-1, 1).float()
-        active = torch.ones_like(error) if active is None else active.reshape(-1, 1).float()
-        is_first = (self.steps == 0) & (active > 0)
-        self.e0 = torch.where(is_first, error, self.e0)
-        self.e_last = torch.where(active > 0, error, self.e_last)
-        self.e_max = torch.where(active > 0, torch.maximum(self.e_max, error), self.e_max)
-        self.err_sum = self.err_sum + error * active
-        self.steps = self.steps + active
-
-    def metrics(self, dt: float) -> dict[str, torch.Tensor]:
-        return per_env_metrics(
-            e0=self.e0, e_last=self.e_last, e_max=self.e_max,
-            err_sum=self.err_sum, steps=self.steps, dt=dt,
-        )
-
-    def summary(self, dt: float, mask: torch.Tensor | None = None) -> dict[str, float]:
-        return summarize(self.metrics(dt), mask)
-
 
 
 class StatManagerEnvWrapper:
@@ -205,12 +163,8 @@ class StatManagerEnvWrapper:
         self._tracking_env_ids = None
         self._tracking_steps = None
         self._completed_slots = None
-        # Slots whose episode ended short of the horizon (env_base's
-        # terminate_out_of_box). AUC/lambda/C are functionals of the full
-        # normalized error curve, and a curve cut at step k is a different
-        # quantity — the short-slot padding below would otherwise report a
-        # fabricated flat tail as if the policy had held there. Excluded from
-        # every reduction instead; see _compute_batched_metrics.
+        # Mark episodes ending before the horizon; incomplete curves cannot be
+        # compared directly with full-horizon AUC and contraction statistics.
         self._invalid_slots = None
         self._recent_early_end_frac: float = 0.0
         self._recent_valid_n: int = 0
@@ -405,13 +359,7 @@ class StatManagerEnvWrapper:
         # 1. AUC per env (trapezoid over the true per-slot time base)
         dt_array = time_buffer[:, 1:] - time_buffer[:, :-1]
         auc_vec = torch.sum(dt_array * 0.5 * (errs[:, :-1] + errs[:, 1:]), dim=1)
-        # Order statistics of the per-env AUC. auc_mean alone cannot distinguish
-        # "the whole population got worse" from "a couple of envs blew up": with
-        # non-terminating envs a diverged one is pinned at the position bound
-        # (env_base.step) and its error grows for the rest of the episode, so its
-        # AUC lands orders of magnitude above a healthy ~1.2 and the mean becomes
-        # a de-facto count of blow-ups. A flat median against a thrashing mean is
-        # exactly that signature.
+        # Keep order statistics to distinguish widespread degradation from a heavy tail.
         auc_np = auc_vec.detach().cpu().numpy()
         auc_median = float(np.median(auc_np))
         auc_p05 = float(np.percentile(auc_np, 5))
@@ -456,16 +404,7 @@ class StatManagerEnvWrapper:
         lambda_vec = torch.clamp(min_lambdas / rate_divisor, min=0.0, max=10.0)
         score_vec = lambda_vec / torch.clamp(best_C, min=1e-6)
 
-        # 5. Running-mean lambda — the whole-Episode contraction rate, averaged
-        #    over episodes that actually contracted.  For each episode slot,
-        #    compare the normalized cost at the end of the episode to its
-        #    start (C = 1): if it decreased, the rate that makes the endpoint
-        #    contraction condition
-        #        C(T) = e^{-lambda·T}·C(0)
-        #    hold with equality is  lambda = ln(C(0) / C(T)) / T.  Episodes
-        #    that did not decrease are dropped from the average entirely (not
-        #    counted as a 0) — this is a rate over contracting episodes only,
-        #    not a score that also penalizes non-contracting ones.
+        # Average whole-episode rates over episodes that actually contracted.
         lengths = tracking_steps.clamp(max=self._max_ep_len + 1).reshape(-1, 1)
         end_idx = (lengths - 1).clamp(min=0)  # (N, 1), last real recorded index
         err_end = torch.gather(errs, 1, end_idx).squeeze(1)
@@ -496,16 +435,7 @@ class StatManagerEnvWrapper:
             "peak_mean": peak_mean, "peak_median": peak_median, "peak_p95": peak_p95,
             "auc_median": auc_median, "auc_p05": auc_p05, "auc_p25": auc_p25,
             "auc_p75": auc_p75, "auc_p95": auc_p95, "auc_max": auc_max,
-            # The unreduced per-env vectors behind the four scalars above, for
-            # log_metric_distributions. Every mean here is over a population
-            # whose spread is the actual finding — a healthy median under a
-            # thrashing mean is a rare-blow-up signature, and no scalar shows
-            # that. Underscored because this dict is the one float-valued
-            # contract in this module that now carries an array: it is read only
-            # by _compute_batched_metrics, which copies named scalars out, so it
-            # never reaches stability_summary() or the wandb scalar loggers.
-            # running_lambda is shorter than the others (contracting episodes
-            # only) and may be empty — the plotter guards on that.
+            # Retain per-environment values for distribution plots and robust summaries.
             "_dist": {
                 "auc": auc_np,
                 "lambda": lambda_vec.detach().cpu().numpy(),
@@ -525,17 +455,8 @@ class StatManagerEnvWrapper:
         self._recent_valid_n = int(valid.sum().item())
         self._recent_early_end_frac = float((~valid).float().mean().item())
         if self._recent_valid_n == 0:
-            # Nothing measurable this round. Leave the _recent_* scalars alone
-            # and let stability_summary() report the metrics as absent — the
-            # house rule (see the agent_patches note on sentinel blending) is
-            # that no datapoint beats a wrong one. Still bump _compute_count so
-            # callers can tell a round completed.
-            #
-            # The per-env distributions and trajectory curves must be cleared,
-            # not left alone: _compute_count is what the plot wrappers watch to
-            # decide a fresh round exists (wandb_plot_wrapper), so keeping the
-            # previous round's arrays here would re-publish stale curves under a
-            # new step as though they had just been measured.
+            # No complete measurement: leave public metrics absent instead of emitting
+            # sentinels or blending in a previous round.
             self._recent_distributions = {}
             self._recent_trajs = ({}, {}, {})
             self._recent_maha_err = {}
@@ -631,13 +552,7 @@ class StatManagerEnvWrapper:
 
         unwrapped = getattr(self.env, "unwrapped", self.env)
         if isinstance(info, dict) and "tracking_error" in info:
-            # Classic BaseEnv (analytical_env.py): "tracking_error" is the true
-            # per-env squared error computed before reset_idx() overwrites
-            # x_t/xref for any env whose episode just ended — same ordering
-            # fix as the reward computation. Reading it from `obs` instead
-            # would, for an auto-reset env, measure the fresh reset (new
-            # episode) state against the old episode's e0/window, spiking the
-            # normalized error at the episode boundary.
+            # Classic tracking_error is squared error measured before automatic reset.
             error = torch.sqrt(torch.clamp(info["tracking_error"].reshape(-1).to(self._device()), min=0.0))
         elif hasattr(unwrapped, "get_tracking_error"):
             # Isaac path-tracking envs: angle-wrapped ||x - x_ref|| per env.
@@ -677,12 +592,8 @@ class StatManagerEnvWrapper:
         # Extract values for tracking
         err_vals = error.detach()
 
-        # At an auto-reset step the classic BaseEnv's info["tracking_error"] is
-        # the old episode's terminal error (computed before reset_idx), while
-        # obs/counters are already the new episode's. A slot opened here would
-        # anchor e0 on a near-zero stale value, inflating every normalized
-        # error in the window. Substitute the env's post-reset initial error
-        # (squared norm, hence sqrt) for the freshly reset envs.
+        # Terminal error belongs to the previous episode; observations and counters
+        # already belong to the reset episode.
         if init_flags.any():
             init_err_sq = self._first_attr("init_tracking_error")
             if isinstance(init_err_sq, torch.Tensor):
@@ -723,12 +634,8 @@ class StatManagerEnvWrapper:
                 complete[mask] = torch.as_tensor(endpoint_positions, device=self._device())[:, :pd]
                 endpoint_positions = complete
 
-        # The reference is taken as the env's whole trajectory, captured once
-        # when a slot opens — not accumulated from the observation window. The
-        # window is subsampled at ref_offset and truncated to the horizon, so a
-        # reference rebuilt from it is an offset-dependent subsample of the real
-        # path; the plot must show the full reference against the policy
-        # rollout. get_reference_trajectory() exists on both env families.
+        # Capture the full reference once per slot; observation windows can omit points
+        # and produce incorrect path plots.
         ref_traj = self._first_attr("get_reference_trajectory")
         full_xref = None
         if callable(ref_traj):
@@ -744,16 +651,8 @@ class StatManagerEnvWrapper:
             for old_slot in old_slots:
                 if not self._completed_slots[old_slot]:
                     self._completed_slots[old_slot] = True
-                    # Close the old episode with its measured endpoint before
-                    # opening the autoreset episode at its own initial error.
-                    # The slot keeps its env id — a completed episode must stay
-                    # in the buffer until the whole buffer is reduced; freeing
-                    # it here would let the very next init reuse and overwrite
-                    # it, and (ids != -1).all() below could then never fire.
-                    # Ended short of the horizon by the env's own termination
-                    # box (not by the time limit)? Then the padding below is a
-                    # fabrication, so the slot is excluded from every metric
-                    # rather than padded into a plausible-looking full curve.
+                    # Close completed episodes at their terminal error before opening the reset
+                    # episode at its own initial error. Keep the slot's environment assignment.
                     step = self._tracking_steps[old_slot]
                     full = bool(ended[int(env_idx)]) and int(step) == self._max_ep_len
                     failed = bool(terminal[int(env_idx)]) or (early_end is not None and bool(early_end[int(env_idx)]))
@@ -797,12 +696,7 @@ class StatManagerEnvWrapper:
                 self._traj_xref_buf[slot] = (
                     [] if full_xref is None else list(full_xref[int(env_idx)]))
 
-        # Update active slots — batched. This runs on every env step, and the
-        # old per-slot Python loop paid a device sync per slot per step (`if
-        # step == 0` on a GPU tensor is a blocking .item()): 64 slots x 2 syncs
-        # x every step. The scatter below is one pass, with a single .tolist()
-        # sync left for the trajectory buffer (a list of numpy rows, which has
-        # no tensor form to scatter into).
+        # Update slots in a batch to avoid per-slot GPU synchronizations.
         active_slots = torch.nonzero((self._tracking_env_ids != -1) & (~self._completed_slots), as_tuple=True)[0]
 
         if active_slots.numel():
@@ -1037,36 +931,8 @@ class StatManagerEnvWrapper:
         if o is not None:
             self._record(o, info if isinstance(info, dict) else None, terminated=terminated, truncated=truncated)
 
-            # Inject metrics into info["log"] so skrl's trainer (cfg
-            # `environment_info: log`, scalar tensors only) tracks them.
-            #
-            # Gated on _compute_count: before the first buffer round completes,
-            # stability_summary() returns the constructor sentinels (auc_mean
-            # and C = 1e2), and the buffer only completes at the end of an
-            # episode. Logging them from step 0 meant ~498 of a 500-step
-            # episode reported 1e2, and skrl's write_interval averages its
-            # window — so the value that reached wandb (and the sweep) was a
-            # Blend of sentinel and truth, not the truth:
-            #     Stability/auc_mean ≈ 60 + 0.4·true_auc
-            # (measured, classic-cartpole-v0 + lqr: true 7.52 → logged 63.01;
-            # overshoot 3.95 → logged 61.58, the same 60/40 mix). Worse, the
-            # blend ratio depends on where buffer completion lands inside the
-            # write window, so it varied run to run — noise of the same order
-            # as the real differences the sweeps are trying to resolve.
-            # Emitting nothing until there is a real value keeps the key
-            # absent instead of wrong; skrl simply has no datapoint to average.
-            # ... and only when the value has actually changed, i.e. once per
-            # buffer round rather than once per step. stability_summary() is
-            # recomputed by _compute_batched_metrics; between rounds it returns
-            # the identical numbers, so emitting every step wrote thousands of
-            # duplicate rows.
-            #
-            # This is not a cosmetic saving. wandb's local transaction log holds
-            # one record per logged scalar, and the summary grew from ~19 keys to
-            # ~54 when the full quantile set was added -- a single active run's
-            # run-*.wandb reached 3.4 GB, 15 concurrent workers put the home
-            # filesystem at 94 GB of a 103 GB quota, and the previous quota
-            # exhaustion killed the whole search.
+            # Emit scalar metrics only after a fresh complete buffer round. This avoids
+            # averaging constructor sentinels and repeatedly logging unchanged values.
             _fresh = self._initialized and self._compute_count > 0 and (
                 self._compute_count != getattr(self, "_last_logged_compute_count", None))
             if _fresh and isinstance(info, dict):
@@ -1229,9 +1095,7 @@ def reward_summary(
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # Unified wandb logging keys
-# ─────────────────────────────────────────────────────────────────────────── #
 
 def track_stability_summary(agent, summary: dict[str, float], *, tab: str = "Stability") -> None:
     """Push a :func:`summarize` dict onto ``agent`` under ``{tab}/...``.
@@ -1285,9 +1149,7 @@ def stability_log_dict(summary: dict[str, float], device, *, tab: str = "Stabili
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # Unified trajectory / normalized-error plots
-# ─────────────────────────────────────────────────────────────────────────── #
 
 def _wandb_run():
     """Return the active wandb run (or None) without importing wandb eagerly."""
@@ -1443,12 +1305,7 @@ def log_tracking_plots(
             payload["global_step"] = step
         log_metrics(payload)
 
-    # All curves for a given wandb key go into one figure laid out as a grid of
-    # subplots — PER_SUBPLOT envs per subplot, ceil(n / PER_SUBPLOT) subplots —
-    # so every eval env is logged (not a random handful) while each panel stays
-    # readable. The grid is sized to the number of envs actually passed in, so
-    # normalized_error / normalized_maha_error / path_tracking share the same
-    # env set and ordering (the caller supplies a single consistent key list).
+    # Plot every evaluated environment in a grid with PER_SUBPLOT curves per panel.
     _trapz = getattr(np, "trapezoid", None) or np.trapz
     PER_SUBPLOT = 5
 
@@ -1476,13 +1333,13 @@ def log_tracking_plots(
         fig.tight_layout()
         _push(fig, key)
 
-    # ── Normalized error / squared-Mahalanobis error curve grids ──────────── #
+    # Normalized error / squared-Mahalanobis error curve grids
     _plot_error_grid(traj_error, "normalized_error", "Normalized Error", "Normalized Error")
     if traj_maha_error:
         _plot_error_grid(traj_maha_error, "normalized_maha_error",
                          "Normalized Mahalanobis Error (squared, V/V₀)", "V(t)/V(0)")
 
-    # ── Position trajectory vs reference grid ─────────────────────────────── #
+    # Position trajectory vs reference grid
     pos_items = []
     for i in traj_x:
         # `x if x else []` (or `x or []`) would raise on a numpy array — these

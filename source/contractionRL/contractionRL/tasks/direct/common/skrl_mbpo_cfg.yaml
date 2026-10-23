@@ -85,10 +85,8 @@ agent:
     wandb_kwargs:
       project: contractionRL
       name: null
-  use_state_norm: false
   use_value_norm: false
-  use_reward_norm: false
-  ensemble_size: 7
+  ensemble_size: 5
   num_elites: 5
   model_hidden:
   - 200

@@ -28,7 +28,21 @@ nc -vz 128.174.245.104 49100
 
 Seeing the scene in the streaming client verifies the video connection; a successful TCP check alone does not.
 
-## Current viewer and experiment rendering
+## Last Segway LQR comparison (stopped)
+
+The Segway renderer was stopped at the user's request to save resources. Its records are preserved. It showed `Isaac-Segway-v0` (PhysX, left) and `Isaac-Classic-Segway-v0` (analytical, right), with green reference poses and colored traces. Both used LQR with Q=I and R=I and preserved the registered Segway task settings: initial position in [-2,2] m, pitch magnitude in [0.65,0.78] rad, the configured shared-sign velocity/pitch-rate sampling, disturbance scales [0,0,0.05,0.05], applied control bounds [-48,48], and 60-second episodes. The default 16 parallel environments ran; the camera showed the first of each backend. The analytical display offset was visual only.
+
+The PhysX LQR uses a local control-affine model measured from nominal PhysX substeps around the upright reference. The analytical LQR uses exact dynamics. No policy or neural model is trained. Source hashes, launch settings, local-model validation, playback states and screenshots are under `experiments/local_rendering/20261021T202708Z-segway-lqr-backend-comparison/`. Fully quit and reopen the Mac streaming client, then reconnect to `128.174.245.104:49100`; UDP video remains on port 47998.
+
+## Previous Car-v0 LQR comparison
+
+The previous Car stream showed `Isaac-Car-v0` (PhysX, blue, left) and `Isaac-Classic-Car-v0` (analytical, orange, right) in one Isaac scene. Each has a green reference path and a colored traveled path. The scene labels identify the backends; viewport buttons focus either car or both. Both use LQR with Q=I and R=I and seed 42. Both retain the user's established playback settings: independent position errors sampled uniformly from [-10,-5] or [5,10] m with equally likely signs, yaw error uniform in [-1,1] rad, speed error uniform in [-0.5,0.5] m/s, and heading-rate/acceleration disturbance bounds of 0.1 rad/s and 0.2 m/s². These settings come from the saved signed-offset playback configuration; the shared environment source is unchanged. The temporary fixed 3 m and smaller-default playback attempts were incorrect and have been superseded, with their records preserved.
+
+The analytical controller linearizes its exact equations. The PhysX controller linearizes a control-affine `NeuralDynamics` model fitted to nominal PhysX transitions, with separate held-out state groups. No RL policy is trained. Reference trajectories use the same generator with backend-specific rollouts.
+
+The launch, model, validation results and screenshots are recorded under `experiments/local_rendering/20261021T195417Z-car-lqr-backend-comparison/`; `attempt02/` preserves the final Car display settings. The Car viewer was stopped when the user requested Segway; its configuration and results remain available.
+
+## Earlier viewer sessions
 
 The initial connection test used Isaac Lab's installed `scripts/tutorials/00_sim/launch_app.py` demo. It has been replaced with continuous C2RL-PPO car playback using the completed 500,000-step checkpoint from sweep run `wncagd2n`. Its command, checkpoint, configuration, PID, and log are recorded under `experiments/local_rendering/20261019T204142Z-c2rl-ppo-car/`. The simulation uses analytical car dynamics rendered in Isaac: the blue body is the car and the green sphere is its reference. Playback uses the deterministic policy mean, without training, and continues across episode resets.
 
@@ -42,6 +56,6 @@ The previous 3 m-gap playback is recorded under `experiments/local_rendering/202
 
 The previous rectangular-offset playback is recorded under `experiments/local_rendering/20261019T211421Z-car-offset-box-gusts/`.
 
-The active playback uses `--viewer_initial_offset_signed_range 5 10 --viewer_disturbance_bounds 0.1 0.2`: each of the x and y initial position errors independently samples a magnitude uniformly in [5,10] m and an equally likely positive or negative sign. Each coordinate therefore samples uniformly from the union [-10,-5] and [5,10] m, with equal probability for the two intervals. Heading-rate and acceleration gust bounds are 0.1 rad/s and 0.2 m/s². Its records are under `experiments/local_rendering/20261019T211905Z-car-independent-signed-offsets/`; prior viewers were stopped and their records retained.
+The earlier signed-offset playback used `--viewer_initial_offset_signed_range 5 10 --viewer_disturbance_bounds 0.1 0.2`: each of the x and y initial position errors independently samples a magnitude uniformly in [5,10] m and an equally likely positive or negative sign. Each coordinate therefore samples uniformly from the union [-10,-5] and [5,10] m, with equal probability for the two intervals. Heading-rate and acceleration gust bounds are 0.1 rad/s and 0.2 m/s². Its records are under `experiments/local_rendering/20261019T211905Z-car-independent-signed-offsets/`; prior viewers were stopped and their records retained.
 
 [NVIDIA's Isaac Sim 5.1 streaming instructions](https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/manual_livestream_clients.html)

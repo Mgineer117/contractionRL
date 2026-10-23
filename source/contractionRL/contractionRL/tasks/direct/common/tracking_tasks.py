@@ -1,18 +1,18 @@
-"""Register paired tracking tasks without importing the Isaac runtime."""
+"""Register Isaac tracking tasks and construct their internal analytical plants."""
 
-import warnings
+from importlib import import_module
 
-warnings.filterwarnings("ignore", message=r".*classic-car-v0 is out of date.*", category=DeprecationWarning)
+from ..Classic import isaac_classic_car, isaac_classic_car_v1, isaac_classic_quadrotor, isaac_classic_cartpole, isaac_classic_segway  # noqa: F401
+from ..PhyX.mobile_robots import isaac_car, isaac_car_v1, isaac_quadrotor, isaac_cartpole, isaac_segway  # noqa: F401
 
-from .. import isaac_classic_car, isaac_car  # noqa: E402,F401
-from .. import isaac_classic_car_v1, isaac_car_v1  # noqa: E402,F401
-from .. import isaac_classic_quadrotor, isaac_quadrotor  # noqa: E402,F401
-from .. import isaac_classic_cartpole, isaac_cartpole  # noqa: E402,F401
-from .. import isaac_classic_segway, isaac_segway  # noqa: E402,F401
-
-ENV_IDS = {"car_v1": "classic-car-v1"}
+_PLANTS = {"car": "CarEnv", "car_v1": "CarV1Env", "cartpole": "CartPoleEnv", "segway": "SegwayEnv", "quadrotor": "QuadrotorEnv"}
 
 
-def env_id(name: str) -> str:
-    """Resolve a plant short name to its CPU-only analytical task ID."""
-    return ENV_IDS.get(name, f"classic-{name}-v0")
+def make_analytical_plant(name, **kwargs):
+    """Construct a plant directly; standalone CPU Gym environments are not registered."""
+    name = name.removeprefix("Isaac-Classic-").removeprefix("classic-")
+    name = "car_v1" if name.lower() == "car-v1" else name.removesuffix("-v0").lower()
+    if name not in _PLANTS:
+        raise ValueError(f"Unknown analytical plant: {name}")
+    module = import_module(f"contractionRL.tasks.direct.Classic.isaac_classic_{name}.dynamics")
+    return getattr(module, _PLANTS[name])(**kwargs)

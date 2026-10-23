@@ -1,0 +1,24 @@
+models:
+  dynamics:
+    class: NeuralDynamics
+    network:
+    - name: net
+      input: STATE_ACTION
+      layers: [128, 128]
+      activations: [tanh, elu, relu, leaky_relu, gelu]  # Distinct fixed activation per ensemble member.
+empirical_dynamics:
+  dynamics_ensemble_size: 5  # Independently initialized, bootstrap-fitted Gaussian models.
+  ood_penalty_coef: 1.0  # MOPO reward deduction; 0 disables it.
+  dataset_mode: reference  # reference: disturbed reference rollouts; uniform: random realizable states/controls.
+  num_controls_per_state: 4  # Used only by uniform collection; must divide emp_dynamics_memory_size.
+  dynamics_lr: 0.001
+  dynamics_lr_scheduler: StepLR
+  dynamics_lr_scheduler_kwargs:
+    step_size: 1
+    gamma: 0.999
+  dynamics_batch_size: 4096
+  dynamics_pretrain_epochs: 100
+  dynamics_pretrain_data_path: ''  # Empty collects fresh PhysX data before training.
+  emp_dynamics_memory_size: 100000
+  dynamics_val_frac: 0.1
+  dynamics_early_stop_patience: 10

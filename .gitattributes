@@ -13,5 +13,5 @@
 
 *.bat text eol=crlf
 
-source/contractionRL/contractionRL/tasks/direct/isaac_cartpole/assets/cartpole.usda -filter diff merge=text text
-source/contractionRL/contractionRL/tasks/direct/isaac_segway/assets/segway.usda -filter diff merge=text text
+source/contractionRL/contractionRL/tasks/direct/PhyX/mobile_robots/isaac_cartpole/assets/cartpole.usda -filter diff merge=text text
+source/contractionRL/contractionRL/tasks/direct/PhyX/mobile_robots/isaac_segway/assets/segway.usda -filter diff merge=text text

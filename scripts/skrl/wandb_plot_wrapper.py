@@ -4,30 +4,11 @@ import numpy as np
 
 
 class WandbPlotWrapper:
-    """
-    Gym wrapper that periodically pushes train/normalized_error and
-    train/path_tracking trajectory curves to wandb.
-
-    Plot data is read directly from the inner StatManagerEnvWrapper's
-    already-validated buffer (`trajectories()` / `_compute_count`) instead of
-    being independently re-derived here — StatManagerEnvWrapper anchors e(0)
-    at the true reset, sqrt's classic BaseEnv's squared "tracking_error", and
-    produces exactly `max_episode_length`-long curves (no extra post-episode
-    transition point), so reusing it sidesteps that whole class of bugs
-    rather than re-solving it a second time in this wrapper.
-    """
+    """Publish tracking curves from the validated StatManagerEnvWrapper buffers."""
     def __init__(self, env, total_timesteps=None, num_plots=10):
         self.env = env
         self.num_envs = getattr(env, "num_envs", 1)
-        # Plot cadence is measured in `.step()` calls (== the trainer's "timesteps"/
-        # "global_step" unit, i.e. Not multiplied by num_envs), so it scales with an
-        # env's actual episode length instead of a fixed episode count. The previous
-        # "every 50 completed episodes" default silently never fired for any run
-        # whose (timesteps / episode_len) never reached a multiple of 50 — e.g. a
-        # 30000-timestep run of a 500-step-episode classic env completes only ~60
-        # episodes total, so it produced at most a single plot (or none, for longer-
-        # episode Isaac path-tracking envs). Spacing plots evenly across the whole
-        # run guarantees ~num_plots of them regardless of episode length.
+        # Space plots by vector step calls, independently of episode length.
         self._step_calls = 0
         self._plot_freq_steps = max(1, int(total_timesteps) // num_plots) if total_timesteps else 1000
         self._last_plot_call = -self._plot_freq_steps
@@ -55,12 +36,7 @@ class WandbPlotWrapper:
                 self._last_plot_call = self._step_calls
             self._last_compute_count = compute_count
 
-        # Lift "log" dicts so Skrl's trainer can log them natively.
-        # SyncVectorEnv structures info differently depending on autoreset mode:
-        #   NEXT_STEP (default): no "final_info"; per-env "log" dicts are flattened
-        #       by _add_info into info["log"] = {metric_key: np.array(num_envs)}
-        #       with a boolean mask info["_log"] indicating which envs have data.
-        #   SAME_STEP: info["final_info"] is a tuple of per-env dicts (or None).
+        # Lift SyncVectorEnv logs for both NEXT_STEP and SAME_STEP autoreset layouts.
         device = getattr(self.env, "device", "cpu")
         lifted = False
 
@@ -92,14 +68,7 @@ class WandbPlotWrapper:
                     info["log"] = new_log
                     lifted = True
 
-        # --- Format 2: SAME_STEP autoreset (final_info is a tuple/list/ndarray) ---
-        # gymnasium's SyncVectorEnv._add_info funnels "final_info" through the
-        # Same generic per-key aggregation as every other info key: since each
-        # env's `info["final_info"]` value is a `dict`, `_init_info_arrays`
-        # allocates an object-DTYPE NUMPY array (`np.zeros(num_envs, dtype=object)`),
-        # not a tuple/list — checking only (tuple, list) silently skipped this
-        # branch on gymnasium>=0.29's SyncVectorEnv, so no Stability/* from
-        # classic envs' terminal info dict ever reached wandb.
+        # SAME_STEP final_info may be an object array as well as a tuple/list.
         if not lifted and "final_info" in info:
             final_info = info["final_info"]
             if isinstance(final_info, (tuple, list, np.ndarray)):
@@ -143,15 +112,7 @@ class WandbPlotWrapper:
         traj_x, traj_xref, traj_err = self.env.trajectories()
         if not traj_err:
             return
-        # trajectories() is keyed by buffer slot (up to num_envs_for_eval,
-        # e.g. 64). Log all slots that actually recorded an episode — the plotter
-        # lays them out as ceil(n/5) subplots, 5 curves each. Unused slots still
-        # carry a full-length all-zero error row in traj_err but an empty traj_x
-        # list, so they are filtered here (gating on non-empty traj_x) — that
-        # both drops flat placeholder lines and keeps every figure
-        # (normalized_error / normalized_maha_error / path_tracking) on the same
-        # env set and ordering.
-        # len(), not truthiness — a numpy array raises on `if arr`.
+        # Filter unused buffer slots; arrays require len() rather than truth testing.
         plot_keys = sorted(k for k in traj_err
                            if traj_x.get(k) is not None and len(traj_x[k]) > 0)
         if not plot_keys:

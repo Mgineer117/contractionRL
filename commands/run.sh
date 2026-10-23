@@ -86,8 +86,8 @@ _success "Mode: ${C_BOLD}$MODE${C_RESET}"
 ALL_ALGOS=(ppo sac c3m lqr sdlqr cvstem-lqr c2rl-ppo c2rl-sac)
 ALGO_ARG=$(prompt_choice "Algorithm to run (or 'all'):" "${ALL_ALGOS[@]}" all)
 
-CLASSIC_ENVS=(classic-car-v0 classic-car-v1 classic-cartpole-v0 classic-segway-v0 classic-quadrotor-v0)
-ISAAC_ENVS=(Humanoid-PathTracking-v0 Humanoid-VelTracking-v0 Manipulator-PathTracking-v0 Manipulator-VelTracking-v0 Quadruped-PathTracking-v0 Quadruped-VelTracking-v0 "Isaac-Car-v0" "Isaac-Car-v1" "Isaac-Quadrotor-v0")
+CLASSIC_ENVS=(Isaac-Classic-Car-v0 Isaac-Classic-Car-v1 Isaac-Classic-Cartpole-v0 Isaac-Classic-Segway-v0 Isaac-Classic-Quadrotor-v0)
+ISAAC_ENVS=(Isaac-Transfer-path-Humanoid-v0 Isaac-Transfer-vel-Humanoid-v0 Isaac-Transfer-path-Manipulator-v0 Isaac-Transfer-vel-Manipulator-v0 Isaac-Transfer-path-Quadruped-v0 Isaac-Transfer-vel-Quadruped-v0 "Isaac-Car-v0" "Isaac-Car-v1" "Isaac-Quadrotor-v0")
 ENV_ARG=$(prompt_choice "Env (or 'all' for every classic env):" \
     car cartpole segway quadrotor "${ISAAC_ENVS[@]}" all)
 
@@ -151,10 +151,10 @@ if [[ "$ENV_ARG" == "all" ]]; then
     ENVS=("${CLASSIC_ENVS[@]}")
 else
     case "$ENV_ARG" in
-        car)       ENVS=(classic-car-v0) ;;
-        cartpole)  ENVS=(classic-cartpole-v0) ;;
-        segway)    ENVS=(classic-segway-v0) ;;
-        quadrotor) ENVS=(classic-quadrotor-v0) ;;
+        car)       ENVS=(Isaac-Classic-Car-v0) ;;
+        cartpole)  ENVS=(Isaac-Classic-Cartpole-v0) ;;
+        segway)    ENVS=(Isaac-Classic-Segway-v0) ;;
+        quadrotor) ENVS=(Isaac-Classic-Quadrotor-v0) ;;
         *)         ENVS=("$ENV_ARG") ;;
     esac
 fi
@@ -269,7 +269,6 @@ SEEDS=(${SEEDS[*]})
 
 gpu_i=0
 for ENV in "\${ENVS[@]}"; do
-    CLASSIC_FLAG=""; [[ "\$ENV" == classic-* ]] && CLASSIC_FLAG="--classic"
     for ALGO in "\${ALGOS[@]}"; do
         for SEED in "\${SEEDS[@]}"; do
             GPU="\${JOB_GPUS[\$(( gpu_i % NG ))]}"; gpu_i=\$(( gpu_i + 1 ))
@@ -277,7 +276,7 @@ for ENV in "\${ENVS[@]}"; do
             echo "[\$(date '+%F %T')] \$ENV / \$ALGO / seed \$SEED  (GPU \$GPU)"
             (
                 CUDA_VISIBLE_DEVICES=\$GPU python scripts/skrl/train.py \\
-                    \$CLASSIC_FLAG --task "\$ENV" --algorithm "\$ALGO" --seed "\$SEED" \\
+                    --task "\$ENV" --algorithm "\$ALGO" --seed "\$SEED" \\
                     ${NUM_TIMESTEPS:+--num_timesteps $NUM_TIMESTEPS} ${EXTRA} \\
                     > "\$RUN_LOG" 2>&1
                 echo "\$?" > "\$RUN_LOG.status"

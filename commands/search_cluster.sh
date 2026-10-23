@@ -36,7 +36,7 @@
 #   ./commands/search_cluster.sh                                   # fully interactive
 #   ./commands/search_cluster.sh --algorithm c2rl-sac-cvstem --env car \
 #       --partition gpu --num-jobs 4 --gpus-per-job 1 --time 12:00:00 -y
-#   ./commands/search_cluster.sh --stop c2rl-sac-cvstem_classic-car-v0_20260722_120000
+#   ./commands/search_cluster.sh --stop c2rl-sac-cvstem_Isaac-Classic-Car-v0_20260722_120000
 #
 # Flags (all optional; anything omitted is prompted for):
 #   --algorithm NAME     a stem in search/configs/ (e.g. ppo, c2rl-sac-cvstem)
@@ -213,8 +213,8 @@ _header "contractionRL cluster sweep launcher"
 _success "Algorithm: ${C_BOLD}$ALGORITHM${C_RESET}"
 
 # ── Env ───────────────────────────────────────────────────────────────────── #
-CLASSIC_ENVS=("classic-car-v0" "classic-car-v1" "classic-cartpole-v0" "classic-segway-v0" "classic-quadrotor-v0")
-ISAAC_ENVS=("Humanoid-PathTracking-v0" "Humanoid-VelTracking-v0" "Manipulator-PathTracking-v0" "Manipulator-VelTracking-v0" "Quadruped-PathTracking-v0" "Quadruped-VelTracking-v0" "Isaac-Car-v0" "Isaac-Car-v1" "Isaac-Quadrotor-v0")
+CLASSIC_ENVS=("Isaac-Classic-Car-v0" "Isaac-Classic-Car-v1" "Isaac-Classic-Cartpole-v0" "Isaac-Classic-Segway-v0" "Isaac-Classic-Quadrotor-v0")
+ISAAC_ENVS=("Isaac-Transfer-path-Humanoid-v0" "Isaac-Transfer-vel-Humanoid-v0" "Isaac-Transfer-path-Manipulator-v0" "Isaac-Transfer-vel-Manipulator-v0" "Isaac-Transfer-path-Quadruped-v0" "Isaac-Transfer-vel-Quadruped-v0" "Isaac-Car-v0" "Isaac-Car-v1" "Isaac-Quadrotor-v0")
 if [[ -z "$ENV_ARG" ]]; then
     ENV_ARG=$(prompt_choice "Select env to sweep (or 'all' for every classic env):" \
         car cartpole segway quadrotor "${ISAAC_ENVS[@]}" all)
@@ -223,11 +223,11 @@ if [[ "$ENV_ARG" == "all" ]]; then
     ENVS=("${CLASSIC_ENVS[@]}")
 else
     case "$ENV_ARG" in
-        car|classic-car-v0)             ENVS=("classic-car-v0") ;;
-        car_v1|classic-car-v1)   ENVS=("classic-car-v1") ;;
-        cartpole|classic-cartpole-v0)   ENVS=("classic-cartpole-v0") ;;
-        segway|classic-segway-v0)       ENVS=("classic-segway-v0") ;;
-        quadrotor|classic-quadrotor-v0) ENVS=("classic-quadrotor-v0") ;;
+        car|Isaac-Classic-Car-v0)             ENVS=("Isaac-Classic-Car-v0") ;;
+        car_v1|Isaac-Classic-Car-v1)   ENVS=("Isaac-Classic-Car-v1") ;;
+        cartpole|Isaac-Classic-Cartpole-v0)   ENVS=("Isaac-Classic-Cartpole-v0") ;;
+        segway|Isaac-Classic-Segway-v0)       ENVS=("Isaac-Classic-Segway-v0") ;;
+        quadrotor|Isaac-Classic-Quadrotor-v0) ENVS=("Isaac-Classic-Quadrotor-v0") ;;
         *)
             _found=0; for e in "${ISAAC_ENVS[@]}"; do [[ "$e" == "$ENV_ARG" ]] && _found=1; done
             [[ "$_found" -ne 1 ]] && { _error "Unknown env '$ENV_ARG'."; exit 1; }
@@ -535,7 +535,6 @@ cfg = yaml.safe_load((pathlib.Path("search/configs")/f"{algo}.yaml").read_text()
 print(cfg["algorithm"], int(cfg["num_envs"]))
 PY
 )
-    CLASSIC_FLAG=""; [[ "$PROBE_ENV" == classic-* ]] && CLASSIC_FLAG="--classic"
     PROBE_LOG="${ENV_LOGDIR[${ENVS[0]}]}/probe.log"
     # The probe body runs on the compute node: launch one training run in the
     # background, poll for ~120s recording the max GPU memory used by the run's
@@ -551,7 +550,7 @@ PY
             set -uo pipefail
             cd "'"$REPO_DIR"'"
             '"${ACTIVATE:+$ACTIVATE;}"'
-            python scripts/skrl/train.py '"$CLASSIC_FLAG"' \
+            python scripts/skrl/train.py \
                 --task "'"$PROBE_ENV"'" --algorithm "'"$PROBE_ALGO"'" \
                 --num_envs "'"$NUM_ENVS"'" --skip_final_eval \
                 > "'"$PROBE_LOG"'" 2>&1 &

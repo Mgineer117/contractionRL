@@ -3,7 +3,7 @@
 def dynamics_backend_for_task(task):
     """The registered task determines transitions; no algorithm setting can override it."""
     name = str(task).split(':')[-1]
-    return 'analytical' if name.startswith(('classic-', 'Isaac-Classic-')) else 'physx'
+    return 'analytical' if name.startswith('Isaac-Classic-') else 'physx'
 
 
 def configure_backend(cfg, *, task):

@@ -190,20 +190,6 @@ def loss_pos_matrix_random_sampling(A: torch.Tensor, num_samples: int = 1024) ->
     return torch.zeros((), device=device, dtype=dtype, requires_grad=True)
 
 
-def loss_pos_matrix_eigen(A: torch.Tensor, reg: bool = True):
-    """PD loss via eigenvalues: relu(-λ).sum() → (loss, reg_loss)."""
-    device = A.device
-    if device.type == "mps":
-        lambdas = torch.linalg.eigvalsh(A.cpu()).to(device)
-    else:
-        lambdas = torch.linalg.eigvalsh(A)
-    loss_eigen = torch.relu(-lambdas).sum(dim=-1).mean()
-    loss_reg = torch.zeros(1, device=device, dtype=A.dtype)
-    if reg:
-        loss_reg = loss_reg + torch.relu(lambdas[:, -1] - 500).mean()
-    return loss_eigen, loss_reg
-
-
 def build_lr_scheduler(optimizer: torch.optim.Optimizer, name: str, kwargs: dict | None = None):
     """Instantiate a ``torch.optim.lr_scheduler`` by class name, or ``None`` if ``name`` is falsy.
 

@@ -1,0 +1,81 @@
+extends: dynamics_cfg.yaml
+seed: 42
+models:
+  encoder:
+    feature_dim: null  # null defaults to 3 * x_dim per GRU.
+    encoder_window: null  # null uses ceil(1 / (1 - discount_factor)) steps for each past/future window.
+  separate: true
+  policy:
+    encoder: null  # No GRU; use gru to encode past and future context.
+    class: GaussianMixin
+    clip_actions: false
+    clip_log_std: true
+    min_log_std: -4.605
+    max_log_std: 2.0
+    network:
+    - name: net
+      input: OBSERVATIONS
+      layers: [256, 256]
+      activations: relu
+    output: ACTIONS
+  critic_1:
+    encoder: gru  # Separate GRUs encode past and future context.
+    class: DeterministicMixin
+    network:
+    - name: net
+      input: concatenate([OBSERVATIONS, ACTIONS])
+      layers: [256, 256]
+      activations: relu
+    output: ONE
+  critic_2:
+    class: DeterministicMixin
+    network:
+    - name: net
+      input: concatenate([OBSERVATIONS, ACTIONS])
+      layers: [256, 256]
+      activations: relu
+    output: ONE
+  target_critic_1:
+    class: DeterministicMixin
+    network:
+    - name: net
+      input: concatenate([OBSERVATIONS, ACTIONS])
+      layers: [256, 256]
+      activations: relu
+    output: ONE
+  target_critic_2:
+    class: DeterministicMixin
+    network:
+    - name: net
+      input: concatenate([OBSERVATIONS, ACTIONS])
+      layers: [256, 256]
+      activations: relu
+    output: ONE
+memory:
+  class: RandomMemory
+  memory_size: 244
+agent:
+  class: SAC
+  gradient_steps: 32
+  batch_size: 8192
+  discount_factor: 0.99
+  polyak: 0.005
+  learning_rate: 1.0e-5
+  learn_entropy: true
+  initial_entropy_value: 0.2
+  random_timesteps: 80
+  learning_starts: 80
+  grad_norm_clip: 0.5
+  experiment:
+    directory: manipulator_path_tracking_sac
+    experiment_name: ''
+    write_interval: auto
+    checkpoint_interval: auto
+    wandb: true
+    wandb_kwargs:
+      project: contractionRL
+      name:
+trainer:
+  class: SequentialTrainer
+  timesteps: 30000
+  environment_info: log

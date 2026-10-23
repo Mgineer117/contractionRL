@@ -4,7 +4,6 @@ The markers carry no contact/rigid-body dynamics. The classic environment owns
 the plant; PhysX advances the scene clock without changing the plant's state.
 """
 
-import gymnasium as gym
 import torch
 
 import isaaclab.sim as sim_utils
@@ -16,11 +15,12 @@ from contractionRL.tasks.direct.common.isaac.physx_model import quadrotor_quat
 
 def make_task_plant(cfg, *, transition_backend=None, defer_reset=False):
     if cfg.reference_mode != "stabilizing":
-        raise ValueError("Paired Isaac tasks support reference_mode=stabilizing; contractive migration requires a pure classic task")
+        raise ValueError("Paired Isaac tasks support reference_mode=stabilizing")
     task_kwargs = {key: getattr(cfg, key) for key in (
         "xe_init_min", "xe_init_max", "xe_init_sign_dims", "reference_feedback_gain", "ref_pool_size"
     ) if hasattr(cfg, key)}
-    return gym.make(
+    from ..tracking_tasks import make_analytical_plant
+    return make_analytical_plant(
         cfg.classic_task, num_envs=cfg.scene.num_envs, device=cfg.sim.device,
         reference_mode=cfg.reference_mode, compact_reference=True,
         disturbance_scales=(getattr(cfg, "disturbance_scales", None)
@@ -28,7 +28,7 @@ def make_task_plant(cfg, *, transition_backend=None, defer_reset=False):
                             else [0.] * len(cfg.disturbance_scales)),
         reference_margin_fraction=getattr(cfg, "reference_margin_fraction", .05),
         transition_backend=transition_backend, defer_reset=defer_reset, **task_kwargs,
-    ).unwrapped
+    )
 
 
 class ClassicIsaacEnv(DirectRLEnv):

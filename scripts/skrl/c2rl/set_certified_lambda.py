@@ -75,7 +75,7 @@ def main() -> int:
     if args.w_ub is not None:
         vals["w_ub"] = f"{args.w_ub:g}"
 
-    base = os.path.join(DIRECT, f"isaac_classic_{args.env}", "agents")
+    base = os.path.join(DIRECT, "Classic", f"isaac_classic_{args.env}", "agents")
     if not os.path.isdir(base):
         print(f"no such env: {base}", file=sys.stderr)
         return 2

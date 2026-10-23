@@ -18,7 +18,7 @@ records a poison metric value on an infeasible SDP rather than leaving a
 metric-less run the sweep controller would ignore (see that file's docstring).
 
 Usage:
-    python search/build_sweep.py --algorithm cvstem-lqr --env classic-car-v0 \
+    python search/build_sweep.py --algorithm cvstem-lqr --env Isaac-Classic-Car-v0 \
         [--method bayes] [--project NAME] [--out PATH]
 """
 
@@ -40,18 +40,7 @@ _CONFIGS = Path(__file__).resolve().parent / "configs"
 # launched from. Sweeps are told apart by their `name:` (env-algorithm) instead.
 DEFAULT_PROJECT = "contractionRL-Search"
 
-# Classic envs run through train.py's --classic route; everything else is an
-# Isaac Lab task and must not get that flag.
-CLASSIC_ENVS = (
-    "classic-car-v0",
-    # The class-III half of the car pair (v in [0.2, 2] makes the Hautus margin
-    # sigma = min(1, v) < 1). Registered here because it was added as an env
-    # without being wired into the sweep tooling, so --env rejected it outright.
-    "classic-car-v1",
-    "classic-cartpole-v0",
-    "classic-segway-v0",
-    "classic-quadrotor-v0",
-)
+CLASSIC_ENVS = ()
 ISAACLAB_ENVS = (
     "Isaac-Classic-Car-v0",
     "Isaac-Classic-Car-v1",
@@ -60,12 +49,12 @@ ISAACLAB_ENVS = (
     "Isaac-Classic-Segway-v0",
     "Isaac-Cartpole-v0",
     "Isaac-Segway-v0",
-    "Humanoid-PathTracking-v0",
-    "Humanoid-VelTracking-v0",
-    "Manipulator-PathTracking-v0",
-    "Manipulator-VelTracking-v0",
-    "Quadruped-PathTracking-v0",
-    "Quadruped-VelTracking-v0",
+    "Isaac-Transfer-path-Humanoid-v0",
+    "Isaac-Transfer-vel-Humanoid-v0",
+    "Isaac-Transfer-path-Manipulator-v0",
+    "Isaac-Transfer-vel-Manipulator-v0",
+    "Isaac-Transfer-path-Quadruped-v0",
+    "Isaac-Transfer-vel-Quadruped-v0",
     "Isaac-Car-v0",
     "Isaac-Car-v1",
     "Isaac-Quadrotor-v0",
@@ -191,7 +180,7 @@ def episode_length(env: str) -> int:
     # where the generated yaml goes under `--out -`. Redirect the import's
     # output to stderr so the yaml on stdout is always parseable.
     with contextlib.redirect_stdout(sys.stderr):
-        mod = importlib.import_module(f"contractionRL.tasks.direct.isaac_classic_{name}.dynamics")
+        mod = importlib.import_module(f"contractionRL.tasks.direct.Classic.isaac_classic_{name}.dynamics")
     cfg = mod.ENV_CONFIG
     return round(cfg["time_bound"] / cfg["dt"])
 
@@ -208,8 +197,6 @@ def build(algorithm: str, env: str, *, method: str, project: str) -> dict:
         program = "scripts/skrl/train.py"
         command = ["${env}", "python", "${program}"]
 
-    if is_classic:
-        command.append("--classic")
     command += [
         "--task", env,
         "--algorithm", str(cfg["algorithm"]),

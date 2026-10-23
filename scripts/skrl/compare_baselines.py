@@ -11,7 +11,6 @@ sys.path.insert(0, str(ROOT/'source/contractionRL'))
 import gymnasium as gym
 import numpy as np
 import torch
-import yaml
 from contractionRL.agents.utils.RL.config import load_agent_config
 import contractionRL.tasks.direct.common.tracking_tasks
 from contractionRL.agents.skrl.contraction_ppo import ContractionPPOPolicy
@@ -37,10 +36,6 @@ def load_actor(env, path):
                                      control_mode=spec.get('control_mode', 'structured'),
                                      encoder=spec.get('encoder') or 'mlp', feature_dim=cfg.get('models', {}).get('encoder', {}).get('feature_dim'))
     state = torch.load(path, map_location='cpu', weights_only=False)
-    if cfg['agent'].get('use_state_norm', False):
-        from contractionRL.agents.utils.RL.env import RunningFeatureScaler
-        model = getattr(actor, 'cl_actor', actor)
-        model.feature_scaler = RunningFeatureScaler(model.tracking_features.output_dim)
     actor.load_state_dict(state['policy'])
     actor.eval()
     return actor
@@ -87,6 +82,7 @@ def evaluate(env, actor, bank):
 
 @torch.no_grad()
 def compare(manifest, checkpoint, output):
+    from contractionRL.tasks.direct.common.tracking_tasks import make_analytical_plant
     entry = json.loads(Path(manifest).read_text())
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
@@ -94,7 +90,7 @@ def compare(manifest, checkpoint, output):
     with np.load(bank_path) as loaded:
         bank = {k: loaded[k].copy() for k in loaded.files}
     n = len(bank['x0'])
-    env = gym.make('classic-car-v0', num_envs=n, device='cpu', disturbance_scales=[0.]*4).unwrapped
+    env = make_analytical_plant('classic-car-v0', num_envs=n, device='cpu', disturbance_scales=[0.]*4).unwrapped
     install_bank(env, bank)
     paths = dict(entry['previous_checkpoints'])
     paths['contraction_ppo'] = {'checkpoint': str(Path(checkpoint).resolve()),

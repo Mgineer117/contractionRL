@@ -16,7 +16,18 @@ import tqdm as _tqdm
 from contractionRL.agents.utils.RL.networks import MLP, _ACT_MAP
 from contractionRL.agents.utils.contraction.math_utils import EarlyStopper, train_val_split
 from contractionRL.agents.utils.system_dynamics.state import StateSymmetry, embed_angles, embedded_dim
-from contractionRL.agents.utils.system_dynamics.state import wrap_diff
+
+
+class ErfActivation(nn.Module):
+    def forward(self, x):
+        return torch.erf(x)
+
+
+RAF_ACTIVATIONS = ("tanh", "elu", "relu", "leaky_relu", "gelu")
+_DYNAMICS_ACT_MAP = _ACT_MAP | {
+    "gelu": nn.GELU, "softsign": nn.Softsign, "silu": nn.SiLU,
+    "selu": nn.SELU, "erf": ErfActivation, "identity": nn.Identity,
+}
 
 
 def dynamics_environment_metadata(env) -> dict:
@@ -182,46 +193,6 @@ def load_offline_dynamics_data(data_path: str, tag: str = "", *, require_disturb
         result["trajectory_id"] = groups.reshape(-1).copy()
     npz.close()
     return result
-
-
-def load_offline_trajectories(data_path: str, tag: str = "") -> dict:
-    """Load an offline ``dynamics_data.npz`` without flattening — returns
-    trajectory-structured ``x`` ``(N, T, x_dim)`` and each trajectory's valid
-    length ``lengths`` ``(N,)``, preserving both the within- and
-    across-trajectory order/boundaries that ``load_offline_dynamics_data``
-    intentionally discards (that loader exists for i.i.d. NeuralDynamics
-    fitting, not for a temporal material-derivative term).
-
-    Used by ``ncm_synthesis.build_cm_dataset``'s ``cm_wdot_trajectory=True``
-    path (see ``C2RLAgent.synthesize_cmg`` / ``c2rl.py``'s ``cm_wdot_trajectory``
-    docstring) to thread a real ``Ẇ ≈ (W̄_t − W̄_{t−1})/dt`` through the CV-STEM
-    SDP using the actual previous state of the same reference trajectory,
-    instead of dropping ``Ẇ`` or using Tsukamoto's static ``(W̄-I)/dt`` proxy.
-
-    Raises if the file has no ``lengths`` array — that means it isn't a
-    trajectory-structured ``dynamics_data.npz`` (see
-    ``scripts/skrl/train.py``'s ``_generate_ref_trajs``), so there is no way
-    to recover per-trajectory boundaries from it. Filters out whole episodes
-    containing any NaN, same as ``load_offline_dynamics_data``.
-    """
-    print(f"{tag} Loading offline reference trajectories from {data_path}")
-    npz = np.load(data_path)
-    if str(npz.get("coordinate_frame", "world")) != "world":
-        raise ValueError("Dynamics training requires world-coordinate data; use the archive's original source for other frames")
-    if "lengths" not in npz:
-        raise ValueError(
-            f"{tag} {data_path} has no 'lengths' array — it isn't a trajectory-structured "
-            f"dynamics_data.npz (see scripts/skrl/train.py's _generate_ref_trajs), so "
-            f"cm_wdot_trajectory can't recover per-trajectory boundaries from it."
-        )
-    x = npz["x"]
-    lengths = npz["lengths"]
-    nan_mask = np.isnan(x).any(axis=(1, 2))
-    if nan_mask.any():
-        print(f"{tag} WARNING: Found NaNs in {nan_mask.sum()} offline episodes! Filtering them out...")
-        x = x[~nan_mask]
-        lengths = lengths[~nan_mask]
-    return {"x": x.astype(np.float32), "lengths": lengths.astype(np.int64)}
 
 
 def pretrain_dynamics(agent, *, epochs: int, data_path: str | None,
@@ -434,7 +405,9 @@ class NeuralDynamics(nn.Module):
         self.nominal_dynamics = nominal_dynamics
         self.transition_metadata = {}
 
-        act = _ACT_MAP[activation.lower()]()
+        if not isinstance(activation, str) or activation.lower() not in _DYNAMICS_ACT_MAP:
+            raise ValueError(f"Unsupported dynamics activation: {activation!r}")
+        act = _DYNAMICS_ACT_MAP[activation.lower()]()
         # Nets see the continuous embedding of x's angle dims; f/B are still
         # shaped/indexed by the raw x_dim (outputs are raw-coordinate ẋ / rows).
         emb_dim = (sym.single_dim() if sym is not None else embedded_dim(x_dim, self.angle_idx))
@@ -444,7 +417,7 @@ class NeuralDynamics(nn.Module):
         self.register_buffer("disturbance_fitted", torch.tensor(False))
         self.to(self.device)
 
-    def get_f_and_B(self, x: torch.Tensor):
+    def get_f_and_B(self, x: torch.Tensor, *, need_null=True):
         """Return (f, B, B_null) — autodiff-compatible for C3M Jacobians."""
         if self.nominal_dynamics is not None:
             return self.nominal_dynamics(x)
@@ -456,7 +429,7 @@ class NeuralDynamics(nn.Module):
         x_emb = (self.sym.single_features(x) if self.sym is not None else embed_angles(x, self.angle_idx))
         f = self.f_net(x_emb)
         B = self.B_net(x_emb).reshape(-1, self.x_dim, self.u_dim)
-        B_null = self._compute_B_null(B)
+        B_null = self._compute_B_null(B) if need_null else None
         return f, B, B_null
 
     def _compute_B_null(self, B: torch.Tensor) -> torch.Tensor:
@@ -468,7 +441,7 @@ class NeuralDynamics(nn.Module):
         return U[:, :, self.u_dim:].contiguous()
 
     def predict_x_dot(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-        f, B, _ = self.get_f_and_B(x)
+        f, B, _ = self.get_f_and_B(x, need_null=False)
         return f + (B @ u.unsqueeze(-1)).squeeze(-1)
 
     def disturbance_log_std(self, x, u):
@@ -526,7 +499,10 @@ class NeuralDynamics(nn.Module):
                 "state_names": list(getattr(self.sym, "names", ()) or ()),
                 "symmetry_mode": getattr(self.sym, "mode", None),
                 "nominal_source": "analytical" if self.nominal_dynamics is not None else "learned",
-                "disturbance_density": "zero_mean_diagonal_gaussian",
+                "disturbance_density": ("gaussian_mixture" if hasattr(self, "members")
+                                        else "zero_mean_diagonal_gaussian"),
+                "ensemble_size": getattr(self, "ensemble_size", None),
+                "member_activations": getattr(self, "member_activations", None),
                 "transition_metadata": self.checkpoint_metadata(),
                 "state_dict": self.state_dict(),
             },
@@ -555,7 +531,16 @@ class NeuralDynamics(nn.Module):
             if weight is not None:
                 candidates = (symmetry, symmetry.demote_to_translation(), symmetry.disabled())
                 symmetry = next((candidate for candidate in candidates if candidate.single_dim() == weight.shape[1]), symmetry)
-        model = cls(
+        factory = EnsembleDynamics if ckpt.get("ensemble_size") is not None else NeuralDynamics
+        ensemble_kwargs = {}
+        if factory is EnsembleDynamics:
+            activations = ckpt.get("member_activations")
+            if activations is None:
+                if not isinstance(ckpt["activation"], str):
+                    raise ValueError("Ensemble checkpoint is missing its member_activations assignment")
+                activations = [ckpt["activation"]] * ckpt["ensemble_size"]
+            ensemble_kwargs = {"ensemble_size": ckpt["ensemble_size"], "member_activations": activations}
+        model = factory(
             x_dim=ckpt["x_dim"],
             u_dim=ckpt["u_dim"],
             hidden_dim=ckpt["hidden_dim"],
@@ -564,6 +549,7 @@ class NeuralDynamics(nn.Module):
             angle_idx=ckpt.get("angle_idx", []),
             sym=symmetry,
             nominal_dynamics=nominal_dynamics,
+            **ensemble_kwargs,
         )
         model.load_state_dict(ckpt["state_dict"])
         model.transition_metadata = metadata.copy()
@@ -580,4 +566,79 @@ class NeuralDynamics(nn.Module):
         result = super().to(*args, **kwargs)
         if args and isinstance(args[0], (torch.device, str)):
             result.device = torch.device(args[0])
+        return result
+
+
+class EnsembleDynamics(NeuralDynamics):
+    """Independently initialized Gaussian models with distinct fixed activations."""
+
+    def __init__(self, x_dim, u_dim, hidden_dim=(256, 256), activation=RAF_ACTIVATIONS, device=None,
+                 angle_idx=(), sym=None, nominal_dynamics=None, *, ensemble_size=5, member_activations=None):
+        nn.Module.__init__(self)
+        if isinstance(ensemble_size, bool) or not isinstance(ensemble_size, int) or ensemble_size < 1:
+            raise ValueError("dynamics_ensemble_size must be a positive integer")
+        pool = [activation] if isinstance(activation, str) else list(activation) if isinstance(activation, (list, tuple)) else []
+        allowed = RAF_ACTIVATIONS if member_activations is None else _DYNAMICS_ACT_MAP
+        if (not pool or any(not isinstance(name, str) or name not in allowed for name in pool)
+                or len(set(pool)) != len(pool)):
+            raise ValueError("Dynamics activation pool must contain distinct supported activation names")
+        if member_activations is None:
+            if ensemble_size > len(pool):
+                raise ValueError("Dynamics activation pool needs at least dynamics_ensemble_size distinct functions")
+            order = torch.randperm(len(pool))[:ensemble_size].tolist()
+            member_activations = [pool[index] for index in order]
+        elif (not isinstance(member_activations, (list, tuple)) or len(member_activations) != ensemble_size
+              or any(name not in pool for name in member_activations)):
+            raise ValueError("Checkpoint member_activations do not match the ensemble activation pool")
+        self.member_activations = list(member_activations)
+        # Separate constructors draw independent weights from the seeded RNG; no model is cloned.
+        self.members = nn.ModuleList([
+            NeuralDynamics(x_dim, u_dim, hidden_dim, name, device, angle_idx, sym, nominal_dynamics)
+            for name in self.member_activations])
+        first = self.members[0]
+        for name in ("x_dim", "u_dim", "null_dim", "device", "angle_idx", "sym", "_hidden_dim",
+                     "_activation_str", "nominal_dynamics"):
+            setattr(self, name, getattr(first, name))
+        self.ensemble_size = ensemble_size
+        self._activation_str = activation if isinstance(activation, str) else list(activation)
+        self.transition_metadata = {}
+        self.register_buffer("disturbance_fitted", torch.tensor(False, device=self.device))
+
+    def get_f_and_B(self, x, *, need_null=True):
+        values = [member.get_f_and_B(x, need_null=False) for member in self.members]
+        f = torch.stack([value[0] for value in values]).mean(0)
+        B = torch.stack([value[1] for value in values]).mean(0)
+        return f, B, self._compute_B_null(B) if need_null else None
+
+    def member_parameters(self, x, u, member_ids):
+        means = torch.stack([member.predict_x_dot(x, u) for member in self.members])
+        stds = torch.stack([member.disturbance_log_std(x, u).exp() for member in self.members])
+        rows = torch.arange(len(x), device=x.device)
+        return means[member_ids, rows], stds[member_ids, rows]
+
+    def uncertainty(self, x, u):
+        """MOPO's max member standard-deviation norm, in derivative coordinates."""
+        return torch.stack([member.disturbance_log_std(x, u).exp().norm(dim=-1)
+                            for member in self.members]).amax(0)
+
+    def disturbance_log_std(self, x, u):
+        means = torch.stack([member.predict_x_dot(x, u) for member in self.members])
+        variances = torch.stack([(2 * member.disturbance_log_std(x, u)).exp() for member in self.members])
+        return .5 * (variances.mean(0) + means.var(0, unbiased=False)).log()
+
+    def log_prob(self, x_dot, x, u):
+        return torch.logsumexp(torch.stack([member.log_prob(x_dot, x, u) for member in self.members]), 0) - math.log(self.ensemble_size)
+
+    @torch.no_grad()
+    def sample_disturbance(self, x, u):
+        if not bool(self.disturbance_fitted):
+            raise RuntimeError("Conditional disturbance ensemble is not fitted")
+        ids = torch.randint(self.ensemble_size, (len(x),), device=x.device)
+        mean, std = self.member_parameters(x, u, ids)
+        return mean + std * torch.randn_like(x) - self.predict_x_dot(x, u)
+
+    def to(self, *args, **kwargs):
+        result = super().to(*args, **kwargs)
+        for member in result.members:
+            member.device = result.device
         return result

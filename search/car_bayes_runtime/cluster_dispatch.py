@@ -1,7 +1,7 @@
 """Submit real immediate-start GPU workers, keeping no pending experiments."""
 from pathlib import Path
 from datetime import datetime,timezone
-import json,os,re,subprocess,sys,time
+import json,re,subprocess,sys,time
 ROOT=Path(__file__).resolve().parent
 
 def save(path,value):

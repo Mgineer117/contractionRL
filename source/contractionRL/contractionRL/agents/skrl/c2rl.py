@@ -34,22 +34,14 @@ from contractionRL.agents.utils.RL.logging import pretraining_logging_enabled
 from contractionRL.agents.utils.RL.config import filter_cfg_fields, make_base_rl_cfg, migrate_c2rl_metric_cfg
 from contractionRL.agents.utils.RL.logging import metric_batch
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # Configuration
-# ─────────────────────────────────────────────────────────────────────────── #
 
-# NOTE: base_algorithm is not a field on either cfg below — it's an explicit
-# C2RLAgent constructor kwarg (see ContractionRunner._setup_c2rl), set by which
-# entry point you use (skrl_c2rl_ppo_cfg.yaml / skrl_c2rl_sac_cfg.yaml). Each
-# cfg's base-algorithm fields mirror the real skrl PPO_CFG/SAC_CFG field names
-# 1:1, so a c2rl-sac.yaml actually validates against SAC's own parameter names.
-# make_base_rl_cfg() still reads from the raw yaml dict (self._raw_cfg) and
-# filters against whichever of PPO_CFG/SAC_CFG applies, so any valid field works
-# from yaml even if not declared below.
+# base_algorithm is an explicit constructor argument, not a dataclass field.
+# Shared dynamics, metric and experiment fields also load from YAML.
 
 @dataclass
 class C2RLMetricCfg(AgentCfg):
-    action_bound_penalty_beta: float = 0.0
+    action_bound_penalty: float = 0.0
     cmg_checkpoint: str = ""
     ccm_w_ub: float = 10.0
     ccm_w_lb: float = 0.1
@@ -102,12 +94,10 @@ class C2RLPPOCfg(C2RLMetricCfg):
     kl_threshold: float = 0.0
     grad_norm_clip: float = 0.5
     time_limit_bootstrap: bool = False
-    use_state_norm: bool = False  # off by default — see module docstring / rl_glue.make_base_rl_cfg
     use_value_norm: bool = True
     use_value_expansion: bool = False
     value_expansion_horizon: int = 3
-    value_expansion_batch_size: int = 512
-    use_reward_norm: bool = False  # non-biasing running-std reward normalizer (r/std) — see rl_glue.make_base_rl_cfg
+    value_expansion_batch_size: int | None = None
     rewards_shaper_scale: float = 1.0  # yaml convenience for PPO_CFG's rewards_shaper — see rl_glue.make_base_rl_cfg
     # Set by ContractionRunner from the yaml `memory:` block's memory_size, not
     # read from `agent:` directly; declared purely so filter_cfg_fields()
@@ -116,14 +106,8 @@ class C2RLPPOCfg(C2RLMetricCfg):
     # Deployed policy's discount factor — a single policy trained against the
     # Mahalanobis reward, so there is no con/opt duality here.
     discount_factor: float = 0.99
-    # The bounded head emits M; its eigenvalues lie in [1/w_ub, 1/w_lb].
-    # "regress" (default): MSE-fit the CMG network onto the offline {x -> W*(x)}
-    # dataset. "sos": skip the fit and evaluate the SOS polynomial the dataset
-    # was generated FROM, exactly (toy envs only -- they are the only family
-    # whose certificate is a closed form). Measured on toy-mg the regression's
-    # median relative error in the deployed M is 2.5%, against 2.5e-6 for the
-    # polynomial; the offline V* solve uses the same M, so a mismatch would
-    # surface as apparent policy suboptimality that is really a metric gap.
+    # The bounded head emits M with eigenvalues in [1/w_ub, 1/w_lb].
+    # Regress from sampled metrics or evaluate the stored SOS polynomial directly.
     metric_source: str = "regress"
     cmg_method: str = "cvstem"  # "cvstem" regression | "ccm" direct metric training
     cmg_ccm_epochs: int = 1000
@@ -134,26 +118,13 @@ class C2RLPPOCfg(C2RLMetricCfg):
     ccm_feasibility_weight: float = 1.0
     tracking_scaler: float = 1.0
     control_scaler: float = 0.0
-    # ── SDP contraction metric — see ncm_synthesis.py ────────────────────── #
+    # SDP contraction metric — see ncm_synthesis.py
     cm_eps: float = 1e-2
     cm_solver: str = "SCS"  # cvxpy SDP solver
-    # CV-STEM regression (build_cm_dataset + regress_cmg): one joint SDP that
-    # keeps B via a Riccati BR⁻¹Bᵀ term, then MSE-regresses the CMG onto its
-    # solutions -- on M, not W, so no SPD inverse per env step. See
-    # ncm_synthesis.py's module docstring for the LMIs.
-    # R = cvstem_r_scaler·I in the BR⁻¹Bᵀ Riccati term (mirrors sdlqr.py's
-    # R_scaler); "cvstem" method only. See ncm_synthesis.cvstem_joint — control
-    # enters the LMI only through this penalty, not a bounded control box.
+    # CV-STEM solves the sampled Riccati LMI, then regresses its metric M.
+    # cvstem_r_scaler sets R in both synthesis and the deployed controller.
     cvstem_r_scaler: float = 1.0
-    # Ablation B — critic cold-start: the critic starts random while the
-    # near-optimal policy's true advantages are ~0, and GAE normalization divides
-    # by that near-zero std, manufacturing a full-scale, confident gradient out
-    # of noise. >0: after Phase A/residual-pretrain, roll out the frozen
-    # pretrained actor in the real env for this many steps and MSE-regress the
-    # critic onto the resulting (short-horizon, since discount_factor is small
-    # here) Monte-Carlo returns before Phase B's PPO updates start. 0 (default)
-    # = off (critic starts from its random init, as before). See
-    # C2RLAgent.pretrain_critic / C2RLSkrlTrainer.train.
+    # Optional critic warmup delays actor updates until the value fit is usable.
     pretrain_critic_steps: int = 0
     pretrain_critic_epochs: int = 200
     pretrain_critic_lr: float = 1.0e-3
@@ -168,32 +139,13 @@ class C2RLPPOCfg(C2RLMetricCfg):
     # With reward_euclidean: Level form r=-‖e‖ (tightest AUC alignment) vs the
     # default decrement form. See env_base.get_rewards.
     reward_level: bool = False
-    # Removed 2026-07-30: hard_control_bound* / gain_net_* knobs, for the
-    # hard-control-bound base (free SDP gain Y + Boyd bounded-peak-input LMI).
-    # Measured worse than the post-hoc actuator filter (cvstem_u_bound/rho,
-    # also since removed 2026-07-30 — never set by any config): 98.4% held-out
-    # violation rate vs 24.6%. Recover with `git log -S hard_control_bound` /
-    # `git log -S cvstem_u_bound`.
     residual_anchor_scale: float = 0.0  # penalize ‖u-u_base‖² in reward (residual trust anchor)
     # Weights of the CV-STEM objective J = cm_chi_weight·χ + cm_nu_weight·ν, which
     # cvstem_joint always minimizes (Tsukamoto's classncm.cvstem0). χ and ν are
     # the metric's condition number and scale, and they are decision variables:
     # W̄ ⪰ I, W̄ ⪯ χI, deployed W = W̄/ν. "cvstem" method only.
     cm_chi_weight: float | None = None  # None → 1/lbd, mirroring Tsukamoto's chi/alp
-    cm_nu_weight: float = 1.0    # On SDP infeasibility at a state, retry that state alone with λ halved,
-    # up to this many times, before giving up on it (0 = old behavior, drop
-    # Guards build_cm_dataset against silently regressing the CMG onto a small,
-    # likely-biased subset of states — raises before regression if the SDP's
-    # feasible fraction falls below this (0.0 = old behavior, only guards
-    # against 0% feasible; see ncm_synthesis.build_cm_dataset). "cvstem" method only.
-    # Cache path for the synthesized {x, W} CM dataset (build_cm_dataset's
-    # expensive per-state SDP solve) — see synthesize_cmg. Loaded instead of
-    # re-solving when it exists and matches lbd/w_lb/w_ub/cm_eps/cm_solver/
-    # cmg_memory_size exactly; written after a fresh solve otherwise. Defaults
-    # to a `cm_data.npz` next to dynamics_pretrain_data_path when unset (Isaac
-    # envs); classic envs with no data_path need this set explicitly to get
-    # caching at all (there's no offline dynamics file to derive a path from).
-    # "cvstem" method only.
+    cm_nu_weight: float = 1.0
     cm_data_path: str = ""
     # SOS metric synthesis (toy/polynomial envs only; see
     # scripts/skrl/c2rl/build_cm_dataset.py::_build_via_sos). Inert on the classic
@@ -202,15 +154,7 @@ class C2RLPPOCfg(C2RLMetricCfg):
     sos_lam_hi: float = 4.0
     sos_bisect_iters: int = 10
     sos_verify_grid: int = 101
-    # ── Offline CMG synthesis (Phase A, always runs before Phase B) ─────────── #
-    # Sample cmg_memory_size states — uniformly from the classic env's analytic
-    # state space (get_rollout) or, when dynamics_pretrain_data_path is set,
-    # uniformly from that offline dynamics_data.npz (capped + warned if
-    # cmg_memory_size exceeds the data on disk; see synthesize_cmg). "cvstem":
-    # solve ONE joint SDP over all samples (cvstem_joint, reusing lbd/w_lb/w_ub/cm_eps/
-    # cm_solver above), then MSE-regress the CMG network onto {x -> W*} for
-    # cmg_regress_epochs (build_cm_dataset / regress_cmg). "ccm": train the CMG
-    # Either way the CMG is frozen (freeze_cmg) before Phase B.
+    # Phase A fits the metric offline, then freezes it before PPO training.
     cmg_regress_epochs: int = 1000
     cmg_regress_lr: float = 1e-3
     cmg_regress_lr_scheduler: str = ""
@@ -250,13 +194,8 @@ class C2RLPPOCfg(C2RLMetricCfg):
     # sampled state in a "dynamics" rollout (env_base.get_rollout); replaces
     # the old hardcoded 3.
     num_controls_per_state: int = 3
-    # Held out from emp_dynamics_memory_size as a validation split never
-    # trained on; pretrain_dynamics stops once its MSE hasn't improved for
-    # dynamics_early_stop_patience consecutive epochs, restoring the
-    # best-val-epoch NeuralDynamics weights instead of whatever
-    # dynamics_pretrain_epochs happens to land on (see
-    # dynamics_pretrain.pretrain_dynamics / math_utils.EarlyStopper). <=0
-    # disables both (always pretrain the full budget).
+    # Hold out dynamics validation data; restore the best validation checkpoint
+    # and report both errors before metric synthesis uses the model.
     dynamics_val_frac: float = 0.1
     dynamics_early_stop_patience: int = 10
 
@@ -280,20 +219,10 @@ class C2RLSACCfg(C2RLMetricCfg):
     grad_norm_clip: float = 0.0
     learn_entropy: bool = True
     initial_entropy_value: float = 0.2
-    use_state_norm: bool = False  # off by default — see module docstring / rl_glue.make_base_rl_cfg
-    use_reward_norm: bool = False  # non-biasing running-std reward normalizer (r/std) — see rl_glue.make_base_rl_cfg
     rewards_shaper_scale: float = 1.0  # yaml convenience for SAC_CFG's rewards_shaper — see rl_glue.make_base_rl_cfg
     memory_size: int = -1
     discount_factor: float = 0.99
-    # ── Metric source — "cmg" frozen CMG network (synthesized how it's
-    # trained). See C2RLPPOCfg for the shared cm/cmg knobs. ─────────────────── #
-    # "regress" (default): MSE-fit the CMG network onto the offline {x -> W*(x)}
-    # dataset. "sos": skip the fit and evaluate the SOS polynomial the dataset
-    # was generated FROM, exactly (toy envs only -- they are the only family
-    # whose certificate is a closed form). Measured on toy-mg the regression's
-    # median relative error in the deployed M is 2.5%, against 2.5e-6 for the
-    # polynomial; the offline V* solve uses the same M, so a mismatch would
-    # surface as apparent policy suboptimality that is really a metric gap.
+    # Regress from sampled metrics or evaluate the stored SOS polynomial directly.
     metric_source: str = "regress"
     cmg_method: str = "cvstem"  # "cvstem" regression | "ccm" direct metric training
     cmg_ccm_epochs: int = 1000
@@ -304,7 +233,7 @@ class C2RLSACCfg(C2RLMetricCfg):
     ccm_feasibility_weight: float = 1.0
     tracking_scaler: float = 1.0
     control_scaler: float = 0.0
-    # ── SDP contraction metric ("cvstem" method only) — see ncm_synthesis.py ── #
+    # SDP contraction metric ("cvstem" method only) — see ncm_synthesis.py
     cm_eps: float = 1e-2
     cm_solver: str = "SCS"
     cvstem_r_scaler: float = 1.0
@@ -322,7 +251,7 @@ class C2RLSACCfg(C2RLMetricCfg):
     sos_lam_hi: float = 4.0
     sos_bisect_iters: int = 10
     sos_verify_grid: int = 101
-    # ── Offline CMG synthesis (Phase A, always runs before Phase B) ─────────── #
+    # Offline CMG synthesis (Phase A, always runs before Phase B)
     cmg_regress_epochs: int = 1000
     cmg_regress_lr: float = 1e-3
     cmg_regress_lr_scheduler: str = ""
@@ -401,9 +330,7 @@ def cm_dataset_target(cfg) -> tuple[Path | None, dict]:
     return cache_path, cache_kwargs
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # Agent
-# ─────────────────────────────────────────────────────────────────────────── #
 
 class C2RLAgent(Agent):
     """C2RL agent — native skrl Agent, single deployed policy.
@@ -458,9 +385,9 @@ class C2RLAgent(Agent):
             self._raw_cfg = cfg.__dict__.copy()
             parsed_cfg = cfg
 
-        beta = float(parsed_cfg.action_bound_penalty_beta)
+        beta = float(parsed_cfg.action_bound_penalty)
         if not math.isfinite(beta) or beta < 0:
-            raise ValueError("action_bound_penalty_beta must be finite and nonnegative")
+            raise ValueError("action_bound_penalty must be finite and nonnegative")
 
         super().__init__(
             cfg=parsed_cfg,
@@ -500,7 +427,7 @@ class C2RLAgent(Agent):
         self._num_envs = num_envs
         self._get_rollout = get_rollout
 
-        # ── Metric source setup ──────────────────────────────────────────── #
+        # Metric source setup
         # This agent always owns the (optional) learned dynamics directly — Phase
         # A's CMG synthesis needs f/B/∂f/∂x (SDP dataset for "cvstem", C1/C2
         # gradient computation for "ccm"). The CMG network (models["cmg"]) is
@@ -525,7 +452,7 @@ class C2RLAgent(Agent):
                 "let ContractionRunner build it (it forces this)."
             )
 
-        # ── Phase B: a real skrl PPO/SAC agent for the deployed policy ───── #
+        # Phase B: a real skrl PPO/SAC agent for the deployed policy
         # PPO's memory holds exactly one on-policy rollout chunk. SAC's is a
         # persistent replay buffer, sized per-parallel-env (memory_size rows ×
         # num_envs) so Isaac Sim's 1000+ envs don't multiply skrl's usual ~1M
@@ -611,7 +538,7 @@ class C2RLAgent(Agent):
         if self._neural_dynamics is not None:
             self.checkpoint_modules["dynamics"] = self._neural_dynamics
 
-    # ── Setup helpers ───────────────────────────────────────────────────── #
+    # Setup helpers
 
     def _setup_dynamics(self, cfg, models, get_f_and_B, x_dim, u_dim, device) -> None:
         """Own the (optional) learned dynamics directly (feeds Phase A's CMG synthesis).
@@ -644,19 +571,14 @@ class C2RLAgent(Agent):
                 self._dynamics_optimizer, cfg.dynamics_lr_scheduler, cfg.dynamics_lr_scheduler_kwargs
             )
 
-    # ── skrl Agent interface ────────────────────────────────────────────── #
+    # skrl Agent interface
 
     def act(self, observations, states, *, timestep: int, timesteps: int):
         """Evaluation entry point (play.py / train_utils' rollouts call this).
 
         Goes to the policy model rather than delegating to ``self._rl_agent.act``
         so a nonzero ``random_timesteps`` can't turn an eval rollout — which
-        always passes ``timestep=0`` — into uniform random actions. The
-        observation preprocessor is applied by hand for the same reason it is
-        applied inside the sub-agent's own act(): skipping it would evaluate the
-        policy on a different input scale than it was trained on whenever
-        ``use_state_norm`` is enabled (it is off in every shipped config, so
-        this is identity today).
+        always passes ``timestep=0`` — into uniform random actions.
         """
         with torch.no_grad():
             inputs = {"observations": self._rl_agent._observation_preprocessor(observations)}
@@ -677,7 +599,7 @@ class C2RLAgent(Agent):
     def update(self, *, timestep: int, timesteps: int) -> None:
         pass
 
-    # ── Phase B update ──────────────────────────────────────────────────── #
+    # Phase B update
 
     def update_policy(self, *, timestep: int, timesteps: int) -> None:
         """Drive the inner RL agent's update, once per trainer rollout chunk.
@@ -688,13 +610,7 @@ class C2RLAgent(Agent):
         the Mahalanobis reward (see the module docstring).
         """
         if self._base_algorithm == "PPO":
-            # skrl's own act() puts the policy in eval() mode for rollout
-            # collection (no dropout/batchnorm here, so that's harmless) and
-            # never re-enables train() before calling update() itself — fine
-            # for every other backbone, but a FiLM gate's GRU (film_gate_
-            # encoder="gru") needs train mode for cuDNN's backward, exactly
-            # like the two pretrain methods above. Vendored skrl/ code is
-            # off-limits to edit, so this is patched from here instead.
+            # Enable training before updates so cuDNN permits GRU gradients.
             self._policy_model.train()
             self._rl_agent.update(timestep=timestep, timesteps=timesteps)
 
@@ -843,36 +759,12 @@ class C2RLAgent(Agent):
               "(analytic potential from the frozen CMG).", flush=True)
 
     def pretrain_critic(self, env, *, num_steps: int, epochs: int, lr: float) -> None:
-        """Ablation B: warm-start the critic on the frozen, already-pretrained
-        actor's own Monte-Carlo returns, before Phase B's PPO updates start.
+        """Warm-start the critic on Monte Carlo returns from the frozen actor.
 
-        After pretraining π's mean is already near-optimal, so the true
-        advantage is ~0 almost everywhere while the critic is still at random
-        init. GAE divides by that near-zero advantage std, turning noise into a
-        full-scale confident gradient the moment the critic produces its first
-        coherent (but wrong) value landscape. A head start on the real return
-        scale removes that source of the single destructive update.
-
-        Rolls the frozen actor out in the real env for ``num_steps`` (the CMG
-        must already be injected — the Mahalanobis reward is the fit target),
-        computes each step's MC return discounting to the end of the window only
-        (no bootstrap past it; negligible bias at this discount_factor, and a
-        longer window shrinks it further), then MSE-regresses ``value`` onto it.
-
-        ``_value_preprocessor`` is not bypassed. Its ``inverse=True`` path (what
-        compute_gae uses) clamps to ±clip_threshold (default 5) Before scaling
-        by sqrt(running_variance) — never an identity map for an output fit
-        directly to MC-return scale, which here runs well past ±5. Regressing
-        the raw output onto ``ret_all`` (an earlier version) meant the first
-        live act() truncated most of the fitted landscape at the clamp, and the
-        scale mismatch against the untouched running stats fed a runaway
-        compute_gae: raw advantage std grew ~2 -> ~1e16 in one run while
-        grad_norm_clip kept the policy bounded and the reward curve looked
-        stable. So: fit the preprocessor's stats to ``ret_all`` once up front
-        (one large representative batch, better calibrated than accumulating
-        from tiny per-rollout ones), then regress onto the forward-standardized
-        target in that same space. Network output and preprocessor stats then
-        agree, and the first live inverse call is near-identity.
+        Roll out the real environment with the fixed metric reward. Discount returns
+        to the collection-window endpoint without a terminal bootstrap. When value
+        normalization is enabled, fit its statistics once and regress standardized
+        returns so playback and subsequent GAE use the same value scale.
         """
         rl_agent = self._rl_agent
         if getattr(rl_agent, "value", None) is None:
@@ -1155,9 +1047,7 @@ class C2RLAgent(Agent):
             print(f"[C2RL] Saved NeuralDynamics → {path}")
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # Trainer
-# ─────────────────────────────────────────────────────────────────────────── #
 
 class C2RLSkrlTrainer(Trainer):
     """skrl Trainer for C2RL — offline CMG synthesis (Phase A), then
@@ -1216,12 +1106,12 @@ class C2RLSkrlTrainer(Trainer):
         injected = 0
         for e in targets:
             e = e.unwrapped if hasattr(e, "unwrapped") else e
-            beta = getattr(agent._cfg, "action_bound_penalty_beta", 0.0)
+            beta = getattr(agent._cfg, "action_bound_penalty", 0.0)
             setter = getattr(e, "set_action_bound_penalty", None)
             if setter is not None:
                 setter(beta)
             elif beta:
-                raise ValueError("action_bound_penalty_beta is currently supported by classic/analytical Isaac environments")
+                raise ValueError("action_bound_penalty is currently supported by classic/analytical Isaac environments")
             if hasattr(e, "set_ccm"):
                 e.set_ccm(
                     ccm,
@@ -1302,15 +1192,8 @@ class C2RLSkrlTrainer(Trainer):
             for parameter in agent._neural_dynamics.parameters():
                 parameter.requires_grad_(False)
 
-        # ── Phase A: offline CMG synthesis — "cvstem" solves a joint sampled
-        # SDP (build_cm_dataset) and MSE-regresses the CMG onto {x -> W*}
-        # (regress_cmg); "ccm" trains the CMG directly with C1/C2 losses
-        # The CMG is frozen before Phase B reads its
-        # static metric. synthesize_cmg logs feasibility/residual/loss/LR itself. ──
-        # Fresh runs synthesize once; continuations retain the checkpoint metric.
-        # There is no per-step alternative: a per-state SDP
-        # carries its own nu/chi and no Wdot term, so it certifies nothing about
-        # contraction, and solving one every step just repeats that error.
+        # Phase A: train a CCM or regress CV-STEM solutions, then freeze the metric.
+        # Phase B fits the policy against that fixed metric; controls still obey U_MIN/U_MAX.
         info = agent.synthesize_cmg(timesteps=timesteps)
         # metric_source='sos' fits nothing, so there is no regression loss to
         # report -- say which metric is in use instead of printing a 0 that

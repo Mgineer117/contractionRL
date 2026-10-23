@@ -65,9 +65,7 @@ class CVSTEMInfeasibleError(RuntimeError):
     """
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # Configuration
-# ─────────────────────────────────────────────────────────────────────────── #
 
 @dataclass
 class CVSTEMLQRCfg(AgentCfg):
@@ -79,7 +77,7 @@ class CVSTEMLQRCfg(AgentCfg):
     # jointly minimal, so the objective weights never activate a trade-off).
     r_scaler: float = 1.0
 
-    # ── The joint CV-STEM SDP (yaml `cm:` block) ───────────────────────────── #
+    # The joint CV-STEM SDP (yaml `cm:` block)
     lbd: float = 0.5              # contraction rate λ (his alpha)
     cm_eps: float = 0.01    # Optional deployment envelope w_lb·I ⪯ W ⪯ w_ub·I on the deployed w = W̄/ν,
     # the two scalar caps solve_cm_metric applies: ν ≤ 1/w_lb, χ ≤ ν·w_ub. Both
@@ -112,7 +110,7 @@ class CVSTEMLQRCfg(AgentCfg):
     # deploying a metric certifying a different rate. Empty string disables it.
     cm_data_path: str = ""
 
-    # ── The metric network (yaml `cmg:` block) ─────────────────────────────── #
+    # The metric network (yaml `cmg:` block)
     cmg_hidden_dims: tuple = (100, 100, 100)   # his 3x100 ReLU MLP
     # Sized for >=100k gradient steps, which is what the fit actually needs:
     # measured on the car, relative metric error 0.55 -> 0.23 -> 0.06 -> 0.03 at
@@ -126,9 +124,7 @@ class CVSTEMLQRCfg(AgentCfg):
     cmg_early_stop_patience: int = 30
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # Agent
-# ─────────────────────────────────────────────────────────────────────────── #
 
 class CVSTEMLQRAgent(Agent):
     """CV-STEM/NCM contraction controller wrapped as a native skrl Agent.
@@ -200,7 +196,7 @@ class CVSTEMLQRAgent(Agent):
         self._metric = CholMetric(self._x_dim, list(cfg.cmg_hidden_dims)).to(device)
         self._synthesize()
 
-    # ── Phase A: his train(), once at construction ─────────────────────────── #
+    # Phase A: his train(), once at construction
 
     def _load_shared_c2rl_dataset(self, *, tag: str) -> dict | None:
         """Load the C2RL ``cm_data_*`` cache for this env, or None.
@@ -329,7 +325,7 @@ class CVSTEMLQRAgent(Agent):
         print(f"{tag} Phase A complete — metric frozen (nu={self.metric_nu:.4g}, "
               f"chi={self.metric_chi:.4g}, J={dataset['J']:.4g}, lbd={self.metric_lbd:.4g}).")
 
-    # ── action computation ─────────────────────────────────────────────────── #
+    # action computation
 
     def _compute_action(self, obs: torch.Tensor) -> torch.Tensor:
         """``M(x) = RᵀR`` from the frozen network, ``K = R⁻¹BᵀM``, ``u = uref - K·e``.

@@ -4,36 +4,20 @@ import sys
 import torch
 
 from contractionRL.agents.utils.RL.logging import log_metrics
+from contractionRL.agents.utils.RL.evaluation import EvaluationControl, evaluation_act
 
 _SAC_LIKE_ALGOS = {"sac", "mbpo", "c2rl-sac", "c2rl_sac", "c3m", "lqr", "sdlqr", "cvstem-lqr", "cvstem_lqr"}
 _DEFAULT_NUM_ENVS_SAC = 64
 _DEFAULT_NUM_ENVS_PPO_CLASSIC = 1024
-_VEL_TASK_TO_ROBOT = {"Quadruped": "quadruped", "Humanoid": "humanoid", "Manipulator": "manipulator"}
+_VEL_TASK_TO_ROBOT = {f"Isaac-Transfer-vel-{name}-v0": name.lower()
+                      for name in ("Quadruped", "Humanoid", "Manipulator")}
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Generated data lives under data/, not logs/. The distinction is lifetime and
-# role, not format: logs/ holds the output of one run (checkpoints, tensorboard
-# events, eval json) and is disposable per run, while data/ holds artifacts that
-# are inputs to later runs of other algorithms — dynamics_data.npz (the
-# reference trajectories path-tracking envs track) and the cm_data*.npz metric
-# caches synthesized from it. Deleting logs/ must never force a re-synthesis.
+# Generated reusable inputs live in data/; per-run outputs live in logs/.
 _DATA_ROOT = os.path.join(_ROOT, "data")
 
 def _default_num_envs_classic(algo: str) -> int:
     return _DEFAULT_NUM_ENVS_SAC if algo.lower() in _SAC_LIKE_ALGOS else _DEFAULT_NUM_ENVS_PPO_CLASSIC
-
-
-def evaluation_act(agent, observations, states=None):
-    """Use the policy mean and bypass random warmup for evaluation/references."""
-    deterministic = getattr(agent, 'act_deterministic', None)
-    if callable(deterministic):
-        return deterministic(observations, states)
-    timestep = max(0, int(getattr(agent.cfg, "random_timesteps", 0)))
-    device = torch.device(getattr(agent, "device", "cpu"))
-    devices = [device.index] if device.type == "cuda" else []
-    with torch.random.fork_rng(devices=devices):
-        actions, outputs = agent.act(observations, states, timestep=timestep, timesteps=max(timestep + 1, 1))
-    return outputs.get("mean_actions", actions), outputs
 
 
 def validate_tracking_options(env, args):
@@ -139,12 +123,7 @@ def _resolve_symmetry_for_env(raw_env) -> int:
     """
     from contractionRL.runners.contraction_runner import _env_attrs, _resolve_symmetry, _unwrap_env
     env = _unwrap_env(raw_env)
-    # _env_attrs, not getattr: a classic SyncVectorEnv forwards none of its
-    # sub-envs' attributes, so x_dim/angle_idx live one level deeper there (a
-    # plain getattr silently returned None and disabled the quotient for the
-    # standalone PPO/SAC route while ContractionRunner had it on -- which would
-    # have made the PPO baseline and C2RL-PPO architecturally incomparable,
-    # exactly the mismatch this function exists to prevent).
+    # Read attributes through sub-environments too: SyncVectorEnv does not forward them.
     x_dim, angle_idx = _env_attrs(env, "x_dim", "angle_idx")
     if x_dim is None:
         (x_dim,) = _env_attrs(env, "num_dim_x")
@@ -416,7 +395,7 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli,
     import numpy as np
     import torch
 
-    robot = next((name for prefix, name in _VEL_TASK_TO_ROBOT.items() if task.startswith(prefix)), None)
+    robot = _VEL_TASK_TO_ROBOT.get(task.split(':')[-1])
     if robot is None:
         print(f"[RefTraj] No robot mapping for task '{task}'; skipping.")
         return
@@ -475,20 +454,8 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli,
     if quality_enabled:
         print(f"\n[RefTraj] Evaluating quality (threshold: mean total reward >= {min_reward}) …")
 
-        # Deliberately measures the same quantity as training's "Reward / Total
-        # reward (mean)": min_reward is calibrated as 0.5 * best-case-per-step *
-        # T, i.e. on a full training episode's scale. So this rollout must
-        # reproduce training's episode structure — fall termination at its cfg
-        # default (True). Evaluate the same deterministic policy mean used for
-        # reference collection; this is not the stochastic training distribution.
-        #
-        # It must not disable terminate_on_fall the way _evaluate_best_model
-        # does: with it off a fallen robot flails for the full T steps,
-        # accumulating the lying-down penalties at ~-2.5/step — a large negative
-        # tail training never sees, since it resets on fall. That measurement
-        # produced gate values of -545 against a +2600 threshold, structurally
-        # unreachable at any policy quality, while the same policy's training
-        # reward was well positive.
+        # Use full episode return, matching the scale of the training reward threshold.
+        # Divide by the actual collected count when too few episodes complete.
         ep_rewards = []
         ep_r = torch.zeros(skrl_env.num_envs, device=skrl_env.device)
         finished = torch.zeros(skrl_env.num_envs, dtype=torch.bool, device=skrl_env.device)
@@ -537,16 +504,8 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli,
             )
             return
 
-    # Collect trajectories. We over-collect a candidate pool larger than
-    # num_trajs (oversample_factor x) and then keep the longest num_trajs of
-    # them — early termination is exactly what a poor/failing rollout looks
-    # like, so ranking by survival length is a simple, direct proxy for
-    # "better trajectory". Recording every one of num_envs (rather than just
-    # the first min(num_trajs, num_envs)) maximizes that pool for free: Isaac
-    # can't shrink the batch, so the extra envs are being simulated regardless.
-    # This also means num_envs < num_trajs naturally loops through as many
-    # per-env episode rounds as it takes to fill the pool — no special-casing
-    # needed for that direction.
+    # Oversample, then retain the longest trajectories; warn when the quality gate
+    # must accept fewer valid candidates than requested.
     import math
 
     import tqdm
@@ -562,15 +521,8 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli,
     obs_dict, _ = skrl_env.reset()
     obs = _get_obs(obs_dict)
 
-    # _act_low/_act_high (defined above, alongside `unwrapped`) are used only
-    # when writing into the saved `u` array below, never to modify what's
-    # stepped through the env. The policy mean can exceed the action bounds
-    # (clipping inside the actor corrupts the log-prob), and the env already
-    # enforces action bounds on its own (its actuator/physics pipeline), so
-    # re-clipping before `skrl_env.step()` would be redundant. But the *saved*
-    # dynamics_data.npz must record actions within the declared action space —
-    # an unclipped, possibly out-of-range command is not a valid "u" for
-    # fitting f(x) + B(x)u.
+    # Save applied (clipped) controls without changing the policy actions sent to step().
+    # The saved dynamics pairs must use the same control the plant applied.
 
     # Pre-allocate tensors to avoid massive python list overhead
     with torch.no_grad():
@@ -623,20 +575,7 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli,
                 step_counts[success_indices] = T + 1
 
             if len(success_indices) > 0:
-                # Move to CPU in bounded chunks. Episodes are length-synchronized
-                # (fixed T), so on the first `done` event success_indices can be
-                # ~num_envs at once — gathering all of them in one fancy-index
-                # would allocate a full (len(success_indices), T, dim) CUDA
-                # temporary, so keep it chunked regardless of pool size.
-                #
-                # Deliberately don't early-break once len(all_states) hits
-                # pool_target here: this round's successes are already sitting
-                # in GPU memory finished at the same time, so cutting the chunk
-                # loop short would arbitrarily favor low env-index trajectories
-                # over otherwise-equal ones later in `success_indices`. Letting
-                # the whole round in (pool may overshoot pool_target a bit)
-                # keeps every env that finished this round in the running for
-                # the final longest-num_trajs selection.
+                # Copy completed trajectories in bounded CPU chunks to avoid large GPU gathers.
                 _CHUNK = 256
                 for start in range(0, len(success_indices), _CHUNK):
                     idx = success_indices[start:start + _CHUNK]
@@ -692,13 +631,7 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli,
     dt = env_cfg.sim.dt * env_cfg.decimation
     print(f"[RefTraj] Computing dynamics (x_dot) via 4th-order central difference (dt={dt:.3f})...")
 
-    # angle_idx columns (e.g. yaw) wrap at +-pi in the saved states_arr — a raw
-    # finite difference across that wrap would spike x_dot by ~2*pi/dt for one
-    # sample. Difference an unwrapped copy instead (np.unwrap makes each angle
-    # column continuous by adding +-2*pi at jumps); states_arr itself (saved as
-    # `x` below) is left untouched — NeuralDynamics only ever consumes x through
-    # its (cos, sin) embedding, which is identical for theta and theta + 2*pi*k,
-    # so this is purely a finite-difference cleanup, not a semantic change to x.
+    # Unwrap angular columns before finite differences to avoid 2*pi/dt spikes.
     angle_idx = list(getattr(isaac_env.unwrapped, "angle_idx", []) or [])
     diff_states = states_arr
     if angle_idx:
@@ -726,14 +659,7 @@ def _generate_ref_trajs(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli,
         x_dot_arr = x_dot_arr[valid_mask]
         lengths_arr = lengths_arr[valid_mask]
 
-    # Single unified file: reference trajectories are the (x, u) part of the
-    # dynamics data, so there is no separate ref_trajs.npz anymore.
-    #   x       (N, T, x_dim)  physical states; steps >= lengths[n] are padding
-    #                          (the last valid state repeated, keeping x_dot ~ 0)
-    #   u       (N, T, u_dim)  executed (clipped) actions, same padding rule
-    #   x_dot   (N, T, x_dim)  4th-order central differences of x
-    #   lengths (N,)           number of valid steps per trajectory — consumers
-    #                          mask with arange(T) < lengths[:, None]
+    # Store one archive with x, u, x_dot and valid trajectory lengths; padding is excluded.
     dyn_path = os.path.join(out_dir, "dynamics_data.npz")
     from contractionRL.tasks.direct.common.reference_domain import save_nominal_references
     accepted = save_nominal_references(dyn_path, x=states_arr, u=actions_arr,
@@ -778,6 +704,7 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
     a separate, differently-scoped number). For an SDP-per-step controller like
     online CV-STEM-LQR it is also the most expensive thing in the trial.
     """
+    from contractionRL.tasks.direct.common.tracking_tasks import make_analytical_plant
     if getattr(args_cli, "skip_final_eval", False):
         print("[Eval] SKIPPED — --skip_final_eval (does not feed the sweep metric).")
         return
@@ -792,7 +719,7 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
         mean_confidence_interval,
     )
 
-    probe = gym.make(task)
+    probe = make_analytical_plant(task)
     if not hasattr(probe.unwrapped, "xref"):
         print(f"[Eval] SKIPPED — env {type(probe.unwrapped).__name__} has no reference trajectory (xref).")
         probe.close()
@@ -819,7 +746,7 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
                       "reference_mode": training_env.reference_mode,
                       "time_bound": training_env.time_bound, "dt": training_env.dt,
                       "disturbance_scales": training_env.disturbance.scales.cpu().tolist()}
-    env = gym.make(task, device=device, **env_kwargs)
+    env = make_analytical_plant(task, device=device, **env_kwargs)
     from contractionRL.agents.skrl.c2rl import C2RLAgent, C2RLSkrlTrainer
     if isinstance(agent, C2RLAgent):
         agent.freeze_cmg()
@@ -930,33 +857,13 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
         # fitted lambda from the running mean lambda over the eval population.
         "contraction_rate_all": [round(float(x), 6) for x in lbd_list],
         "overshoot_all": [round(float(x), 6) for x in C_list],
-        # Raw per-episode AUCs. auc_mean +/- CI alone cannot distinguish the two
-        # very different ways a seed ends up with a bad number: a uniform shift
-        # (every episode slightly worse — a genuinely weaker controller) versus a
-        # heavy tail (most episodes fine, a handful diverging — a robustness
-        # failure). Those call for opposite fixes, and across-seed AUC spread is
-        # exactly the symptom under investigation, so the per-episode
-        # distribution is kept alongside the robust summaries below.
+        # Keep episode-level AUCs to distinguish a population shift from heavy-tail failures.
         "auc_all": [round(float(x), 6) for x in auc_list],
         "auc_median": float(np.median(auc_list)) if auc_list else None,
         "auc_p90": float(np.percentile(auc_list, 90)) if auc_list else None,
         "auc_max": float(np.max(auc_list)) if auc_list else None,
-        # Fraction of episodes whose normalized error never really contracts.
-        # AUC = int(||e||/||e0||) dt over a time_bound-long episode, so an
-        # episode that merely holds its initial error scores ~time_bound.
-        #
-        # The threshold was 0.1*time_bound (= 1.5 at time_bound 15) on the
-        # assumption that a contracting episode scores ~1. It does not: the
-        # best arms measured run 1.48-2.06 per episode, i.e. At or above that
-        # cut, so the metric labelled the strongest controller in the study
-        # ~50% "diverged". Measured distribution across 1095 archived runs:
-        #     contracting   1.5 - 2.1
-        #     marginal      2.2 - 6.0
-        #     diverged     12.4 - 81.0
-        # 1/3 of time_bound (= 5.0) sits in the empty band between marginal and
-        # diverged, ~3x above the good arms and ~2.5x below the failures. This
-        # is a robustness heuristic for spotting heavy tails, not a sharp
-        # classifier -- read it next to auc_p90/auc_max, never alone.
+        # Flag AUC above one third of the episode duration as a heavy-tail heuristic.
+        # Interpret it alongside the AUC distribution, not as a sharp failure classifier.
         "auc_diverged_frac": (float(np.mean(np.asarray(auc_list) > (1.0 / 3.0) * _time_bound))
                               if _time_bound > 0 and auc_list else None),
     }
@@ -990,13 +897,7 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
                     wandb_logs[f"final_eval/{k}"] = v
         log_metrics(wandb_logs)
 
-    # makedirs, because agent.experiment_dir may not exist. skrl creates it
-    # lazily on its first write there, and for a sweep trial train.py sets
-    # checkpoint_interval = 0 (hundreds of throwaway trials must not each write
-    # ten checkpoints) -- so nothing ever writes, the directory is never made,
-    # and this open() raised FileNotFoundError on every sweep trial that got as
-    # far as evaluating. Training had already finished at that point, so a
-    # multi-hour trial was being thrown away at the last step.
+    # Create lazily initialized run directories before writing evaluation results.
     _json_name = f"eval_results{'_' + label.lower() if label else ''}.json"
     out_json = os.path.join(agent.experiment_dir, _json_name)
     try:
@@ -1015,6 +916,30 @@ def _evaluate_classic_path_tracking(*, task, runner, args_cli, _is_classic, num_
 
 
 def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli, num_groups: int = 10):
+    from contractionRL.tasks.direct.common.transfer_dynamics import is_transfer_path, evaluation_backend
+    from contractionRL.agents.utils.RL.logging import evaluation_section
+    raw = isaac_env.unwrapped
+    kwargs = dict(task=task, runner=runner, isaac_env=isaac_env, skrl_env=skrl_env,
+                  env_cfg=env_cfg, args_cli=args_cli, num_groups=num_groups)
+    if not is_transfer_path(raw) or not hasattr(raw, 'set_transition_backend'):
+        return _evaluate_best_model_single(**kwargs)
+    if getattr(args_cli, 'skip_final_eval', False):
+        return
+    results = {}
+    for backend, label, key in (('learned', 'Simulation Evaluation', 'simulation'),
+                                 ('physx', 'Sim-to-Real Evaluation', 'sim_to_real')):
+        print(f'[Eval] {label}')
+        with evaluation_backend(raw, backend), evaluation_section(label):
+            results[key] = _evaluate_best_model_single(**kwargs, output_name=f'eval_results_{key}.json')
+    import json
+    path = os.path.join(runner.agent.experiment_dir, 'eval_results.json')
+    with open(path, 'w') as stream:
+        json.dump({**_run_metadata(args_cli, task), **results}, stream, indent=2)
+    return results
+
+
+def _evaluate_best_model_single(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli,
+                                num_groups: int = 10, output_name='eval_results.json'):
     """Post-training evaluation of the best checkpoint (CAC-dev style).
 
     Loads best_agent.pt and rolls out one episode per environment, preserving
@@ -1064,13 +989,8 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
         agent.freeze_cmg()
         C2RLSkrlTrainer._inject_ccm(isaac_env, agent)
     unwrapped = isaac_env.unwrapped
-    # Same rule as the classic evaluator, and it bites harder here: this loop
-    # runs a fixed T steps without checking dones, so an env that terminated
-    # early would be auto-reset underneath it and every later
-    # get_tracking_error() would silently measure a different episode against
-    # the old e(0). Inert today (Isaac _state_bounds is ±inf, so the box never
-    # fires) — disarmed anyway, because the day a subclass declares finite
-    # bounds this would corrupt the error curve without any error message.
+    # Freeze episode completion during evaluation so auto-resets cannot splice
+    # several episodes into a single fixed-horizon error curve.
     _disarm_termination_for_eval(isaac_env, "[Eval]")
     dt = env_cfg.sim.dt * env_cfg.decimation
     T = int(env_cfg.episode_length_s / dt)
@@ -1087,8 +1007,8 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
     prev_flag = getattr(unwrapped.cfg, "terminate_on_fall", True)
     # Preserve robot failures; never join a reset episode to the original curve.
     try:
-        if hasattr(skrl_env, "_reset_once"):
-            skrl_env._reset_once = True
+        from contractionRL.tasks.direct.common.transfer_dynamics import force_wrapper_reset
+        force_wrapper_reset(skrl_env)
         obs_dict, _ = skrl_env.reset()
         obs = obs_dict["policy"] if isinstance(obs_dict, dict) else obs_dict
 
@@ -1100,28 +1020,24 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
         alive = torch.ones(num_envs, dtype=torch.bool, device=skrl_env.device)
         failed = torch.zeros_like(alive)
         print(f"[Eval] Rolling out {num_envs} episodes of at most {T} steps …")
-        for k in range(T):
-            with torch.no_grad():
-                # agent.act() is the uniform interface across every skrl Agent
-                # (PPO/SAC/C3M/C2RL/SDLQR/LQR) — unlike agent.policy.act(...),
-                # which assumes PPO/SAC's internal attribute names and breaks
-                # on contraction agents. "mean_actions" (present for Gaussian
-                # policies) gives the deterministic action; deterministic
-                # policies (e.g. C3M's CLDeterministicActorModel) have no
-                # separate mean, so their raw action is already deterministic.
-                actions, outputs = evaluation_act(agent, obs)
-                actions = torch.clamp(outputs.get("mean_actions", actions), _act_low, _act_high)
-            obs_dict, rewards, terminated, truncated, transition_info = skrl_env.step(actions)
-            obs = obs_dict["policy"] if isinstance(obs_dict, dict) else obs_dict
-            total_reward += rewards.reshape(-1) * alive
-            reward_steps += alive
-            failed |= alive & terminated.reshape(-1)
-            terminal_error = transition_info.get("terminal_tracking_error")
-            if terminal_error is None and "tracking_error" in transition_info:
-                terminal_error = transition_info["tracking_error"].clamp(min=0).sqrt()
-            endpoint_error = unwrapped.get_tracking_error() if terminal_error is None else terminal_error.reshape(-1)
-            errors[:, k + 1] = torch.where(alive & ~terminated.reshape(-1), endpoint_error, torch.nan)
-            alive &= ~(terminated | truncated).reshape(-1)
+        with EvaluationControl(skrl_env, agent) as control:
+            for k in range(T):
+                states = skrl_env.state() if hasattr(skrl_env, "state") else None
+                actions = control.act(obs, states, active=alive).clamp(_act_low, _act_high)
+                obs_dict, rewards, terminated, truncated, transition_info = skrl_env.step(actions)
+                obs = obs_dict["policy"] if isinstance(obs_dict, dict) else obs_dict
+                total_reward += rewards.reshape(-1) * alive
+                reward_steps += alive
+                failed |= alive & terminated.reshape(-1)
+                terminal_error = transition_info.get("terminal_tracking_error")
+                if terminal_error is None and "tracking_error" in transition_info:
+                    terminal_error = transition_info["tracking_error"].clamp(min=0).sqrt()
+                endpoint_error = unwrapped.get_tracking_error() if terminal_error is None else terminal_error.reshape(-1)
+                errors[:, k + 1] = torch.where(alive & ~terminated.reshape(-1), endpoint_error, torch.nan)
+                done = (terminated | truncated).reshape(-1)
+                control.after_step(done)
+                alive &= ~done
+            control_metrics = control.summary(num_envs=min(num_envs, _DEFAULT_NUM_ENVS_SAC))
     finally:
         unwrapped.cfg.terminate_on_fall = prev_flag
 
@@ -1129,13 +1045,7 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
     rew_np = (total_reward / reward_steps.clamp_min(1)).cpu().numpy()
     failure_rate = float(failed.float().mean())
 
-    # Cap the Stability-tab sample size to the SAC-family env count, regardless
-    # of how many parallel envs this run actually used. PPO-family algorithms
-    # train/roll out with far more parallel envs (e.g. 4096) than SAC-family
-    # ones (64, see _DEFAULT_NUM_ENVS_SAC) — without this cap, PPO's mean/CI
-    # would be computed from a much larger sample than SAC's, so the two
-    # wouldn't be comparable on the Stability tab. Truncating (not resampling)
-    # keeps this deterministic across reruns.
+    # Cap stability samples consistently across algorithms without changing training parallelism.
     if num_envs > _DEFAULT_NUM_ENVS_SAC:
         num_envs = _DEFAULT_NUM_ENVS_SAC
         err_np = err_np[:num_envs]
@@ -1173,6 +1083,7 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
     auc_mean, auc_ci = mean_confidence_interval(auc_np)
     results = {
         **_run_metadata(args_cli, task),
+        **control_metrics,
         "checkpoint": best_ckpt if os.path.exists(best_ckpt) else "final",
         "failure_rate": failure_rate,
         "num_episodes": int(num_envs),
@@ -1199,11 +1110,13 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
     print("[Eval] ── Best-model evaluation (failure termination enabled) ──")
     print(f"[Eval] average reward   : {rew_mean:.2f} ± {rew_ci:.2f} (95% CI, n={num_envs})")
     print(f"[Eval] error AUC        : {auc_mean:.4f} ± {auc_ci:.4f}")
+    if control_metrics:
+        print(f"[Eval] Control timing   : {control_metrics}")
     if C_list:
         print(f"[Eval] overshoot C      : {C_mean:.3f} ± {C_ci:.3f}")
         print(f"[Eval] contraction rate : {lbd_mean:.4f} ± {lbd_ci:.4f}  (C·e^(−λkΔt), min AUC)")
 
-    out_json = os.path.join(agent.experiment_dir, "eval_results.json")
+    out_json = os.path.join(agent.experiment_dir, output_name)
     with open(out_json, "w") as f:
         json.dump(results, f, indent=2)
     print(f"[Eval] Saved → {out_json}")
@@ -1212,16 +1125,17 @@ def _evaluate_best_model(*, task, runner, isaac_env, skrl_env, env_cfg, args_cli
         wandb_logs = {}
         for k, v in results.items():
             if isinstance(v, (int, float)):
-                if "reward" in k:
+                if k.startswith("control_"):
+                    wandb_logs[f"Evaluation/Control/{k}"] = v
+                elif "reward" in k:
                     wandb_logs[f"Reward/{k}"] = v
                 elif any(s in k for s in ["auc", "overshoot", "contraction_rate", "contraction_score"]):
                     wandb_logs[f"Stability/{k}"] = v
                 else:
                     wandb_logs[f"final_eval/{k}"] = v
         log_metrics(wandb_logs)
+    return results
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Classic route  (--classic flag)
-# ══════════════════════════════════════════════════════════════════════════════
 from contractionRL.agents.utils.RL.env import BatchedGymnasiumWrapper

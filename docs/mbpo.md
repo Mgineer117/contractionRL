@@ -39,7 +39,7 @@ The compact tracking actor uses the existing structured, bounded SAC controller 
 | `discount_factor` | 0.99 | SAC discount |
 | `gradient_steps` / `batch_size` | 20 / 256 | SAC updates per vector step / samples per update |
 | `learning_starts` / `random_timesteps` | 100 / 100 | Vector steps before updates / random warmup |
-| `ensemble_size` / `num_elites` | 7 / 5 | Independent models / rollout models |
+| `ensemble_size` / `num_elites` | 5 / 5 | Independent models / rollout models |
 | `model_hidden` | [200, 200, 200, 200] | Each model's SiLU MLP |
 | `model_train_frequency` | 250 | Vector steps between model refits; first fit occurs once learning starts and enough samples exist |
 | `model_min_samples` / `model_max_samples` | 1,000 / 100,000 | Minimum real samples / maximum rows used per fit |

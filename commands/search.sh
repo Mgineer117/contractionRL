@@ -117,8 +117,8 @@ fi
 [[ "$DETACHED" -ne 1 ]] && _success "Algorithm: ${C_BOLD}$ALGORITHM${C_RESET}"
 
 # ── Env ─────────────────────────────────────────────────────────────────── #
-CLASSIC_ENVS=("classic-car-v0" "classic-cartpole-v0" "classic-segway-v0" "classic-quadrotor-v0")
-ISAAC_ENVS=("Humanoid-PathTracking-v0" "Humanoid-VelTracking-v0" "Manipulator-PathTracking-v0" "Manipulator-VelTracking-v0" "Quadruped-PathTracking-v0" "Quadruped-VelTracking-v0" "Isaac-Car-v0" "Isaac-Car-v1" "Isaac-Quadrotor-v0")
+CLASSIC_ENVS=("Isaac-Classic-Car-v0" "Isaac-Classic-Cartpole-v0" "Isaac-Classic-Segway-v0" "Isaac-Classic-Quadrotor-v0")
+ISAAC_ENVS=("Isaac-Transfer-path-Humanoid-v0" "Isaac-Transfer-vel-Humanoid-v0" "Isaac-Transfer-path-Manipulator-v0" "Isaac-Transfer-vel-Manipulator-v0" "Isaac-Transfer-path-Quadruped-v0" "Isaac-Transfer-vel-Quadruped-v0" "Isaac-Car-v0" "Isaac-Car-v1" "Isaac-Quadrotor-v0")
 
 if [[ -z "$ENV_ARG" ]]; then
     ENV_ARG=$(prompt_choice "Select env to sweep (or 'all' for every classic env):" \
@@ -129,10 +129,10 @@ if [[ "$ENV_ARG" == "all" ]]; then
     ENVS=("${CLASSIC_ENVS[@]}")
 else
     case "$ENV_ARG" in
-        car|classic-car-v0)             ENVS=("classic-car-v0") ;;
-        cartpole|classic-cartpole-v0)   ENVS=("classic-cartpole-v0") ;;
-        segway|classic-segway-v0)       ENVS=("classic-segway-v0") ;;
-        quadrotor|classic-quadrotor-v0) ENVS=("classic-quadrotor-v0") ;;
+        car|Isaac-Classic-Car-v0)             ENVS=("Isaac-Classic-Car-v0") ;;
+        cartpole|Isaac-Classic-Cartpole-v0)   ENVS=("Isaac-Classic-Cartpole-v0") ;;
+        segway|Isaac-Classic-Segway-v0)       ENVS=("Isaac-Classic-Segway-v0") ;;
+        quadrotor|Isaac-Classic-Quadrotor-v0) ENVS=("Isaac-Classic-Quadrotor-v0") ;;
         *)
             # Isaac Lab task id — accept only ids that actually exist.
             _found=0

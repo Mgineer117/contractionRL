@@ -27,7 +27,6 @@ import time
 from pathlib import Path
 
 import gymnasium as gym
-import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
 DIRECT = ROOT / "source/contractionRL/contractionRL/tasks/direct"
@@ -44,13 +43,13 @@ def _task_id(task: str) -> str:
     """Accept either the short key or the full classic gym id."""
     if task.startswith("classic-"):
         return task
-    from contractionRL.tasks.direct.common.tracking_tasks import env_id
-    return env_id(task)
+
+    return task
 
 
 def _agents_dir(task: str) -> Path:
     key = "car_v1" if task == "classic-car-v1" else _short(task)
-    return DIRECT / f"isaac_classic_{key}" / "agents"
+    return DIRECT / "Classic" / f"isaac_classic_{key}" / "agents"
 
 
 def _load_cfg(task: str, algorithm: str):
@@ -75,6 +74,7 @@ def _load_cfg(task: str, algorithm: str):
 
 
 def main() -> int:
+    from contractionRL.tasks.direct.common.tracking_tasks import make_analytical_plant
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--task", required=True,
@@ -159,7 +159,7 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
-    env = gym.make(_task_id(args.task), num_envs=1, device="cpu").unwrapped
+    env = make_analytical_plant(_task_id(args.task), num_envs=1, device="cpu").unwrapped
     x_samples = sample_state_box(env.X_MIN, env.X_MAX, n=cfg.cmg_memory_size,
                                  seed=getattr(cfg, "cm_seed", 0))
 

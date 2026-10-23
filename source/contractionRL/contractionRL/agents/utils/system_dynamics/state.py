@@ -135,7 +135,7 @@ def wrap_diff(diff: torch.Tensor, angle_idx: Sequence[int]) -> torch.Tensor:
 
 
 
-# ── Name vocabulary ──────────────────────────────────────────────────────── #
+# Name vocabulary
 # World-frame planar position: translates and rotates.
 _POS_XY = ("pos_x", "pos_y")
 # Translates but does not rotate (the rotation axis).
@@ -182,7 +182,7 @@ class StateSymmetry:
     rot_pairs: tuple[tuple[int, int], ...] = () # (x, y) index pairs that co-rotate
     angle_idx: tuple[int, ...] = ()
 
-    # ── construction ────────────────────────────────────────────────────── #
+    # construction
     @classmethod
     def from_names(cls, names: Sequence[str], *, allow_se2: bool = True) -> StateSymmetry:
         names = tuple(str(n) for n in names)
@@ -227,7 +227,7 @@ class StateSymmetry:
     def disabled(self) -> StateSymmetry:
         return StateSymmetry(self.x_dim, self.names, "none", angle_idx=self.angle_idx)
 
-    # ── derived legacy views ────────────────────────────────────────────── #
+    # derived legacy views
     @property
     def pos_dimension(self) -> int:
         """Back-compat: the historic leading-block position count. Only equal to
@@ -236,7 +236,7 @@ class StateSymmetry:
         ``pos_idx`` directly so they do not depend on it."""
         return len(self.pos_idx)
 
-    # ── index bookkeeping ───────────────────────────────────────────────── #
+    # index bookkeeping
     def _kept_idx(self) -> tuple[int, ...]:
         """State dims a network sees per block: everything except the position
         dims (pure symmetry directions) and, under SE(2), the absolute yaw
@@ -250,7 +250,7 @@ class StateSymmetry:
         kept = self._kept_idx()
         return [kept.index(i) for i in self.angle_idx if i in kept]
 
-    # ── single-block features: W(x), NeuralDynamics f/B ─────────────────── #
+    # single-block features: W(x), NeuralDynamics f/B
     def single_dim(self) -> int:
         if self.mode == "none":
             return embedded_dim(self.x_dim, self.angle_idx)
@@ -274,7 +274,7 @@ class StateSymmetry:
         kept = list(self._kept_idx())
         return embed_angles(x[..., kept], self._kept_angle_idx())
 
-    # ── pair features: the actor's gain nets and the critics ────────────── #
+    # pair features: the actor's gain nets and the critics
     def pair_dim(self) -> int:
         if self.mode == "none":
             return 2 * embedded_dim(self.x_dim, self.angle_idx)
@@ -301,7 +301,7 @@ class StateSymmetry:
                               self.single_features(x),
                               self.single_features(xref)], dim=-1)
 
-        # ── SE(2): rotate the whole scene so the reference yaw is zero ──── #
+        # SE(2): rotate the whole scene so the reference yaw is zero
         yaw_ref = xref[..., self.yaw_idx]
         cos, sin = torch.cos(-yaw_ref), torch.sin(-yaw_ref)
         x_r, xref_r = self._rotate(x, cos, sin), self._rotate(xref, cos, sin)
@@ -331,7 +331,7 @@ class StateSymmetry:
             x[..., self.yaw_idx] + ang + math.pi, 2 * math.pi) - math.pi
         return out
 
-    # ── the feedback error vector ───────────────────────────────────────── #
+    # the feedback error vector
     def error_features(self, x: torch.Tensor, xref: torch.Tensor) -> torch.Tensor:
         """The tracking error CLActor's bilinear feedback multiplies, expressed in
         the canonical frame. Full ``x_dim`` width — every state dim still gets
@@ -361,7 +361,7 @@ class StateSymmetry:
             out[..., iy] = sin * ex + cos * ey
         return out
 
-    # ── numerical verification against the env's own dynamics ───────────── #
+    # numerical verification against the env's own dynamics
     def verify_translation(self, get_f_and_B, x_min, x_max, *, samples=256,
                            offset=10.0, atol=1e-5) -> bool:
         """f and B must not depend on the position dims at all."""

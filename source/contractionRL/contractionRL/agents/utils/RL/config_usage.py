@@ -1,7 +1,7 @@
 """Validate PPO-family options and expose conditional parameters to optimizers."""
 
-PPO_FEATURE_FIELDS = {'use_state_norm','use_value_norm','use_reward_norm','rewards_shaper_scale',
-    'use_value_expansion','value_expansion_horizon','value_expansion_batch_size','action_bound_penalty_beta',
+PPO_FEATURE_FIELDS = {'use_value_norm','rewards_shaper_scale',
+    'use_value_expansion','value_expansion_horizon','value_expansion_batch_size','action_bound_penalty',
     'reward_euclidean','reward_level'}
 
 
@@ -67,7 +67,7 @@ def validate_algorithm_config(cfg):
             unknown = set(network) - {'name','input','layers','activations'}
             if unknown:
                 raise ValueError(f"Unsupported models.{role}.network parameters {sorted(unknown)}")
-    empirical_fields = {'num_controls_per_state','dynamics_lr','dynamics_lr_scheduler',
+    empirical_fields = {'dataset_mode','dynamics_ensemble_size','ood_penalty_coef','num_controls_per_state','dynamics_lr','dynamics_lr_scheduler',
         'dynamics_lr_scheduler_kwargs','dynamics_batch_size','dynamics_pretrain_epochs',
         'dynamics_pretrain_data_path','emp_dynamics_memory_size','dynamics_val_frac','dynamics_early_stop_patience'}
     unknown = set(cfg.get('empirical_dynamics', {})) - empirical_fields
@@ -87,7 +87,9 @@ def config_parameter_usage(cfg, env=None, *, task=None):
         from contractionRL.tasks.direct.common.isaac.backend import dynamics_backend_for_task
         exact = dynamics_backend_for_task(task)=='analytical'
     c2rl = algorithm.startswith('c2rl')
-    needs_model = c2rl or algorithm == 'c3m' or a.get('use_value_expansion',False)
+    task_id = task or getattr(getattr(raw, 'spec', None), 'id', '') or ''
+    transfer = task_id.split(':')[-1].startswith('Isaac-Transfer-path-')
+    needs_model = transfer or c2rl or algorithm == 'c3m' or a.get('use_value_expansion',False)
     method = a.get('cmg_method','ccm' if c2rl else '')
     compact = getattr(getattr(raw, 'ref_window', None), 'compact', True)
     inactive, leaves = {}, []
@@ -121,8 +123,15 @@ def config_parameter_usage(cfg, env=None, *, task=None):
         if role=='policy' and block.get('clip_log_std') is False:
             for key in ('min_log_std','max_log_std'):
                 mark(f'models.{role}.{key}','Log-standard-deviation clipping is disabled')
-    if algorithm in ('ppo','c2rl-ppo','contractionppo','contraction-ppo'):
+    if transfer and cfg.get('empirical_dynamics', {}).get('dataset_mode') != 'uniform':
+        mark('empirical_dynamics.num_controls_per_state','Only uniform collection uses controls per state')
+    elif not transfer and algorithm in ('ppo','c2rl-ppo','contractionppo','contraction-ppo'):
         mark('empirical_dynamics.num_controls_per_state','Measured rollout collector records one applied control per transition')
+    if not transfer:
+        for key in ('dynamics_ensemble_size', 'ood_penalty_coef'):
+            mark('empirical_dynamics.' + key, 'Only transfer-path learned simulators use MOPO ensembles and reward penalties')
+    elif algorithm not in ('ppo', 'c2rl-ppo', 'c2rl-sac', 'contractionppo', 'contraction-ppo', 'sac', 'mbpo'):
+        mark('empirical_dynamics.ood_penalty_coef', 'This controller does not optimize a reward objective')
     mark('environment','Recorded metadata; change the environment configuration instead')
     mark('dynamics_backend','The task selects the dynamics backend')
     if not enabled:
@@ -130,7 +139,7 @@ def config_parameter_usage(cfg, env=None, *, task=None):
     if not a.get('use_value_expansion',False):
         for key in ('value_expansion_horizon','value_expansion_batch_size'):
             mark('agent.'+key,'Value expansion is disabled')
-    if exact or not needs_model:
+    if (exact and not transfer) or not needs_model:
         reason = 'The environment supplies exact dynamics' if exact else 'This configuration does not use a dynamics model'
         mark('models.dynamics',reason); mark('empirical_dynamics',reason)
     elif not cfg.get('empirical_dynamics',{}).get('dynamics_lr_scheduler'):
@@ -157,7 +166,7 @@ def config_parameter_usage(cfg, env=None, *, task=None):
         for key in ('reward_euclidean','reward_level'):
             mark('agent.'+key,'Compact PPO tracking uses its fixed energy-decrease reward')
     if raw is not None and not hasattr(raw,'set_action_bound_penalty'):
-        mark('agent.action_bound_penalty_beta','Environment does not implement an action-bound penalty')
+        mark('agent.action_bound_penalty','Environment does not implement an action-bound penalty')
     return {'active':[path for path in leaves if path not in inactive], 'inactive':inactive}
 
 

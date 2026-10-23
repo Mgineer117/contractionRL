@@ -8,6 +8,16 @@ import sys
 _defined_run = None
 _epoch_metrics = set()
 _pending_metrics = ContextVar("contractionrl_metrics", default=None)
+_evaluation_section = ContextVar('contractionrl_evaluation_section', default=None)
+
+
+@contextmanager
+def evaluation_section(section):
+    token = _evaluation_section.set(section)
+    try:
+        yield
+    finally:
+        _evaluation_section.reset(token)
 
 STABILITY_SCALARS = frozenset({'auc_mean', 'auc_stddev', 'lambda', 'lambda_stddev',
                              'completed_episodes', 'failed_episodes', 'total_episodes', 'episode_completion'})
@@ -26,6 +36,11 @@ _SHARED_LOSSES = frozenset({"Policy loss", "Value loss", "Critic loss", "Entropy
 def metric_name(name):
     """Map legacy metrics to their training/evaluation sections; omit extra statistics."""
     parts = [part.strip() for part in name.split("/")]
+    if parts[0] in ('Simulation Evaluation', 'Sim-to-Real Evaluation'):
+        canonical = metric_name('/'.join(['Evaluation', *parts[1:]]))
+        return canonical.replace('Evaluation/', parts[0] + '/', 1) if canonical is not None else None
+    if any(re.match(r"kl[\s_-]*guard", part, re.IGNORECASE) for part in parts):
+        return None
     if any(part.lower() == "stability_maha" for part in parts):
         return None
     group_index = int(len(parts) > 1 and parts[0] in ("Training", "Evaluation"))
@@ -121,6 +136,10 @@ def log_metrics(metrics, *, step=None, axis="global_step"):
         return
     payload = {key: value for name, value in metrics.items()
                if (key := metric_name(name)) is not None}
+    section = _evaluation_section.get()
+    if section:
+        payload = {key.replace('Evaluation/', section + '/', 1) if key.startswith('Evaluation/') else key: value
+                   for key, value in payload.items()}
     if not payload:
         return
     pending = _pending_metrics.get()
@@ -132,6 +151,8 @@ def log_metrics(metrics, *, step=None, axis="global_step"):
         wandb.define_metric("Evaluation/video_step", hidden=True)
         wandb.define_metric("*", step_metric="global_step")
         wandb.define_metric("Evaluation/*", step_metric="global_step")
+        wandb.define_metric("Simulation Evaluation/*", step_metric="global_step")
+        wandb.define_metric("Sim-to-Real Evaluation/*", step_metric="global_step")
         wandb.define_metric("Training/*", step_metric="global_step")
         wandb.define_metric("CMG Training/*", step_metric="global_step")
         wandb.define_metric("Dynamics Training/*", step_metric="global_step")

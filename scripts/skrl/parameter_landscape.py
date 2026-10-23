@@ -170,6 +170,7 @@ def plot(output, rows, axis, hs):
 
 
 def run(args):
+    from contractionRL.tasks.direct.common.tracking_tasks import make_analytical_plant
     sys.path[:0] = [str(args.source_root / 'source/contractionRL'), str(args.source_root / 'scripts/skrl')]
     import gymnasium as gym
     try:
@@ -219,7 +220,7 @@ def run(args):
         spec = cfg['models']['policy']
         if spec.get('encoder', 'mlp') == 'gru':
             raise ValueError('Checkpoint must use compact state without future/history windows')
-        env = gym.make('classic-car-v0', num_envs=args.batch_size * args.episodes, device=args.device,
+        env = make_analytical_plant('classic-car-v0', num_envs=args.batch_size * args.episodes, device=args.device,
                        disturbance_scales=[0.] * 4).unwrapped
         try:
             if not env.ref_window.compact or not np.isclose(float(bank['dt']), env.dt):

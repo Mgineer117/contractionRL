@@ -1,0 +1,58 @@
+seed: 1
+
+models:
+  encoder:
+    feature_dim: null  # null defaults to 3 * x_dim per GRU.
+    encoder_window: null  # null uses ceil(1 / (1 - discount_factor)) steps for each past/future window.
+  separate: true
+  policy:
+    encoder: null  # No GRU; use gru to encode past and future context.
+    class: DeterministicMixin
+    clip_actions: false
+    network:
+    - name: net
+      input: OBSERVATIONS
+      layers: [128, 128]
+      activations: tanh
+  cmg:
+    class: CMG
+    network:
+    - name: net
+      input: OBSERVATIONS
+      layers: [128, 128]
+      activations: tanh
+      constrain_eigenvalues: true
+memory:
+  class: RandomMemory
+  memory_size: 131072
+
+agent:
+  class: C3M
+  batch_size: 1024
+  learning_rate_scheduler: "ExponentialLR"
+  learning_rate_scheduler_kwargs:
+    gamma: 0.9999
+  W_lr: 1.0e-3
+  u_lr: 1.0e-3
+  lbd: 0.0514
+  eps: 0.01
+  w_ub: 1000.0
+  w_lb: 0.001
+  c1_c2_scale: 0.5
+  detach_warmup_frac: 0.0
+  num_controls_per_state: 3
+  experiment:
+    directory: "segway_c3m"
+    experiment_name: ""
+    write_interval: "auto"
+    checkpoint_interval: "auto"
+    wandb: true
+    wandb_kwargs:
+      project: contractionRL
+      name:
+
+trainer:
+  class: C3MTrainer
+  timesteps: 100
+  eval_interval: 1
+  environment_info: log

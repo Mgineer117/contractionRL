@@ -5,13 +5,12 @@ CV-STEM-LQR, C2RL-PPO, C2RL-SAC — run through one [skrl](https://github.com/To
 backend across two environment families that share a single interface, so any algorithm trains and
 evaluates on any environment and the reported stability metrics are directly comparable.
 
-- **Classic envs** — batched PyTorch/Gymnasium, no simulator. Analytically synthesize a fresh reference
-  trajectory every `reset()`. These provide the analytical plants for the Isaac tasks:
-  `car-v0`, `car-v1`, `cartpole`, `segway`, and `quadrotor`.
 - **Isaac envs** — quadruped / humanoid / manipulator velocity- and path-tracking. Need Isaac Lab.
 - **Exact classic plants in Isaac** — `Isaac-Classic-Car-v0`, `Isaac-Classic-Car-v1`, `Isaac-Classic-Quadrotor-v0`, `Isaac-Classic-Cartpole-v0`, and `Isaac-Classic-Segway-v0` reuse the analytical equations, bounds, time step, references, and rewards, with their own algorithm configs. Isaac displays a blue body and green reference point; the markers do not add contact or rigid-body dynamics. The old Isaac `Cartpole-v0` is no longer registered.
 
-Each Isaac task owns a directory under `tasks/direct/`, such as `isaac_car/`, `isaac_classic_car/`, or `humanoid_path_tracking/`, with its registration, environment, configuration, and `agents/` configs. Shared analytical plants and Isaac backend support live in `common/`. The CPU-only `classic-*` aliases use the analytical dynamics and configs in the corresponding `isaac_classic_*/` directory.
+Each Isaac task owns a directory under `tasks/direct/`, with its registration, environment, configuration, and `agents/` configs. `Classic/` contains the `isaac_classic_*/` analytical tasks. `PhyX/mobile_robots/` contains the PhysX car, cartpole, segway, and quadrotor tasks; `PhyX/complex_robots/` contains the quadruped, humanoid, and manipulator transfer tasks. Shared plant and backend support lives in `common/`. Standalone CPU-only Gym aliases are no longer registered.
+
+Under `PhyX/complex_robots/`, transfer tasks use `isaac_transfer_path_{robot}/` and `isaac_transfer_vel_{robot}/`, where `robot` is `quadruped`, `humanoid`, or `manipulator`. Their registered environment IDs are `Isaac-Transfer-path-{Robot}-v0` and `Isaac-Transfer-vel-{Robot}-v0`.
 
 The current state/control bounds, reference generation, rewards, disturbances, and termination rules are documented in [Isaac MDPs](docs/isaac_mdp.md). Tracking policies use compact reference parameters and MLPs, with structured nominal-plus-feedback control by default. Legacy sequence policies require their original observation layout.
 
@@ -30,7 +29,7 @@ python scripts/list_experiments.py --env Isaac-Classic-Car-v1 --algorithm c2rl-p
 ## Install
 
 ```bash
-python -m pip install -e source/contractionRL        # classic envs need nothing else
+python -m pip install -e source/contractionRL
 ```
 
 Isaac envs additionally need [Isaac Lab](https://isaac-sim.github.io/IsaacLab/). Isaac Sim 5.1 requires `numpy==1.26.0`; NumPy 2.x is incompatible with its native video-capture bindings.
@@ -44,13 +43,13 @@ python scripts/list_envs.py --keyword classic   # list envs without loading Isaa
 ## Quick start
 
 ```bash
-# Classic (no simulator). --num_envs sets the batched plant count.
-python scripts/skrl/train.py --classic --task classic-car-v0 --algorithm c2rl-ppo --num_envs 4
+# Analytical transitions rendered in Isaac Sim.
+python scripts/skrl/train.py --task Isaac-Classic-Car-v0 --algorithm c2rl-ppo --num_envs 4
 
 # Isaac: pretrain locomotion on velocity-tracking, then do contraction control on path-tracking
-python scripts/skrl/train.py --task Quadruped-VelTracking-v0  --algorithm ppo --num_envs 4096
-python scripts/skrl/train.py --task Quadruped-PathTracking-v0 --algorithm c3m
-# Exact car equations batched on GPU inside Isaac Lab (omit --classic).
+python scripts/skrl/train.py --task Isaac-Transfer-vel-Quadruped-v0  --algorithm ppo --num_envs 4096
+python scripts/skrl/train.py --task Isaac-Transfer-path-Quadruped-v0 --algorithm c3m
+# Exact car equations batched on GPU inside Isaac Lab .
 python scripts/skrl/train.py --task Isaac-Classic-Car-v0 --algorithm ppo --num_envs 128
 # Isaac Sim runs headless by default; pass --headon to render a window.
 
@@ -63,6 +62,8 @@ python scripts/skrl/play.py --classic --task classic-car-v0
 ```
 
 Task names select the transition model: `Isaac-Classic-*` uses analytical equations rendered in Isaac, while `Isaac-*` uses PhysX. Both families provide Car-v0, Car-v1, Quadrotor-v0, Cartpole-v0, and Segway-v0 and support parallel GPU environments. Each pair shares the same public state, control meanings and bounds, observations, resets, reference generator, rewards, disturbances and episode rules; only dynamics processing differs. See [backend choices and MDPs](docs/isaac_backends.md) for all five tasks, commands, controls and checkpoint compatibility.
+
+The native robot tasks use `Isaac-Transfer-path-<Robot>-v0` and `Isaac-Transfer-vel-<Robot>-v0`, where `<Robot>` is `Quadruped`, `Humanoid`, or `Manipulator`. Velocity tasks generate nominal references for the corresponding path-tracking tasks.
 
 Isaac RL defaults scale with the task: car v0/v1 **500k**, cartpole/segway **1M**, quadrotor **2M**, manipulator **3M**, quadruped **4M**, and humanoid **5M** batched training steps. The robot budgets apply to both velocity and path tracking, and classic-derived Isaac budgets apply to both analytical and PhysX backends. PPO, SAC, C2RL-PPO/SAC, ContractionPPO and MBPO use these defaults. Classic-only tasks and offline controller horizons keep their existing settings. Explicit `--num_timesteps`, `--max_iterations`, dotted/Hydra timestep overrides and sweep budgets take precedence. These are vector steps: 500k steps with 128 environments collect 64 million transitions. The task defaults are applied by `scripts/skrl/train.py` before CLI/sweep overrides and before the resolved configuration is saved; task YAMLs retain their CPU-only budgets before the Isaac task defaults are applied.
 
@@ -110,7 +111,9 @@ PPO, C2RL-PPO and ContractionPPO optionally use [model-based value expansion](do
 
 Each environment owns [its PPO config](docs/ppo_configuration.md), and its C2RL-PPO and ContractionPPO configs inherit that local file. Algorithm overlays contain their own additions, and saved configs report inactive settings so they are not silently swept.
 
-C2RL [stochastic dynamics learning](docs/stochastic_dynamics.md) uses conditional Gaussian negative log likelihood for PhysX environments. Metrics use nominal f/B only. Analytical runs skip model fitting and use exact dynamics with prescribed disturbances. PhysX trains the dynamics model for metric synthesis, retains physical gusts in real policy rollouts, and uses learned residuals in model rollouts. References remain nominal.
+C2RL [stochastic dynamics learning](docs/stochastic_dynamics.md) uses conditional Gaussian negative log likelihood for PhysX environments. Metrics use nominal f/B only. Analytical runs skip model fitting and use exact dynamics with prescribed disturbances. Classic-derived PhysX tasks train the dynamics model for metric synthesis, retain physical gusts in policy rollouts, and use learned residuals in model rollouts. References remain nominal.
+
+`Isaac-Transfer-path-*` instead optimize every policy in a frozen learned stochastic simulator. Each robot's local `dynamics_cfg.yaml` selects uniform state/control sampling with second-order forward differences or disturbed reference rollouts with fourth-order differences. All algorithms inherit its empirical fitting settings. Reward-based optimization includes a configurable MOPO ensemble-uncertainty deduction. Evaluation compares the original task reward in the learned simulator and PhysX under `Simulation Evaluation` and `Sim-to-Real Evaluation`, including control-delay metrics. See [transfer dynamics](docs/transfer_dynamics.md).
 
 CCM is the C2RL-PPO default. Relative-position PPO metrics reject physical-state CV-STEM caches and historical metric checkpoints require their archived source. Select CCM explicitly with `--cmg_method ccm` or `cmg_method: ccm` under `cm:`. Its training knobs are
 `ccm_epochs`, `ccm_lr`, `ccm_memory_size`, and `ccm_batch_size` under `cmg:`. CV-STEM uses `cvstem_memory_size`, `cvstem_batch_size`, and `regress_*` settings. `val_frac` and `early_stop_patience` apply to both methods. The three loss weights
@@ -131,7 +134,7 @@ analytic base controller in the loop and no certificate-based warm start of `pi`
 
 The metric and the reward always use **raw** observations: `M(x)` and `e = x - xref` are physical
 quantities, and per-dimension normalization would scale `x` and `xref` independently, distorting
-`e`. `use_state_norm` is `false` in every shipped config.
+`e`.
 
 ## Metrics
 
@@ -167,7 +170,7 @@ Use the new utility paths in new code, for example `from contractionRL.agents.ut
 
 ## Configuration
 
-One yaml per (env, algorithm), next to the env: `tasks/direct/<env>/agents/skrl_<algorithm>_cfg.yaml`.
+One yaml per (env, algorithm), next to the env: `tasks/direct/Classic/<env>/agents/skrl_<algorithm>_cfg.yaml` or `tasks/direct/PhyX/<robot_group>/<env>/agents/skrl_<algorithm>_cfg.yaml`.
 
 **A yaml key that is not a declared field of the algorithm's `Cfg` dataclass is not applied.**
 `agents.utils.RL.config.filter_cfg_fields` warns loudly rather than dropping it silently, because a run with an

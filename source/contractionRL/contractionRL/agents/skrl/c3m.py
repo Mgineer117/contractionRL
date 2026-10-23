@@ -1,48 +1,15 @@
-"""C3M — skrl-native Control Contraction Metric agent.
+"""C3M jointly learns a physical-state metric and tracking controller.
 
-Jointly learns:
-  * W(x)        — contraction-metric generator over physical state
-  * u(x,xref)   — contracting controller (CLActor / CLActorModel)
+Independent (x, xref, uref) samples cover the physical state/control boxes.
+Analytical tasks supply exact f and B; PhysX tasks fit NeuralDynamics.
+Both networks update from the same contraction-loss backward pass.
 
-Training uses random (x, xref, uref) triples from ``env.get_rollout`` — no
-environment rollouts needed. States, references and reference inputs are drawn
-independently over the full physical state/applied-input boxes, sharing C2RL's
-CCM sampler. Both networks learn from the same triples. Use with C3MSkrlTrainer.
+Cu = M_dot + 2 sym(M(A + BK)) + 2 lambda M < 0
+C1 = B_perp.T(-W_dot_f + 2 sym(Df/Dx W) + 2 lambda W)B_perp < 0
+C2 = B_perp.T(W_dot_b - 2 sym(DB/Dx W))B_perp = 0
 
-Contraction conditions verified jointly:
-  Cu = Ṁ + 2·sym(M(A+BK)) + 2λM ≺ 0     (closed-loop)
-  C1 = Bᗩᵀ(-Ẇ_f + 2·sym(Df/Dx·W) + 2λW)Bᗩ ≺ 0
-  C2 = Bᗩᵀ(Ẇ_b - 2·sym(∂B/∂x·W))Bᗩ = 0
-
-Per-``update()`` workflow (called once per ``timestep`` by C3MSkrlTrainer,
-see ``update()`` and ``_learn()`` below):
-
-  1. **Dynamics** (for PhysX tasks) — draw a fresh
-     ``(x, u, x_dot)`` batch via ``get_rollout(..., "dynamics")`` and take one
-     Likelihood gradient step on ``NeuralDynamics`` (``ẋ = f_net(x) + B_net(x)·u``).
-     PhysX envs use this path (no closed-form dynamics available);
-     analytical environments use the
-     env's exact ``get_f_and_B(x)``, skipping dynamics fitting.
-  2. **``_learn()``** — one full pass over ``self._data`` (a static/periodically
-     -refreshed buffer of ``(x, xref, uref)`` triples from
-     ``get_rollout(..., "c3m")``) in ``batch_size`` chunks. For each chunk,
-     ``_compute_loss`` builds the same combined loss (``pd_loss + c1_loss +
-     c2_loss (+ os_loss)``) over both networks, and ``_optimize_params`` takes
-     one joint gradient step — CMG and controller updated simultaneously from
-     the same backward pass, matching the reference C3M training script. (An
-     earlier version alternated — CMG-only step, then controller-only step,
-     each with a fresh forward/backward — mirroring a different, unrelated
-     codebase's convention; that alternation made training a stale-view
-     chasing dynamic between the two networks, similar to gan training
-     instability, and was found to be substantially more seed-sensitive than
-     the reference's simultaneous update — see git history for the A/B.)
-
-Physical observations stay raw for dynamics, metric and controller Jacobians.
-The compact controller scales its neural inputs through the shared
-``TrackingFeatures`` map (including p - p_ref and periodic angles) at both
-training and evaluation time, as in C2RL. C3M's CMG takes physical x only,
-and its material derivative follows physical dynamics, as in C2RL-PPO's CCM
-training. C3M has no critic or running observation/value preprocessor.
+Dynamics, metrics and their Jacobians use physical coordinates. The controller
+uses shared TrackingFeatures, as in C2RL. There is no critic or running scaler.
 """
 
 from __future__ import annotations
@@ -55,7 +22,6 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import tqdm as _tqdm
 from skrl.agents.torch.base import Agent, AgentCfg
 from skrl.trainers.torch.base import Trainer, TrainerCfg
@@ -73,9 +39,7 @@ from contractionRL.agents.utils.contraction.math_utils import (
 from contractionRL.agents.utils.system_dynamics.reference import RefWindow
 from contractionRL.agents.utils.RL.config import filter_cfg_fields
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # Configuration
-# ─────────────────────────────────────────────────────────────────────────── #
 
 @dataclass
 class C3MCfg(AgentCfg):
@@ -91,73 +55,31 @@ class C3MCfg(AgentCfg):
     eps: float = 1e-2
     w_ub: float = 10.0
     w_lb: float = 0.1
-    # QR-orthonormalize the control annihilator B_null before the C1/C2
-    # projections. The envs supply B_null as a non-orthonormal basis (turtlebot's
-    # columns carry factors like k₂·sinθ·k₃), so the C1_reg = C1 + ε·I margin
-    # means a different thing at every state and the random-projection PD loss
-    # weights each state by ‖B_null‖² — the same inconsistency
-    # the removed train_cmg_ccm fixed via QR (orthonormalize_bbot); see git history.
-    # Off by default here (unlike there, where QR is free): C1/C2 are the
-    # Training signal, so orthonormalizing
-    # reweights the loss across states and shifts C3M's (seed-sensitive) training
-    # dynamics — enable to A/B, not silently. Feasible set is unchanged either way.
+    # Orthonormalize B_null so the epsilon margin and PD loss do not depend on
+    # the scale of the supplied annihilator basis.
     orthonormalize_bbot: bool = False
-    # Multiplies (c1_loss + c2_loss) before summing into the total loss, e.g.
-    # 0.1 → loss = os_loss + pd_loss + 0.1 * (c1_loss + c2_loss). Does not touch
-    # pd_loss/os_loss — only C1/C2 (the open-loop metric-feasibility conditions),
-    # letting the closed-loop controller term (pd_loss, Cu) dominate training
-    # when C1/C2 are noisy/dominant early on. Defaults to 1.0 (no-op, matches
-    # the reference C3M script's unweighted sum).
+    # Scale C1/C2 feasibility losses independently of the PD and controller terms.
     c1_c2_scale: float = 1.0
-    # Fraction of training (by progress, 0-1) during which the metric M is held
-    # fixed (detached) in the contraction term Cu, mirroring the reference C3M
-    # script's `detach=True if epoch < lr_step else False` warmup (5 of 15
-    # epochs ≈ 1/3). Lets the policy start becoming contracting w.r.t. a frozen
-    # initial metric before the double-backward Ṁ term (numerically the most
-    # fragile part of the loss) starts shaping both networks jointly.
+    # Detach M in Cu during the initial training fraction to stabilize metric learning.
     detach_warmup_frac: float = 1.0 / 3.0
-    # Random directions sampled per loss_pos_matrix_random_sampling() call (the
-    # PD-violation hinge loss for pd_loss/c1_loss/os_loss). This is a pure
-    # statistical-coverage knob — it does not affect numerical stability
-    # (unlike an eigenvalue-decomposition loss, this method never
-    # differentiates through an eigendecomposition at any sample count).
-    # The reference script used 1024, but that's overkill for a loss called
-    # every SGD step (not a one-shot certificate): for low-dimensional systems
-    # (x_dim ~4-6, e.g. classic car/cartpole/segway/turtlebot) 1024 directions
-    # measured ~13x slower per call than the old eigvalsh-based loss it
-    # replaced, for negligible extra coverage. 128 stays comfortably above
-    # every x_dim in this repo (~4-33) while costing only ~2x eigvalsh.
+    # Number of random directions used to estimate PD violations; more samples
+    # improve statistical coverage without differentiating eigenvalues.
     pd_loss_num_samples: int = 128
-    # Defaults to always-on: an unbounded LR indefinitely re-visiting the same
-    # static offline buffer (see module docstring) is a major driver of the
-    # late-training drift/degradation this schedule is meant to damp. Configs
-    # may still override to "" to opt out. Shared across all optimizers (CMG,
-    # controller, and — for PhysX tasks — NeuralDynamics); there is
-    # no separate dynamics-only scheduler knob.
+    # Anneal learning rates while repeatedly fitting the offline buffer.
     learning_rate_scheduler: str = "ExponentialLR"
     learning_rate_scheduler_kwargs: dict = field(default_factory=lambda: {"gamma": 0.9999})
     dynamics_lr: float = 1e-3
     dynamics_batch_size: int = 4096
     dynamics_pretrain_epochs: int = 5
     dynamics_pretrain_data_path: str = ""
-    # Fixed pretraining buffer size — sampled once (offline-data subsample when
-    # dynamics_pretrain_data_path is set, else a fresh get_rollout draw), then
-    # multi-epoch trained over, mirroring cmg_memory_size's role in C2RL's CMG
-    # synthesis (see dynamics_pretrain.pretrain_dynamics). Classic envs can
-    # feasibly use any size (synthetic analytic sampling); Isaac envs with a
-    # data_path are capped (+ warned) to the offline data actually on disk.
+    # Sample a fixed dynamics buffer, then fit it over multiple epochs.
     emp_dynamics_memory_size: int = 8192
     # Classic envs only: how many distinct control vectors get paired with each
     # sampled state in a "dynamics" rollout (env_base.get_rollout); replaces the
     # old hardcoded 3. Used both for pretraining and this agent's per-step
     # online dynamics refinement (see update()).
     num_controls_per_state: int = 3
-    # Held out from emp_dynamics_memory_size as a validation split never
-    # trained on; pretrain_dynamics stops once its MSE hasn't improved for
-    # dynamics_early_stop_patience consecutive epochs, restoring the
-    # best-val-epoch NeuralDynamics weights (see
-    # dynamics_pretrain.pretrain_dynamics / math_utils.EarlyStopper). <=0
-    # disables both (always pretrain the full budget).
+    # Hold out dynamics validation data and restore the best validation checkpoint.
     dynamics_val_frac: float = 0.1
     dynamics_early_stop_patience: int = 10
 
@@ -174,9 +96,7 @@ class C3MTrainerCfg(TrainerCfg):
     environment_info: str = "default"
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # Agent
-# ─────────────────────────────────────────────────────────────────────────── #
 
 class C3MAgent(Agent):
     """Control Contraction Metric agent — native skrl Agent, zero mjrl dependency.
@@ -238,7 +158,7 @@ class C3MAgent(Agent):
         self._cfg = cfg
 
 
-        # ── Dynamics: analytical or learned online ──────────────────────── #
+        # Dynamics: analytical or learned online
         if get_f_and_B is not None:
             self._get_f_and_B = get_f_and_B
             self._neural_dynamics = None
@@ -253,16 +173,12 @@ class C3MAgent(Agent):
                 self._neural_dynamics.parameters(), lr=cfg.dynamics_lr
             )
 
-        # ── Extract underlying nn.Module objects from project model wrappers ── #
+        # Extract underlying nn.Module objects from project model wrappers
         self._ccm_gen = models["cmg"].ccm_gen
         self._cl_actor = models["policy"].cl_actor
 
-        # ── Optimizers + LR schedulers ──────────────────────────────────── #
-        # Separated optimizers matching actual CAC-dev behavior to allow alternating updates
-        # and gradient NaN-filtering. A single scheduler type/kwargs (cfg.learning_rate_scheduler)
-        # is shared across the CMG (W), controller (u), and — when learned — NeuralDynamics
-        # optimizers, all stepped together once per update() (see _learn()); there is no
-        # separate dynamics-only scheduler config.
+        # Keep separate optimizers for CMG/controller gradient filtering,
+        # with one configured scheduler type shared by the optimizers.
         self._w_optimizer = torch.optim.Adam(self._ccm_gen.parameters(), lr=cfg.W_lr)
         self._u_optimizer = torch.optim.Adam(self._cl_actor.parameters(), lr=cfg.u_lr)
         self._progress = 0.0
@@ -281,7 +197,7 @@ class C3MAgent(Agent):
             self._u_lr_scheduler = None
             self._dynamics_lr_scheduler = None
 
-        # ── Data buffer (numpy; static for analytical, or pre-generated) ────── #
+        # Data buffer (numpy; static for analytical, or pre-generated)
         self._memory_size = getattr(self.memory, "memory_size", cfg.memory_size) if self.memory is not None else cfg.memory_size
         if self._memory_size < 1:
             raise ValueError("C3M memory.memory_size must be positive")
@@ -295,7 +211,7 @@ class C3MAgent(Agent):
             modules["dynamics"] = self._neural_dynamics
         self.checkpoint_modules.update(modules)
 
-    # ── skrl Agent interface ────────────────────────────────────────────── #
+    # skrl Agent interface
 
     def act(self, observations, states, *, timestep: int, timesteps: int):
         with torch.no_grad():
@@ -354,7 +270,7 @@ class C3MAgent(Agent):
         if dyn_loss is not None:
             self._last_metrics["C3M/dynamics/mse"] = dyn_loss
 
-    # ── Contraction math (inlined from mjrl C3M) ───────────────────────── #
+    # Contraction math (inlined from mjrl C3M)
 
     def _to_tensor(self, arr):
         dev = self.device
@@ -404,39 +320,12 @@ class C3MAgent(Agent):
             # uniform across states — see C3MCfg.orthonormalize_bbot.
             Bbot = torch.linalg.qr(Bbot).Q
 
-        # Certify the *deterministic* controller: use the mean control, not a
-        # noisy rsample. Exploration noise would otherwise perturb A and dot_x
-        # (and hence the contraction condition Cu) — this matches C2RL's CMG loss.
-        #
-        # Go through the policy model's own compute() rather than calling
-        # self._cl_actor.mean_control() directly: which control law gets
-        # certified (raw/unbounded vs. tanh-squashed/bounded) is then purely a
-        # function of which backbone built the model (CLDeterministicActorModel
-        # vs. SquashedCLDeterministicActorModel — see models.py), the same
-        # "backbone name selects the class, class defines the behavior"
-        # convention SAC's control-squashed backbone already uses, rather than
-        # a boolean flag threaded through here. A hard torch.clamp instead of
-        # the tanh squash would not be equivalent: clamp's gradient is exactly
-        # zero at saturation, so K = jacobian(u, x) collapses to zero there
-        # too, and the certificate degrades to checking the open-Loop drift
-        # alone in every state that needed feedback most — this is what caused
-        # the real AUC divergence documented in project memory
-        # (project_c3m_clip_actions_divergence.md,
-        # project_c3m_env_divergence_2026-07-10.md).
-        # Window slots 1.. are random plausible references (see
-        # RefWindow.synth_obs): the certificate must hold for the window content
-        # the actor actually meets, not just a constant one.
+        # Certify the deterministic policy mean, including its own squashing behavior.
+        # Hard clipping would erase the controller Jacobian at saturation.
+        # Sample reference windows from the same distribution seen by the actor.
         state = self._window.synth_obs(x, xref, uref, *self._c3m_pools())
-        # cuDNN's RNN kernel has no double-backward support (a hard cuDNN API
-        # limitation, not a train/eval-mode issue) and this loss needs exactly
-        # that: K = jacobian(u, x, create_graph=True) is itself a backward
-        # through this forward, and _optimize_params then backprops through K.
-        # Only bites when the reference-window encoder is a GRU (--encoder gru),
-        # which since the window refactor sits inside the certified control path
-        # (CLActor.w2) for every algorithm, C3M included. Disabling cuDNN for
-        # this one call switches PyTorch to its generic RNN path, which does
-        # support double-backward, at some extra compute cost here only.
-        # Same guard as C2RL's contraction-pretrain loop.
+        # Disable cuDNN here: contraction differentiates through du/dx and requires
+        # double backward, which cuDNN GRUs do not support.
         with torch.backends.cudnn.flags(enabled=False):
             u = self.models["policy"].compute({"observations": state}, role="policy")[0]
         K = jacobian(u, x)
@@ -604,9 +493,7 @@ class C3MAgent(Agent):
             print(f"[C3M] Saved NeuralDynamics → {path}")
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
 # Trainer
-# ─────────────────────────────────────────────────────────────────────────── #
 
 class C3MSkrlTrainer(Trainer):
     """skrl Trainer for C3M with optional dynamics-data collection before fitting.
@@ -619,16 +506,7 @@ class C3MSkrlTrainer(Trainer):
         timesteps = self.cfg.timesteps
         eval_interval = getattr(self.cfg, "eval_interval", 1)
 
-        # Must be set on the instance attribute before init(): base Agent.init()
-        # only creates self.writer when self.write_interval > 0 *at that moment*
-        # (self.write_interval starts out as the literal "auto" string from
-        # __init__, and init()'s "auto" resolution — timesteps // 100, which is
-        # 0 for any timesteps < 100 — reads/writes that same attribute, not
-        # self.cfg.experiment.write_interval). Overriding it only after init()
-        # leaves self.writer unset while write_tracking_data() still gets
-        # called every eval_interval steps → AttributeError: 'C3MAgent' object
-        # has no attribute 'writer', crashing the run before any metric is
-        # ever logged to W&B.
+        # Set write_interval before init(), which conditionally creates the writer.
         agent.write_interval = eval_interval
         agent.init(trainer_cfg=self.cfg)
 
@@ -692,14 +570,18 @@ class C3MSkrlTrainer(Trainer):
                 for key in tuple(agent.tracking_data):
                     if key.startswith("Stability/"):
                         agent.tracking_data.pop(key)
-                track_stability_summary(agent, ev["stability"])
-                track_reward_summary(agent, ev["reward"])
-                # C3M's trainer never forwards info["log"] (its eval loop discards
-                # info), so the generic Clamp/* passthrough that PPO/SAC/C2RL get
-                # from their trainers does not reach here. Emit it explicitly on
-                # the agent-side route instead of letting the metric go silently
-                # missing for exactly the algorithm whose whole claim is a
-                # contraction certificate.
+                if 'sim_to_real' in ev:
+                    for section, values in (('Simulation Evaluation', ev), ('Sim-to-Real Evaluation', ev['sim_to_real'])):
+                        track_stability_summary(agent, values['stability'], tab=f'{section}/Stability')
+                        track_reward_summary(agent, values['reward'], tab=f'{section}/Reward')
+                        for key, value in values.get('control', {}).items():
+                            agent.track_data(f'{section}/Control/{key}', value)
+                else:
+                    track_stability_summary(agent, ev['stability'])
+                    track_reward_summary(agent, ev['reward'])
+                    for key, value in ev.get('control', {}).items():
+                        agent.track_data(f'Evaluation/Control/{key}', value)
+                # C3M's trainer discards info["log"]; forward clamp metrics explicitly.
                 _clamp = getattr(self.env, "clamp_summary", None)
                 if callable(_clamp):
                     _cs = _clamp()
@@ -774,6 +656,16 @@ class C3MSkrlTrainer(Trainer):
                 return
 
     def eval(self, timestep: int = 0) -> dict:
+        from contractionRL.tasks.direct.common.transfer_dynamics import is_transfer_path, evaluate_backend_pair
+        raw = self.env.unwrapped
+        if is_transfer_path(raw) and hasattr(raw, 'set_transition_backend'):
+            pair = evaluate_backend_pair(self.env, lambda: self._eval_single(timestep))
+            return {**pair['simulation'], 'sim_to_real': pair['sim_to_real']}
+        return self._eval_single(timestep)
+
+    def _eval_single(self, timestep: int = 0) -> dict:
+        from contractionRL.agents.utils.RL.evaluation import EvaluationControl
+
         agent = self.agents if not isinstance(self.agents, list) else self.agents[0]
         agent.enable_training_mode(False)
         self._force_env_reset()
@@ -799,20 +691,21 @@ class C3MSkrlTrainer(Trainer):
         computes_before = getattr(self.env, "_compute_count", None)
 
         eval_pbar = tqdm(range(max_steps), desc="C3M eval", leave=False, file=sys.stdout)
-        for step in eval_pbar:
-            eval_pbar.set_postfix(timestep=f"{step + 1}/{max_steps}")
-            with torch.no_grad():
-                actions, _ = agent.act(observations, states, timestep=0, timesteps=1)
-
-            active = ~finished
-            observations, rewards, terminated, truncated, _ = self.env.step(actions)
-            states = self.env.state() if hasattr(self.env, "state") else None
-            total_reward += rewards.view(num_envs, 1) * active.unsqueeze(-1).float()
-            reward_steps += active.unsqueeze(-1)
-
-            finished |= (terminated | truncated).view(num_envs)
-            if finished.all():
-                break
+        with EvaluationControl(self.env, agent) as control:
+            for step in eval_pbar:
+                eval_pbar.set_postfix(timestep=f"{step + 1}/{max_steps}")
+                active = ~finished
+                actions = control.act(observations, states, active=active)
+                observations, rewards, terminated, truncated, _ = self.env.step(actions)
+                states = self.env.state() if hasattr(self.env, "state") else None
+                total_reward += rewards.view(num_envs, 1) * active.unsqueeze(-1).float()
+                reward_steps += active.unsqueeze(-1)
+                done = (terminated | truncated).view(num_envs)
+                control.after_step(done)
+                finished |= done
+                if finished.all():
+                    break
+            control_metrics = control.summary()
         eval_pbar.close()
 
         agent.enable_training_mode(True)
@@ -834,4 +727,5 @@ class C3MSkrlTrainer(Trainer):
         return {
             "stability": self.env.stability_summary() if fresh else {},
             "reward": reward_summary(total_reward, f_mask, steps=reward_steps),
+            "control": control_metrics,
         }

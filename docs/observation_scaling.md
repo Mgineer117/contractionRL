@@ -1,6 +1,6 @@
 # Observation scaling
 
-Physical observations remain unchanged for dynamics, rewards, contraction metrics and control synthesis. Scaling happens inside the neural model, so training and evaluation use the same features. `use_state_norm: false` disables a running observation preprocessor; it does not disable the compact model's fixed feature scaling. `use_value_norm` separately normalizes PPO's value targets.
+Physical observations remain unchanged for dynamics, rewards, contraction metrics and control synthesis. Fixed feature transformations happen inside the neural model, so training and evaluation use the same features. `use_value_norm` separately normalizes PPO's value targets.
 
 | Algorithm / observation layout | Policy inputs | Critic inputs |
 | --- | --- | --- |

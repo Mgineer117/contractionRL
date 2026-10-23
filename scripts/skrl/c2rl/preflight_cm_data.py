@@ -16,7 +16,7 @@ about -- a check that agrees with itself and disagrees with the agent is worse
 than no check.
 
 Usage:
-    python scripts/skrl/c2rl/preflight_cm_data.py classic-cartpole-v0 classic-car-v1 ...
+    python scripts/skrl/c2rl/preflight_cm_data.py Isaac-Classic-Cartpole-v0 Isaac-Classic-Car-v1 ...
     python scripts/skrl/c2rl/preflight_cm_data.py --batch        # the four gamma-batch envs
 Exit status is 1 if any env would fail, so it can gate a submit script.
 """
@@ -30,7 +30,7 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "source" / "contractionRL"))
 
 # The envs of the gamma batch, in the order they are submitted.
-BATCH = ["classic-cartpole-v0", "classic-segway-v0", "classic-car-v0", "classic-car-v1"]
+BATCH = ["Isaac-Classic-Cartpole-v0", "Isaac-Classic-Segway-v0", "Isaac-Classic-Car-v0", "Isaac-Classic-Car-v1"]
 
 
 def cfg_for(task: str, algorithm: str):
@@ -82,7 +82,7 @@ def check(task: str, algorithm: str = "c2rl_ppo", cmg_method: str | None = None)
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("tasks", nargs="*", help="task ids, e.g. classic-car-v1")
+    ap.add_argument("tasks", nargs="*", help="task ids, e.g. Isaac-Classic-Car-v1")
     ap.add_argument("--batch", action="store_true", help="check the four gamma-batch envs")
     ap.add_argument("--algorithm", default="c2rl_ppo")
     ap.add_argument("--cmg-method", choices=["cvstem", "ccm"])

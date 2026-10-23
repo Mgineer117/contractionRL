@@ -22,7 +22,7 @@ class PlanarTrackingEnv(PhysXTrackingEnv):
 
     def _setup_scene(self):
         task = 'segway' if self.segway else 'cartpole'
-        asset = Path(__file__).parents[2] / f'isaac_{task}' / 'assets' / f'{task}.usda'
+        asset = Path(__file__).parents[2] / 'PhyX' / 'mobile_robots' / f'isaac_{task}' / 'assets' / f'{task}.usda'
         cfg = ArticulationCfg(
             prim_path='/World/envs/env_.*/Robot',
             spawn=sim_utils.UsdFileCfg(

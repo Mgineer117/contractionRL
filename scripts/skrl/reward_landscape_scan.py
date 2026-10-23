@@ -33,6 +33,7 @@ def training_plane(initial, ppo, c2rl):
 
 @torch.no_grad()
 def scan(args):
+    from contractionRL.tasks.direct.common.tracking_tasks import make_analytical_plant
     root, output = args.root.resolve(), args.output.resolve()
     sys.path[:0] = [str(root / 'code/source/contractionRL'), str(root / 'code/scripts/skrl')]
     import gymnasium as gym
@@ -65,7 +66,7 @@ def scan(args):
             'Exploration variance stays at each checkpoint and can change between checkpoints.'],
         started_at=datetime.now(timezone.utc).isoformat())
     write_json(output / 'summary.json', summary)
-    env = gym.make('classic-car-v0', num_envs=64*args.batch_size, device='cpu', disturbance_scales=[0.]*4).unwrapped
+    env = make_analytical_plant('classic-car-v0', num_envs=64*args.batch_size, device='cpu', disturbance_scales=[0.]*4).unwrapped
     started = time.monotonic()
     progress = 0
     (output / 'progress.csv').write_text('Steps,ElapsedSeconds\n0,0\n')

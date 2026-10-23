@@ -1,6 +1,6 @@
 """Export safe nominal references from a trained velocity-tracking policy.
 
-Example: python scripts/skrl/generate_ref_traj.py --task Quadruped-VelTracking-v0
+Example: python scripts/skrl/generate_ref_traj.py --task Isaac-Transfer-vel-Quadruped-v0
 --checkpoint logs/skrl/.../checkpoints/best_agent.pt --robot quadruped
 --num_envs 8 --num_trajs 20 --out_dir data/quadruped --headless
 """
@@ -42,7 +42,7 @@ def validate_args(args):
     if args.min_ref_quality is not None and not math.isfinite(args.min_ref_quality):
         raise ValueError('--min_ref_quality must be finite')
     task = args.task.split(':')[-1]
-    if not task.startswith(args.robot.capitalize() + '-VelTracking'):
+    if task != f'Isaac-Transfer-vel-{args.robot.capitalize()}-v0':
         raise ValueError('--robot must match the velocity-tracking task')
     args.ref_num_trajs = args.num_trajs
     return args

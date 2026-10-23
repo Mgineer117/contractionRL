@@ -89,20 +89,39 @@ def _deterministic_factory(observation_space, state_space, action_space, device,
 
 
 class CLActorRunner(Runner):
+    def run(self, mode='train'):
+        from contractionRL.runners.contraction_runner import _unwrap_env
+        from contractionRL.tasks.direct.common.transfer_dynamics import is_transfer_path, evaluate_backend_pair
+        from contractionRL.agents.utils.RL.logging import evaluation_section
+        raw = _unwrap_env(self._env)
+        transfer = is_transfer_path(raw)
+        if mode == 'eval' and transfer:
+            from contractionRL.agents.utils.RL.evaluation import rollout_stability
+            from contractionRL.agents.utils.contraction.metrics import StatManagerEnvWrapper
+            env = self._env if hasattr(self._env, 'stability_summary') else StatManagerEnvWrapper(self._env)
+            return evaluate_backend_pair(env, lambda: rollout_stability(env, self.agent, max_steps=raw.max_episode_length + 1))
+        with evaluation_section('Simulation Evaluation' if transfer else None):
+            return super().run(mode)
+
     @staticmethod
     def load_cfg_from_yaml(path):
         from contractionRL.agents.utils.RL.config import load_agent_config
         return load_agent_config(path)
 
     def __init__(self, env, cfg):
+        from contractionRL.runners.contraction_runner import _unwrap_env
+        from contractionRL.tasks.direct.common.transfer_dynamics import is_transfer_path
+        raw = _unwrap_env(env)
+        if is_transfer_path(raw) and getattr(raw, '_dynamics_model', None) is None:
+            raise RuntimeError('Prepare the transfer simulator before constructing the runner')
         from contractionRL.agents.utils.RL.config import configure_encoder_context, validate_observation_normalization
         import copy
         cfg = copy.deepcopy(cfg)
-        if any(key in cfg.get('agent', {}) for key in ('use_value_norm','use_reward_norm')):
+        if 'use_value_norm' in cfg.get('agent', {}):
             from contractionRL.agents.utils.RL.config import normalize_agent_cfg
             normalize_agent_cfg(cfg, algorithm=str(cfg['agent']['class']).lower(), device=getattr(env, 'device', None))
         configure_encoder_context(env, cfg)
-        validate_observation_normalization(cfg.get("agent", {}), allow_features="PPO" in str(cfg.get("agent", {}).get("class", "")).upper())
+        validate_observation_normalization(cfg.get("agent", {}))
         if hasattr(env, "set_discount_factor"):
             env.set_discount_factor(cfg.get("agent", {}).get("discount_factor", .99))
         # Select the policy distribution before model construction.
@@ -118,7 +137,6 @@ class CLActorRunner(Runner):
         if self._contractionppo:
             import copy
             cfg = copy.deepcopy(cfg)
-            cfg["agent"].pop("use_state_norm", None)
             value_norm = cfg["agent"].pop("use_value_norm", False)
             if value_norm:
                 cfg["agent"]["value_preprocessor"] = "RunningStandardScaler"
@@ -133,23 +151,25 @@ class CLActorRunner(Runner):
         return super()._generate_models(env, cfg)
 
     def _generate_agent(self, env, cfg, models):
-        for key in ('use_value_expansion','value_expansion_horizon','value_expansion_batch_size','use_state_norm','action_bound_penalty_beta'):
+        for key in ('use_value_expansion','value_expansion_horizon','value_expansion_batch_size','action_bound_penalty'):
             cfg['agent'].pop(key, None)
         agent = super()._generate_agent(env, cfg, models)
+        from contractionRL.runners.contraction_runner import _unwrap_env
+        from contractionRL.tasks.direct.common.transfer_dynamics import attach_transfer_agent
+        attach_transfer_agent(_unwrap_env(env), agent)
         from contractionRL.agents.utils.RL.agent_patches import patch_kl_logging
         patch_kl_logging(agent)
         if self._contractionppo or self._mbpo:
             agent.bind_env(env)
-        if 'action_bound_penalty_beta' in self._feature_cfg.get('agent', {}):
+        if 'action_bound_penalty' in self._feature_cfg.get('agent', {}):
             from contractionRL.runners.contraction_runner import _unwrap_env
             raw = _unwrap_env(env)
-            beta = self._feature_cfg['agent']['action_bound_penalty_beta']
+            beta = self._feature_cfg['agent']['action_bound_penalty']
             if hasattr(raw, 'set_action_bound_penalty'):
                 raw.set_action_bound_penalty(beta)
             elif beta:
-                raise ValueError('Environment does not implement action_bound_penalty_beta')
-        if 'PPO' in self._agent_class.upper() and any(self._feature_cfg.get('agent', {}).get(key, False)
-                for key in ('use_value_expansion','use_state_norm')):
+                raise ValueError('Environment does not implement action_bound_penalty')
+        if 'PPO' in self._agent_class.upper() and self._feature_cfg.get('agent', {}).get('use_value_expansion', False):
             from contractionRL.agents.utils.RL.ppo_features import PPOFeatures
             agent._ppo_features = PPOFeatures(agent, env, self._feature_cfg)
         return agent

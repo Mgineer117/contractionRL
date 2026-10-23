@@ -1,7 +1,8 @@
 # `search/configs/` — one search space per algorithm
 
-Each `<algorithm>.yaml` here declares the hyperparameters and ranges swept for
-that algorithm, and applies to **every** env. `search.sh` prompts for the
+Algorithm configs declare shared search spaces. The separate
+`car-c2rl-bayes-encoder-pairs.yaml` defines the current analytical-car campaign;
+see [Bayesian search](../../docs/bayesian_search.md). `search.sh` prompts for the
 algorithm + env, and `build_sweep.py` merges the chosen config with the env to
 emit a W&B sweep yaml.
 
@@ -41,12 +42,11 @@ runner:
 | `lqr.yaml` | `lqr` | AUC | analytical |
 | `sdlqr.yaml` | `sdlqr` | AUC | analytical |
 | `cvstem-lqr.yaml` | `cvstem-lqr` | AUC | analytical, online SDP, 1-episode eval |
-| `c2rl-<ppo\|sac>-<ccm\|cvstem>.yaml` | `c2rl-ppo` / `c2rl-sac` | reward (ccm) / AUC (cvstem) | 4 combinations |
+| `c2rl-ppo-cvstem.yaml`, `c2rl-sac-cvstem.yaml` | `c2rl-ppo` / `c2rl-sac` | AUC | CV-STEM metric synthesis |
 
-The `c2rl-*-cvstem` configs sweep the RL hyperparameters *and* the CV-STEM LMI
-knobs that decide feasibility, so they use the wrapper. `c2rl-*-ccm` sweeps
-`w_lb`/`w_ub` as a joint categorical because the pair must satisfy
-`w_lb < w_ub` — see the comment in those files.
+The `c2rl-*-cvstem` configs sweep RL hyperparameters and CV-STEM feasibility
+settings, so they use the failure-reporting wrapper. The car campaign samples
+CCM bounds as paired categories to enforce `w_lb < w_ub`.
 
 ## Adding an algorithm
 

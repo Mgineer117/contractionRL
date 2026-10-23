@@ -19,11 +19,8 @@ class PPOFeatures:
         self._u_min = torch.as_tensor(space.low, device=agent.device)
         self._u_max = torch.as_tensor(space.high, device=agent.device)
         self._raw_cfg = dict(cfg.get('agent', {}))
-        from contractionRL.agents.utils.RL.env import RunningRewardScaler
-        if isinstance(self._raw_cfg.get('rewards_shaper'), RunningRewardScaler):
-            self._raw_cfg.pop('rewards_shaper')
         settings = dict(use_value_expansion=False, value_expansion_horizon=3,
-                        value_expansion_batch_size=512, rewards_shaper_scale=1., action_bound_penalty_beta=0.,
+                        value_expansion_batch_size=None, rewards_shaper_scale=1., action_bound_penalty=0.,
                         dynamics_lr=.001, dynamics_lr_scheduler='', dynamics_lr_scheduler_kwargs={},
                         dynamics_batch_size=4096, dynamics_pretrain_epochs=100,
                         dynamics_pretrain_data_path='', emp_dynamics_memory_size=8192,
@@ -42,17 +39,17 @@ class PPOFeatures:
         if self._cfg.use_value_expansion:
             if not getattr(self._window, 'compact', False):
                 raise ValueError('PPO value expansion requires compact tracking observations')
-            if not getattr(raw, 'has_analytical_dynamics', hasattr(raw, '_f_logic')):
+            if getattr(raw, 'transition_backend', None) == 'learned':
+                self._neural_dynamics = raw._dynamics_model
+            elif not getattr(raw, 'has_analytical_dynamics', hasattr(raw, '_f_logic')):
                 self._build_dynamics(cfg)
             install_value_expansion(self, raw)
-        if self._raw_cfg.get('use_state_norm', False):
-            from contractionRL.agents.utils.RL.env import install_feature_normalization
-            install_feature_normalization(self)
         original_enable = agent.enable_training_mode
 
         def enable_training_mode(enabled=True):
             original_enable(enabled)
-            if enabled and self._neural_dynamics is not None and not bool(self._neural_dynamics.disturbance_fitted):
+            if (enabled and getattr(raw, 'transition_backend', None) != 'learned'
+                    and self._neural_dynamics is not None and not bool(self._neural_dynamics.disturbance_fitted)):
                 self._pretrain()
 
         agent.enable_training_mode = enable_training_mode

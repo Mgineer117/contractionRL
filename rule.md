@@ -311,7 +311,7 @@ so segway's frozen metric yields a non-stabilizing feedback direction. See
 
 ### Regenerating the per-env table
 
-`lbd` per env lives in `tasks/direct/isaac_classic_<env>/agents/skrl_c2rl_ppo_cfg.yaml`
+`lbd` per env lives in `tasks/direct/Classic/isaac_classic_<env>/agents/skrl_c2rl_ppo_cfg.yaml`
 under `cm:`; `dt` and `time_bound` in `isaac_classic_<env>/dynamics.py`. Sizing off the yaml `lbd`
 gives the *certified* horizon — treat it as an optimistic lower bound on T95
 until a run confirms the rate, exactly as segway shows.

@@ -128,6 +128,7 @@ def rollout(env, xs, W, r, steps):
 
 
 def main() -> int:
+    from contractionRL.tasks.direct.common.tracking_tasks import make_analytical_plant
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--env", required=True)
@@ -142,14 +143,14 @@ def main() -> int:
     short = _short(args.env)
     task = f"classic-{short}-v0" if short != "car_v1" else "classic-car-v1"
     with open(os.path.join(_ROOT, "source/contractionRL/contractionRL/tasks/direct/"
-                           f"isaac_classic_{short}/agents/"
+                           f"Classic/isaac_classic_{short}/agents/"
                            f"skrl_{args.algorithm.replace('-', '_')}_cfg.yaml")) as fh:
         from contractionRL.agents.utils.RL.config import load_agent_config
         cm = load_agent_config(fh.name)["cm"]
     r = float(cm["cvstem_r_scaler"]) + 1e-5
     xs, W, npz = load_metric(short)
 
-    env = gym.make(task, num_envs=args.paths, device="cpu").unwrapped
+    env = make_analytical_plant(task, num_envs=args.paths, device="cpu").unwrapped
     names = list(getattr(env, "state_names", None) or
                  [f"x{i}" for i in range(int(env.num_dim_x))])
     steps = args.steps or int(env.episode_len)

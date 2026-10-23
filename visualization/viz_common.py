@@ -130,8 +130,8 @@ METRIC_KINDS = ("ccm", "cvstem_pretrained", "cvstem_online", "random")
 
 def _env_id(name: str) -> str:
     """Short name -> gym id, via the one map the classic package owns."""
-    from contractionRL.tasks.direct.common.tracking_tasks import env_id
-    return env_id(name)
+
+    return name
 
 def make_env(env_name: str, seed: int, time_bound: float | None = None):
     """Instantiate a classic env (num_envs=1, cpu) with a seeded reset.
@@ -140,15 +140,15 @@ def make_env(env_name: str, seed: int, time_bound: float | None = None):
     reset draws x0/xref/uref through torch.rand — so the seed fully determines
     the scenario.
     """
+    from contractionRL.tasks.direct.common.tracking_tasks import make_analytical_plant
     if env_name not in CLASSIC_ENVS:
         raise ValueError(f"env must be one of {CLASSIC_ENVS}, got {env_name!r}")
     torch.manual_seed(seed)
     np.random.seed(seed)
-    env = gym.make(
+    env = make_analytical_plant(
         _env_id(env_name),
         num_envs=1,
         device="cpu",
-        disable_env_checker=True,
         **({"time_bound": time_bound} if time_bound is not None else {}),
     ).unwrapped
     return env
@@ -676,7 +676,7 @@ def load_algo_cfg(env_name: str, algo: str) -> dict:
         with open(local) as f:
             return load_agent_config(f.name)
     task_yaml = os.path.join(
-        _SRC, "contractionRL", "tasks", "direct", "classic", env_name, "agents",
+        _SRC, "contractionRL", "tasks", "direct", "Classic", f"isaac_classic_{env_name}", "agents",
         _CFG_FILENAMES[algo],
     )
     if not os.path.exists(task_yaml) and algo == "cvstem_lqr":

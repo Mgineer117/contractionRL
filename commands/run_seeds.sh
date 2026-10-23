@@ -137,8 +137,8 @@ else
 fi
 
 # ── Env ─────────────────────────────────────────────────────────────────── #
-CLASSIC_ENVS=("classic-car-v0" "classic-car-v1" "classic-cartpole-v0" "classic-segway-v0" "classic-quadrotor-v0")
-ISAAC_ENVS=("Humanoid-PathTracking-v0" "Humanoid-VelTracking-v0" "Manipulator-PathTracking-v0" "Manipulator-VelTracking-v0" "Quadruped-PathTracking-v0" "Quadruped-VelTracking-v0" "Isaac-Car-v0" "Isaac-Car-v1" "Isaac-Quadrotor-v0")
+CLASSIC_ENVS=(Isaac-Classic-Car-v0 Isaac-Classic-Car-v1 Isaac-Classic-Cartpole-v0 Isaac-Classic-Segway-v0 Isaac-Classic-Quadrotor-v0)
+ISAAC_ENVS=("Isaac-Transfer-path-Humanoid-v0" "Isaac-Transfer-vel-Humanoid-v0" "Isaac-Transfer-path-Manipulator-v0" "Isaac-Transfer-vel-Manipulator-v0" "Isaac-Transfer-path-Quadruped-v0" "Isaac-Transfer-vel-Quadruped-v0" "Isaac-Car-v0" "Isaac-Car-v1" "Isaac-Quadrotor-v0")
 
 if [[ -z "$ENV_ARG" ]]; then
     ENV_ARG=$(prompt_choice "Select env (or 'all' for every classic env):" \
@@ -149,11 +149,11 @@ if [[ "$ENV_ARG" == "all" ]]; then
     ENVS=("${CLASSIC_ENVS[@]}")
 else
     case "$ENV_ARG" in
-        car|classic-car-v0)             ENVS=("classic-car-v0") ;;
-        car_v1|classic-car-v1)   ENVS=("classic-car-v1") ;;
-        cartpole|classic-cartpole-v0)   ENVS=("classic-cartpole-v0") ;;
-        segway|classic-segway-v0)       ENVS=("classic-segway-v0") ;;
-        quadrotor|classic-quadrotor-v0) ENVS=("classic-quadrotor-v0") ;;
+        car|Isaac-Classic-Car-v0)             ENVS=("Isaac-Classic-Car-v0") ;;
+        car_v1|Isaac-Classic-Car-v1)   ENVS=("Isaac-Classic-Car-v1") ;;
+        cartpole|Isaac-Classic-Cartpole-v0)   ENVS=("Isaac-Classic-Cartpole-v0") ;;
+        segway|Isaac-Classic-Segway-v0)       ENVS=("Isaac-Classic-Segway-v0") ;;
+        quadrotor|Isaac-Classic-Quadrotor-v0) ENVS=("Isaac-Classic-Quadrotor-v0") ;;
         *)
             _found=0
             for e in "${ISAAC_ENVS[@]}"; do [[ "$e" == "$ENV_ARG" ]] && _found=1; done
@@ -276,8 +276,6 @@ DONE=0
 gpu_i=0
 
 for ENV in "${ENVS[@]}"; do
-    IS_CLASSIC=0
-    for e in "${CLASSIC_ENVS[@]}"; do [[ "$e" == "$ENV" ]] && IS_CLASSIC=1; done
 
     for ALGO in "${ALGOS[@]}"; do
         for SEED in "${SEEDS[@]}"; do
@@ -293,7 +291,6 @@ for ENV in "${ENVS[@]}"; do
             # eval_results.json, and the aggregator reports a smaller n_seeds.
             (
                 CUDA_VISIBLE_DEVICES=$GPU python scripts/skrl/train.py \
-                    $([[ "$IS_CLASSIC" -eq 1 ]] && echo "--classic") \
                     --task "$ENV" \
                     --algorithm "$ALGO" \
                     --seed "$SEED" \

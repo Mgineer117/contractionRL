@@ -18,14 +18,6 @@ models:
       layers: [128, 128]
       activations: tanh
       constrain_eigenvalues: true
-  dynamics:
-    class: NeuralDynamics
-    network:
-    - name: net
-      input: STATE_ACTION
-      layers: [128, 128]
-      activations: relu
-
 memory:
   class: RandomMemory
   memory_size: 131072

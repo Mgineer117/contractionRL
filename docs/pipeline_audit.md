@@ -56,8 +56,8 @@ Audit date: October 15, 2026. The findings below are **fixed in the working tree
 
 9. **Normalization, exploration, and scheduler options were overridden or ignored** ([config.py](../source/contractionRL/contractionRL/agents/utils/RL/config.py); [agent_patches.py](../source/contractionRL/contractionRL/agents/utils/RL/agent_patches.py)).
    - **What this is:** These settings control the scale and schedule of policy updates.
-   - **Problem:** Backbone defaults overrode explicit annealing settings; standalone reward normalization was dropped; C2RL value-normalization choices could disappear. A diagnostic hook replaced non-KL schedulers, and the inner scheduler-name resolver overwrote the run-name variable.
-   - **Fix:** Remove policy-noise scheduling entirely: PPO learns its exploration standard deviation. Construct the requested reward scaler, preserve configured learning-rate schedulers, and resolve scheduler classes without changing run identity. Unsupported physical-state normalization fails clearly. Tests exercise a real StepLR step, reward scaling, Gaussian sampling, and learnable exploration noise.
+   - **Problem:** Backbone defaults overrode explicit annealing settings; C2RL value-normalization choices could disappear. A diagnostic hook replaced non-KL schedulers, and the inner scheduler-name resolver overwrote the run-name variable.
+   - **Fix:** Remove policy-noise scheduling entirely: PPO learns its exploration standard deviation. Preserve configured fixed reward scaling and learning-rate schedulers, and resolve scheduler classes without changing run identity. Unsupported physical-state normalization fails clearly. Tests exercise a real StepLR step, reward scaling, Gaussian sampling, and learnable exploration noise.
    - **If left unfixed:** Hyperparameter comparisons can change exploration, learning rate, or target scale unintentionally.
 
 10. **Network settings differed between compact and legacy paths** ([runner.py](../source/contractionRL/contractionRL/agents/utils/RL/runner.py); [models.py](../source/contractionRL/contractionRL/agents/utils/RL/models.py)).
@@ -123,7 +123,7 @@ Audit date: October 15, 2026. The findings below are **fixed in the working tree
 | `w_lb`, `w_ub` | Structural dual bounds; C2RL emits M with reciprocal bounds, C3M emits W |
 | `mode` | `analytical` uses exact dynamics; `sim_to_real` learns dynamics; PhysX-only tasks force `sim_to_real` |
 | Disturbance / reference / timestep / horizon | Environment constructor, saved classic config, evaluation and playback restoration |
-| Value/reward normalization, exploration schedule | Shared configuration translation; unsupported state normalization rejected |
+| Value normalization, fixed reward scaling, exploration schedule | Shared configuration translation; unsupported observation preprocessing rejected |
 | C3M memory size and minibatch size | Actual sampled buffer and all samples in each epoch |
 | Checkpoint / reference-bank identity | Model-layout restoration, task/algorithm filtering, backend cache namespace |
 

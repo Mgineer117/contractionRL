@@ -210,6 +210,7 @@ def evaluate(env, agent, n_envs):
 
 
 def main() -> int:
+    from contractionRL.tasks.direct.common.tracking_tasks import make_analytical_plant
     p = argparse.ArgumentParser(
         description="Search (lbd, r) for cvstem-lqr over uniform state samples, "
                     "then evaluate one episode.")
@@ -299,7 +300,7 @@ def main() -> int:
     torch.manual_seed(args.seed)
     import contractionRL.tasks.direct.common.tracking_tasks  # noqa: F401  (registers the ids)
     import gymnasium as gym
-    env = gym.make(args.task, num_envs=args.eval_envs, device="cpu").unwrapped
+    env = make_analytical_plant(args.task, num_envs=args.eval_envs, device="cpu").unwrapped
 
     def _np(t):
         return t.detach().cpu().numpy().astype(np.float64)

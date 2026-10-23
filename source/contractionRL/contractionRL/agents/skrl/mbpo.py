@@ -24,7 +24,7 @@ from contractionRL.agents.utils.system_dynamics.state import wrap_diff
 
 @dataclass(kw_only=True)
 class MBPOCfg(SAC_CFG):
-    ensemble_size: int = 7
+    ensemble_size: int = 5
     num_elites: int = 5
     model_hidden: list[int] = field(default_factory=lambda: [200, 200, 200, 200])
     model_learning_rate: float = 0.001

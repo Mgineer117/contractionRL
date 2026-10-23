@@ -24,7 +24,7 @@ parameters:
     - 0.95
     - 0.99
     - 1.0
-  agent.action_bound_penalty_beta:
+  agent.action_bound_penalty:
     values:
     - 0.01
     - 1.0

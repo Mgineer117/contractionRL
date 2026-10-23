@@ -174,6 +174,7 @@ def visualize(output, rows, scales, axis, hs, preview=False):
 
 
 def analyze(args, preview=False, cache=None):
+    from contractionRL.tasks.direct.common.tracking_tasks import make_analytical_plant
     root, output = args.root.resolve(), args.output.resolve()
     if preview:
         output = output.with_name(output.name + '-preview')
@@ -228,7 +229,7 @@ def analyze(args, preview=False, cache=None):
             folder = output / f'{step:06d}' / method
             folder.mkdir(parents=True)
             checkpoint = root / ('preflight' if args.smoke else 'training') / method / 'snapshots' / f'{step:06d}/checkpoints/agent.pt'
-            env = gym.make('classic-car-v0', num_envs=args.batch_size*episodes, device=args.device,
+            env = make_analytical_plant('classic-car-v0', num_envs=args.batch_size*episodes, device=args.device,
                            disturbance_scales=[0.]*4).unwrapped
             try:
                 for key, value in list(vars(env).items()):

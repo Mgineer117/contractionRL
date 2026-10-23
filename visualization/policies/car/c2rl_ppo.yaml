@@ -1,35 +1,38 @@
 seed: 42
 
 models:
+  encoder:
+    feature_dim: null  # null defaults to 3 * x_dim per GRU.
+    encoder_window: null  # null uses ceil(1 / (1 - discount_factor)) steps for each past/future window.
   separate: true
   policy:
     class: GaussianMixin
+    encoder: null  # No GRU; use gru to encode past and future context.
     clip_actions: false
     clip_log_std: true
-    min_log_std: -20.0
+    min_log_std: -6.9
     max_log_std: 2.0
     network:
     - name: net
       input: OBSERVATIONS
-      layers: [128, 128]
+      layers:
+      - 256
+      - 256
       activations: tanh
     output: ACTIONS
-    initial_log_std: 0.0
-  critic:
+    initial_log_std: -0.5
+    control_mode: structured
+  value:
+    encoder: gru  # Separate GRUs encode past and future context.
     class: DeterministicMixin
     network:
     - name: net
       input: OBSERVATIONS
-      layers: [128, 128]
+      layers:
+      - 256
+      - 256
       activations: tanh
     output: ONE
-  dynamics:
-    class: NeuralDynamics
-    network:
-    - name: net
-      input: STATE_ACTION
-      layers: [128, 128]
-      activations: relu
   cmg:
     class: CMG
     network:
@@ -44,11 +47,11 @@ memory:
 
 agent:
   class: C2RL-PPO
-  rollouts: 24
+  rollouts: 64
   learning_epochs: 5
   mini_batches: 4
   gae_lambda: 0.95
-  learning_rate: 1.0e-5
+  learning_rate: 1.0e-05
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.008
@@ -65,14 +68,13 @@ agent:
   value_loss_scale: 2.5
   kl_threshold: 0.032
   time_limit_bootstrap: true
-  rewards_shaper_scale: 1.0
-  use_state_norm: false
+  rewards_shaper_scale: 0.1
   use_value_norm: true
-  use_value_expansion: false
-  value_expansion_horizon: 3
-  value_expansion_batch_size: 512
-
-  discount_factor: 0.01
+  use_value_expansion: true
+  value_expansion_horizon: 10
+  value_expansion_batch_size: null  # Defaults to agent.rollouts.
+  discount_factor: 0.995
+  action_bound_penalty: 1.0
   experiment:
     directory: "car_c2rl_ppo"
     experiment_name: ""
@@ -109,16 +111,6 @@ cmg:
     step_size: 1
     gamma: 0.99
   cvstem_batch_size: 512
-
-empirical_dynamics:
-  num_controls_per_state: 3
-  dynamics_lr: 1.0e-3
-  dynamics_lr_scheduler: "StepLR"
-  dynamics_lr_scheduler_kwargs:
-    step_size: 1
-    gamma: 0.99
-  dynamics_batch_size: 4096
-  dynamics_pretrain_epochs: 100
 
 trainer:
   class: C2RLSkrlTrainer

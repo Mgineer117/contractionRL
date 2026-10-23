@@ -61,7 +61,7 @@ Sign convention: ``--bad-value`` must match ``metric.goal``. For the AUC metrics
 these configs use (minimized) it is a large positive number, not a negative one.
 
 Usage (normally invoked by the sweep yaml search/build_sweep.py generates):
-    python search/sweep_runner.py --task classic-car-v0 --algorithm cvstem-lqr \
+    python search/sweep_runner.py --task Isaac-Classic-Car-v0 --algorithm cvstem-lqr \
         --num_envs 64 --metric-name "Stability/auc_mean" --bad-value=1e3 [...]
 """
 
@@ -79,7 +79,7 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 _TRAIN_PY = _ROOT / "scripts" / "skrl" / "train.py"
 
-# ── Infeasibility signals ─────────────────────────────────────────────────── #
+# Infeasibility signals
 # Substrings that unambiguously mean "the SDP failed" regardless of counts.
 _HARD_MARKERS = (
     # cvstem_lqr.INFEASIBLE_MARKER — the online abort, raised both by CV-STEM-LQR's
@@ -235,14 +235,12 @@ def _log_bad_metric(metric_name: str, bad_value: float, reason: str, run_id: str
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--task", required=True, help="Env id, e.g. classic-car-v0.")
+    parser.add_argument("--task", required=True, help="Env id, e.g. Isaac-Classic-Car-v0.")
     parser.add_argument("--algorithm", required=True, help="train.py --algorithm value.")
     parser.add_argument("--num_envs", "--num-envs", dest="num_envs", type=int, required=True)
     parser.add_argument("--num_timesteps", "--num-timesteps", dest="num_timesteps",
                         type=int, default=None,
                         help="Forwarded to train.py; set by one_episode configs.")
-    parser.add_argument("--classic", action="store_true",
-                        help="Forwarded to train.py for classic envs.")
     parser.add_argument("--metric-name", default="Stability/auc_mean",
                         help="Sweep metric to poison. Must match the yaml's metric.name.")
     parser.add_argument("--bad-value", type=float, default=1e4,
@@ -262,8 +260,6 @@ def main() -> int:
             run_id = None
 
     cmd = [sys.executable, str(_TRAIN_PY)]
-    if args.classic or args.task.startswith("classic-"):
-        cmd.append("--classic")
     cmd += [
         "--task", args.task,
         "--algorithm", args.algorithm,

@@ -26,7 +26,6 @@ Isaac env:   env is already a SkrlVecEnvWrapper — passed through.
 
 Custom YAML flags handled here (stripped before passing to skrl)
 -----------------------------------------------------------------
-use_state_norm: false      →  physical observations; models scale neural inputs
 use_value_norm: true/false  →  value_preprocessor (PPO only)
 """
 
@@ -287,9 +286,7 @@ def _build_critics(models_cfg: dict, block_name: str, base_algorithm: str, obs_s
         raise ValueError(f"Unsupported base_algorithm: {base_algorithm}")
 
 
-# ────────────────────────────────────────────────────────────────────────── #
 # Helper: translate custom YAML flags to skrl format
-# ────────────────────────────────────────────────────────────────────────── #
 
 def _resolve_dynamics_model(algo: str, agent_cfg: dict, has_analytical_dynamics: bool, device,
                             explicit_model=None, expected_metadata=None):
@@ -340,7 +337,6 @@ def _prepare_skrl_cfg(cfg: dict, algo: str, device=None) -> dict:
     return cfg
 
 
-# ────────────────────────────────────────────────────────────────────────── #
 
 def _make_skrl_env(env, task_id: str | None, num_envs: int, is_classic: bool):
     """Return a skrl-wrapped env suitable for contraction agents."""
@@ -348,16 +344,7 @@ def _make_skrl_env(env, task_id: str | None, num_envs: int, is_classic: bool):
         if isinstance(env, gym.Env) and hasattr(env.unwrapped, "num_envs"):
             from contractionRL.agents.utils.RL.env import BatchedGymnasiumWrapper
             env = BatchedGymnasiumWrapper(env)
-        # Reuse the caller's env if it's already a real, usable one instead of
-        # unconditionally rebuilding a bare duplicate. train.py's classic path
-        # already constructs SyncVectorEnv + wrap_env + WandbPlotWrapper before
-        # calling ContractionRunner — rebuilding from scratch here silently
-        # discarded that wrapping, so C3M/LQR/SDLQR/C2RL's actual training loop
-        # (which steps whatever this function returns, not the caller's `env`)
-        # ran against an unwrapped env: no Stability/* forwarding, no
-        # normalized_error/path_tracking plots. Building fresh from `task_id`
-        # remains the fallback for callers that pass a bare/unvectorized env
-        # (see the module docstring's documented usage).
+        # Reuse an already wrapped environment to preserve wrappers and evaluation state.
         from contractionRL.agents.utils.contraction.metrics import StatManagerEnvWrapper
         if hasattr(env, "step") and hasattr(env, "observation_space") and hasattr(env, "num_envs"):
             # Auto-collect path-tracking metrics on every reset/step so eval loops
@@ -370,23 +357,12 @@ def _make_skrl_env(env, task_id: str | None, num_envs: int, is_classic: bool):
         from gymnasium.vector import SyncVectorEnv
         from skrl.envs.wrappers.torch import wrap_env
         vec_env = SyncVectorEnv([lambda: gym.make(task_id)] * num_envs)
-        # Do not force vec_env.device = "cpu" here. The underlying physics step
-        # is numpy/CPU-bound either way, but GymnasiumWrapper.step/reset already
-        # bridges numpy <-> torch at the right device via tensorize_space /
-        # untensorize_space (actions are .cpu().numpy()'d before being handed to
-        # the numpy env; observations are re-tensorized onto `device` after).
-        # Leaving vec_env.device unset lets GymnasiumWrapper fall back to the
-        # global skrl device (cuda:0 when available) — matching Isaac envs and
-        # letting C3M/C2RL's batched Jacobian/backprop math run on GPU instead
-        # of silently pinning the whole classic pipeline (including the neural
-        # networks) to CPU.
+        # Preserve the wrapper's device; it handles CPU physics/GPU tensor transfers.
         return StatManagerEnvWrapper(wrap_env(vec_env)) if not hasattr(env, "stability_summary") else wrap_env(vec_env)
     return env  # Isaac: already wrapped
 
 
-# ────────────────────────────────────────────────────────────────────────── #
 # ContractionRunner
-# ────────────────────────────────────────────────────────────────────────── #
 
 class ContractionRunner:
     """Unified runner — same interface as ``skrl.utils.runner.torch.Runner``.
@@ -416,7 +392,7 @@ class ContractionRunner:
     ) -> None:
         algo = cfg.get("agent", {}).get("class", "ppo").lower()
         from contractionRL.agents.utils.RL.config import configure_encoder_context, validate_observation_normalization
-        validate_observation_normalization(cfg.get("agent", {}), allow_features='ppo' in algo)
+        validate_observation_normalization(cfg.get("agent", {}))
         raw = _unwrap_env(env)
         configure_encoder_context(raw, cfg)
 
@@ -436,8 +412,10 @@ class ContractionRunner:
                 f"Unknown algorithm '{algo}'. "
                 f"skrl: {sorted(_SKRL_ALGOS)}, contraction: {sorted(_CONTRACTION_ALGOS)}"
             )
+        from contractionRL.tasks.direct.common.transfer_dynamics import attach_transfer_agent
+        attach_transfer_agent(raw, self.agent)
 
-    # ── skrl-native algos (PPO/SAC/etc.) ───────────────────────────────── #
+    # skrl-native algos (PPO/SAC/etc.)
 
     def _setup_skrl(self, env, cfg, algo, task_id, num_envs, is_classic, ml_framework):
         skrl_cfg = _prepare_skrl_cfg(cfg, algo, getattr(env, "device", None))
@@ -465,18 +443,11 @@ class ContractionRunner:
         from contractionRL.agents.utils.RL.agent_patches import patch_terminal_observations
         patch_terminal_observations(self._runner.agent)
 
-    # ── contraction agents (C3M/LQR/SDLQR/C2RL) ───────────────────────── #
+    # contraction agents (C3M/LQR/SDLQR/C2RL)
 
     def _setup_contraction(self, env, cfg, algo, task_id, num_envs, is_classic, dynamics_model=None):
         skrl_env = _make_skrl_env(env, task_id, num_envs, is_classic)
-        # Use the wrapped env's device for both classic and Isaac envs. The
-        # classic env's own physics step is numpy/CPU-bound regardless (see
-        # _make_skrl_env), but the agent's neural networks and gradient math
-        # (C3M/C2RL Jacobians, batched contraction losses) benefit hugely from
-        # GPU — hardcoding CPU here was pinning that compute off the GPU even
-        # when one was available. SD-LQR/LQR are unaffected: they pin their own
-        # internal `_compute_device = "cpu"` regardless of this value, since
-        # scipy's care solver is CPU-only anyway.
+        # Run neural models on the wrapped environment's device.
         device = skrl_env.device
         obs_space = skrl_env.observation_space
         act_space = skrl_env.action_space
@@ -494,14 +465,22 @@ class ContractionRunner:
         # injected here, or get_f_and_B raises mid-rollout. No-op for classic
         # envs and for C3M/C2RL, which own their dynamics model directly.
         from contractionRL.agents.utils.system_dynamics.dynamics import dynamics_environment_metadata
-        dynamics_model = _resolve_dynamics_model(
-            algo, agent_cfg, has_analytical_dynamics, skrl_env.device, dynamics_model,
-            expected_metadata=dynamics_environment_metadata(raw_env))
+        from contractionRL.tasks.direct.common.transfer_dynamics import is_transfer_path
+        shared_transfer = is_transfer_path(raw_env)
+        if shared_transfer:
+            dynamics_model = raw_env._dynamics_model
+            agent_cfg.pop('dynamics_checkpoint', None)
+            if dynamics_model is None:
+                raise RuntimeError('Prepare the transfer simulator before constructing the runner')
+        else:
+            dynamics_model = _resolve_dynamics_model(
+                algo, agent_cfg, has_analytical_dynamics, skrl_env.device, dynamics_model,
+                expected_metadata=dynamics_environment_metadata(raw_env))
         if dynamics_model is not None and hasattr(raw_env, "set_dynamics_model"):
             raw_env.set_dynamics_model(dynamics_model)
 
         get_f_and_B, get_rollout = _env_attrs(raw_env, "get_f_and_B", "get_rollout")
-        if not has_analytical_dynamics and algo in ("c3m", "c2rl-ppo", "c2rl-sac"):
+        if not shared_transfer and not has_analytical_dynamics and algo in ("c3m", "c2rl-ppo", "c2rl-sac"):
             get_f_and_B = None
         if dynamics_model is not None and algo not in ("c3m", "c2rl-ppo", "c2rl-sac"):
             get_f_and_B = dynamics_model.get_f_and_B
@@ -538,7 +517,7 @@ class ContractionRunner:
         # contraction_metrics.log_raw_config for why this is logged separately
         # from skrl's own dataclass-based wandb config.
         raw_cfg_snapshot = copy.deepcopy({
-            "dynamics_backend": "analytical" if has_analytical_dynamics else "physx",
+            "dynamics_backend": "learned" if shared_transfer else "analytical" if has_analytical_dynamics else "physx",
             "agent": agent_cfg, "trainer": trainer_cfg, "models": copy.deepcopy(cfg.get("models", {})),
             "cm": cm_cfg, "cmg": cmg_cfg, "empirical_dynamics": empirical_dynamics_cfg,
         })
@@ -556,13 +535,7 @@ class ContractionRunner:
                               agent_cfg, trainer_cfg, models_cfg, get_f_and_B, lqr=(algo == "lqr"), x_dim=x_dim, u_dim=u_dim, angle_idx=angle_idx, sym=sym,
                               raw_cfg_snapshot=raw_cfg_snapshot)
         elif algo in ("cvstem-lqr",):
-            # CV-STEM-LQR reads the same `cm:`/`cmg:` blocks C2RL does (joint SDP
-            # + metric-network knobs), merged into agent_cfg. The agent builds and
-            # freezes its own CholMetric — no model comes from `models:`.
-            #
-            # The joint SDP samples uniformly over the env's own state box and
-            # differences W̄ against I over its own dt — both read from the env,
-            # never configured (see CVSTEMLQRAgent).
+            # CV-STEM-LQR builds its own metric from cm/cmg config, independently of models.
             x_min, x_max, env_dt = _env_attrs(raw_env, "X_MIN", "X_MAX", "dt")
             self._setup_cvstem_lqr(skrl_env, device, obs_space, state_space, act_space,
                                    agent_cfg, trainer_cfg, models_cfg, get_rollout, get_f_and_B,
@@ -763,7 +736,9 @@ class ContractionRunner:
         # yaml category blocks after it silently clobbered them with the yaml
         # default. No yaml declares the same key in two blocks, so for a
         # yaml-only run the merge order makes no difference.
-        agent_cfg = {**(cm_cfg or {}), **(cmg_cfg or {}), **(empirical_dynamics_cfg or {}), **agent_cfg}
+        empirical_agent_cfg = {key: value for key, value in (empirical_dynamics_cfg or {}).items()
+                               if key not in {'dataset_mode', 'dynamics_ensemble_size', 'ood_penalty_coef'}}
+        agent_cfg = {**(cm_cfg or {}), **(cmg_cfg or {}), **empirical_agent_cfg, **agent_cfg}
         agent_cfg = migrate_c2rl_metric_cfg(agent_cfg)
 
         base_algorithm = base_algorithm.upper()
@@ -864,9 +839,6 @@ class ContractionRunner:
         if base_algorithm == "PPO" and agent._cfg.use_value_expansion:
             from contractionRL.agents.utils.RL.value_expansion import install_value_expansion
             install_value_expansion(agent, raw_env)
-        if base_algorithm == 'PPO' and agent._cfg.use_state_norm:
-            from contractionRL.agents.utils.RL.env import install_feature_normalization
-            install_feature_normalization(agent)
         if hasattr(env, "set_discount_factor"):
             env.set_discount_factor(agent._cfg.discount_factor)
         trainer_cfg.setdefault("timesteps", 300000)
@@ -893,7 +865,7 @@ class ContractionRunner:
                 cmg_bounds_fn=_make_cmg_bounds_fn(cmg_model, w_lb),
             )
 
-    # ── public interface ────────────────────────────────────────────────── #
+    # public interface
 
     @property
     def agent(self):
@@ -914,6 +886,9 @@ class ContractionRunner:
             self._agent.load(path)
 
     def run(self):
-        if self._mode == "skrl":
-            return self._runner.run()
-        return self._trainer.train()
+        from contractionRL.tasks.direct.common.transfer_dynamics import is_transfer_path
+        from contractionRL.agents.utils.RL.logging import evaluation_section
+        with evaluation_section('Simulation Evaluation' if is_transfer_path(_unwrap_env(self._env)) else None):
+            if self._mode == "skrl":
+                return self._runner.run()
+            return self._trainer.train()
