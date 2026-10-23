@@ -154,6 +154,11 @@ class CLActorRunner(Runner):
         for key in ('use_value_expansion','value_expansion_horizon','value_expansion_batch_size','action_bound_penalty'):
             cfg['agent'].pop(key, None)
         agent = super()._generate_agent(env, cfg, models)
+        # skrl inserts spaces even for disabled preprocessors; tracking spaces
+        # reference the live simulator and cannot be copied into W&B config.
+        for name in ('observation', 'state', 'value'):
+            if getattr(agent.cfg, name + '_preprocessor', None) is None:
+                setattr(agent.cfg, name + '_preprocessor_kwargs', {})
         from contractionRL.runners.contraction_runner import _unwrap_env
         from contractionRL.tasks.direct.common.transfer_dynamics import attach_transfer_agent
         attach_transfer_agent(_unwrap_env(env), agent)
